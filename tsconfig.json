@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    "strict": true,
+    "skipLibCheck": true,
+
+    "noEmit": true,
+    "isolatedModules": true,
+
+    "resolveJsonModule": true,
+    "types": ["node"],
+
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": [
+    "scripts/**/*.ts",
+    "*.ts",
+    "*.mts",
+    "*.cts",
+    "vite.config.ts",
+    "eslint.config.*",
+    "tailwind.config.*",
+    "postcss.config.*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "apps/**/dist",
+    "packages/**/dist"
+  ]
+}

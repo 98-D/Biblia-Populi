@@ -1,0 +1,152 @@
+
+       /* base.css — Biblia Populi (minimal, reading-first) */
+
+   :root {
+       --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, Arial, "Noto Sans",
+       "Apple Color Emoji", "Segoe UI Emoji";
+       --font-serif: ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", Times, serif;
+
+       /* Light */
+       --bg: #ffffff;
+       --fg: #0b0b0b;
+       --muted: rgba(11, 11, 11, 0.60);
+       --hairline: rgba(11, 11, 11, 0.10);
+
+       --radius: 16px;
+       --radius-sm: 12px;
+
+       --text: 16px;
+       --leading: 1.6;
+
+       --focus: rgba(11, 11, 11, 0.25);
+   }
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #070707;
+        --fg: #f4f4f4;
+        --muted: rgba(244, 244, 244, 0.70);
+        --hairline: rgba(244, 244, 244, 0.12);
+        --focus: rgba(244, 244, 244, 0.28);
+    }
+}
+
+/* Manual override (optional) */
+html[data-theme="light"] {
+    --bg: #ffffff;
+    --fg: #0b0b0b;
+    --muted: rgba(11, 11, 11, 0.60);
+    --hairline: rgba(11, 11, 11, 0.10);
+    --focus: rgba(11, 11, 11, 0.25);
+}
+
+html[data-theme="dark"] {
+    --bg: #070707;
+    --fg: #f4f4f4;
+    --muted: rgba(244, 244, 244, 0.70);
+    --hairline: rgba(244, 244, 244, 0.12);
+    --focus: rgba(244, 244, 244, 0.28);
+}
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+html {
+    font-family: var(--font-sans);
+    font-size: var(--text);
+    line-height: var(--leading);
+    background: var(--bg);
+    color: var(--fg);
+    text-size-adjust: 100%;
+    -webkit-text-size-adjust: 100%;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--fg);
+}
+
+#root {
+    min-height: 100vh;
+}
+
+h1, h2, h3, h4 {
+    margin: 0;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+}
+
+p { margin: 0; }
+
+a {
+    color: inherit;
+    text-decoration: none;
+}
+a:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+}
+
+::selection {
+    background: color-mix(in oklab, var(--fg) 14%, transparent);
+}
+
+button,
+input,
+textarea,
+select {
+    font: inherit;
+    color: inherit;
+}
+
+:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+    border-radius: 10px;
+}
+
+/* Minimal utilities (only what we actually need) */
+.container {
+    width: min(1040px, calc(100% - 32px));
+    margin-inline: auto;
+}
+
+.hairline {
+    height: 1px;
+    background: var(--hairline);
+}
+
+.kicker {
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+/* Reading */
+.prose,
+.scripture {
+    font-family: var(--font-serif);
+    font-size: 18px;
+    line-height: 1.75;
+    color: var(--fg);
+}
+
+@media (max-width: 480px) {
+    .prose,
+    .scripture {
+        font-size: 17px;
+    }
+}
+
+/* Motion */
+@media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+}

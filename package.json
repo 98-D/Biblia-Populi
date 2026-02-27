@@ -1,0 +1,13 @@
+{
+  "name": "biblia-populi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "bun run --filter @bp/web dev",
+    "build": "bun run --filter @bp/web build",
+    "preview": "bun run --filter @bp/web preview",
+    "typecheck": "bun run --filter @bp/web typecheck"
+  }
+}
