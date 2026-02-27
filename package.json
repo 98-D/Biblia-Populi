@@ -9,5 +9,8 @@
     "build": "bun run --filter @bp/web build",
     "preview": "bun run --filter @bp/web preview",
     "typecheck": "bun run --filter @bp/web typecheck"
+  },
+  "dependencies": {
+    "@types/node": "^25.3.2"
   }
 }
