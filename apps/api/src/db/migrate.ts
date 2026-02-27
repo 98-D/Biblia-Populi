@@ -139,7 +139,7 @@ function setExtra(sqlite: SqliteLike, key: string, value: string): void {
     sqlite
         .query(
             `INSERT INTO __bp_extras(key, value) VALUES(?, ?)
-       ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
         )
         .run(key, value);
 }
