@@ -24,7 +24,3 @@ I believe God’s Word does not belong to gatekeepers — it is given for the wo
 **Biblia Populi** exists so that anyone, anywhere, may read, search, study, and share the Scriptures without barrier — and encounter the truth of Jesus Christ.
 
 ---
-
-Ancient in name.  
-Modern in form.  
-Open to all.
