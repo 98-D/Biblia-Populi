@@ -2,8 +2,8 @@
 
 **Latin for “The Bible of the People.”**
 
-> The Word of God, open to all.
 
+> The Word of God, open to all.
 ---
 
 ## About
