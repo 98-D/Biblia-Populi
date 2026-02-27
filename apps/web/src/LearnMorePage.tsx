@@ -13,11 +13,11 @@ type Props = {
 };
 
 /**
- * Ultra-minimal Learn More page
- * - Matches your styling tokens (muted, hairline, panel, shadowSoft)
- * - Tight typography, whitespace, no cards
- * - Single thin rail on wide screens
- * - No runtime style mutation; responsive handled via state + inline style
+ * Ultra-minimal Learn More page (chill typography, narrower + centered body)
+ * - Statement first
+ * - Less wide content for a calmer reading feel
+ * - Content column centered within its area
+ * - Keeps your tokens: --muted, --hairline, --panel
  */
 export function LearnMorePage(props: Props) {
     const { mode, onToggleTheme, onBack, styles } = props;
@@ -34,11 +34,11 @@ export function LearnMorePage(props: Props) {
     }, []);
 
     const layout = useMemo(() => {
-        const railW = isNarrow ? 0 : 180;
+        const railW = isNarrow ? 0 : 160;
         return {
             railW,
-            contentMax: isNarrow ? 760 : 720,
-            gap: isNarrow ? 0 : 26,
+            contentMax: isNarrow ? 640 : 600,
+            gap: isNarrow ? 0 : 20,
         };
     }, [isNarrow]);
 
@@ -54,31 +54,37 @@ export function LearnMorePage(props: Props) {
                 <ThemeToggle mode={mode} onToggle={onToggleTheme} styles={styles} />
             </div>
 
-            <div style={{ ...local.headerWrap, marginTop: 28, gap: layout.gap }}>
+            <div style={{ ...local.headerWrap, marginTop: 22, gap: layout.gap }}>
                 {!isNarrow && (
-                    <aside style={{ width: layout.railW, paddingTop: 8 }}>
+                    <aside style={{ width: layout.railW, paddingTop: 6 }}>
                         <div style={local.rail}>
                             <div style={local.railKicker}>Biblia Populi</div>
-                            <div style={local.railMeta}>Reading-first Scripture</div>
+                            <div style={local.railMeta}>Reading-first</div>
                             <div style={local.railMeta}>Open access</div>
                             <div style={local.railMeta}>Quiet by design</div>
                         </div>
                     </aside>
                 )}
 
-                <section style={{ maxWidth: layout.contentMax }}>
+                {/* Center the content column */}
+                <section style={{ maxWidth: layout.contentMax, marginInline: "auto" }}>
                     <div style={local.kicker}>Learn more</div>
-                    <h1 style={local.title}>Built for quiet reading.</h1>
+                    <h1 style={local.title}>Quiet reading, modern form.</h1>
                     <p style={local.lede}>
-                        Biblia Populi is a calm, modern Scripture platform — designed to keep the text central, and everything else
-                        secondary.
+                        Biblia Populi is designed to keep the text central. Everything else stays secondary — available, but never in
+                        the way.
                     </p>
 
                     <div style={local.hr} />
 
+                    <Section title="Statement">
+                        Biblia Populi exists to proclaim and preserve the Holy Scriptures as the true and living Word of God —
+                        fulfilled in <strong>Jesus Christ</strong>, crucified and risen.
+                    </Section>
+
                     <Section title="Purpose">
                         A personal labor of faith: to make Scripture freely accessible, readable, and shareable — without noise or
-                        gatekeeping.
+                        gatekeeping. I am the sole developer.
                     </Section>
 
                     <Section title="Design">
@@ -86,14 +92,9 @@ export function LearnMorePage(props: Props) {
                         never competing with the passage.
                     </Section>
 
-                    <Section title="Statement">
-                        Biblia Populi exists to proclaim and preserve the Holy Scriptures as the true and living Word of God —
-                        fulfilled in <strong>Jesus Christ</strong>, crucified and risen.
-                    </Section>
-
                     <div style={local.hr} />
 
-                    <footer style={{ marginTop: 22 }}>
+                    <footer style={{ marginTop: 18 }}>
                         <div style={styles.footerMuted}>© {new Date().getFullYear()} Biblia Populi</div>
                     </footer>
                 </section>
@@ -120,7 +121,7 @@ function ThemeToggle(props: { mode: Mode; onToggle: () => void; styles: Styles }
 
 function Section(props: { title: string; children: React.ReactNode }) {
     return (
-        <section style={{ marginTop: 18 }}>
+        <section style={{ marginTop: 14 }}>
             <div style={local.sectionTitle}>{props.title}</div>
             <div style={local.sectionBody}>{props.children}</div>
         </section>
@@ -135,63 +136,65 @@ const local: Record<string, React.CSSProperties> = {
 
     rail: {
         borderLeft: "1px solid var(--hairline)",
-        paddingLeft: 14,
+        paddingLeft: 12,
     },
     railKicker: {
-        fontSize: 10,
+        fontSize: 9,
         letterSpacing: "0.33em",
         textTransform: "uppercase",
         color: "var(--muted)",
     },
     railMeta: {
-        marginTop: 10,
-        fontSize: 12,
+        marginTop: 8,
+        fontSize: 11,
         color: "var(--muted)",
         letterSpacing: "0.04em",
         lineHeight: 1.6,
+        opacity: 0.92,
     },
 
     kicker: {
-        fontSize: 11,
-        letterSpacing: "0.33em",
+        fontSize: 10,
+        letterSpacing: "0.30em",
         textTransform: "uppercase",
         color: "var(--muted)",
     },
     title: {
-        marginTop: 10,
-        fontSize: 44,
-        lineHeight: 1.06,
-        letterSpacing: "-0.05em",
+        marginTop: 8,
+        fontSize: 28,
+        lineHeight: 1.14,
+        letterSpacing: "-0.03em",
         marginBottom: 0,
     },
     lede: {
         marginTop: 10,
-        fontSize: 13,
+        fontSize: 12,
         letterSpacing: "0.04em",
         lineHeight: 1.9,
         color: "var(--muted)",
-        maxWidth: 640,
+        maxWidth: 520,
     },
 
     hr: {
-        marginTop: 18,
+        marginTop: 16,
         height: 1,
         background: "var(--hairline)",
         opacity: 1,
     },
 
     sectionTitle: {
-        fontSize: 11,
+        fontSize: 10,
         letterSpacing: "0.22em",
         textTransform: "uppercase",
         color: "var(--muted)",
+        opacity: 0.95,
     },
     sectionBody: {
-        marginTop: 8,
-        fontSize: 13,
+        marginTop: 6,
+        fontSize: 12,
         letterSpacing: "0.04em",
         lineHeight: 1.9,
         color: "var(--muted)",
-        maxWidth: 660,
+        maxWidth: 560,
     },
 };

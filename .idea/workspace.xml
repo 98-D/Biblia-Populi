@@ -7,6 +7,9 @@
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
+  <component name="ProblemsViewState">
+    <option name="selectedTabId" value="ProjectErrors" />
+  </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 7
 }</component>
@@ -52,7 +55,7 @@
       <updated>1772217602591</updated>
       <workItem from="1772217603743" duration="1923000" />
       <workItem from="1772221463091" duration="2347000" />
-      <workItem from="1772224586896" duration="5304000" />
+      <workItem from="1772224586896" duration="7181000" />
     </task>
     <servers />
   </component>

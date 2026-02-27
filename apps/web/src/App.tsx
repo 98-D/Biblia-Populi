@@ -1,6 +1,7 @@
 // apps/web/src/App.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { LearnMorePage } from "./LearnMorePage";
+import { Reader } from "./Reader";
 
 type Mode = "light" | "dark";
 
@@ -26,7 +27,7 @@ function useTheme() {
   return { mode, toggle };
 }
 
-type Page = "home" | "learn";
+type Page = "home" | "learn" | "reader";
 
 export default function App() {
   const { mode, toggle } = useTheme();
@@ -37,22 +38,38 @@ export default function App() {
   return (
       <div style={{ ...styles.page, ...themeVars }}>
         {page === "home" ? (
-            <Home mode={mode} onToggleTheme={toggle} onLearnMore={() => setPage("learn")} />
-        ) : (
+            <Home
+                mode={mode}
+                onToggleTheme={toggle}
+                onLearnMore={() => setPage("learn")}
+                onStartReading={() => setPage("reader")}
+            />
+        ) : page === "learn" ? (
             <LearnMorePage mode={mode} onToggleTheme={toggle} onBack={() => setPage("home")} styles={styles} />
+        ) : (
+            <Reader styles={styles} onBackHome={() => setPage("home")} />
         )}
       </div>
   );
 }
 
-/* ---------------- Home (no header, centered) ---------------- */
+/* ---------------- Home ---------------- */
 
-function Home(props: { mode: Mode; onToggleTheme: () => void; onLearnMore: () => void }) {
-  const { mode, onToggleTheme, onLearnMore } = props;
+function Home(props: {
+  mode: Mode;
+  onToggleTheme: () => void;
+  onLearnMore: () => void;
+  onStartReading: () => void;
+}) {
+  const { mode, onToggleTheme, onLearnMore, onStartReading } = props;
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [q, setQ] = useState("");
+  const [isFocused, setIsFocused] = useState(false);
+  const [pressingPrimary, setPressingPrimary] = useState(false);
+  const [pressingLearn, setPressingLearn] = useState(false);
 
+  // Keep Ctrl+K behavior (hidden affordance)
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       const meta = e.metaKey || e.ctrlKey;
@@ -64,13 +81,27 @@ function Home(props: { mode: Mode; onToggleTheme: () => void; onLearnMore: () =>
         if (q) setQ("");
         else inputRef.current?.blur();
       }
+      if (e.key === "Enter" && document.activeElement === inputRef.current) {
+        // “Enter to read” is a nice quiet UX default (even before search is wired)
+        onStartReading();
+      }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [q]);
+  }, [q, onStartReading]);
 
   const crossSrc = "/cross.png";
   const hasQuery = q.trim().length > 0;
+
+  const primaryStyle: React.CSSProperties = {
+    ...styles.primaryBtnButton,
+    ...(pressingPrimary ? styles.btnPressed : null),
+  };
+
+  const learnStyle: React.CSSProperties = {
+    ...styles.learnMoreBtn,
+    ...(pressingLearn ? styles.linkPressed : null),
+  };
 
   return (
       <main style={styles.centerStage} aria-label="Landing">
@@ -85,27 +116,49 @@ function Home(props: { mode: Mode; onToggleTheme: () => void; onLearnMore: () =>
             </div>
 
             <h1 style={styles.h1}>Biblia Populi</h1>
-
             <div style={styles.latin}>“The Bible of the People”</div>
 
             <p style={styles.lede}>
               A public, open-access Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen.
             </p>
 
-            <SearchBar q={q} setQ={setQ} inputRef={inputRef} />
+            <SearchBar
+                q={q}
+                setQ={setQ}
+                inputRef={inputRef}
+                focused={isFocused}
+                onFocus={() => setIsFocused(true)}
+                onBlur={() => setIsFocused(false)}
+            />
 
-            {!hasQuery && <div style={styles.microHint}>Type a word or reference.</div>}
+            {!hasQuery && !isFocused && <div style={styles.microHint}>Type a word or reference.</div>}
 
             <div style={styles.ctaRow}>
-              <a href="#" style={styles.primaryBtn}>
+              <button
+                  type="button"
+                  onClick={onStartReading}
+                  style={primaryStyle}
+                  aria-label="Start reading"
+                  onMouseDown={() => setPressingPrimary(true)}
+                  onMouseUp={() => setPressingPrimary(false)}
+                  onMouseLeave={() => setPressingPrimary(false)}
+                  onTouchStart={() => setPressingPrimary(true)}
+                  onTouchEnd={() => setPressingPrimary(false)}
+              >
                 Start reading
-              </a>
-              <a href="#" style={styles.secondaryBtn}>
-                Open a book
-              </a>
+              </button>
             </div>
 
-            <button type="button" onClick={onLearnMore} style={styles.learnMoreBtn}>
+            <button
+                type="button"
+                onClick={onLearnMore}
+                style={learnStyle}
+                onMouseDown={() => setPressingLearn(true)}
+                onMouseUp={() => setPressingLearn(false)}
+                onMouseLeave={() => setPressingLearn(false)}
+                onTouchStart={() => setPressingLearn(true)}
+                onTouchEnd={() => setPressingLearn(false)}
+            >
               Learn more
             </button>
           </div>
@@ -118,11 +171,14 @@ function SearchBar(props: {
   q: string;
   setQ: (v: string) => void;
   inputRef: React.RefObject<HTMLInputElement | null>;
+  focused: boolean;
+  onFocus: () => void;
+  onBlur: () => void;
 }) {
-  const { q, setQ, inputRef } = props;
+  const { q, setQ, inputRef, focused, onFocus, onBlur } = props;
 
   return (
-      <div style={styles.searchRow} aria-label="Search">
+      <div style={{ ...styles.searchRow, ...(focused ? styles.searchRowFocused : null) }} aria-label="Search">
       <span style={styles.searchIcon} aria-hidden>
         ⌕
       </span>
@@ -136,6 +192,8 @@ function SearchBar(props: {
             aria-label="Search scripture"
             spellCheck={false}
             inputMode="search"
+            onFocus={onFocus}
+            onBlur={onBlur}
         />
       </div>
   );
@@ -169,7 +227,8 @@ function getThemeVars(mode: Mode): React.CSSProperties {
       ["--hairline" as any]: "rgba(255,255,255,0.10)",
       ["--shadow" as any]: "0 18px 60px rgba(0,0,0,0.45)",
       ["--shadowSoft" as any]: "0 10px 34px rgba(0,0,0,0.34)",
-      ["--focus" as any]: "rgba(255,255,255,0.20)",
+      ["--focus" as any]: "rgba(255,255,255,0.22)",
+      ["--focusRing" as any]: "rgba(255,255,255,0.12)",
     };
   }
   return {
@@ -181,6 +240,7 @@ function getThemeVars(mode: Mode): React.CSSProperties {
     ["--shadow" as any]: "0 18px 60px rgba(0,0,0,0.12)",
     ["--shadowSoft" as any]: "0 10px 34px rgba(0,0,0,0.10)",
     ["--focus" as any]: "rgba(0,0,0,0.16)",
+    ["--focusRing" as any]: "rgba(0,0,0,0.10)",
   };
 }
 
@@ -221,7 +281,6 @@ export const styles: Record<string, React.CSSProperties> = {
   },
 
   themePill: {
-    // keep it clean for ALL pages (no landing-specific offsets)
     width: 36,
     height: 20,
     borderRadius: 999,
@@ -232,6 +291,7 @@ export const styles: Record<string, React.CSSProperties> = {
     display: "inline-flex",
     alignItems: "center",
     boxShadow: "none",
+    transition: "transform 140ms ease, opacity 140ms ease",
   },
   themeDot: {
     width: 14,
@@ -248,7 +308,7 @@ export const styles: Record<string, React.CSSProperties> = {
     opacity: 0.965,
   },
   crossImg: {
-    marginRight:10,
+    marginRight: 10,
     width: 112,
     height: 112,
     objectFit: "contain",
@@ -258,7 +318,7 @@ export const styles: Record<string, React.CSSProperties> = {
 
   h1: {
     marginTop: 2,
-    marginLeft:0,
+    marginLeft: 0,
     fontSize: 52,
     lineHeight: 1.075,
     letterSpacing: "-0.02em",
@@ -289,7 +349,7 @@ export const styles: Record<string, React.CSSProperties> = {
     display: "grid",
     gridTemplateColumns: "24px 1fr",
     alignItems: "center",
-    gap: 5,
+    gap: 6,
     padding: "8px 10px",
     borderRadius: 30,
     border: "1px solid var(--hairline)",
@@ -297,7 +357,13 @@ export const styles: Record<string, React.CSSProperties> = {
     maxWidth: 550,
     marginInline: "auto",
     boxShadow: "var(--shadowSoft)",
-    transition: "box-shadow 160ms ease, border-color 160ms ease, transform 160ms ease",
+    transition: "box-shadow 160ms ease, border-color 160ms ease, transform 160ms ease, opacity 160ms ease",
+  },
+  searchRowFocused: {
+    borderColor: "var(--focus)",
+    boxShadow: "var(--shadowSoft)",
+    outline: "1px solid var(--focusRing)",
+    transform: "translateY(-1px)",
   },
   searchIcon: { width: 24, textAlign: "center", color: "var(--muted)", fontSize: 14 },
   searchInput: {
@@ -320,47 +386,41 @@ export const styles: Record<string, React.CSSProperties> = {
   },
 
   ctaRow: {
-    marginTop: 20,
+    marginTop: 18,
     display: "flex",
     justifyContent: "center",
     gap: 10,
     flexWrap: "wrap",
   },
 
-  primaryBtn: {
+  primaryBtnButton: {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    padding: "11px 14px",
+    padding: "11px 16px",
     borderRadius: 14,
     background: "var(--fg)",
     color: "var(--bg)",
     fontSize: 13,
     fontWeight: 760,
-    textDecoration: "none",
     letterSpacing: "-0.01em",
     boxShadow: "var(--shadowSoft)",
-    transform: "translateY(0px)",
+    border: "none",
+    cursor: "pointer",
     transition: "transform 140ms ease, box-shadow 140ms ease, opacity 140ms ease",
   },
-  secondaryBtn: {
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    padding: "11px 14px",
-    borderRadius: 14,
-    border: "1px solid var(--hairline)",
-    background: "transparent",
-    color: "inherit",
-    fontSize: 13,
-    fontWeight: 760,
-    textDecoration: "none",
-    letterSpacing: "-0.01em",
-    transition: "transform 140ms ease, border-color 140ms ease, opacity 140ms ease",
+
+  // pressed states (subtle interaction)
+  btnPressed: {
+    transform: "translateY(1px) scale(0.99)",
+    opacity: 0.95,
+  },
+  linkPressed: {
+    opacity: 0.72,
   },
 
   learnMoreBtn: {
-    marginTop: 18,
+    marginTop: 16,
     fontSize: 12,
     color: "var(--muted)",
     border: "none",
@@ -374,7 +434,7 @@ export const styles: Record<string, React.CSSProperties> = {
     opacity: 0.92,
   },
 
-  /* ---- Learn page styles (needed by LearnMorePage.tsx) ---- */
+  /* ---- Learn page styles ---- */
   learnPage: {
     paddingTop: 24,
     paddingBottom: 88,

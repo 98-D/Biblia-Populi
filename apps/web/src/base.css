@@ -1,4 +1,4 @@
-/* base.css — Biblia Populi (minimal, reading-first) */
+/* apps/web/src/base.css — Biblia Populi (minimal, reading-first) */
 
 :root {
     --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, Arial, "Noto Sans",
@@ -20,6 +20,10 @@
 
     --text: 16px;
     --leading: 1.6;
+
+    /* Layout widths */
+    --container: 980px; /* general */
+    --reading: 720px;   /* scripture pages / learn page */
 }
 
 /* System preference (only when user has NOT manually set a theme) */
@@ -111,15 +115,23 @@ select {
     color: inherit;
 }
 
+/* focus (calm, consistent) */
 :focus-visible {
     outline: 2px solid var(--focus);
     outline-offset: 2px;
     border-radius: 10px;
 }
 
-/* Minimal utilities (only what we actually need) */
+/* ---------------- Layout utilities ---------------- */
+
 .container {
-    width: min(1040px, calc(100% - 32px));
+    width: min(var(--container), calc(100% - 32px));
+    margin-inline: auto;
+}
+
+/* narrower, centered reading column */
+.container-reading {
+    width: min(var(--reading), calc(100% - 32px));
     margin-inline: auto;
 }
 
@@ -129,179 +141,47 @@ select {
 }
 
 .kicker {
-    font-size: 12px;
+    font-size: 11px;
     letter-spacing: 0.14em;
     text-transform: uppercase;
     color: var(--muted);
 }
 
-/* Reading */
-.prose,
-.scripture {
-    font-family: var(--font-serif);
-    font-size: 18px;
-    line-height: 1.75;
-    color: var(--fg);
-}
+/* ---------------- Controls (subtle) ---------------- */
 
-@media (max-width: 480px) {
-    .prose,
-    .scripture {
-        font-size: 17px;
-    }
-}
-
-/* Optional: helps the landing grid collapse cleanly on small screens */
-@media (max-width: 860px) {
-    .container [data-landing-grid] {
-        grid-template-columns: 1fr !important;
-    }
-    .container [data-toc-grid] {
-        grid-template-columns: 1fr !important;
-    }
-}
-
-/* Motion */
-@media (prefers-reduced-motion: reduce) {
-    * { transition: none !important; animation: none !important; }
-}/* base.css — Biblia Populi (minimal, reading-first) */
-
-:root {
-    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, Arial, "Noto Sans",
-    "Apple Color Emoji", "Segoe UI Emoji";
-    --font-serif: ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", Times, serif;
-
-    /* Default (Light) */
-    --bg: #ffffff;
-    --fg: #0b0b0b;
-    --muted: rgba(11, 11, 11, 0.60);
-    --hairline: rgba(11, 11, 11, 0.10);
-    --focus: rgba(11, 11, 11, 0.25);
-
-    /* Subtle surfaces */
-    --panel: rgba(0, 0, 0, 0.02);
-
-    --radius: 16px;
-    --radius-sm: 12px;
-
-    --text: 16px;
-    --leading: 1.6;
-}
-
-/* System preference (only when user has NOT manually set a theme) */
-@media (prefers-color-scheme: dark) {
-    html:not([data-theme]) {
-        --bg: #070707;
-        --fg: #f4f4f4;
-        --muted: rgba(244, 244, 244, 0.70);
-        --hairline: rgba(244, 244, 244, 0.12);
-        --focus: rgba(244, 244, 244, 0.28);
-        --panel: rgba(255, 255, 255, 0.03);
-    }
-}
-
-/* Manual override (wins over system preference) */
-html[data-theme="light"] {
-    --bg: #ffffff;
-    --fg: #0b0b0b;
-    --muted: rgba(11, 11, 11, 0.60);
-    --hairline: rgba(11, 11, 11, 0.10);
-    --focus: rgba(11, 11, 11, 0.25);
-    --panel: rgba(0, 0, 0, 0.02);
-}
-
-html[data-theme="dark"] {
-    --bg: #070707;
-    --fg: #f4f4f4;
-    --muted: rgba(244, 244, 244, 0.70);
-    --hairline: rgba(244, 244, 244, 0.12);
-    --focus: rgba(244, 244, 244, 0.28);
-    --panel: rgba(255, 255, 255, 0.03);
-}
-
-*,
-*::before,
-*::after {
-    box-sizing: border-box;
-}
-
-html {
-    font-family: var(--font-sans);
-    font-size: var(--text);
-    line-height: var(--leading);
-    background: var(--bg);
-    color: var(--fg);
-    text-size-adjust: 100%;
-    -webkit-text-size-adjust: 100%;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-}
-
-body {
-    margin: 0;
-    min-height: 100vh;
-    background: var(--bg);
-    color: var(--fg);
-}
-
-#root {
-    min-height: 100vh;
-}
-
-h1, h2, h3, h4 {
-    margin: 0;
-    font-weight: 600;
-    letter-spacing: -0.02em;
-}
-
-p { margin: 0; }
-
-a {
-    color: inherit;
-    text-decoration: none;
-}
-a:hover {
-    text-decoration: underline;
-    text-underline-offset: 3px;
-}
-
-::selection {
-    background: color-mix(in oklab, var(--fg) 14%, transparent);
+button {
+    -webkit-tap-highlight-color: transparent;
 }
 
 button,
+select,
+input {
+    transition: transform 140ms ease, opacity 140ms ease, border-color 140ms ease, background 140ms ease;
+}
+
+button:active {
+    transform: translateY(1px);
+}
+
 input,
-textarea,
+select,
+textarea {
+    background: transparent;
+}
+
 select {
-    font: inherit;
-    color: inherit;
+    appearance: none;
 }
 
-:focus-visible {
-    outline: 2px solid var(--focus);
-    outline-offset: 2px;
-    border-radius: 10px;
+/* Optional: calm “pill” controls */
+.surface {
+    background: var(--panel);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-sm);
 }
 
-/* Minimal utilities (only what we actually need) */
-.container {
-    width: min(1040px, calc(100% - 32px));
-    margin-inline: auto;
-}
+/* ---------------- Reading ---------------- */
 
-.hairline {
-    height: 1px;
-    background: var(--hairline);
-}
-
-.kicker {
-    font-size: 12px;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    color: var(--muted);
-}
-
-/* Reading */
 .prose,
 .scripture {
     font-family: var(--font-serif);

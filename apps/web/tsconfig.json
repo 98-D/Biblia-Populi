@@ -16,7 +16,12 @@
     "useDefineForClassFields": true,
     "resolveJsonModule": true,
 
-    "types": ["vite/client"]
+    "types": ["vite/client"],
+
+    "allowImportingTsExtensions": false,
+    "verbatimModuleSyntax": true,
+    "forceConsistentCasingInFileNames": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["dist", "node_modules"]
 }
