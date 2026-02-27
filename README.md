@@ -1,10 +1,6 @@
 # Biblia Populi
 **“The Bible of the People.”**
 
-
-> The Word of God, open to all.
----
-
 ## About
 
 **Biblia Populi** is a one-man project — built and maintained by me — born from a simple conviction:
