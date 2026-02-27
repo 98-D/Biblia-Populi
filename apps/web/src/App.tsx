@@ -1,13 +1,9 @@
+// apps/web/src/App.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { LearnMorePage } from "./LearnMorePage";
 
 type Mode = "light" | "dark";
 
-/**
- * Two-theme-only (Light <-> Dark).
- * - Persists localStorage["bp_theme"]
- * - Applies html[data-theme="light"|"dark"]
- * - Also sets meta theme-color for nicer mobile/OS chrome
- */
 function useTheme() {
   const [mode, setMode] = useState<Mode>(() => {
     const saved = localStorage.getItem("bp_theme");
@@ -19,7 +15,6 @@ function useTheme() {
     document.documentElement.setAttribute("data-theme", mode);
     localStorage.setItem("bp_theme", mode);
 
-    // nice on mobile / PWA chrome
     const meta = document.querySelector('meta[name="theme-color"]');
     if (meta) meta.setAttribute("content", mode === "dark" ? "#0b0b0c" : "#fbfbfc");
   }, [mode]);
@@ -37,7 +32,6 @@ export default function App() {
   const { mode, toggle } = useTheme();
   const [page, setPage] = useState<Page>("home");
 
-  // set CSS vars in one place (minimalism: no extra files needed yet)
   const themeVars = useMemo(() => getThemeVars(mode), [mode]);
 
   return (
@@ -45,7 +39,7 @@ export default function App() {
         {page === "home" ? (
             <Home mode={mode} onToggleTheme={toggle} onLearnMore={() => setPage("learn")} />
         ) : (
-            <LearnMore mode={mode} onToggleTheme={toggle} onBack={() => setPage("home")} />
+            <LearnMorePage mode={mode} onToggleTheme={toggle} onBack={() => setPage("home")} styles={styles} />
         )}
       </div>
   );
@@ -76,29 +70,18 @@ function Home(props: { mode: Mode; onToggleTheme: () => void; onLearnMore: () =>
   }, [q]);
 
   const crossSrc = "/cross.png";
+  const hasQuery = q.trim().length > 0;
 
   return (
       <main style={styles.centerStage} aria-label="Landing">
-        {/* Minimal corner controls (no header bar) */}
         <div style={styles.cornerControls} aria-label="Landing controls">
-          <button type="button" onClick={onLearnMore} style={styles.cornerLink}>
-            Learn more
-          </button>
-
           <ThemeToggle mode={mode} onToggle={onToggleTheme} />
         </div>
 
         <div className="container" style={styles.centerInner}>
           <div style={styles.centerBlock}>
             <div style={styles.crossWrap} aria-hidden>
-              <img
-                  src={crossSrc}
-                  alt=""
-                  style={styles.crossImg}
-                  draggable={false}
-                  decoding="async"
-                  loading="eager"
-              />
+              <img src={crossSrc} alt="" style={styles.crossImg} draggable={false} decoding="async" loading="eager" />
             </div>
 
             <h1 style={styles.h1}>Biblia Populi</h1>
@@ -106,22 +89,25 @@ function Home(props: { mode: Mode; onToggleTheme: () => void; onLearnMore: () =>
             <div style={styles.latin}>“The Bible of the People”</div>
 
             <p style={styles.lede}>
-              A public, open-access Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen —
-              designed for quiet reading, fast lookup, and sharing without barrier.
+              A public, open-access Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen.
             </p>
 
             <SearchBar q={q} setQ={setQ} inputRef={inputRef} />
+
+            {!hasQuery && <div style={styles.microHint}>Type a word or reference.</div>}
 
             <div style={styles.ctaRow}>
               <a href="#" style={styles.primaryBtn}>
                 Start reading
               </a>
-              <a href="#" style={styles.ghostBtn}>
+              <a href="#" style={styles.secondaryBtn}>
                 Open a book
               </a>
             </div>
 
-            <div style={styles.tagline}>Ancient in name. Modern in form. Open to all.</div>
+            <button type="button" onClick={onLearnMore} style={styles.learnMoreBtn}>
+              Learn more
+            </button>
           </div>
         </div>
       </main>
@@ -151,10 +137,6 @@ function SearchBar(props: {
             spellCheck={false}
             inputMode="search"
         />
-
-        <kbd style={styles.kbd} aria-hidden>
-          Ctrl&nbsp;K
-        </kbd>
       </div>
   );
 }
@@ -162,7 +144,6 @@ function SearchBar(props: {
 function ThemeToggle(props: { mode: Mode; onToggle: () => void }) {
   const { mode, onToggle } = props;
 
-  // Minimal “pill” toggle (smaller, calmer than a label button)
   return (
       <button
           type="button"
@@ -176,93 +157,44 @@ function ThemeToggle(props: { mode: Mode; onToggle: () => void }) {
   );
 }
 
-/* ---------------- Learn More (simple page) ---------------- */
-
-function LearnMore(props: { mode: Mode; onToggleTheme: () => void; onBack: () => void }) {
-  const { mode, onToggleTheme, onBack } = props;
-
-  return (
-      <main className="container" style={styles.learnPage} aria-label="Learn more">
-        <div style={styles.learnTopRow}>
-          <button type="button" onClick={onBack} style={styles.backBtn}>
-            ← Back
-          </button>
-
-          <div style={{ flex: 1 }} />
-
-          <ThemeToggle mode={mode} onToggle={onToggleTheme} />
-        </div>
-
-        <div style={styles.learnTop}>
-          <h1 style={styles.learnTitle}>Learn more</h1>
-          <p style={styles.learnLede}>
-            Biblia Populi is built to be quiet, clear, and uncompromisingly reading-first — Scripture without noise or
-            gatekeeping.
-          </p>
-        </div>
-
-        <div style={styles.learnSection}>
-          <h2 style={styles.h2}>About</h2>
-          <p style={styles.body}>
-            <strong>Biblia Populi</strong> is a one-man project. Not sponsored by an institution or publisher — built as a
-            personal labor of faith to make Scripture freely accessible and faithful to the text.
-          </p>
-        </div>
-
-        <div style={styles.learnSection}>
-          <h2 style={styles.h2}>Statement</h2>
-          <p style={styles.body}>
-            Biblia Populi exists to proclaim and preserve the Holy Scriptures as the true and living Word of God —
-            fulfilled in <strong>Jesus Christ</strong>, crucified and risen.
-          </p>
-        </div>
-
-        <footer style={styles.footer}>
-          <div style={styles.footerMuted}>© {new Date().getFullYear()} Biblia Populi</div>
-        </footer>
-      </main>
-  );
-}
-
-/* ---------------- Theme Vars (minimal, museum-like) ---------------- */
+/* ---------------- Theme Vars ---------------- */
 
 function getThemeVars(mode: Mode): React.CSSProperties {
   if (mode === "dark") {
     return {
-      // charcoal + warm paper highlight
       ["--bg" as any]: "#0b0b0c",
-      ["--panel" as any]: "rgba(255,255,255,0.04)",
-      ["--fg" as any]: "#f3f3f2",
-      ["--muted" as any]: "rgba(243,243,242,0.62)",
+      ["--panel" as any]: "rgba(255,255,255,0.045)",
+      ["--fg" as any]: "#f4f3f1",
+      ["--muted" as any]: "rgba(244,243,241,0.62)",
       ["--hairline" as any]: "rgba(255,255,255,0.10)",
       ["--shadow" as any]: "0 18px 60px rgba(0,0,0,0.45)",
+      ["--shadowSoft" as any]: "0 10px 34px rgba(0,0,0,0.34)",
       ["--focus" as any]: "rgba(255,255,255,0.20)",
     };
   }
   return {
     ["--bg" as any]: "#fbfbfc",
-    ["--panel" as any]: "rgba(0,0,0,0.03)",
+    ["--panel" as any]: "rgba(0,0,0,0.028)",
     ["--fg" as any]: "#0b0b0c",
-    ["--muted" as any]: "rgba(11,11,12,0.58)",
+    ["--muted" as any]: "rgba(11,11,12,0.56)",
     ["--hairline" as any]: "rgba(0,0,0,0.10)",
     ["--shadow" as any]: "0 18px 60px rgba(0,0,0,0.12)",
+    ["--shadowSoft" as any]: "0 10px 34px rgba(0,0,0,0.10)",
     ["--focus" as any]: "rgba(0,0,0,0.16)",
   };
 }
 
 /* ---------------- Styles ---------------- */
 
-const styles: Record<string, React.CSSProperties> = {
+export const styles: Record<string, React.CSSProperties> = {
   page: {
     minHeight: "100vh",
     background: "var(--bg)",
     color: "var(--fg)",
-    // nicer text rendering
     WebkitFontSmoothing: "antialiased",
     MozOsxFontSmoothing: "grayscale",
   },
 
-  /* Landing */
   centerStage: {
     minHeight: "100vh",
     display: "grid",
@@ -278,7 +210,6 @@ const styles: Record<string, React.CSSProperties> = {
     paddingInline: 18,
   },
 
-  /* Corner controls */
   cornerControls: {
     position: "fixed",
     top: 16,
@@ -288,18 +219,9 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 8,
     zIndex: 5,
   },
-  cornerLink: {
-    fontSize: 12,
-    color: "var(--muted)",
-    border: "1px solid transparent",
-    background: "transparent",
-    cursor: "pointer",
-    padding: "6px 8px",
-    borderRadius: 10,
-    lineHeight: 1,
-  },
 
   themePill: {
+    // keep it clean for ALL pages (no landing-specific offsets)
     width: 36,
     height: 20,
     borderRadius: 999,
@@ -322,60 +244,64 @@ const styles: Record<string, React.CSSProperties> = {
   crossWrap: {
     display: "grid",
     placeItems: "center",
-    marginBottom: 10,
-    opacity: 0.96,
+    marginBottom: 0,
+    opacity: 0.965,
   },
   crossImg: {
-    width: 110,
-    height: 110,
+    marginRight:10,
+    width: 112,
+    height: 112,
     objectFit: "contain",
     userSelect: "none",
-    filter: "drop-shadow(0 14px 26px rgba(0,0,0,0.16))",
+    filter: "drop-shadow(0 14px 26px rgba(0,0,0,0.14))",
   },
 
   h1: {
     marginTop: 2,
-    fontSize: 64,
-    lineHeight: 1.02,
-    letterSpacing: "-0.06em",
+    marginLeft:0,
+    fontSize: 52,
+    lineHeight: 1.075,
+    letterSpacing: "-0.02em",
     marginBottom: 0,
   },
 
   latin: {
     marginTop: 12,
-    fontSize: 11,
-    letterSpacing: "0.22em",
+    fontSize: 11.5,
+    letterSpacing: "0.33em",
     textTransform: "uppercase",
     color: "var(--muted)",
+    lineHeight: 1.75,
   },
 
   lede: {
-    marginTop: 20,
-    fontSize: 15,
-    lineHeight: 1.95,
+    marginTop: 10,
+    fontSize: 12.5,
+    letterSpacing: "0.08em",
+    lineHeight: 2.05,
     color: "var(--muted)",
-    maxWidth: 720,
+    maxWidth: 600,
     marginInline: "auto",
   },
 
-  // Smaller, tighter search bar (more minimal)
   searchRow: {
-    marginTop: 38,
+    marginTop: 16,
     display: "grid",
-    gridTemplateColumns: "24px 1fr auto",
+    gridTemplateColumns: "24px 1fr",
     alignItems: "center",
-    gap: 10,
-    padding: "10px 12px",
-    borderRadius: 14,
+    gap: 5,
+    padding: "8px 10px",
+    borderRadius: 30,
     border: "1px solid var(--hairline)",
     background: "var(--panel)",
-    maxWidth: 640,
+    maxWidth: 550,
     marginInline: "auto",
-    boxShadow: "var(--shadow)",
+    boxShadow: "var(--shadowSoft)",
+    transition: "box-shadow 160ms ease, border-color 160ms ease, transform 160ms ease",
   },
-  searchIcon: { width: 24, textAlign: "center", color: "var(--muted)", fontSize: 12 },
+  searchIcon: { width: 24, textAlign: "center", color: "var(--muted)", fontSize: 14 },
   searchInput: {
-    width: "100%",
+    width: "98%",
     border: "none",
     outline: "none",
     background: "transparent",
@@ -383,23 +309,24 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 13,
     padding: "8px 0",
   },
-  kbd: {
-    fontSize: 11,
+
+  microHint: {
+    marginTop: 8,
+    fontSize: 10,
+    letterSpacing: "0.12em",
     color: "var(--muted)",
-    border: "1px solid var(--hairline)",
-    padding: "5px 8px",
-    borderRadius: 999,
+    opacity: 0.85,
     userSelect: "none",
-    background: "transparent",
   },
 
   ctaRow: {
-    marginTop: 22,
+    marginTop: 20,
     display: "flex",
     justifyContent: "center",
     gap: 10,
     flexWrap: "wrap",
   },
+
   primaryBtn: {
     display: "inline-flex",
     alignItems: "center",
@@ -409,30 +336,45 @@ const styles: Record<string, React.CSSProperties> = {
     background: "var(--fg)",
     color: "var(--bg)",
     fontSize: 13,
-    fontWeight: 750,
+    fontWeight: 760,
     textDecoration: "none",
     letterSpacing: "-0.01em",
+    boxShadow: "var(--shadowSoft)",
+    transform: "translateY(0px)",
+    transition: "transform 140ms ease, box-shadow 140ms ease, opacity 140ms ease",
   },
-  ghostBtn: {
+  secondaryBtn: {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
     padding: "11px 14px",
     borderRadius: 14,
     border: "1px solid var(--hairline)",
+    background: "transparent",
     color: "inherit",
     fontSize: 13,
-    fontWeight: 750,
+    fontWeight: 760,
     textDecoration: "none",
-    background: "transparent",
-  },
-  tagline: {
-    marginTop: 22,
-    fontSize: 12,
-    color: "var(--muted)",
+    letterSpacing: "-0.01em",
+    transition: "transform 140ms ease, border-color 140ms ease, opacity 140ms ease",
   },
 
-  /* Learn more */
+  learnMoreBtn: {
+    marginTop: 18,
+    fontSize: 12,
+    color: "var(--muted)",
+    border: "none",
+    background: "transparent",
+    cursor: "pointer",
+    padding: "8px 10px",
+    borderRadius: 10,
+    letterSpacing: "0.10em",
+    textTransform: "uppercase",
+    transition: "opacity 140ms ease",
+    opacity: 0.92,
+  },
+
+  /* ---- Learn page styles (needed by LearnMorePage.tsx) ---- */
   learnPage: {
     paddingTop: 24,
     paddingBottom: 88,
@@ -455,20 +397,8 @@ const styles: Record<string, React.CSSProperties> = {
     color: "inherit",
     lineHeight: 1,
   },
-
-  learnTop: { marginTop: 28, maxWidth: 760 },
-  learnTitle: { fontSize: 44, lineHeight: 1.05, letterSpacing: "-0.05em", margin: 0 },
-  learnLede: {
-    marginTop: 14,
-    fontSize: 15,
-    lineHeight: 1.95,
+  footerMuted: {
+    fontSize: 12,
     color: "var(--muted)",
   },
-
-  learnSection: { marginTop: 56, maxWidth: 760 },
-  h2: { fontSize: 16, fontWeight: 750, letterSpacing: "-0.02em", margin: 0 },
-  body: { marginTop: 10, fontSize: 14, lineHeight: 1.95, color: "var(--muted)" },
-
-  footer: { marginTop: 84 },
-  footerMuted: { fontSize: 12, color: "var(--muted)" },
 };
