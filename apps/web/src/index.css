@@ -1,6 +1,30 @@
 @import "./base.css";
 
+/* Theme tokens used by your inline styles */
+:root {
+    --bg: #ffffff;
+    --fg: #0b0b0b;
+    --muted: rgba(11, 11, 11, 0.60);
+    --hairline: rgba(0, 0, 0, 0.10);
+}
+
+html[data-theme="dark"] {
+    --bg: #0b0b0b;
+    --fg: #ffffff;
+    --muted: rgba(255, 255, 255, 0.62);
+    --hairline: rgba(255, 255, 255, 0.14);
+}
+
+/* sensible defaults */
+html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+}
+
+* { box-sizing: border-box; }
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-

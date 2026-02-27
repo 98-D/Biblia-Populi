@@ -1,11 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
 
-// ✅ Put these in src/assets/
-// - cross-black.svg = black cross on transparent
-// - cross-white.svg = white cross on transparent
-import crossBlack from "./assets/cross-black.svg";
-import crossWhite from "./assets/cross-white.svg";
-
 type Mode = "light" | "dark";
 
 /**
@@ -72,8 +66,15 @@ function Home(props: { mode: Mode; onToggleTheme: () => void; onLearnMore: () =>
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [q]);
 
-  const crossSrc = mode === "dark" ? crossWhite : crossBlack;
+  // ✅ Use PNG from /public (recommended). Put file at: public/cross.png
+  const crossSrc = "/cross.png";
 
+  // If your PNG is BLACK and you want it to appear WHITE in dark mode:
+  //const crossFilter =
+     // mode === "dark"
+    //      ? "invert(1) drop-shadow(0 10px 24px rgba(0,0,0,0.18))"
+  //        : "drop-shadow(0 10px 24px rgba(0,0,0,0.18))";
+//
   return (
       <main style={styles.centerStage} aria-label="Landing">
         {/* Minimal corner controls (not a header bar) */}
@@ -92,7 +93,7 @@ function Home(props: { mode: Mode; onToggleTheme: () => void; onLearnMore: () =>
               <img
                   src={crossSrc}
                   alt=""
-                  style={styles.crossImg}
+                  style={{ ...styles.crossImg}}
                   draggable={false}
                   decoding="async"
                   loading="eager"
@@ -101,7 +102,7 @@ function Home(props: { mode: Mode; onToggleTheme: () => void; onLearnMore: () =>
 
             <h1 style={styles.h1}>Biblia Populi</h1>
 
-            <div style={styles.latin}>Biblia Populi — “The Bible of the People.”</div>
+            <div style={styles.latin}>“The Bible of the People”</div>
 
             <p style={styles.lede}>
               A public, open-access Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen —
@@ -146,7 +147,7 @@ function Home(props: { mode: Mode; onToggleTheme: () => void; onLearnMore: () =>
 /* ---------------- Learn More (simple page) ---------------- */
 
 function LearnMore(props: { mode: Mode; onToggleTheme: () => void; onBack: () => void }) {
-  const { mode, onToggleTheme, onBack } = props;
+  const { onToggleTheme, onBack } = props;
 
   return (
       <main className="container" style={styles.learnPage} aria-label="Learn more">
@@ -158,7 +159,7 @@ function LearnMore(props: { mode: Mode; onToggleTheme: () => void; onBack: () =>
           <div style={{ flex: 1 }} />
 
           <button type="button" onClick={onToggleTheme} style={styles.cornerBtn} aria-label="Toggle theme">
-            {mode === "dark" ? "Light" : "Dark"}
+            Toggle
           </button>
         </div>
 
@@ -249,21 +250,18 @@ const styles: Record<string, React.CSSProperties> = {
   crossWrap: {
     display: "grid",
     placeItems: "center",
-    marginBottom: 22,
-    // gives it a tiny “gallery” presence without being loud
+    marginBottom: 8,
     opacity: 0.95,
   },
   crossImg: {
-    width: 106,
-    height: 106,
+    width: 126,
+    height: 126,
     objectFit: "contain",
     userSelect: "none",
-    // soft “expensive” lift; works for both themes
-    filter: "drop-shadow(0 10px 24px color-mix(in oklab, var(--fg, #0b0b0b) 12%, transparent))",
   },
 
   h1: {
-    marginTop: 0,
+    marginTop: 0.5,
     fontSize: 70,
     lineHeight: 1.01,
     letterSpacing: "-0.06em",

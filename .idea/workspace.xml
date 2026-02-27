@@ -28,6 +28,12 @@
     &quot;ts.external.directory.path&quot;: &quot;C:\\Users\\dannydekker\\Desktop\\Biblia-Populi\\apps\\web\\node_modules\\typescript\\lib&quot;
   }
 }</component>
+  <component name="RecentsManager">
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="C:\Users\dannydekker\Desktop\Biblia-Populi\apps\web\public" />
+      <recent name="C:\Users\dannydekker\Desktop\Biblia-Populi\apps\web\src\assets" />
+    </key>
+  </component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
@@ -44,7 +50,7 @@
       <option name="presentableId" value="Default" />
       <updated>1772217602591</updated>
       <workItem from="1772217603743" duration="1923000" />
-      <workItem from="1772221463091" duration="1099000" />
+      <workItem from="1772221463091" duration="2347000" />
     </task>
     <servers />
   </component>
