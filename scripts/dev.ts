@@ -1,39 +1,50 @@
 // scripts/dev.ts (run from repo root with: bun run dev)
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
 
-type Proc = { name: string; child: ReturnType<typeof spawn> };
-
-function run(name: string, cwd: string, args: string[], extraEnv?: Record<string, string>): Proc {
-    const child = spawn(process.execPath, args, {
-        cwd,
-        stdio: "inherit",
-        env: { ...process.env, ...(extraEnv ?? {}) },
-    });
-
-    child.on("exit", (code, signal) => {
-        // If one process dies, we shut everything down.
-        console.error(`\n[dev] ${name} exited (${code ?? "null"}${signal ? `, ${signal}` : ""})`);
-        shutdown(1);
-    });
-
-    return { name, child };
-}
+type Proc = { name: string; child: ChildProcess };
 
 const ROOT = process.cwd();
 const API_CWD = path.join(ROOT, "apps", "api");
 const WEB_CWD = path.join(ROOT, "apps", "web");
 
+// If this script is executed with Bun, process.execPath is bun.
+// If executed with Node, fall back to "bun" on PATH.
+const BUN_BIN = process.execPath.toLowerCase().includes("bun") ? process.execPath : "bun";
+
 const procs: Proc[] = [];
+let shuttingDown = false;
+
+function run(name: string, cwd: string, args: string[], extraEnv?: Record<string, string>): Proc {
+    const child = spawn(BUN_BIN, args, {
+        cwd,
+        stdio: "inherit",
+        env: { ...process.env, ...(extraEnv ?? {}) },
+        // Helps on Windows when using "bun" from PATH (when BUN_BIN === "bun")
+        shell: process.platform === "win32" && BUN_BIN === "bun",
+    });
+
+    child.on("exit", (code, signal) => {
+        if (shuttingDown) return;
+        console.error(`\n[dev] ${name} exited (${code ?? "null"}${signal ? `, ${signal}` : ""})`);
+        shutdown(code === 0 ? 0 : 1);
+    });
+
+    return { name, child };
+}
 
 function shutdown(exitCode = 0) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
     for (const p of procs) {
         try {
-            p.child.kill("SIGTERM");
+            // On Windows, signals are limited; plain kill() is fine.
+            p.child.kill();
         } catch {}
     }
-    // Give children a moment then hard-exit
+
     setTimeout(() => process.exit(exitCode), 250);
 }
 
@@ -45,13 +56,10 @@ console.log("API:", API_CWD);
 console.log("WEB:", WEB_CWD);
 console.log("");
 
-// API (Hono)
-procs.push(run("api", API_CWD, ["bun", "run", "dev"]));
-
-// Web (Vite)
+// ✅ NOTE: no leading "bun" here — BUN_BIN is already bun
+procs.push(run("api", API_CWD, ["run", "dev"]));
 procs.push(
-    run("web", WEB_CWD, ["bun", "run", "dev"], {
-        // Optional, only if you want to override; with Vite proxy you can omit.
+    run("web", WEB_CWD, ["run", "dev"], {
         // VITE_API_BASE: "http://localhost:3000",
     }),
 );
