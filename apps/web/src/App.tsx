@@ -1,453 +1,396 @@
+import React, { useEffect, useRef, useState } from "react";
 
-import { useEffect, useMemo, useState } from "react";
+// ✅ Put these in src/assets/
+// - cross-black.svg = black cross on transparent
+// - cross-white.svg = white cross on transparent
+import crossBlack from "./assets/cross-black.svg";
+import crossWhite from "./assets/cross-white.svg";
 
 type Mode = "light" | "dark";
 
+/**
+ * Two-theme-only (Light <-> Dark).
+ * - Persists localStorage["bp_theme"]
+ * - Applies html[data-theme="light"|"dark"]
+ */
 function useTheme() {
   const [mode, setMode] = useState<Mode>(() => {
     const saved = localStorage.getItem("bp_theme");
-    if (saved === "light" || saved === "dark") return saved;
-    return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
+    return saved === "dark" ? "dark" : "light";
   });
 
   useEffect(() => {
-    document.documentElement.dataset.theme = mode;
+    document.documentElement.setAttribute("data-theme", mode);
     localStorage.setItem("bp_theme", mode);
   }, [mode]);
 
-  return { mode, setMode };
+  function toggle(): void {
+    setMode((m) => (m === "dark" ? "light" : "dark"));
+  }
+
+  return { mode, toggle };
 }
+
+type Page = "home" | "learn";
 
 export default function App() {
-  const { mode, setMode } = useTheme();
+  const { mode, toggle } = useTheme();
+  const [page, setPage] = useState<Page>("home");
 
   return (
-    <div style={styles.page}>
-      <Header mode={mode} setMode={setMode} />
-      <main>
-        <Hero />
-        <Hairline />
-        <About />
-        <Hairline />
-        <Statement />
-        <Footer />
-      </main>
-    </div>
+      <div style={styles.page}>
+        {page === "home" ? (
+            <Home mode={mode} onToggleTheme={toggle} onLearnMore={() => setPage("learn")} />
+        ) : (
+            <LearnMore mode={mode} onToggleTheme={toggle} onBack={() => setPage("home")} />
+        )}
+      </div>
   );
 }
 
-function Header(props: { mode: Mode; setMode: (m: Mode) => void }) {
-  const { mode, setMode } = props;
+/* ---------------- Home (no header, centered) ---------------- */
+
+function Home(props: { mode: Mode; onToggleTheme: () => void; onLearnMore: () => void }) {
+  const { mode, onToggleTheme, onLearnMore } = props;
+
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const [q, setQ] = useState("");
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      const meta = e.metaKey || e.ctrlKey;
+      if (meta && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        inputRef.current?.focus();
+      }
+      if (e.key === "Escape" && document.activeElement === inputRef.current) {
+        if (q) setQ("");
+        else inputRef.current?.blur();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [q]);
+
+  const crossSrc = mode === "dark" ? crossWhite : crossBlack;
 
   return (
-    <header style={styles.header}>
-      <div className="container" style={styles.headerInner}>
-        <a href="#" style={styles.brand} aria-label="Biblia Populi">
-          <div style={styles.mark} aria-hidden>
-            B
-          </div>
-          <div style={{ lineHeight: 1.05 }}>
-            <div style={styles.brandTitle}>Biblia Populi</div>
-            <div style={styles.brandSub}>The Word of God, open to all.</div>
-          </div>
-        </a>
-
-        <nav style={styles.nav} aria-label="Primary">
-          <a href="#about" style={styles.link}>
-            About
-          </a>
-          <a href="#statement" style={styles.link}>
-            Statement
-          </a>
-          <button
-            type="button"
-            onClick={() => setMode(mode === "dark" ? "light" : "dark")}
-            style={styles.themeBtn}
-            aria-label="Toggle theme"
-            title="Toggle theme"
-          >
+      <main style={styles.centerStage} aria-label="Landing">
+        {/* Minimal corner controls (not a header bar) */}
+        <div style={styles.cornerControls} aria-label="Landing controls">
+          <button type="button" onClick={onLearnMore} style={styles.cornerLink}>
+            Learn more
+          </button>
+          <button type="button" onClick={onToggleTheme} style={styles.cornerBtn} aria-label="Toggle theme">
             {mode === "dark" ? "Light" : "Dark"}
           </button>
-        </nav>
-      </div>
-    </header>
+        </div>
+
+        <div className="container" style={styles.centerInner}>
+          <div style={styles.centerBlock}>
+            <div style={styles.crossWrap} aria-hidden>
+              <img
+                  src={crossSrc}
+                  alt=""
+                  style={styles.crossImg}
+                  draggable={false}
+                  decoding="async"
+                  loading="eager"
+              />
+            </div>
+
+            <h1 style={styles.h1}>Biblia Populi</h1>
+
+            <div style={styles.latin}>Biblia Populi — “The Bible of the People.”</div>
+
+            <p style={styles.lede}>
+              A public, open-access Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen —
+              designed for quiet reading, fast lookup, and sharing without barrier.
+            </p>
+
+            <div style={styles.searchRow} aria-label="Search">
+            <span style={styles.searchIcon} aria-hidden>
+              ⌕
+            </span>
+
+              <input
+                  ref={inputRef}
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  placeholder="Search…"
+                  style={styles.searchInput}
+                  aria-label="Search scripture"
+              />
+
+              <span style={styles.searchHint} aria-hidden>
+              Ctrl K
+            </span>
+            </div>
+
+            <div style={styles.ctaRow}>
+              <a href="#" style={styles.primaryBtn}>
+                Start reading
+              </a>
+              <a href="#" style={styles.ghostBtn}>
+                Open a book
+              </a>
+            </div>
+
+            <div style={styles.tagline}>Ancient in name. Modern in form. Open to all.</div>
+          </div>
+        </div>
+      </main>
   );
 }
 
-function Hero() {
+/* ---------------- Learn More (simple page) ---------------- */
+
+function LearnMore(props: { mode: Mode; onToggleTheme: () => void; onBack: () => void }) {
+  const { mode, onToggleTheme, onBack } = props;
+
   return (
-    <section className="container" style={styles.sectionTop}>
-      <div style={styles.heroGrid}>
-        <div>
-          <div className="kicker">Latin for “The Bible of the People.”</div>
+      <main className="container" style={styles.learnPage} aria-label="Learn more">
+        <div style={styles.learnTopRow}>
+          <button type="button" onClick={onBack} style={styles.backBtn}>
+            ← Back
+          </button>
 
-          <h1 style={styles.h1}>
-            Biblia Populi
-            <span style={styles.h1Sub}>The Word of God, open to all.</span>
-          </h1>
+          <div style={{ flex: 1 }} />
 
-          <p style={styles.lede}>
-            A public, open-access Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen —
-            built to be clear, faithful to the text, and available without barrier.
+          <button type="button" onClick={onToggleTheme} style={styles.cornerBtn} aria-label="Toggle theme">
+            {mode === "dark" ? "Light" : "Dark"}
+          </button>
+        </div>
+
+        <div style={styles.learnTop}>
+          <h1 style={styles.learnTitle}>Learn more</h1>
+          <p style={styles.learnLede}>
+            Biblia Populi is built to be quiet, clear, and uncompromisingly reading-first — Scripture without noise or
+            gatekeeping.
           </p>
-
-          <div style={styles.ctaRow}>
-            <a href="#start" style={styles.primaryBtn}>
-              Start Reading
-            </a>
-            <a href="#about" style={styles.ghostBtn}>
-              Learn More
-            </a>
-          </div>
-
-          <div style={styles.tagline}>Ancient in name. Modern in form. Open to all.</div>
         </div>
 
-        <aside style={styles.aside}>
-          <div style={styles.asideTitle}>Purpose</div>
-          <div style={styles.asideBody}>
-            Readable, searchable, shareable Scripture — without noise, without gatekeeping.
-          </div>
-
-          <div style={styles.asideList}>
-            <Bullet>Reading-first layout and calm typography.</Bullet>
-            <Bullet>Fast navigation and verse linking (planned).</Bullet>
-            <Bullet>Built so anyone can encounter the truth of Christ.</Bullet>
-          </div>
-        </aside>
-      </div>
-    </section>
-  );
-}
-
-function About() {
-  return (
-    <section id="about" className="container" style={styles.section}>
-      <h2 style={styles.h2}>About</h2>
-
-      <p style={styles.body}>
-        <strong>Biblia Populi</strong> is a one-man project — built and maintained by me. It is not sponsored by an
-        institution, denomination, or publishing house. It is a personal labor of faith: to make Scripture freely
-        accessible, clearly presented, and faithful to the text.
-      </p>
-
-      <div style={styles.trio}>
-        <div style={styles.trioItem}>
-          <div style={styles.trioTitle}>Public</div>
-          <div style={styles.trioBody}>No locked content. No gatekeepers. Open by design.</div>
+        <div style={styles.learnSection}>
+          <h2 style={styles.h2}>About</h2>
+          <p style={styles.body}>
+            <strong>Biblia Populi</strong> is a one-man project. Not sponsored by an institution or publisher — built as a
+            personal labor of faith to make Scripture freely accessible and faithful to the text.
+          </p>
         </div>
-        <div style={styles.trioItem}>
-          <div style={styles.trioTitle}>Clear</div>
-          <div style={styles.trioBody}>Simple UI that stays out of the way.</div>
+
+        <div style={styles.learnSection}>
+          <h2 style={styles.h2}>Statement</h2>
+          <p style={styles.body}>
+            Biblia Populi exists to proclaim and preserve the Holy Scriptures as the true and living Word of God —
+            fulfilled in <strong>Jesus Christ</strong>, crucified and risen.
+          </p>
         </div>
-        <div style={styles.trioItem}>
-          <div style={styles.trioTitle}>Christ-centered</div>
-          <div style={styles.trioBody}>The Bible testifies to Jesus Christ, crucified and risen.</div>
-        </div>
-      </div>
 
-      <div id="start" style={{ height: 1 }} />
-    </section>
+        <footer style={styles.footer}>
+          <div style={styles.footerMuted}>© {new Date().getFullYear()} Biblia Populi</div>
+        </footer>
+      </main>
   );
 }
 
-function Statement() {
-  return (
-    <section id="statement" className="container" style={styles.section}>
-      <h2 style={styles.h2}>Statement</h2>
-
-      <div style={styles.statement}>
-        <p style={styles.body}>
-          Biblia Populi exists to proclaim and preserve the Holy Scriptures as the true and living Word of God —
-          fulfilled in <strong>Jesus Christ</strong>, crucified and risen.
-        </p>
-
-        <p style={{ ...styles.body, marginTop: 10 }}>
-          I believe the Bible testifies to Christ, reveals the gospel of His death and resurrection, and speaks with
-          authority to every generation.
-        </p>
-
-        <p style={{ ...styles.body, marginTop: 10 }}>
-          This platform is built on the conviction that God’s Word does not belong to institutions, publishers, or
-          gatekeepers — but is given for the world. Designed for reading, searching, studying, and sharing the
-          Scriptures without barrier — so that all may encounter the truth of Jesus Christ.
-        </p>
-      </div>
-    </section>
-  );
-}
-
-function Footer() {
-  return (
-    <footer className="container" style={styles.footer}>
-      <div style={styles.footerRow}>
-        <div style={styles.footerMuted}>© {new Date().getFullYear()} Biblia Populi</div>
-        <div style={styles.footerMuted}>Ancient in name. Modern in form. Open to all.</div>
-      </div>
-    </footer>
-  );
-}
-
-function Hairline() {
-  return (
-    <div className="container" aria-hidden style={{ paddingTop: 18, paddingBottom: 18 }}>
-      <div className="hairline" />
-    </div>
-  );
-}
-
-function Bullet(props: { children: React.ReactNode }) {
-  return (
-    <div style={styles.bulletRow}>
-      <span style={styles.bulletDot} aria-hidden />
-      <div>{props.children}</div>
-    </div>
-  );
-}
+/* ---------------- Styles ---------------- */
 
 const styles: Record<string, React.CSSProperties> = {
   page: {
     minHeight: "100vh",
-    background: "var(--bg)",
-    color: "var(--fg)",
+    background: "var(--bg, #ffffff)",
+    color: "var(--fg, #0b0b0b)",
   },
 
-  header: {
-    position: "sticky",
-    top: 0,
-    zIndex: 10,
-    background: "color-mix(in oklab, var(--bg) 92%, transparent)",
-    backdropFilter: "blur(10px)",
-  },
-  headerInner: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: "14px 0",
-  },
-
-  brand: {
-    display: "flex",
-    alignItems: "center",
-    gap: 12,
-    textDecoration: "none",
-  },
-  mark: {
-    width: 36,
-    height: 36,
-    borderRadius: 14,
+  /* Landing: centered, calm, “museum” whitespace */
+  centerStage: {
+    minHeight: "100vh",
     display: "grid",
     placeItems: "center",
-    fontWeight: 700,
-    letterSpacing: "-0.02em",
-    border: "1px solid var(--hairline)",
+    padding: "76px 0",
+    position: "relative",
   },
-  brandTitle: {
-    fontSize: 14,
-    fontWeight: 650,
-    letterSpacing: "0.02em",
-  },
-  brandSub: {
-    fontSize: 12,
-    color: "var(--muted)",
-    marginTop: 2,
+  centerInner: { width: "100%" },
+  centerBlock: {
+    maxWidth: 820,
+    marginInline: "auto",
+    textAlign: "center",
   },
 
-  nav: {
+  /* Minimal corner controls (not a bar) */
+  cornerControls: {
+    position: "fixed",
+    top: 18,
+    right: 18,
     display: "flex",
     alignItems: "center",
-    gap: 8,
+    gap: 10,
+    zIndex: 5,
   },
-  link: {
+  cornerLink: {
     fontSize: 13,
-    color: "var(--muted)",
-    padding: "8px 10px",
-    borderRadius: 10,
-    textDecoration: "none",
-  },
-  themeBtn: {
-    fontSize: 13,
-    padding: "8px 10px",
-    borderRadius: 10,
-    border: "1px solid var(--hairline)",
+    color: "var(--muted, rgba(11,11,11,0.60))",
+    border: "none",
     background: "transparent",
+    cursor: "pointer",
+    padding: "8px 10px",
+    borderRadius: 10,
+  },
+  cornerBtn: {
+    fontSize: 13,
+    padding: "8px 10px",
+    borderRadius: 10,
+    border: "1px solid var(--hairline, rgba(0,0,0,0.10))",
+    background: "transparent",
+    cursor: "pointer",
+    color: "inherit",
   },
 
-  sectionTop: { paddingTop: 56, paddingBottom: 10 },
-  section: { paddingTop: 46, paddingBottom: 10 },
-
-  heroGrid: {
+  crossWrap: {
     display: "grid",
-    gap: 24,
-    gridTemplateColumns: "1.25fr 0.75fr",
-    alignItems: "start",
+    placeItems: "center",
+    marginBottom: 22,
+    // gives it a tiny “gallery” presence without being loud
+    opacity: 0.95,
+  },
+  crossImg: {
+    width: 106,
+    height: 106,
+    objectFit: "contain",
+    userSelect: "none",
+    // soft “expensive” lift; works for both themes
+    filter: "drop-shadow(0 10px 24px color-mix(in oklab, var(--fg, #0b0b0b) 12%, transparent))",
   },
 
   h1: {
-    marginTop: 12,
-    fontSize: 52,
-    lineHeight: 1.02,
-    letterSpacing: "-0.035em",
+    marginTop: 0,
+    fontSize: 70,
+    lineHeight: 1.01,
+    letterSpacing: "-0.06em",
   },
-  h1Sub: {
-    display: "block",
-    marginTop: 10,
-    fontSize: 20,
-    color: "var(--muted)",
-    fontWeight: 500,
-    letterSpacing: "-0.01em",
+
+  latin: {
+    marginTop: 14,
+    fontSize: 12,
+    letterSpacing: "0.20em",
+    textTransform: "uppercase",
+    color: "var(--muted, rgba(11,11,11,0.60))",
   },
 
   lede: {
-    marginTop: 18,
-    maxWidth: 680,
-    color: "var(--muted)",
+    marginTop: 22,
     fontSize: 16,
-    lineHeight: 1.75,
+    lineHeight: 2.0,
+    color: "var(--muted, rgba(11,11,11,0.60))",
+    maxWidth: 740,
+    marginInline: "auto",
+  },
+
+  searchRow: {
+    marginTop: 46,
+    display: "grid",
+    gridTemplateColumns: "28px 1fr auto",
+    alignItems: "center",
+    gap: 10,
+    padding: "16px 16px",
+    borderRadius: 18,
+    border: "1px solid var(--hairline, rgba(0,0,0,0.10))",
+    background: "transparent",
+    maxWidth: 760,
+    marginInline: "auto",
+  },
+  searchIcon: { width: 28, textAlign: "center", color: "var(--muted, rgba(11,11,11,0.60))" },
+  searchInput: {
+    width: "100%",
+    border: "none",
+    outline: "none",
+    background: "transparent",
+    color: "inherit",
+    fontSize: 14,
+    padding: "10px 0",
+  },
+  searchHint: {
+    fontSize: 12,
+    color: "var(--muted, rgba(11,11,11,0.60))",
+    border: "1px solid var(--hairline, rgba(0,0,0,0.10))",
+    padding: "6px 10px",
+    borderRadius: 999,
+    userSelect: "none",
   },
 
   ctaRow: {
+    marginTop: 30,
     display: "flex",
+    justifyContent: "center",
     gap: 10,
-    marginTop: 18,
     flexWrap: "wrap",
   },
   primaryBtn: {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    padding: "11px 15px",
+    padding: "12px 15px",
     borderRadius: 14,
-    background: "var(--fg)",
-    color: "var(--bg)",
+    background: "var(--fg, #0b0b0b)",
+    color: "var(--bg, #ffffff)",
     fontSize: 13,
-    fontWeight: 700,
+    fontWeight: 760,
     textDecoration: "none",
   },
   ghostBtn: {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    padding: "11px 15px",
+    padding: "12px 15px",
     borderRadius: 14,
-    border: "1px solid var(--hairline)",
-    color: "var(--fg)",
+    border: "1px solid var(--hairline, rgba(0,0,0,0.10))",
+    color: "inherit",
     fontSize: 13,
-    fontWeight: 700,
+    fontWeight: 760,
     textDecoration: "none",
     background: "transparent",
   },
   tagline: {
-    marginTop: 12,
+    marginTop: 26,
     fontSize: 12,
-    color: "var(--muted)",
+    color: "var(--muted, rgba(11,11,11,0.60))",
   },
 
-  aside: {
-    border: "1px solid var(--hairline)",
-    borderRadius: 16,
-    padding: 16,
+  /* Learn more page */
+  learnPage: {
+    paddingTop: 28,
+    paddingBottom: 96,
+    maxWidth: 900,
   },
-  asideTitle: {
-    fontSize: 12,
-    letterSpacing: "0.14em",
-    textTransform: "uppercase",
-    color: "var(--muted)",
-  },
-  asideBody: {
-    marginTop: 10,
-    fontSize: 14,
-    lineHeight: 1.7,
-    color: "var(--muted)",
-  },
-  asideList: {
-    marginTop: 12,
-    display: "grid",
-    gap: 10,
-    fontSize: 13,
-    lineHeight: 1.65,
-    color: "var(--muted)",
-  },
-
-  bulletRow: {
-    display: "grid",
-    gridTemplateColumns: "10px 1fr",
-    gap: 10,
-    alignItems: "start",
-  },
-  bulletDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 999,
-    background: "color-mix(in oklab, var(--fg) 38%, transparent)",
-    marginTop: 7,
-  },
-
-  h2: {
-    fontSize: 18,
-    fontWeight: 650,
-    letterSpacing: "-0.02em",
-  },
-  body: {
-    marginTop: 12,
-    color: "var(--muted)",
-    fontSize: 14,
-    lineHeight: 1.75,
-  },
-
-  trio: {
-    marginTop: 16,
-    display: "grid",
-    gap: 12,
-    gridTemplateColumns: "repeat(3, 1fr)",
-  },
-  trioItem: {
-    border: "1px solid var(--hairline)",
-    borderRadius: 16,
-    padding: 14,
-  },
-  trioTitle: {
-    fontSize: 13,
-    fontWeight: 650,
-    letterSpacing: "-0.01em",
-  },
-  trioBody: {
-    marginTop: 8,
-    fontSize: 13,
-    lineHeight: 1.6,
-    color: "var(--muted)",
-  },
-
-  statement: {
-    marginTop: 12,
-    border: "1px solid var(--hairline)",
-    borderRadius: 16,
-    padding: 16,
-  },
-
-  footer: { paddingTop: 40, paddingBottom: 34 },
-  footerRow: {
+  learnTopRow: {
     display: "flex",
-    justifyContent: "space-between",
+    alignItems: "center",
     gap: 12,
-    flexWrap: "wrap",
+    paddingTop: 10,
   },
-  footerMuted: { fontSize: 12, color: "var(--muted)" },
+  backBtn: {
+    fontSize: 13,
+    padding: "8px 10px",
+    borderRadius: 10,
+    border: "1px solid var(--hairline, rgba(0,0,0,0.10))",
+    background: "transparent",
+    cursor: "pointer",
+    color: "inherit",
+  },
+
+  learnTop: { marginTop: 34, maxWidth: 760 },
+  learnTitle: { fontSize: 46, lineHeight: 1.05, letterSpacing: "-0.045em", margin: 0 },
+  learnLede: {
+    marginTop: 14,
+    fontSize: 16,
+    lineHeight: 1.95,
+    color: "var(--muted, rgba(11,11,11,0.60))",
+  },
+
+  learnSection: { marginTop: 64, maxWidth: 760 },
+  h2: { fontSize: 18, fontWeight: 700, letterSpacing: "-0.02em", margin: 0 },
+  body: { marginTop: 12, fontSize: 14, lineHeight: 1.95, color: "var(--muted, rgba(11,11,11,0.60))" },
+
+  footer: { marginTop: 96 },
+  footerMuted: { fontSize: 12, color: "var(--muted, rgba(11,11,11,0.60))" },
 };
-
-/* Responsive tweaks (non-clunky) */
-function useResponsiveTweaks() {
-  useEffect(() => {
-    const mq = window.matchMedia("(max-width: 900px)");
-    const apply = () => {
-      styles.heroGrid.gridTemplateColumns = mq.matches ? "1fr" : "1.25fr 0.75fr";
-      styles.h1.fontSize = mq.matches ? 42 : 52;
-      styles.trio.gridTemplateColumns = mq.matches ? "1fr" : "repeat(3, 1fr)";
-    };
-    apply();
-    mq.addEventListener?.("change", apply);
-    return () => mq.removeEventListener?.("change", apply);
-  }, []);
-}
-useResponsiveTweaks();
-
