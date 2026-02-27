@@ -1,6 +1,5 @@
 # Biblia Populi
-
-**Latin for “The Bible of the People.”**
+**“The Bible of the People.”**
 
 
 > The Word of God, open to all.
