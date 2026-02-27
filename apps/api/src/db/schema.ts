@@ -1,21 +1,18 @@
 // apps/api/src/db/schema.ts
-// Biblia Populi — Drizzle (SQLite) schema (upgraded)
+// Biblia Populi — Drizzle (SQLite) schema (upgraded + chrono/geo engine)
 //
-// Upgrades in this version:
-// - Stronger CHECK constraints (testament, sex, etc.)
-// - Added "chapter" table (optional but useful for headings per chapter)
-// - Added "cross_ref" (Scripture references between verses)
-// - Added "tag" + "person_tag" / "place_tag" for lightweight categorization
-// - Added "entity_source" tables to keep profiles Scripture-grounded (traceability)
-// - Added "translation_default_revision" helper table (fast lookup for "current")
-// - Added "settings" (local app prefs) + "drawer_history" (optional UX)
-// - Improved indexing for common queries (book read, entity lookup, mentions)
+// Adds (chrono/geo engine):
+// - source_doc: structured citation records (Scripture, gazetteer, atlas, etc.)
+// - chrono_span: time windows (approx/uncertain) attached to person/place/event/journey
+// - chrono_relation: temporal relationships between entities (before/after/during/overlaps)
+// - place_geo: multi-geometry per place (point/bbox/polygon/line) with confidence + provenance
+// - journey_path: optional polyline(s) per journey for map rendering
 //
 // Notes:
 // - FTS5 is still created via migration SQL (see FTS_MIGRATION_SQL).
 // - SQLite "enum" is modeled as TEXT + CHECK constraints.
-// - This file does not declare foreign key refs explicitly to keep SQLite FK coupling simple.
-//   (You can add refs later if desired; ensure PRAGMA foreign_keys=ON in client.ts.)
+// - Foreign keys are intentionally not declared (keep coupling light); enforce with app logic.
+// - Ensure PRAGMA foreign_keys=ON in client.ts anyway for future FK additions.
 
 import {
     sqliteTable,
@@ -37,6 +34,7 @@ export const EntityType = {
     person: "person",
     place: "place",
     event: "event",
+    journey: "journey",
 } as const;
 export type EntityType = (typeof EntityType)[keyof typeof EntityType];
 
@@ -126,6 +124,54 @@ export const PlaceKind = {
 } as const;
 export type PlaceKind = (typeof PlaceKind)[keyof typeof PlaceKind];
 
+/* ------------------------------- Chrono / Geo ------------------------------ */
+
+export const SourceKind = {
+    scripture: "scripture",
+    gazetteer: "gazetteer",
+    atlas: "atlas",
+    academic: "academic",
+    tradition: "tradition",
+    other: "other",
+} as const;
+export type SourceKind = (typeof SourceKind)[keyof typeof SourceKind];
+
+export const GeoShapeKind = {
+    point: "point",
+    bbox: "bbox",
+    polygon: "polygon",
+    polyline: "polyline",
+} as const;
+export type GeoShapeKind = (typeof GeoShapeKind)[keyof typeof GeoShapeKind];
+
+export const ChronoKind = {
+    life: "life",
+    reign: "reign",
+    ministry: "ministry",
+    journey: "journey",
+    event_window: "event_window",
+    composition: "composition",
+    other: "other",
+} as const;
+export type ChronoKind = (typeof ChronoKind)[keyof typeof ChronoKind];
+
+export const ChronoPrecision = {
+    exact: "exact",
+    approx: "approx",
+    uncertain: "uncertain",
+} as const;
+export type ChronoPrecision = (typeof ChronoPrecision)[keyof typeof ChronoPrecision];
+
+export const ChronoRelationKind = {
+    before: "before",
+    after: "after",
+    during: "during",
+    overlaps: "overlaps",
+    same_time: "same_time",
+    unknown: "unknown",
+} as const;
+export type ChronoRelationKind = (typeof ChronoRelationKind)[keyof typeof ChronoRelationKind];
+
 /* ------------------------------- Canon / Books ------------------------------ */
 /**
  * canon_book: defines books for a given canon (66-book protestant, 73 catholic, etc.)
@@ -148,17 +194,13 @@ export const canonBook = sqliteTable(
         testIdx: index("canon_book_testament_idx").on(t.canonId, t.testament),
         chapterCountCheck: check("canon_book_chapters_count_check", sql`${t.chaptersCount} > 0`),
         ordCheck: check("canon_book_ordinal_check", sql`${t.ordinal} > 0`),
-        testamentCheck: check(
-            "canon_book_testament_check",
-            sql`${t.testament} in ('OT','NT','DC')`,
-        ),
+        testamentCheck: check("canon_book_testament_check", sql`${t.testament} in ('OT','NT','DC')`),
         bookIdCheck: check("canon_book_book_id_check", sql`length(${t.bookId}) between 2 and 8`),
     }),
 );
 
 /**
  * chapter: optional, but useful for per-chapter headings/metadata.
- * (You can use verseMark too, but chapter makes book navigation nicer.)
  */
 export const chapter = sqliteTable(
     "chapter",
@@ -166,7 +208,6 @@ export const chapter = sqliteTable(
         canonId: text("canon_id").notNull(),
         bookId: text("book_id").notNull(),
         chapter: integer("chapter").notNull(),
-        // Optional: chapter title or summary (keep minimal)
         title: text("title"),
         summary: text("summary"),
     },
@@ -239,9 +280,7 @@ export const translationRevision = sqliteTable(
 
 /**
  * translation_default_revision:
- * A helper table to find the current active revision (per translation + canon).
- * You can keep a row for:
- * - "reading" revision (published) and maybe "editing" revision (draft).
+ * Helper for the current active revision (per translation + canon + purpose).
  */
 export const translationDefaultRevision = sqliteTable(
     "translation_default_revision",
@@ -275,7 +314,9 @@ export const verseText = sqliteTable(
         updatedAt: text("updated_at").notNull().default(nowIso),
     },
     (t) => ({
-        pk: primaryKey({ columns: [t.translationRevisionId, t.canonId, t.bookId, t.chapter, t.verse] }),
+        pk: primaryKey({
+            columns: [t.translationRevisionId, t.canonId, t.bookId, t.chapter, t.verse],
+        }),
         bookReadIdx: index("verse_text_book_read_idx").on(
             t.translationRevisionId,
             t.canonId,
@@ -347,8 +388,7 @@ export const footnote = sqliteTable(
 );
 
 /**
- * cross_ref: links a verse to another verse (classic marginal references).
- * "kind" can be "see_also" | "parallel" | "quotation" etc. (kept text for flexibility)
+ * cross_ref: links a verse to another verse.
  */
 export const crossRef = sqliteTable(
     "cross_ref",
@@ -507,9 +547,10 @@ export const place = sqliteTable(
         id: text("id").primaryKey(), // "pl_jerusalem"
         name: text("name").notNull(),
         kind: text("kind").notNull().default("other"), // city|region|...
+        // "primary" point (optional); richer geometry lives in place_geo.
         lat: real("lat"),
         lon: real("lon"),
-        geojson: text("geojson"),
+        geojson: text("geojson"), // optional legacy/quick geometry
         summary: text("summary"),
         description: text("description"),
         era: text("era"),
@@ -524,6 +565,8 @@ export const place = sqliteTable(
             "place_kind_check",
             sql`${t.kind} in ('city','region','river','mountain','sea','desert','route','other')`,
         ),
+        latCheck: check("place_lat_check", sql`${t.lat} is null or (${t.lat} >= -90 and ${t.lat} <= 90)`),
+        lonCheck: check("place_lon_check", sql`${t.lon} is null or (${t.lon} >= -180 and ${t.lon} <= 180)`),
     }),
 );
 
@@ -581,6 +624,7 @@ export const journey = sqliteTable(
     (t) => ({
         personIdx: index("journey_person_idx").on(t.personId, t.ord),
         labelIdx: index("journey_label_idx").on(t.label),
+        labelCheck: check("journey_label_check", sql`length(${t.label}) > 0`),
     }),
 );
 
@@ -602,6 +646,39 @@ export const journeyStop = sqliteTable(
         journeyIdx: index("journey_stop_journey_idx").on(t.journeyId, t.seq),
         placeIdx: index("journey_stop_place_idx").on(t.placeId),
         seqCheck: check("journey_stop_seq_check", sql`${t.seq} >= 0`),
+        refCheck: check(
+            "journey_stop_ref_check",
+            sql`(${t.chapter} is null and ${t.verse} is null) or (${t.chapter} > 0 and ${t.verse} > 0)`,
+        ),
+    }),
+);
+
+/**
+ * journey_path: optional geometry for rendering a journey as one or more lines.
+ * Keep it simple: GeoJSON LineString/MultiLineString in WGS84, plus provenance + confidence.
+ */
+export const journeyPath = sqliteTable(
+    "journey_path",
+    {
+        id: text("id").primaryKey(), // uuid
+        journeyId: text("journey_id").notNull(),
+        seq: integer("seq").notNull().default(0),
+        geojson: text("geojson").notNull(),
+        sourceDocId: text("source_doc_id"),
+        sourceRef: text("source_ref"), // optional scripture ref / note
+        confidence: real("confidence"),
+        note: text("note"),
+        createdAt: text("created_at").notNull().default(nowIso),
+        updatedAt: text("updated_at").notNull().default(nowIso),
+    },
+    (t) => ({
+        uniq: uniqueIndex("journey_path_unique_seq").on(t.journeyId, t.seq),
+        journeyIdx: index("journey_path_journey_idx").on(t.journeyId, t.seq),
+        geojsonCheck: check("journey_path_geojson_check", sql`length(${t.geojson}) > 0`),
+        confCheck: check(
+            "journey_path_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
     }),
 );
 
@@ -622,6 +699,7 @@ export const event = sqliteTable(
     (t) => ({
         titleIdx: index("event_title_idx").on(t.title),
         placeIdx: index("event_place_idx").on(t.placeId),
+        titleCheck: check("event_title_check", sql`length(${t.title}) > 0`),
     }),
 );
 
@@ -667,7 +745,6 @@ export const eventRef = sqliteTable(
 /* -------------------------- Traceability (Scripture-grounded) -------------------------- */
 /**
  * entity_source: attach Scripture references to claims in bios/summaries.
- * Keep it simple: "this paragraph" / "this fact" -> verse range.
  */
 export const entitySource = sqliteTable(
     "entity_source",
@@ -675,7 +752,6 @@ export const entitySource = sqliteTable(
         id: text("id").primaryKey(), // uuid
         entityType: text("entity_type").notNull(), // person|place|event
         entityId: text("entity_id").notNull(),
-        // Reference range
         canonId: text("canon_id").notNull(),
         bookId: text("book_id").notNull(),
         startChapter: integer("start_chapter").notNull(),
@@ -696,6 +772,218 @@ export const entitySource = sqliteTable(
     }),
 );
 
+/* ------------------------------- Source Documents --------------------------- */
+/**
+ * source_doc: structured citations for non-scripture provenance (gazetteers, atlases, papers),
+ * and can also hold “Scripture” as a first-class source if you want consistent referencing.
+ */
+export const sourceDoc = sqliteTable(
+    "source_doc",
+    {
+        id: text("id").primaryKey(), // uuid or stable slug
+        kind: text("kind").notNull(), // scripture|gazetteer|atlas|academic|tradition|other
+        title: text("title").notNull(),
+        author: text("author"),
+        year: integer("year"),
+        url: text("url"),
+        license: text("license"),
+        citation: text("citation"), // free-form short citation string
+        note: text("note"),
+        createdAt: text("created_at").notNull().default(nowIso),
+        updatedAt: text("updated_at").notNull().default(nowIso),
+    },
+    (t) => ({
+        kindIdx: index("source_doc_kind_idx").on(t.kind),
+        titleIdx: index("source_doc_title_idx").on(t.title),
+        kindCheck: check(
+            "source_doc_kind_check",
+            sql`${t.kind} in ('scripture','gazetteer','atlas','academic','tradition','other')`,
+        ),
+        titleCheck: check("source_doc_title_check", sql`length(${t.title}) > 0`),
+        yearCheck: check("source_doc_year_check", sql`${t.year} is null or (${t.year} >= 0 and ${t.year} <= 3000)`),
+    }),
+);
+
+/* ------------------------------- Geo Engine -------------------------------- */
+/**
+ * place_geo:
+ * - multiple geometry candidates per place (point/bbox/polygon/polyline)
+ * - confidence + provenance (source_doc + optional scripture ref)
+ * - bbox fields make map extents fast without parsing GeoJSON
+ */
+export const placeGeo = sqliteTable(
+    "place_geo",
+    {
+        id: text("id").primaryKey(), // uuid
+        placeId: text("place_id").notNull(),
+        kind: text("kind").notNull(), // point|bbox|polygon|polyline
+
+        // point (optional)
+        lat: real("lat"),
+        lon: real("lon"),
+
+        // bbox (optional, but recommended when kind=bbox/polygon/polyline)
+        minLat: real("min_lat"),
+        minLon: real("min_lon"),
+        maxLat: real("max_lat"),
+        maxLon: real("max_lon"),
+
+        // full geometry (GeoJSON). For point-only you can omit geojson.
+        geojson: text("geojson"),
+
+        // provenance
+        sourceDocId: text("source_doc_id"),
+        sourceRef: text("source_ref"), // "GEN 12:1-9" or JSON
+        confidence: real("confidence"),
+        note: text("note"),
+        ord: integer("ord").notNull().default(0),
+
+        createdAt: text("created_at").notNull().default(nowIso),
+        updatedAt: text("updated_at").notNull().default(nowIso),
+    },
+    (t) => ({
+        placeIdx: index("place_geo_place_idx").on(t.placeId, t.ord),
+        kindIdx: index("place_geo_kind_idx").on(t.placeId, t.kind),
+        bboxIdx: index("place_geo_bbox_idx").on(t.minLat, t.minLon, t.maxLat, t.maxLon),
+
+        kindCheck: check(
+            "place_geo_kind_check",
+            sql`${t.kind} in ('point','bbox','polygon','polyline')`,
+        ),
+        latCheck: check("place_geo_lat_check", sql`${t.lat} is null or (${t.lat} >= -90 and ${t.lat} <= 90)`),
+        lonCheck: check("place_geo_lon_check", sql`${t.lon} is null or (${t.lon} >= -180 and ${t.lon} <= 180)`),
+
+        bboxCheck: check(
+            "place_geo_bbox_check",
+            sql`(${t.minLat} is null and ${t.minLon} is null and ${t.maxLat} is null and ${t.maxLon} is null)
+          or (${t.minLat} <= ${t.maxLat} and ${t.minLon} <= ${t.maxLon})`,
+        ),
+        confCheck: check(
+            "place_geo_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+        ordCheck: check("place_geo_ord_check", sql`${t.ord} >= 0`),
+    }),
+);
+
+/* ------------------------------ Chrono Engine ------------------------------ */
+/**
+ * chrono_span: attach a time window to any entity.
+ * Uses signed years for BCE/CE (e.g., -1200, -5, 30).
+ * Granularity can be "year-only" (month/day null) or more precise.
+ */
+export const chronoSpan = sqliteTable(
+    "chrono_span",
+    {
+        id: text("id").primaryKey(), // uuid
+        entityType: text("entity_type").notNull(), // person|place|event|journey
+        entityId: text("entity_id").notNull(),
+
+        kind: text("kind").notNull(), // life|reign|ministry|journey|event_window|composition|other
+        precision: text("precision").notNull().default("uncertain"), // exact|approx|uncertain
+
+        startYear: integer("start_year"),
+        startMonth: integer("start_month"),
+        startDay: integer("start_day"),
+
+        endYear: integer("end_year"),
+        endMonth: integer("end_month"),
+        endDay: integer("end_day"),
+
+        // provenance
+        sourceDocId: text("source_doc_id"),
+        sourceRef: text("source_ref"), // scripture ref / note / JSON
+        confidence: real("confidence"),
+        note: text("note"),
+        ord: integer("ord").notNull().default(0),
+
+        createdAt: text("created_at").notNull().default(nowIso),
+        updatedAt: text("updated_at").notNull().default(nowIso),
+    },
+    (t) => ({
+        entityIdx: index("chrono_span_entity_idx").on(t.entityType, t.entityId, t.kind, t.ord),
+        kindIdx: index("chrono_span_kind_idx").on(t.kind),
+        rangeIdx: index("chrono_span_range_idx").on(t.startYear, t.endYear),
+
+        typeCheck: check(
+            "chrono_span_entity_type_check",
+            sql`${t.entityType} in ('person','place','event','journey')`,
+        ),
+        kindCheck: check(
+            "chrono_span_kind_check",
+            sql`${t.kind} in ('life','reign','ministry','journey','event_window','composition','other')`,
+        ),
+        precisionCheck: check(
+            "chrono_span_precision_check",
+            sql`${t.precision} in ('exact','approx','uncertain')`,
+        ),
+
+        // month/day sanity (allow null)
+        startMonthCheck: check(
+            "chrono_span_start_month_check",
+            sql`${t.startMonth} is null or (${t.startMonth} >= 1 and ${t.startMonth} <= 12)`,
+        ),
+        endMonthCheck: check(
+            "chrono_span_end_month_check",
+            sql`${t.endMonth} is null or (${t.endMonth} >= 1 and ${t.endMonth} <= 12)`,
+        ),
+        startDayCheck: check(
+            "chrono_span_start_day_check",
+            sql`${t.startDay} is null or (${t.startDay} >= 1 and ${t.startDay} <= 31)`,
+        ),
+        endDayCheck: check(
+            "chrono_span_end_day_check",
+            sql`${t.endDay} is null or (${t.endDay} >= 1 and ${t.endDay} <= 31)`,
+        ),
+
+        // confidence
+        confCheck: check(
+            "chrono_span_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+        ordCheck: check("chrono_span_ord_check", sql`${t.ord} >= 0`),
+    }),
+);
+
+/**
+ * chrono_relation: express time relationships without committing to absolute years.
+ * Example: "Exodus occurs after Joseph's death", "Paul's ministry overlaps with ...".
+ */
+export const chronoRelation = sqliteTable(
+    "chrono_relation",
+    {
+        id: text("id").primaryKey(), // uuid
+        fromEntityType: text("from_entity_type").notNull(),
+        fromEntityId: text("from_entity_id").notNull(),
+        toEntityType: text("to_entity_type").notNull(),
+        toEntityId: text("to_entity_id").notNull(),
+
+        kind: text("kind").notNull(), // before|after|during|overlaps|same_time|unknown
+        confidence: real("confidence"),
+        note: text("note"),
+
+        sourceDocId: text("source_doc_id"),
+        sourceRef: text("source_ref"),
+        createdAt: text("created_at").notNull().default(nowIso),
+    },
+    (t) => ({
+        fromIdx: index("chrono_relation_from_idx").on(t.fromEntityType, t.fromEntityId, t.kind),
+        toIdx: index("chrono_relation_to_idx").on(t.toEntityType, t.toEntityId, t.kind),
+        kindCheck: check(
+            "chrono_relation_kind_check",
+            sql`${t.kind} in ('before','after','during','overlaps','same_time','unknown')`,
+        ),
+        confCheck: check(
+            "chrono_relation_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+        notSelfCheck: check(
+            "chrono_relation_not_self_check",
+            sql`not (${t.fromEntityType} = ${t.toEntityType} and ${t.fromEntityId} = ${t.toEntityId})`,
+        ),
+    }),
+);
+
 /* ----------------------------------- Tags ---------------------------------- */
 
 export const tag = sqliteTable(
@@ -711,6 +999,7 @@ export const tag = sqliteTable(
         slugUniq: uniqueIndex("tag_unique_slug").on(t.slug),
         kindCheck: check("tag_kind_check", sql`${t.kind} in ('general','role','era','topic')`),
         slugCheck: check("tag_slug_check", sql`length(${t.slug}) > 0`),
+        labelCheck: check("tag_label_check", sql`length(${t.label}) > 0`),
     }),
 );
 
@@ -863,7 +1152,6 @@ export const settings = sqliteTable(
 
 /**
  * drawer_history: optional UX helper to keep back/forward inside the drawer.
- * (Nice for "Abraham -> Sarah -> Isaac" without navigation.)
  */
 export const drawerHistory = sqliteTable(
     "drawer_history",
@@ -873,7 +1161,6 @@ export const drawerHistory = sqliteTable(
         createdAt: text("created_at").notNull().default(nowIso),
         entityType: text("entity_type").notNull(),
         entityId: text("entity_id").notNull(),
-        // Optional context: where the click came from
         canonId: text("canon_id"),
         bookId: text("book_id"),
         chapter: integer("chapter"),
@@ -882,7 +1169,14 @@ export const drawerHistory = sqliteTable(
     (t) => ({
         userIdx: index("drawer_history_user_idx").on(t.userId, t.createdAt),
         entityIdx: index("drawer_history_entity_idx").on(t.entityType, t.entityId),
-        typeCheck: check("drawer_history_type_check", sql`${t.entityType} in ('person','place','event')`),
+        typeCheck: check(
+            "drawer_history_type_check",
+            sql`${t.entityType} in ('person','place','event')`,
+        ),
+        refCheck: check(
+            "drawer_history_ref_check",
+            sql`(${t.chapter} is null and ${t.verse} is null) or (${t.chapter} > 0 and ${t.verse} > 0)`,
+        ),
     }),
 );
 
@@ -945,14 +1239,22 @@ export const schema = {
     place,
     placeAlias,
     personPlace,
+
     journey,
     journeyStop,
+    journeyPath,
 
     event,
     eventParticipant,
     eventRef,
 
     entitySource,
+
+    // chrono/geo engine
+    sourceDoc,
+    placeGeo,
+    chronoSpan,
+    chronoRelation,
 
     tag,
     personTag,
