@@ -100,20 +100,20 @@ function collectFiles(
 }
 
 function main() {
-    console.log("🚀 Starting clean export of CRA Tool codebase...");
+    console.log("🚀 Starting clean export of BIBLIA POPULI codebase...");
 
     const start = Date.now();
     const files = collectFiles(ROOT);
     files.sort((a, b) => a.path.localeCompare(b.path));
 
-    let md = `# CRA Tool - Clean Codebase Export\n\n`;
+    let md = `# BIBLIA POPULI Tool - Clean Codebase Export\n\n`;
     md += `Generated: ${new Date().toISOString()}\n`;
     md += `Total files: ${files.length}\n`;
     md += `Export time: ${Date.now() - start}ms\n\n`;
 
     // Clean Directory Tree
     md += `## Directory Structure\n\n\`\`\`\n`;
-    md += `cra-tool/\n`;
+    md += `/\n`;
 
     const seen = new Set<string>();
     for (const file of files) {

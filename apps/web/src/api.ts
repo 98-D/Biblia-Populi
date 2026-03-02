@@ -1,33 +1,63 @@
 // apps/web/src/api.ts
-// Biblia Populi — tiny typed client (upgraded for bp_* API)
+// Biblia Populi — tiny typed client (bp_* API)
 //
-// Server endpoints now return:
-// - /meta  -> { translation, ftsEnabled }
-// - /books -> { books }
-// - /chapters/:bookId -> { bookId, chapters: [{chapter,startVerseOrd,endVerseOrd,verseCount}] }
-// - /chapter/:bookId/:chapter -> {
-//      translationId, bookId, chapter, chapterBounds,
-//      verses: [{ verseKey, verseOrd, chapter, verse, text, updatedAt }],
-//      ranges, links, crossrefs,
-//      marks/mentions/footnotes: [] (legacy placeholders)
-//   }
-// - /search?q=... -> { q, mode, results }
-// - /people/:id, /places/:id, /events/:id -> drawer payloads
+// Goals:
+// - Calm, explicit, traceable
+// - Same-origin by default (Vite proxy / production reverse-proxy)
+// - Optional VITE_API_BASE override for remote API
+// - Consistent errors with codes
+// - Request timeouts + AbortSignal support
+// - Safe JSON parsing + better diagnostics
 //
-// Notes:
-// - Vite dev proxy: API_BASE should be "" (same-origin).
-// - VITE_API_BASE can override for remote API.
+// Server endpoints:
+// - GET /meta
+// - GET /books
+// - GET /chapters/:bookId
+// - GET /chapter/:bookId/:chapter
+// - GET /search?q=...&limit=...
+// - GET /people/:id
+// - GET /places/:id
+// - GET /events/:id
 
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: { code: string; message: string } };
 export type ApiRes<T> = ApiOk<T> | ApiErr;
 
 export type ApiRequestOptions = {
-    /** Abort after N ms (default 12s) */
+    /** Abort after N ms (default 12s). Set 0 to disable timeout. */
     timeoutMs?: number;
     /** Extra headers */
     headers?: Record<string, string>;
+    /** Optional caller-provided AbortSignal (merged with timeout) */
+    signal?: AbortSignal;
 };
+
+export type ApiErrorCode =
+    | "TIMEOUT"
+    | "NETWORK"
+    | "HTTP_ERROR"
+    | "BAD_RESPONSE"
+    | "NOT_JSON"
+    | "API_ERROR"
+    | "ABORTED";
+
+export class ApiError extends Error {
+    readonly code: ApiErrorCode;
+    readonly status?: number;
+    readonly url?: string;
+    readonly bodyText?: string;
+
+    constructor(code: ApiErrorCode, message: string, init?: { status?: number; url?: string; bodyText?: string }) {
+        super(`${code}: ${message}`);
+        this.name = "ApiError";
+        this.code = code;
+        this.status = init?.status;
+        this.url = init?.url;
+        this.bodyText = init?.bodyText;
+    }
+}
+
+/* --------------------------------- Types --------------------------------- */
 
 export type TranslationMeta = {
     translationId: string;
@@ -133,7 +163,7 @@ export type ChapterPayload = {
     links: LinkRow[];
     crossrefs: CrossrefRow[];
 
-    // legacy placeholders (server returns empty arrays)
+    // legacy placeholders
     marks: unknown[];
     mentions: unknown[];
     footnotes: unknown[];
@@ -156,7 +186,6 @@ export type SearchPayload = {
     results: SearchResult[];
 };
 
-// Drawer payloads (minimal typing; can tighten later)
 export type PersonPayload =
     | null
     | {
@@ -255,61 +284,118 @@ export type EventPayload =
     }>;
 };
 
-// If VITE_API_BASE is set, use it. Otherwise use same-origin (works with Vite proxy).
+/* --------------------------------- Base URL -------------------------------- */
+
+// If VITE_API_BASE is set, use it. Otherwise same-origin (works with Vite proxy).
 const API_BASE = (import.meta.env?.VITE_API_BASE ?? "") as string;
 
 function joinUrl(base: string, p: string): string {
-    const path = p.startsWith("/") ? p : `/${p}`;
-    if (!base) return path;
+    const pathname = p.startsWith("/") ? p : `/${p}`;
+    if (!base) return pathname;
     const b = base.endsWith("/") ? base.slice(0, -1) : base;
-    return `${b}${path}`;
+    return `${b}${pathname}`;
+}
+
+/* ------------------------------ JSON / Errors ------------------------------ */
+
+function isObj(v: unknown): v is Record<string, unknown> {
+    return typeof v === "object" && v !== null;
+}
+
+function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false } {
+    if (!text) return { ok: true, value: null };
+    try {
+        return { ok: true, value: JSON.parse(text) as unknown };
+    } catch {
+        return { ok: false };
+    }
+}
+
+function mergeSignals(a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined {
+    if (!a) return b;
+    if (!b) return a;
+
+    // If already aborted, prefer that immediate state.
+    if (a.aborted) return a;
+    if (b.aborted) return b;
+
+    const ctrl = new AbortController();
+    const onAbort = () => ctrl.abort();
+
+    a.addEventListener("abort", onAbort, { once: true });
+    b.addEventListener("abort", onAbort, { once: true });
+
+    return ctrl.signal;
+}
+
+function classifyFetchError(e: unknown): ApiError {
+    if (e && typeof e === "object" && (e as any).name === "AbortError") {
+        return new ApiError("ABORTED", "Request aborted.");
+    }
+    if (e instanceof ApiError) return e;
+    const msg = e instanceof Error ? e.message : String(e);
+    return new ApiError("NETWORK", msg || "Network error.");
 }
 
 async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T> {
     const url = joinUrl(API_BASE, path);
 
-    const controller = new AbortController();
     const timeoutMs = opts.timeoutMs ?? 12_000;
-    const t = setTimeout(() => controller.abort(), timeoutMs);
+    const timeoutCtrl = new AbortController();
+    const timeoutOn = Number.isFinite(timeoutMs) && timeoutMs > 0;
+
+    const t = timeoutOn ? setTimeout(() => timeoutCtrl.abort(), timeoutMs) : null;
+
+    const signal = mergeSignals(opts.signal, timeoutCtrl.signal);
 
     try {
         const res = await fetch(url, {
             method: "GET",
             headers: { Accept: "application/json", ...(opts.headers ?? {}) },
-            signal: controller.signal,
+            signal,
         });
 
-        const text = await res.text();
-        let parsed: unknown = null;
-        try {
-            parsed = text ? JSON.parse(text) : null;
-        } catch {
-            parsed = null;
-        }
+        const bodyText = await res.text();
+        const parsed = tryParseJson(bodyText);
 
         if (!res.ok) {
-            const maybe = parsed as Partial<ApiErr> | null;
-            const msg =
-                maybe?.ok === false
-                    ? `${maybe.error?.code ?? "HTTP_ERROR"}: ${maybe.error?.message ?? res.statusText}`
-                    : `HTTP_${res.status}: ${res.statusText}`;
-            throw new Error(msg);
+            // Prefer server-provided ApiErr shape when present.
+            if (parsed.ok && isObj(parsed.value) && (parsed.value as any).ok === false) {
+                const v = parsed.value as ApiErr;
+                throw new ApiError("API_ERROR", v.error?.message ?? res.statusText, { status: res.status, url, bodyText });
+            }
+            throw new ApiError("HTTP_ERROR", res.statusText || `HTTP ${res.status}`, { status: res.status, url, bodyText });
         }
 
-        const data = parsed as ApiRes<T>;
-        if (!data || typeof data !== "object") throw new Error("BAD_RESPONSE: Expected JSON object.");
-
-        if ((data as ApiErr).ok === false) {
-            const e = data as ApiErr;
-            throw new Error(`${e.error.code}: ${e.error.message}`);
+        if (!parsed.ok) {
+            throw new ApiError("NOT_JSON", "Expected JSON response but got non-JSON.", { status: res.status, url, bodyText });
         }
 
-        return (data as ApiOk<T>).data;
-    } catch (e: any) {
-        if (e?.name === "AbortError") throw new Error("TIMEOUT: Request took too long.");
-        throw e;
+        // Expect ApiRes<T> envelope.
+        if (!isObj(parsed.value)) {
+            throw new ApiError("BAD_RESPONSE", "Expected JSON object envelope.", { status: res.status, url, bodyText });
+        }
+
+        const env = parsed.value as ApiRes<T>;
+        if ((env as any).ok === false) {
+            const e = env as ApiErr;
+            throw new ApiError("API_ERROR", e.error?.message ?? "API error.", { status: res.status, url, bodyText });
+        }
+
+        if ((env as any).ok !== true) {
+            throw new ApiError("BAD_RESPONSE", "Missing ok:true in response envelope.", { status: res.status, url, bodyText });
+        }
+
+        return (env as ApiOk<T>).data;
+    } catch (e) {
+        // Distinguish timeout vs user abort.
+        if (e && typeof e === "object" && (e as any).name === "AbortError") {
+            if (timeoutOn) throw new ApiError("TIMEOUT", "Request took too long.", { url });
+            throw new ApiError("ABORTED", "Request aborted.", { url });
+        }
+        throw classifyFetchError(e);
     } finally {
-        clearTimeout(t);
+        if (t) clearTimeout(t);
     }
 }
 
@@ -328,7 +414,7 @@ export function apiGetChapters(bookId: string, opts?: ApiRequestOptions): Promis
 }
 
 export function apiGetChapter(bookId: string, chapter: number, opts?: ApiRequestOptions): Promise<ChapterPayload> {
-    return getJson(`/chapter/${encodeURIComponent(bookId)}/${chapter}`, opts);
+    return getJson(`/chapter/${encodeURIComponent(bookId)}/${encodeURIComponent(String(chapter))}`, opts);
 }
 
 export function apiSearch(q: string, limit = 30, opts?: ApiRequestOptions): Promise<SearchPayload> {

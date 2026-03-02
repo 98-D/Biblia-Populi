@@ -6,24 +6,20 @@
   "scripts": {
     "dev": "bun --watch src/server.ts",
     "start": "bun src/server.ts",
-
     "db:gen": "bunx drizzle-kit generate --config ./drizzle.config.ts",
     "db:studio": "bunx drizzle-kit studio --config ./drizzle.config.ts",
-
     "db:migrate": "bun src/db/migrate.ts",
     "db:seed": "bun src/db/seed.ts",
     "db:bootstrap": "bun src/db/migrate.ts && bun src/db/seed.ts",
-
     "import:osis": "bun scripts/import-osis.ts",
-
     "db:reset": "bun scripts/reset-db.ts",
     "db:verify": "bun scripts/verify-db.ts",
-
     "db:build": "bun scripts/reset-db.ts && bun scripts/import-osis.ts && bun scripts/verify-db.ts"
   },
   "dependencies": {
     "drizzle-orm": "^0.45.1",
     "hono": "^4.12.3",
+    "saxes": "^6.0.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
