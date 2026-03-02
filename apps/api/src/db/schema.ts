@@ -1,1270 +1,854 @@
 // apps/api/src/db/schema.ts
-// Biblia Populi — Drizzle (SQLite) schema (upgraded + chrono/geo engine)
+// Biblia Populi — Canonical Data Universe Schema v1 (SQLite / Drizzle)
 //
-// Adds (chrono/geo engine):
-// - source_doc: structured citation records (Scripture, gazetteer, atlas, etc.)
-// - chrono_span: time windows (approx/uncertain) attached to person/place/event/journey
-// - chrono_relation: temporal relationships between entities (before/after/during/overlaps)
-// - place_geo: multi-geometry per place (point/bbox/polygon/line) with confidence + provenance
-// - journey_path: optional polyline(s) per journey for map rendering
-//
-// Notes:
-// - FTS5 is still created via migration SQL (see FTS_MIGRATION_SQL).
-// - SQLite "enum" is modeled as TEXT + CHECK constraints.
-// - Foreign keys are intentionally not declared (keep coupling light); enforce with app logic.
-// - Ensure PRAGMA foreign_keys=ON in client.ts anyway for future FK additions.
+// Orientation-only canon.
+// - Stable Scripture identity: verse_key + verse_ord
+// - Text is swappable: translation overlays
+// - All links target ranges (ordinals), never strings
+// - Uncertainty is first-class (time + geo precision/confidence)
+// - No interpretation layer in canon (no commentary, no devotional "summary", etc.)
 
+import { sql } from "drizzle-orm";
 import {
     sqliteTable,
     text,
     integer,
     real,
-    primaryKey,
     index,
     uniqueIndex,
+    primaryKey,
     check,
 } from "drizzle-orm/sqlite-core";
-import { sql } from "drizzle-orm";
 
-/* --------------------------------- Helpers -------------------------------- */
+const nowIso = sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`;
 
-export const nowIso = sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`;
+/* ---------------------------------- Enums ---------------------------------- */
 
-export const EntityType = {
-    person: "person",
-    place: "place",
-    event: "event",
-    journey: "journey",
-} as const;
-export type EntityType = (typeof EntityType)[keyof typeof EntityType];
-
-export const RevisionStatus = {
-    draft: "draft",
-    published: "published",
-    archived: "archived",
-} as const;
-export type RevisionStatus = (typeof RevisionStatus)[keyof typeof RevisionStatus];
-
-export const Testament = {
-    OT: "OT",
-    NT: "NT",
-    DC: "DC",
-} as const;
+export const Testament = { OT: "OT", NT: "NT" } as const;
 export type Testament = (typeof Testament)[keyof typeof Testament];
 
-export const Sex = {
-    male: "male",
-    female: "female",
+export const LicenseKind = {
+    PUBLIC_DOMAIN: "PUBLIC_DOMAIN",
+    LICENSED: "LICENSED",
+    CUSTOM: "CUSTOM",
 } as const;
-export type Sex = (typeof Sex)[keyof typeof Sex];
+export type LicenseKind = (typeof LicenseKind)[keyof typeof LicenseKind];
 
-export const RelationshipKind = {
-    parent: "parent",
-    child: "child",
-    spouse: "spouse",
-    sibling: "sibling",
-    teacher_of: "teacher_of",
-    disciple_of: "disciple_of",
-    king_of: "king_of",
-    prophet_to: "prophet_to",
-    enemy_of: "enemy_of",
-    covenant_with: "covenant_with",
+export const ParagraphStyle = {
+    PROSE: "PROSE",
+    POETRY: "POETRY",
+    LIST: "LIST",
+    QUOTE: "QUOTE",
+    LETTER: "LETTER",
 } as const;
-export type RelationshipKind = (typeof RelationshipKind)[keyof typeof RelationshipKind];
+export type ParagraphStyle = (typeof ParagraphStyle)[keyof typeof ParagraphStyle];
 
-export const PlaceLinkKind = {
-    born_in: "born_in",
-    died_in: "died_in",
-    lived_in: "lived_in",
-    traveled_to: "traveled_to",
-    ministered_in: "ministered_in",
-    exiled_to: "exiled_to",
-    battle_at: "battle_at",
-    imprisoned_in: "imprisoned_in",
+export const DocUnitKind = {
+    SECTION: "SECTION",
+    SPEECH: "SPEECH",
+    SONG: "SONG",
+    LETTER_PART: "LETTER_PART",
+    NARRATIVE_BLOCK: "NARRATIVE_BLOCK",
 } as const;
-export type PlaceLinkKind = (typeof PlaceLinkKind)[keyof typeof PlaceLinkKind];
+export type DocUnitKind = (typeof DocUnitKind)[keyof typeof DocUnitKind];
 
-export const MarkKind = {
-    heading: "heading",
-    subheading: "subheading",
-    paragraph_break: "paragraph_break",
-    poetry_line: "poetry_line",
-    speaker: "speaker",
-    red_letter: "red_letter",
-    selah: "selah",
+export const EntityKind = {
+    PERSON: "PERSON",
+    PLACE: "PLACE",
+    GROUP: "GROUP",
+    DYNASTY: "DYNASTY",
+    EMPIRE: "EMPIRE",
+    REGION: "REGION",
+    ARTIFACT: "ARTIFACT",
+    OFFICE: "OFFICE",
 } as const;
-export type MarkKind = (typeof MarkKind)[keyof typeof MarkKind];
+export type EntityKind = (typeof EntityKind)[keyof typeof EntityKind];
 
-export const HighlightColor = {
-    gray: "gray",
-    yellow: "yellow",
-    green: "green",
-    blue: "blue",
-    purple: "purple",
-    red: "red",
+export const RelationKind = {
+    PARENT_OF: "PARENT_OF",
+    CHILD_OF: "CHILD_OF",
+    SPOUSE_OF: "SPOUSE_OF",
+    SIBLING_OF: "SIBLING_OF",
+    RULES_OVER: "RULES_OVER",
+    MEMBER_OF: "MEMBER_OF",
+    ALLY_OF: "ALLY_OF",
+    ENEMY_OF: "ENEMY_OF",
+    SUCCEEDS: "SUCCEEDS",
 } as const;
-export type HighlightColor = (typeof HighlightColor)[keyof typeof HighlightColor];
+export type RelationKind = (typeof RelationKind)[keyof typeof RelationKind];
 
-export const AssetKind = {
-    image: "image",
-    icon: "icon",
-    svg: "svg",
+export const GeoType = {
+    POINT: "POINT",
+    BBOX: "BBOX",
+    REGION_POLYGON: "REGION_POLYGON",
 } as const;
-export type AssetKind = (typeof AssetKind)[keyof typeof AssetKind];
+export type GeoType = (typeof GeoType)[keyof typeof GeoType];
 
-export const PlaceKind = {
-    city: "city",
-    region: "region",
-    river: "river",
-    mountain: "mountain",
-    sea: "sea",
-    desert: "desert",
-    route: "route",
-    other: "other",
+export const CalendarKind = { BCE_CE: "BCE_CE", ANNO_MUNDI: "ANNO_MUNDI" } as const;
+export type CalendarKind = (typeof CalendarKind)[keyof typeof CalendarKind];
+
+export const EraTag = {
+    PRIMEVAL: "PRIMEVAL",
+    PATRIARCHS: "PATRIARCHS",
+    EXODUS_WILDERNESS: "EXODUS_WILDERNESS",
+    CONQUEST_JUDGES: "CONQUEST_JUDGES",
+    UNITED_MONARCHY: "UNITED_MONARCHY",
+    DIVIDED_KINGDOM: "DIVIDED_KINGDOM",
+    EXILE: "EXILE",
+    SECOND_TEMPLE: "SECOND_TEMPLE",
+    GOSPELS: "GOSPELS",
+    APOSTOLIC: "APOSTOLIC",
 } as const;
-export type PlaceKind = (typeof PlaceKind)[keyof typeof PlaceKind];
+export type EraTag = (typeof EraTag)[keyof typeof EraTag];
 
-/* ------------------------------- Chrono / Geo ------------------------------ */
-
-export const SourceKind = {
-    scripture: "scripture",
-    gazetteer: "gazetteer",
-    atlas: "atlas",
-    academic: "academic",
-    tradition: "tradition",
-    other: "other",
+export const AnchorKind = {
+    SETTING: "SETTING",
+    EVENT_WINDOW: "EVENT_WINDOW",
+    REIGN: "REIGN",
+    JOURNEY_WINDOW: "JOURNEY_WINDOW",
 } as const;
+export type AnchorKind = (typeof AnchorKind)[keyof typeof AnchorKind];
+
+export const EventKind = {
+    BIRTH: "BIRTH",
+    DEATH: "DEATH",
+    BATTLE: "BATTLE",
+    COVENANT: "COVENANT",
+    EXODUS: "EXODUS",
+    MIGRATION: "MIGRATION",
+    SPEECH: "SPEECH",
+    MIRACLE: "MIRACLE",
+    PROPHECY: "PROPHECY",
+    CAPTIVITY: "CAPTIVITY",
+    RETURN: "RETURN",
+    CRUCIFIXION: "CRUCIFIXION",
+    RESURRECTION: "RESURRECTION",
+    MISSION_JOURNEY: "MISSION_JOURNEY",
+    COUNCIL: "COUNCIL",
+    LETTER_WRITTEN: "LETTER_WRITTEN",
+    OTHER: "OTHER",
+} as const;
+export type EventKind = (typeof EventKind)[keyof typeof EventKind];
+
+export const ParticipantRole = {
+    SUBJECT: "SUBJECT",
+    AGENT: "AGENT",
+    WITNESS: "WITNESS",
+    OPPONENT: "OPPONENT",
+    RULER: "RULER",
+    PEOPLE: "PEOPLE",
+    OTHER: "OTHER",
+} as const;
+export type ParticipantRole = (typeof ParticipantRole)[keyof typeof ParticipantRole];
+
+export const LinkTargetKind = {
+    ENTITY: "ENTITY",
+    EVENT: "EVENT",
+    ROUTE: "ROUTE",
+    PLACE_GEO: "PLACE_GEO",
+} as const;
+export type LinkTargetKind = (typeof LinkTargetKind)[keyof typeof LinkTargetKind];
+
+export const LinkKind = {
+    MENTIONS: "MENTIONS",
+    PRIMARY_SUBJECT: "PRIMARY_SUBJECT",
+    LOCATION: "LOCATION",
+    SETTING: "SETTING",
+    JOURNEY_STEP: "JOURNEY_STEP",
+    PARALLEL_ACCOUNT: "PARALLEL_ACCOUNT",
+    QUOTE_SOURCE: "QUOTE_SOURCE",
+    QUOTE_TARGET: "QUOTE_TARGET",
+} as const;
+export type LinkKind = (typeof LinkKind)[keyof typeof LinkKind];
+
+export const CrossrefKind = {
+    PARALLEL: "PARALLEL",
+    QUOTE: "QUOTE",
+    ALLUSION: "ALLUSION",
+    TOPICAL: "TOPICAL",
+} as const;
+export type CrossrefKind = (typeof CrossrefKind)[keyof typeof CrossrefKind];
+
+export const ReaderEventType = {
+    VIEW_VERSE: "VIEW_VERSE",
+    VIEW_CHAPTER: "VIEW_CHAPTER",
+    SCROLL_BACK: "SCROLL_BACK",
+    COPY_TEXT: "COPY_TEXT",
+    OPEN_ENTITY: "OPEN_ENTITY",
+    OPEN_MAP: "OPEN_MAP",
+    OPEN_TIMELINE: "OPEN_TIMELINE",
+    SEARCH: "SEARCH",
+} as const;
+export type ReaderEventType = (typeof ReaderEventType)[keyof typeof ReaderEventType];
+
+export const SourceKind = { IMPORT: "IMPORT", MANUAL: "MANUAL", DATASET: "DATASET" } as const;
 export type SourceKind = (typeof SourceKind)[keyof typeof SourceKind];
 
-export const GeoShapeKind = {
-    point: "point",
-    bbox: "bbox",
-    polygon: "polygon",
-    polyline: "polyline",
-} as const;
-export type GeoShapeKind = (typeof GeoShapeKind)[keyof typeof GeoShapeKind];
+export const AuditAction = { INSERT: "INSERT", UPDATE: "UPDATE", DELETE: "DELETE" } as const;
+export type AuditAction = (typeof AuditAction)[keyof typeof AuditAction];
 
-export const ChronoKind = {
-    life: "life",
-    reign: "reign",
-    ministry: "ministry",
-    journey: "journey",
-    event_window: "event_window",
-    composition: "composition",
-    other: "other",
-} as const;
-export type ChronoKind = (typeof ChronoKind)[keyof typeof ChronoKind];
+/* ------------------------- 1) Canonical Scripture Layer ---------------------- */
 
-export const ChronoPrecision = {
-    exact: "exact",
-    approx: "approx",
-    uncertain: "uncertain",
-} as const;
-export type ChronoPrecision = (typeof ChronoPrecision)[keyof typeof ChronoPrecision];
-
-export const ChronoRelationKind = {
-    before: "before",
-    after: "after",
-    during: "during",
-    overlaps: "overlaps",
-    same_time: "same_time",
-    unknown: "unknown",
-} as const;
-export type ChronoRelationKind = (typeof ChronoRelationKind)[keyof typeof ChronoRelationKind];
-
-/* ------------------------------- Canon / Books ------------------------------ */
-/**
- * canon_book: defines books for a given canon (66-book protestant, 73 catholic, etc.)
- * book_id is a stable code: GEN, EXO, MAT, ROM, ...
- */
-export const canonBook = sqliteTable(
-    "canon_book",
+export const bpBook = sqliteTable(
+    "bp_book",
     {
-        canonId: text("canon_id").notNull(), // e.g. "protestant_66"
-        bookId: text("book_id").notNull(), // e.g. "GEN"
-        ordinal: integer("ordinal").notNull(), // 1..N
-        name: text("name").notNull(), // "Genesis"
-        nameShort: text("name_short").notNull(), // "Gen"
-        testament: text("testament").notNull(), // OT | NT | DC
-        chaptersCount: integer("chapters_count").notNull(),
-    },
-    (t) => ({
-        pk: primaryKey({ columns: [t.canonId, t.bookId] }),
-        ordIdx: uniqueIndex("canon_book_unique_ordinal").on(t.canonId, t.ordinal),
-        testIdx: index("canon_book_testament_idx").on(t.canonId, t.testament),
-        chapterCountCheck: check("canon_book_chapters_count_check", sql`${t.chaptersCount} > 0`),
-        ordCheck: check("canon_book_ordinal_check", sql`${t.ordinal} > 0`),
-        testamentCheck: check("canon_book_testament_check", sql`${t.testament} in ('OT','NT','DC')`),
-        bookIdCheck: check("canon_book_book_id_check", sql`length(${t.bookId}) between 2 and 8`),
-    }),
-);
-
-/**
- * chapter: optional, but useful for per-chapter headings/metadata.
- */
-export const chapter = sqliteTable(
-    "chapter",
-    {
-        canonId: text("canon_id").notNull(),
-        bookId: text("book_id").notNull(),
-        chapter: integer("chapter").notNull(),
-        title: text("title"),
-        summary: text("summary"),
-    },
-    (t) => ({
-        pk: primaryKey({ columns: [t.canonId, t.bookId, t.chapter] }),
-        chapterCheck: check("chapter_chapter_check", sql`${t.chapter} > 0`),
-    }),
-);
-
-/**
- * verse: defines the address space + ensures verse validity for a canon.
- * verseOrdinal provides fast range queries.
- */
-export const verse = sqliteTable(
-    "verse",
-    {
-        canonId: text("canon_id").notNull(),
-        bookId: text("book_id").notNull(),
-        chapter: integer("chapter").notNull(),
-        verse: integer("verse").notNull(),
-        verseOrdinal: integer("verse_ordinal").notNull(), // global order within canon (1..total_verses)
-    },
-    (t) => ({
-        pk: primaryKey({ columns: [t.canonId, t.bookId, t.chapter, t.verse] }),
-        ordIdx: uniqueIndex("verse_unique_ordinal").on(t.canonId, t.verseOrdinal),
-        bookIdx: index("verse_book_idx").on(t.canonId, t.bookId, t.chapter, t.verse),
-        chapterCheck: check("verse_chapter_check", sql`${t.chapter} > 0`),
-        verseCheck: check("verse_verse_check", sql`${t.verse} > 0`),
-        ordinalCheck: check("verse_ordinal_check", sql`${t.verseOrdinal} > 0`),
-    }),
-);
-
-/* -------------------------- Translations / Revisions ------------------------- */
-
-export const translation = sqliteTable(
-    "translation",
-    {
-        translationId: text("translation_id").primaryKey(), // e.g. "biblia_populi"
-        name: text("name").notNull(), // "Biblia Populi"
-        language: text("language").notNull(), // "en"
-        description: text("description"),
-        createdAt: text("created_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        langIdx: index("translation_language_idx").on(t.language),
-        idCheck: check("translation_id_check", sql`length(${t.translationId}) > 0`),
-    }),
-);
-
-export const translationRevision = sqliteTable(
-    "translation_revision",
-    {
-        translationRevisionId: text("translation_revision_id").primaryKey(), // uuid
-        translationId: text("translation_id").notNull(),
-        label: text("label").notNull(), // "draft", "v0.1", "2026-03-10"
-        status: text("status").notNull(), // draft|published|archived
-        basedOnRevisionId: text("based_on_revision_id"),
-        createdAt: text("created_at").notNull().default(nowIso),
-        publishedAt: text("published_at"),
-    },
-    (t) => ({
-        byTranslationIdx: index("translation_revision_translation_idx").on(t.translationId, t.status),
-        statusCheck: check(
-            "translation_revision_status_check",
-            sql`${t.status} in ('draft','published','archived')`,
-        ),
-        labelCheck: check("translation_revision_label_check", sql`length(${t.label}) > 0`),
-    }),
-);
-
-/**
- * translation_default_revision:
- * Helper for the current active revision (per translation + canon + purpose).
- */
-export const translationDefaultRevision = sqliteTable(
-    "translation_default_revision",
-    {
-        translationId: text("translation_id").notNull(),
-        canonId: text("canon_id").notNull(),
-        purpose: text("purpose").notNull(), // "reading" | "editing"
-        translationRevisionId: text("translation_revision_id").notNull(),
-        updatedAt: text("updated_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        pk: primaryKey({ columns: [t.translationId, t.canonId, t.purpose] }),
-        purposeCheck: check(
-            "translation_default_revision_purpose_check",
-            sql`${t.purpose} in ('reading','editing')`,
-        ),
-    }),
-);
-
-/* ----------------------------- Verse Text Layer ----------------------------- */
-
-export const verseText = sqliteTable(
-    "verse_text",
-    {
-        translationRevisionId: text("translation_revision_id").notNull(),
-        canonId: text("canon_id").notNull(),
-        bookId: text("book_id").notNull(),
-        chapter: integer("chapter").notNull(),
-        verse: integer("verse").notNull(),
-        text: text("text").notNull(),
-        updatedAt: text("updated_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        pk: primaryKey({
-            columns: [t.translationRevisionId, t.canonId, t.bookId, t.chapter, t.verse],
-        }),
-        bookReadIdx: index("verse_text_book_read_idx").on(
-            t.translationRevisionId,
-            t.canonId,
-            t.bookId,
-            t.chapter,
-            t.verse,
-        ),
-        revisionIdx: index("verse_text_revision_idx").on(t.translationRevisionId),
-        textNonEmpty: check("verse_text_nonempty_check", sql`length(${t.text}) > 0`),
-        chapterCheck: check("verse_text_chapter_check", sql`${t.chapter} > 0`),
-        verseCheck: check("verse_text_verse_check", sql`${t.verse} > 0`),
-    }),
-);
-
-export const verseMark = sqliteTable(
-    "verse_mark",
-    {
-        id: text("id").primaryKey(), // uuid
-        translationRevisionId: text("translation_revision_id").notNull(),
-        canonId: text("canon_id").notNull(),
-        bookId: text("book_id").notNull(),
-        chapter: integer("chapter").notNull(),
-        verse: integer("verse").notNull(),
-        kind: text("kind").notNull(),
-        ord: integer("ord").notNull(),
-        payload: text("payload"), // JSON string optional
-    },
-    (t) => ({
-        verseIdx: index("verse_mark_verse_idx").on(
-            t.translationRevisionId,
-            t.canonId,
-            t.bookId,
-            t.chapter,
-            t.verse,
-            t.ord,
-        ),
-        kindCheck: check(
-            "verse_mark_kind_check",
-            sql`${t.kind} in ('heading','subheading','paragraph_break','poetry_line','speaker','red_letter','selah')`,
-        ),
-        ordCheck: check("verse_mark_ord_check", sql`${t.ord} >= 0`),
-    }),
-);
-
-export const footnote = sqliteTable(
-    "footnote",
-    {
-        id: text("id").primaryKey(), // uuid
-        translationRevisionId: text("translation_revision_id").notNull(),
-        canonId: text("canon_id").notNull(),
-        bookId: text("book_id").notNull(),
-        chapter: integer("chapter").notNull(),
-        verse: integer("verse").notNull(),
-        marker: text("marker"),
-        content: text("content").notNull(),
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        verseIdx: index("footnote_verse_idx").on(
-            t.translationRevisionId,
-            t.canonId,
-            t.bookId,
-            t.chapter,
-            t.verse,
-            t.ord,
-        ),
-        contentCheck: check("footnote_nonempty_check", sql`length(${t.content}) > 0`),
-    }),
-);
-
-/**
- * cross_ref: links a verse to another verse.
- */
-export const crossRef = sqliteTable(
-    "cross_ref",
-    {
-        id: text("id").primaryKey(), // uuid
-        // from
-        canonId: text("canon_id").notNull(),
-        bookId: text("book_id").notNull(),
-        chapter: integer("chapter").notNull(),
-        verse: integer("verse").notNull(),
-        // to
-        toCanonId: text("to_canon_id").notNull(),
-        toBookId: text("to_book_id").notNull(),
-        toChapter: integer("to_chapter").notNull(),
-        toVerse: integer("to_verse").notNull(),
-        kind: text("kind").notNull().default("see_also"),
-        note: text("note"),
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        fromIdx: index("cross_ref_from_idx").on(t.canonId, t.bookId, t.chapter, t.verse, t.ord),
-        toIdx: index("cross_ref_to_idx").on(t.toCanonId, t.toBookId, t.toChapter, t.toVerse),
-        kindCheck: check("cross_ref_kind_check", sql`length(${t.kind}) > 0`),
-        spanCheck: check(
-            "cross_ref_span_check",
-            sql`${t.chapter} > 0 and ${t.verse} > 0 and ${t.toChapter} > 0 and ${t.toVerse} > 0`,
-        ),
-    }),
-);
-
-/* --------------------------- Mentions (Clickable) --------------------------- */
-
-export const verseMention = sqliteTable(
-    "verse_mention",
-    {
-        id: text("id").primaryKey(), // uuid
-        translationRevisionId: text("translation_revision_id").notNull(),
-        canonId: text("canon_id").notNull(),
-        bookId: text("book_id").notNull(),
-        chapter: integer("chapter").notNull(),
-        verse: integer("verse").notNull(),
-
-        entityType: text("entity_type").notNull(), // person|place|event
-        entityId: text("entity_id").notNull(),
-
-        start: integer("start").notNull(), // inclusive
-        end: integer("end").notNull(), // exclusive
-        surface: text("surface").notNull(),
-
-        ord: integer("ord").notNull().default(0),
-        note: text("note"),
-    },
-    (t) => ({
-        verseIdx: index("verse_mention_verse_idx").on(
-            t.translationRevisionId,
-            t.canonId,
-            t.bookId,
-            t.chapter,
-            t.verse,
-            t.start,
-            t.end,
-        ),
-        entityIdx: index("verse_mention_entity_idx").on(t.entityType, t.entityId),
-        typeCheck: check("verse_mention_type_check", sql`${t.entityType} in ('person','place','event')`),
-        spanCheck: check("verse_mention_span_check", sql`${t.start} >= 0 and ${t.end} > ${t.start}`),
-        surfaceCheck: check("verse_mention_surface_check", sql`length(${t.surface}) > 0`),
-    }),
-);
-
-/* ------------------------------- People / Places ---------------------------- */
-
-export const asset = sqliteTable(
-    "asset",
-    {
-        id: text("id").primaryKey(), // uuid
-        kind: text("kind").notNull(), // image|icon|svg
-        mime: text("mime").notNull(),
-        path: text("path"),
-        data: text("data"),
-        createdAt: text("created_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        kindCheck: check("asset_kind_check", sql`${t.kind} in ('image','icon','svg')`),
-        mimeCheck: check("asset_mime_check", sql`length(${t.mime}) > 0`),
-        hasOne: check("asset_has_path_or_data_check", sql`${t.path} is not null or ${t.data} is not null`),
-    }),
-);
-
-export const person = sqliteTable(
-    "person",
-    {
-        id: text("id").primaryKey(), // "p_abraham"
-        displayName: text("display_name").notNull(),
-        sortName: text("sort_name"),
-        sex: text("sex"), // male|female|null
-        title: text("title"),
-        summary: text("summary"),
-        bio: text("bio"),
-        era: text("era"),
-        imageAssetId: text("image_asset_id"),
-        createdAt: text("created_at").notNull().default(nowIso),
-        updatedAt: text("updated_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        nameIdx: index("person_display_name_idx").on(t.displayName),
-        sortIdx: index("person_sort_name_idx").on(t.sortName),
-        sexCheck: check("person_sex_check", sql`${t.sex} is null or ${t.sex} in ('male','female')`),
-    }),
-);
-
-export const personAlias = sqliteTable(
-    "person_alias",
-    {
-        id: text("id").primaryKey(), // uuid
-        personId: text("person_id").notNull(),
-        alias: text("alias").notNull(),
-        lang: text("lang"),
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        aliasIdx: index("person_alias_alias_idx").on(t.alias),
-        personIdx: index("person_alias_person_idx").on(t.personId, t.ord),
-        uniq: uniqueIndex("person_alias_unique").on(t.personId, t.alias),
-        aliasCheck: check("person_alias_nonempty_check", sql`length(${t.alias}) > 0`),
-    }),
-);
-
-export const personRelationship = sqliteTable(
-    "person_relationship",
-    {
-        id: text("id").primaryKey(), // uuid
-        fromPersonId: text("from_person_id").notNull(),
-        toPersonId: text("to_person_id").notNull(),
-        kind: text("kind").notNull(),
-        confidence: real("confidence"),
-        note: text("note"),
-    },
-    (t) => ({
-        fromIdx: index("person_relationship_from_idx").on(t.fromPersonId, t.kind),
-        toIdx: index("person_relationship_to_idx").on(t.toPersonId, t.kind),
-        kindCheck: check(
-            "person_relationship_kind_check",
-            sql`${t.kind} in ('parent','child','spouse','sibling','teacher_of','disciple_of','king_of','prophet_to','enemy_of','covenant_with')`,
-        ),
-        confCheck: check(
-            "person_relationship_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-        notSelf: check("person_relationship_not_self_check", sql`${t.fromPersonId} != ${t.toPersonId}`),
-    }),
-);
-
-export const place = sqliteTable(
-    "place",
-    {
-        id: text("id").primaryKey(), // "pl_jerusalem"
+        bookId: text("book_id").primaryKey(), // GEN, EXO, ...
+        ordinal: integer("ordinal").notNull(), // 1..66
+        testament: text("testament").notNull(), // OT | NT
         name: text("name").notNull(),
-        kind: text("kind").notNull().default("other"), // city|region|...
-        // "primary" point (optional); richer geometry lives in place_geo.
-        lat: real("lat"),
-        lon: real("lon"),
-        geojson: text("geojson"), // optional legacy/quick geometry
-        summary: text("summary"),
-        description: text("description"),
-        era: text("era"),
-        imageAssetId: text("image_asset_id"),
-        createdAt: text("created_at").notNull().default(nowIso),
-        updatedAt: text("updated_at").notNull().default(nowIso),
+        nameShort: text("name_short").notNull(),
+        chapters: integer("chapters").notNull(),
+        osised: text("osised"),
+        abbrs: text("abbrs"), // JSON array string (optional)
     },
     (t) => ({
-        nameIdx: index("place_name_idx").on(t.name),
-        coordIdx: index("place_coord_idx").on(t.lat, t.lon),
-        kindCheck: check(
-            "place_kind_check",
-            sql`${t.kind} in ('city','region','river','mountain','sea','desert','route','other')`,
-        ),
-        latCheck: check("place_lat_check", sql`${t.lat} is null or (${t.lat} >= -90 and ${t.lat} <= 90)`),
-        lonCheck: check("place_lon_check", sql`${t.lon} is null or (${t.lon} >= -180 and ${t.lon} <= 180)`),
+        ordinalUniq: uniqueIndex("bp_book_ordinal_uniq").on(t.ordinal),
+        ordCheck: check("bp_book_ordinal_check", sql`${t.ordinal} >= 1`),
+        chaptersCheck: check("bp_book_chapters_check", sql`${t.chapters} >= 1`),
+        testamentCheck: check("bp_book_testament_check", sql`${t.testament} in ('OT','NT')`),
+        bookIdCheck: check("bp_book_book_id_check", sql`length(${t.bookId}) between 2 and 8`),
     }),
 );
 
-export const placeAlias = sqliteTable(
-    "place_alias",
+export const bpVerse = sqliteTable(
+    "bp_verse",
     {
-        id: text("id").primaryKey(),
-        placeId: text("place_id").notNull(),
-        alias: text("alias").notNull(),
-        lang: text("lang"),
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        aliasIdx: index("place_alias_alias_idx").on(t.alias),
-        placeIdx: index("place_alias_place_idx").on(t.placeId, t.ord),
-        uniq: uniqueIndex("place_alias_unique").on(t.placeId, t.alias),
-        aliasCheck: check("place_alias_nonempty_check", sql`length(${t.alias}) > 0`),
-    }),
-);
-
-export const personPlace = sqliteTable(
-    "person_place",
-    {
-        id: text("id").primaryKey(),
-        personId: text("person_id").notNull(),
-        placeId: text("place_id").notNull(),
-        kind: text("kind").notNull(),
-        timeHint: text("time_hint"),
-        sourceRef: text("source_ref"), // may store JSON or "GEN 12:1-9"
-        note: text("note"),
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        personIdx: index("person_place_person_idx").on(t.personId, t.kind, t.ord),
-        placeIdx: index("person_place_place_idx").on(t.placeId, t.kind),
-        kindCheck: check(
-            "person_place_kind_check",
-            sql`${t.kind} in ('born_in','died_in','lived_in','traveled_to','ministered_in','exiled_to','battle_at','imprisoned_in')`,
-        ),
-    }),
-);
-
-/* ------------------------------ Journeys / Routes --------------------------- */
-
-export const journey = sqliteTable(
-    "journey",
-    {
-        id: text("id").primaryKey(),
-        personId: text("person_id"),
-        label: text("label").notNull(),
-        summary: text("summary"),
-        era: text("era"),
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        personIdx: index("journey_person_idx").on(t.personId, t.ord),
-        labelIdx: index("journey_label_idx").on(t.label),
-        labelCheck: check("journey_label_check", sql`length(${t.label}) > 0`),
-    }),
-);
-
-export const journeyStop = sqliteTable(
-    "journey_stop",
-    {
-        id: text("id").primaryKey(),
-        journeyId: text("journey_id").notNull(),
-        seq: integer("seq").notNull(),
-        placeId: text("place_id").notNull(),
-        note: text("note"),
-        canonId: text("canon_id"),
-        bookId: text("book_id"),
-        chapter: integer("chapter"),
-        verse: integer("verse"),
-    },
-    (t) => ({
-        uniq: uniqueIndex("journey_stop_unique_seq").on(t.journeyId, t.seq),
-        journeyIdx: index("journey_stop_journey_idx").on(t.journeyId, t.seq),
-        placeIdx: index("journey_stop_place_idx").on(t.placeId),
-        seqCheck: check("journey_stop_seq_check", sql`${t.seq} >= 0`),
-        refCheck: check(
-            "journey_stop_ref_check",
-            sql`(${t.chapter} is null and ${t.verse} is null) or (${t.chapter} > 0 and ${t.verse} > 0)`,
-        ),
-    }),
-);
-
-/**
- * journey_path: optional geometry for rendering a journey as one or more lines.
- * Keep it simple: GeoJSON LineString/MultiLineString in WGS84, plus provenance + confidence.
- */
-export const journeyPath = sqliteTable(
-    "journey_path",
-    {
-        id: text("id").primaryKey(), // uuid
-        journeyId: text("journey_id").notNull(),
-        seq: integer("seq").notNull().default(0),
-        geojson: text("geojson").notNull(),
-        sourceDocId: text("source_doc_id"),
-        sourceRef: text("source_ref"), // optional scripture ref / note
-        confidence: real("confidence"),
-        note: text("note"),
-        createdAt: text("created_at").notNull().default(nowIso),
-        updatedAt: text("updated_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        uniq: uniqueIndex("journey_path_unique_seq").on(t.journeyId, t.seq),
-        journeyIdx: index("journey_path_journey_idx").on(t.journeyId, t.seq),
-        geojsonCheck: check("journey_path_geojson_check", sql`length(${t.geojson}) > 0`),
-        confCheck: check(
-            "journey_path_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-    }),
-);
-
-/* ----------------------------------- Events -------------------------------- */
-
-export const event = sqliteTable(
-    "event",
-    {
-        id: text("id").primaryKey(), // "ev_*"
-        title: text("title").notNull(),
-        summary: text("summary"),
-        placeId: text("place_id"),
-        era: text("era"),
-        timeHint: text("time_hint"),
-        createdAt: text("created_at").notNull().default(nowIso),
-        updatedAt: text("updated_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        titleIdx: index("event_title_idx").on(t.title),
-        placeIdx: index("event_place_idx").on(t.placeId),
-        titleCheck: check("event_title_check", sql`length(${t.title}) > 0`),
-    }),
-);
-
-export const eventParticipant = sqliteTable(
-    "event_participant",
-    {
-        id: text("id").primaryKey(),
-        eventId: text("event_id").notNull(),
-        personId: text("person_id").notNull(),
-        role: text("role"),
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        eventIdx: index("event_participant_event_idx").on(t.eventId, t.ord),
-        personIdx: index("event_participant_person_idx").on(t.personId),
-        uniq: uniqueIndex("event_participant_unique").on(t.eventId, t.personId, t.role),
-    }),
-);
-
-export const eventRef = sqliteTable(
-    "event_ref",
-    {
-        id: text("id").primaryKey(),
-        eventId: text("event_id").notNull(),
-        canonId: text("canon_id").notNull(),
-        bookId: text("book_id").notNull(),
-        startChapter: integer("start_chapter").notNull(),
-        startVerse: integer("start_verse").notNull(),
-        endChapter: integer("end_chapter").notNull(),
-        endVerse: integer("end_verse").notNull(),
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        eventIdx: index("event_ref_event_idx").on(t.eventId, t.ord),
-        rangeIdx: index("event_ref_range_idx").on(t.canonId, t.bookId, t.startChapter, t.startVerse),
-        spanCheck: check(
-            "event_ref_span_check",
-            sql`${t.startChapter} > 0 and ${t.startVerse} > 0 and ${t.endChapter} > 0 and ${t.endVerse} > 0`,
-        ),
-    }),
-);
-
-/* -------------------------- Traceability (Scripture-grounded) -------------------------- */
-/**
- * entity_source: attach Scripture references to claims in bios/summaries.
- */
-export const entitySource = sqliteTable(
-    "entity_source",
-    {
-        id: text("id").primaryKey(), // uuid
-        entityType: text("entity_type").notNull(), // person|place|event
-        entityId: text("entity_id").notNull(),
-        canonId: text("canon_id").notNull(),
-        bookId: text("book_id").notNull(),
-        startChapter: integer("start_chapter").notNull(),
-        startVerse: integer("start_verse").notNull(),
-        endChapter: integer("end_chapter").notNull(),
-        endVerse: integer("end_verse").notNull(),
-        note: text("note"),
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        entityIdx: index("entity_source_entity_idx").on(t.entityType, t.entityId, t.ord),
-        rangeIdx: index("entity_source_range_idx").on(t.canonId, t.bookId, t.startChapter, t.startVerse),
-        typeCheck: check("entity_source_type_check", sql`${t.entityType} in ('person','place','event')`),
-        spanCheck: check(
-            "entity_source_span_check",
-            sql`${t.startChapter} > 0 and ${t.startVerse} > 0 and ${t.endChapter} > 0 and ${t.endVerse} > 0`,
-        ),
-    }),
-);
-
-/* ------------------------------- Source Documents --------------------------- */
-/**
- * source_doc: structured citations for non-scripture provenance (gazetteers, atlases, papers),
- * and can also hold “Scripture” as a first-class source if you want consistent referencing.
- */
-export const sourceDoc = sqliteTable(
-    "source_doc",
-    {
-        id: text("id").primaryKey(), // uuid or stable slug
-        kind: text("kind").notNull(), // scripture|gazetteer|atlas|academic|tradition|other
-        title: text("title").notNull(),
-        author: text("author"),
-        year: integer("year"),
-        url: text("url"),
-        license: text("license"),
-        citation: text("citation"), // free-form short citation string
-        note: text("note"),
-        createdAt: text("created_at").notNull().default(nowIso),
-        updatedAt: text("updated_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        kindIdx: index("source_doc_kind_idx").on(t.kind),
-        titleIdx: index("source_doc_title_idx").on(t.title),
-        kindCheck: check(
-            "source_doc_kind_check",
-            sql`${t.kind} in ('scripture','gazetteer','atlas','academic','tradition','other')`,
-        ),
-        titleCheck: check("source_doc_title_check", sql`length(${t.title}) > 0`),
-        yearCheck: check("source_doc_year_check", sql`${t.year} is null or (${t.year} >= 0 and ${t.year} <= 3000)`),
-    }),
-);
-
-/* ------------------------------- Geo Engine -------------------------------- */
-/**
- * place_geo:
- * - multiple geometry candidates per place (point/bbox/polygon/polyline)
- * - confidence + provenance (source_doc + optional scripture ref)
- * - bbox fields make map extents fast without parsing GeoJSON
- */
-export const placeGeo = sqliteTable(
-    "place_geo",
-    {
-        id: text("id").primaryKey(), // uuid
-        placeId: text("place_id").notNull(),
-        kind: text("kind").notNull(), // point|bbox|polygon|polyline
-
-        // point (optional)
-        lat: real("lat"),
-        lon: real("lon"),
-
-        // bbox (optional, but recommended when kind=bbox/polygon/polyline)
-        minLat: real("min_lat"),
-        minLon: real("min_lon"),
-        maxLat: real("max_lat"),
-        maxLon: real("max_lon"),
-
-        // full geometry (GeoJSON). For point-only you can omit geojson.
-        geojson: text("geojson"),
-
-        // provenance
-        sourceDocId: text("source_doc_id"),
-        sourceRef: text("source_ref"), // "GEN 12:1-9" or JSON
-        confidence: real("confidence"),
-        note: text("note"),
-        ord: integer("ord").notNull().default(0),
-
-        createdAt: text("created_at").notNull().default(nowIso),
-        updatedAt: text("updated_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        placeIdx: index("place_geo_place_idx").on(t.placeId, t.ord),
-        kindIdx: index("place_geo_kind_idx").on(t.placeId, t.kind),
-        bboxIdx: index("place_geo_bbox_idx").on(t.minLat, t.minLon, t.maxLat, t.maxLon),
-
-        kindCheck: check(
-            "place_geo_kind_check",
-            sql`${t.kind} in ('point','bbox','polygon','polyline')`,
-        ),
-        latCheck: check("place_geo_lat_check", sql`${t.lat} is null or (${t.lat} >= -90 and ${t.lat} <= 90)`),
-        lonCheck: check("place_geo_lon_check", sql`${t.lon} is null or (${t.lon} >= -180 and ${t.lon} <= 180)`),
-
-        bboxCheck: check(
-            "place_geo_bbox_check",
-            sql`(${t.minLat} is null and ${t.minLon} is null and ${t.maxLat} is null and ${t.maxLon} is null)
-          or (${t.minLat} <= ${t.maxLat} and ${t.minLon} <= ${t.maxLon})`,
-        ),
-        confCheck: check(
-            "place_geo_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-        ordCheck: check("place_geo_ord_check", sql`${t.ord} >= 0`),
-    }),
-);
-
-/* ------------------------------ Chrono Engine ------------------------------ */
-/**
- * chrono_span: attach a time window to any entity.
- * Uses signed years for BCE/CE (e.g., -1200, -5, 30).
- * Granularity can be "year-only" (month/day null) or more precise.
- */
-export const chronoSpan = sqliteTable(
-    "chrono_span",
-    {
-        id: text("id").primaryKey(), // uuid
-        entityType: text("entity_type").notNull(), // person|place|event|journey
-        entityId: text("entity_id").notNull(),
-
-        kind: text("kind").notNull(), // life|reign|ministry|journey|event_window|composition|other
-        precision: text("precision").notNull().default("uncertain"), // exact|approx|uncertain
-
-        startYear: integer("start_year"),
-        startMonth: integer("start_month"),
-        startDay: integer("start_day"),
-
-        endYear: integer("end_year"),
-        endMonth: integer("end_month"),
-        endDay: integer("end_day"),
-
-        // provenance
-        sourceDocId: text("source_doc_id"),
-        sourceRef: text("source_ref"), // scripture ref / note / JSON
-        confidence: real("confidence"),
-        note: text("note"),
-        ord: integer("ord").notNull().default(0),
-
-        createdAt: text("created_at").notNull().default(nowIso),
-        updatedAt: text("updated_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        entityIdx: index("chrono_span_entity_idx").on(t.entityType, t.entityId, t.kind, t.ord),
-        kindIdx: index("chrono_span_kind_idx").on(t.kind),
-        rangeIdx: index("chrono_span_range_idx").on(t.startYear, t.endYear),
-
-        typeCheck: check(
-            "chrono_span_entity_type_check",
-            sql`${t.entityType} in ('person','place','event','journey')`,
-        ),
-        kindCheck: check(
-            "chrono_span_kind_check",
-            sql`${t.kind} in ('life','reign','ministry','journey','event_window','composition','other')`,
-        ),
-        precisionCheck: check(
-            "chrono_span_precision_check",
-            sql`${t.precision} in ('exact','approx','uncertain')`,
-        ),
-
-        // month/day sanity (allow null)
-        startMonthCheck: check(
-            "chrono_span_start_month_check",
-            sql`${t.startMonth} is null or (${t.startMonth} >= 1 and ${t.startMonth} <= 12)`,
-        ),
-        endMonthCheck: check(
-            "chrono_span_end_month_check",
-            sql`${t.endMonth} is null or (${t.endMonth} >= 1 and ${t.endMonth} <= 12)`,
-        ),
-        startDayCheck: check(
-            "chrono_span_start_day_check",
-            sql`${t.startDay} is null or (${t.startDay} >= 1 and ${t.startDay} <= 31)`,
-        ),
-        endDayCheck: check(
-            "chrono_span_end_day_check",
-            sql`${t.endDay} is null or (${t.endDay} >= 1 and ${t.endDay} <= 31)`,
-        ),
-
-        // confidence
-        confCheck: check(
-            "chrono_span_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-        ordCheck: check("chrono_span_ord_check", sql`${t.ord} >= 0`),
-    }),
-);
-
-/**
- * chrono_relation: express time relationships without committing to absolute years.
- * Example: "Exodus occurs after Joseph's death", "Paul's ministry overlaps with ...".
- */
-export const chronoRelation = sqliteTable(
-    "chrono_relation",
-    {
-        id: text("id").primaryKey(), // uuid
-        fromEntityType: text("from_entity_type").notNull(),
-        fromEntityId: text("from_entity_id").notNull(),
-        toEntityType: text("to_entity_type").notNull(),
-        toEntityId: text("to_entity_id").notNull(),
-
-        kind: text("kind").notNull(), // before|after|during|overlaps|same_time|unknown
-        confidence: real("confidence"),
-        note: text("note"),
-
-        sourceDocId: text("source_doc_id"),
-        sourceRef: text("source_ref"),
-        createdAt: text("created_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        fromIdx: index("chrono_relation_from_idx").on(t.fromEntityType, t.fromEntityId, t.kind),
-        toIdx: index("chrono_relation_to_idx").on(t.toEntityType, t.toEntityId, t.kind),
-        kindCheck: check(
-            "chrono_relation_kind_check",
-            sql`${t.kind} in ('before','after','during','overlaps','same_time','unknown')`,
-        ),
-        confCheck: check(
-            "chrono_relation_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-        notSelfCheck: check(
-            "chrono_relation_not_self_check",
-            sql`not (${t.fromEntityType} = ${t.toEntityType} and ${t.fromEntityId} = ${t.toEntityId})`,
-        ),
-    }),
-);
-
-/* ----------------------------------- Tags ---------------------------------- */
-
-export const tag = sqliteTable(
-    "tag",
-    {
-        id: text("id").primaryKey(), // uuid
-        slug: text("slug").notNull(), // "patriarch", "prophet", "king", ...
-        label: text("label").notNull(), // "Patriarch"
-        kind: text("kind").notNull().default("general"), // general|role|era|topic
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        slugUniq: uniqueIndex("tag_unique_slug").on(t.slug),
-        kindCheck: check("tag_kind_check", sql`${t.kind} in ('general','role','era','topic')`),
-        slugCheck: check("tag_slug_check", sql`length(${t.slug}) > 0`),
-        labelCheck: check("tag_label_check", sql`length(${t.label}) > 0`),
-    }),
-);
-
-export const personTag = sqliteTable(
-    "person_tag",
-    {
-        personId: text("person_id").notNull(),
-        tagId: text("tag_id").notNull(),
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        pk: primaryKey({ columns: [t.personId, t.tagId] }),
-        idx: index("person_tag_person_idx").on(t.personId, t.ord),
-    }),
-);
-
-export const placeTag = sqliteTable(
-    "place_tag",
-    {
-        placeId: text("place_id").notNull(),
-        tagId: text("tag_id").notNull(),
-        ord: integer("ord").notNull().default(0),
-    },
-    (t) => ({
-        pk: primaryKey({ columns: [t.placeId, t.tagId] }),
-        idx: index("place_tag_place_idx").on(t.placeId, t.ord),
-    }),
-);
-
-/* ------------------------------ User Layer (Local) -------------------------- */
-
-export const user = sqliteTable("user", {
-    id: text("id").primaryKey(), // "local" or uuid
-    displayName: text("display_name"),
-    createdAt: text("created_at").notNull().default(nowIso),
-});
-
-export const bookmark = sqliteTable(
-    "bookmark",
-    {
-        id: text("id").primaryKey(),
-        userId: text("user_id").notNull(),
-        canonId: text("canon_id").notNull(),
+        verseKey: text("verse_key").primaryKey(), // BOOK.CHAPTER.VERSE (GEN.1.1)
         bookId: text("book_id").notNull(),
         chapter: integer("chapter").notNull(),
         verse: integer("verse").notNull(),
+        verseOrd: integer("verse_ord").notNull(), // BIGINT in PG; SQLite uses INTEGER (64-bit)
+        chapterOrd: integer("chapter_ord"),
+        isSuperscription: integer("is_superscription", { mode: "boolean" }).notNull().default(false),
+        isDeuterocanon: integer("is_deuterocanon", { mode: "boolean" }).notNull().default(false),
+    },
+    (t) => ({
+        ordUniq: uniqueIndex("bp_verse_ord_uniq").on(t.verseOrd),
+        byBcvUniq: uniqueIndex("bp_verse_bcv_uniq").on(t.bookId, t.chapter, t.verse),
+        bookIdx: index("bp_verse_book_idx").on(t.bookId, t.chapter, t.verse),
+        chapterCheck: check("bp_verse_chapter_check", sql`${t.chapter} >= 1`),
+        verseCheck: check("bp_verse_verse_check", sql`${t.verse} >= 1`),
+        ordCheck: check("bp_verse_ord_check", sql`${t.verseOrd} >= 1`),
+        // keep verse_key format enforcement in app validator; SQLite CHECK regex is awkward.
+    }),
+);
+
+export const bpChapter = sqliteTable(
+    "bp_chapter",
+    {
+        bookId: text("book_id").notNull(),
+        chapter: integer("chapter").notNull(),
+        startVerseOrd: integer("start_verse_ord").notNull(),
+        endVerseOrd: integer("end_verse_ord").notNull(),
+        verseCount: integer("verse_count").notNull(),
+    },
+    (t) => ({
+        pk: primaryKey({ columns: [t.bookId, t.chapter] }),
+        rangeIdx: index("bp_chapter_range_idx").on(t.bookId, t.startVerseOrd, t.endVerseOrd),
+        chapterCheck: check("bp_chapter_chapter_check", sql`${t.chapter} >= 1`),
+        countCheck: check("bp_chapter_verse_count_check", sql`${t.verseCount} >= 1`),
+        spanCheck: check("bp_chapter_span_check", sql`${t.startVerseOrd} <= ${t.endVerseOrd}`),
+    }),
+);
+
+/* --------------------------- 2) Translation / Text -------------------------- */
+
+export const bpTranslation = sqliteTable(
+    "bp_translation",
+    {
+        translationId: text("translation_id").primaryKey(), // KJV, BP1, ...
+        name: text("name").notNull(),
+        language: text("language").notNull(), // ISO (en)
+        derivedFrom: text("derived_from"),
+        licenseKind: text("license_kind").notNull(),
+        licenseText: text("license_text"),
+        sourceUrl: text("source_url"),
+        isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
+        createdAt: text("created_at").notNull().default(nowIso),
+    },
+    (t) => ({
+        licenseKindCheck: check(
+            "bp_translation_license_kind_check",
+            sql`${t.licenseKind} in ('PUBLIC_DOMAIN','LICENSED','CUSTOM')`,
+        ),
+        idCheck: check("bp_translation_id_check", sql`length(${t.translationId}) > 0`),
+    }),
+);
+
+export const bpVerseText = sqliteTable(
+    "bp_verse_text",
+    {
+        translationId: text("translation_id").notNull(),
+        verseKey: text("verse_key").notNull(),
+        text: text("text").notNull(),
+        textNorm: text("text_norm"),
+        hash: text("hash"),
+        updatedAt: text("updated_at").notNull().default(nowIso),
+    },
+    (t) => ({
+        pk: primaryKey({ columns: [t.translationId, t.verseKey] }),
+        idx: index("bp_verse_text_idx").on(t.translationId, t.verseKey),
+        textCheck: check("bp_verse_text_text_check", sql`length(${t.text}) > 0`),
+    }),
+);
+
+// Optional tokens (for future highlighting/search; safe since it’s not interpretive)
+export const bpToken = sqliteTable(
+    "bp_token",
+    {
+        translationId: text("translation_id").notNull(),
+        verseKey: text("verse_key").notNull(),
+        tokenIndex: integer("token_index").notNull(),
+        token: text("token").notNull(),
+        tokenNorm: text("token_norm").notNull(),
+    },
+    (t) => ({
+        pk: primaryKey({ columns: [t.translationId, t.verseKey, t.tokenIndex] }),
+        normIdx: index("bp_token_norm_idx").on(t.tokenNorm),
+        idx: index("bp_token_idx").on(t.translationId, t.verseKey),
+        tokCheck: check("bp_token_token_check", sql`length(${t.token}) > 0`),
+    }),
+);
+
+/* ----------------------- 3) Range & Structural Layer ------------------------ */
+
+export const bpRange = sqliteTable(
+    "bp_range",
+    {
+        rangeId: text("range_id").primaryKey(), // uuid
+        startVerseOrd: integer("start_verse_ord").notNull(),
+        endVerseOrd: integer("end_verse_ord").notNull(),
+        startVerseKey: text("start_verse_key").notNull(),
+        endVerseKey: text("end_verse_key").notNull(),
         label: text("label"),
         createdAt: text("created_at").notNull().default(nowIso),
     },
     (t) => ({
-        userIdx: index("bookmark_user_idx").on(t.userId, t.createdAt),
-        refIdx: index("bookmark_ref_idx").on(t.userId, t.canonId, t.bookId, t.chapter, t.verse),
-        chapterCheck: check("bookmark_chapter_check", sql`${t.chapter} > 0`),
-        verseCheck: check("bookmark_verse_check", sql`${t.verse} > 0`),
+        ordIdx: index("bp_range_ord_idx").on(t.startVerseOrd, t.endVerseOrd),
+        spanCheck: check("bp_range_span_check", sql`${t.startVerseOrd} <= ${t.endVerseOrd}`),
     }),
 );
 
-export const highlight = sqliteTable(
-    "highlight",
+export const bpPericope = sqliteTable(
+    "bp_pericope",
     {
-        id: text("id").primaryKey(),
-        userId: text("user_id").notNull(),
-        canonId: text("canon_id").notNull(),
+        pericopeId: text("pericope_id").primaryKey(), // uuid
         bookId: text("book_id").notNull(),
-        chapter: integer("chapter").notNull(),
-        verse: integer("verse").notNull(),
-        start: integer("start"),
-        end: integer("end"),
-        color: text("color").notNull(),
-        note: text("note"),
-        createdAt: text("created_at").notNull().default(nowIso),
-        updatedAt: text("updated_at").notNull().default(nowIso),
+        rangeId: text("range_id").notNull(),
+        title: text("title").notNull(),
+        source: text("source").notNull(),
+        confidence: real("confidence"),
+        rank: integer("rank"),
     },
     (t) => ({
-        userIdx: index("highlight_user_idx").on(t.userId, t.createdAt),
-        refIdx: index("highlight_ref_idx").on(t.userId, t.canonId, t.bookId, t.chapter, t.verse),
-        colorCheck: check(
-            "highlight_color_check",
-            sql`${t.color} in ('gray','yellow','green','blue','purple','red')`,
-        ),
-        spanCheck: check(
-            "highlight_span_check",
-            sql`(${t.start} is null and ${t.end} is null) or (${t.start} >= 0 and ${t.end} > ${t.start})`,
+        bookIdx: index("bp_pericope_book_idx").on(t.bookId),
+        rangeIdx: index("bp_pericope_range_idx").on(t.rangeId),
+        confCheck: check(
+            "bp_pericope_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
         ),
     }),
 );
 
-export const note = sqliteTable(
-    "note",
+export const bpParagraph = sqliteTable(
+    "bp_paragraph",
     {
-        id: text("id").primaryKey(),
-        userId: text("user_id").notNull(),
-        canonId: text("canon_id"),
-        bookId: text("book_id"),
-        chapter: integer("chapter"),
-        verse: integer("verse"),
-        entityType: text("entity_type"),
-        entityId: text("entity_id"),
-        title: text("title"),
-        body: text("body").notNull(),
-        createdAt: text("created_at").notNull().default(nowIso),
-        updatedAt: text("updated_at").notNull().default(nowIso),
+        paragraphId: text("paragraph_id").primaryKey(), // uuid
+        translationId: text("translation_id").notNull(),
+        rangeId: text("range_id").notNull(),
+        style: text("style").notNull(),
+        indent: integer("indent").notNull().default(0),
+        source: text("source").notNull(),
     },
     (t) => ({
-        userIdx: index("note_user_idx").on(t.userId, t.createdAt),
-        verseIdx: index("note_verse_idx").on(t.userId, t.canonId, t.bookId, t.chapter, t.verse),
-        entityIdx: index("note_entity_idx").on(t.userId, t.entityType, t.entityId),
-        typeCheck: check(
-            "note_entity_type_check",
-            sql`${t.entityType} is null or ${t.entityType} in ('person','place','event')`,
+        rangeIdx: index("bp_paragraph_range_idx").on(t.translationId, t.rangeId),
+        styleCheck: check(
+            "bp_paragraph_style_check",
+            sql`${t.style} in ('PROSE','POETRY','LIST','QUOTE','LETTER')`,
         ),
-        bodyCheck: check("note_body_nonempty_check", sql`length(${t.body}) > 0`),
+        indentCheck: check("bp_paragraph_indent_check", sql`${t.indent} >= 0`),
     }),
 );
 
-export const readingProgress = sqliteTable(
-    "reading_progress",
+export const bpDocUnit = sqliteTable(
+    "bp_doc_unit",
     {
-        userId: text("user_id").notNull(),
-        canonId: text("canon_id").notNull(),
-        bookId: text("book_id").notNull(),
-        chapter: integer("chapter").notNull(),
-        verse: integer("verse").notNull(),
-        updatedAt: text("updated_at").notNull().default(nowIso),
+        unitId: text("unit_id").primaryKey(), // uuid
+        kind: text("kind").notNull(),
+        title: text("title").notNull(),
+        rangeId: text("range_id").notNull(),
+        source: text("source").notNull(),
+        confidence: real("confidence"),
     },
     (t) => ({
-        pk: primaryKey({ columns: [t.userId, t.canonId, t.bookId] }),
-        chapterCheck: check("reading_progress_chapter_check", sql`${t.chapter} > 0`),
-        verseCheck: check("reading_progress_verse_check", sql`${t.verse} > 0`),
+        kindCheck: check(
+            "bp_doc_unit_kind_check",
+            sql`${t.kind} in ('SECTION','SPEECH','SONG','LETTER_PART','NARRATIVE_BLOCK')`,
+        ),
+        rangeIdx: index("bp_doc_unit_range_idx").on(t.rangeId),
+        confCheck: check(
+            "bp_doc_unit_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
     }),
 );
 
-/**
- * settings: local app preferences (theme, preferred canon, font scale, etc.)
- */
-export const settings = sqliteTable(
-    "settings",
-    {
-        userId: text("user_id").notNull(),
-        key: text("key").notNull(),
-        value: text("value").notNull(), // store JSON
-        updatedAt: text("updated_at").notNull().default(nowIso),
-    },
-    (t) => ({
-        pk: primaryKey({ columns: [t.userId, t.key] }),
-        keyCheck: check("settings_key_check", sql`length(${t.key}) > 0`),
-        valueCheck: check("settings_value_check", sql`length(${t.value}) > 0`),
-    }),
-);
+/* --------------------------- 4) Entity Universe ----------------------------- */
 
-/**
- * drawer_history: optional UX helper to keep back/forward inside the drawer.
- */
-export const drawerHistory = sqliteTable(
-    "drawer_history",
+export const bpEntity = sqliteTable(
+    "bp_entity",
     {
-        id: text("id").primaryKey(), // uuid
-        userId: text("user_id").notNull(),
+        entityId: text("entity_id").primaryKey(), // uuid
+        kind: text("kind").notNull(),
+        canonicalName: text("canonical_name").notNull(),
+        slug: text("slug").notNull(),
+        summaryNeutral: text("summary_neutral"),
+        confidence: real("confidence"),
         createdAt: text("created_at").notNull().default(nowIso),
-        entityType: text("entity_type").notNull(),
+    },
+    (t) => ({
+        slugUniq: uniqueIndex("bp_entity_slug_uniq").on(t.slug),
+        kindCheck: check(
+            "bp_entity_kind_check",
+            sql`${t.kind} in ('PERSON','PLACE','GROUP','DYNASTY','EMPIRE','REGION','ARTIFACT','OFFICE')`,
+        ),
+        confCheck: check(
+            "bp_entity_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+        nameCheck: check("bp_entity_name_check", sql`length(${t.canonicalName}) > 0`),
+    }),
+);
+
+export const bpEntityName = sqliteTable(
+    "bp_entity_name",
+    {
+        entityNameId: text("entity_name_id").primaryKey(), // uuid
         entityId: text("entity_id").notNull(),
-        canonId: text("canon_id"),
-        bookId: text("book_id"),
-        chapter: integer("chapter"),
-        verse: integer("verse"),
+        name: text("name").notNull(),
+        nameNorm: text("name_norm").notNull(),
+        language: text("language"),
+        isPrimary: integer("is_primary", { mode: "boolean" }).notNull().default(false),
+        source: text("source"),
+        confidence: real("confidence"),
     },
     (t) => ({
-        userIdx: index("drawer_history_user_idx").on(t.userId, t.createdAt),
-        entityIdx: index("drawer_history_entity_idx").on(t.entityType, t.entityId),
+        normIdx: index("bp_entity_name_norm_idx").on(t.nameNorm),
+        entityIdx: index("bp_entity_name_entity_idx").on(t.entityId),
+        confCheck: check(
+            "bp_entity_name_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+    }),
+);
+
+export const bpEntityRelation = sqliteTable(
+    "bp_entity_relation",
+    {
+        relationId: text("relation_id").primaryKey(), // uuid
+        fromEntityId: text("from_entity_id").notNull(),
+        toEntityId: text("to_entity_id").notNull(),
+        kind: text("kind").notNull(),
+        timeSpanId: text("time_span_id"),
+        source: text("source").notNull(),
+        confidence: real("confidence"),
+        noteNeutral: text("note_neutral"),
+    },
+    (t) => ({
+        fromIdx: index("bp_entity_relation_from_idx").on(t.fromEntityId),
+        toIdx: index("bp_entity_relation_to_idx").on(t.toEntityId),
+        kindIdx: index("bp_entity_relation_kind_idx").on(t.kind),
+        kindCheck: check(
+            "bp_entity_relation_kind_check",
+            sql`${t.kind} in ('PARENT_OF','CHILD_OF','SPOUSE_OF','SIBLING_OF','RULES_OVER','MEMBER_OF','ALLY_OF','ENEMY_OF','SUCCEEDS')`,
+        ),
+        notSelf: check("bp_entity_relation_not_self", sql`not (${t.fromEntityId} = ${t.toEntityId})`),
+        confCheck: check(
+            "bp_entity_relation_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+    }),
+);
+
+/* ----------------------------- 5) Geography -------------------------------- */
+
+export const bpPlaceGeo = sqliteTable(
+    "bp_place_geo",
+    {
+        placeGeoId: text("place_geo_id").primaryKey(), // uuid
+        entityId: text("entity_id").notNull(), // bp_entity(kind=PLACE)
+        geoType: text("geo_type").notNull(),
+        lat: real("lat"),
+        lng: real("lng"),
+        bbox: text("bbox"), // JSON
+        polygon: text("polygon"), // GeoJSON
+        precisionM: real("precision_m"),
+        source: text("source").notNull(),
+        confidence: real("confidence"),
+    },
+    (t) => ({
+        entityIdx: index("bp_place_geo_entity_idx").on(t.entityId),
+        typeCheck: check("bp_place_geo_type_check", sql`${t.geoType} in ('POINT','BBOX','REGION_POLYGON')`),
+        confCheck: check(
+            "bp_place_geo_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+        // enforce required fields per geo_type in app validator (SQLite CHECK gets gnarly).
+    }),
+);
+
+export const bpRoute = sqliteTable(
+    "bp_route",
+    {
+        routeId: text("route_id").primaryKey(), // uuid
+        title: text("title").notNull(),
+        source: text("source").notNull(),
+        confidence: real("confidence"),
+    },
+    (t) => ({
+        confCheck: check(
+            "bp_route_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+    }),
+);
+
+export const bpRouteStep = sqliteTable(
+    "bp_route_step",
+    {
+        routeStepId: text("route_step_id").primaryKey(), // uuid
+        routeId: text("route_id").notNull(),
+        ordinal: integer("ordinal").notNull(),
+        placeEntityId: text("place_entity_id").notNull(),
+        rangeId: text("range_id"),
+        noteNeutral: text("note_neutral"),
+    },
+    (t) => ({
+        ordUniq: uniqueIndex("bp_route_step_ord_uniq").on(t.routeId, t.ordinal),
+        routeIdx: index("bp_route_step_route_idx").on(t.routeId),
+        ordCheck: check("bp_route_step_ord_check", sql`${t.ordinal} >= 1`),
+    }),
+);
+
+/* ----------------------- 6) Time / Chronology (Uncertain) ------------------- */
+
+export const bpTimeSpan = sqliteTable(
+    "bp_time_span",
+    {
+        timeSpanId: text("time_span_id").primaryKey(), // uuid
+        startYear: integer("start_year"),
+        endYear: integer("end_year"),
+        startYearMin: integer("start_year_min"),
+        startYearMax: integer("start_year_max"),
+        endYearMin: integer("end_year_min"),
+        endYearMax: integer("end_year_max"),
+        calendar: text("calendar").notNull().default("BCE_CE"),
+        eraTag: text("era_tag"),
+        source: text("source").notNull(),
+        confidence: real("confidence"),
+    },
+    (t) => ({
+        calCheck: check("bp_time_span_calendar_check", sql`${t.calendar} in ('BCE_CE','ANNO_MUNDI')`),
+        eraCheck: check(
+            "bp_time_span_era_check",
+            sql`${t.eraTag} is null or ${t.eraTag} in (
+            'PRIMEVAL','PATRIARCHS','EXODUS_WILDERNESS','CONQUEST_JUDGES','UNITED_MONARCHY',
+            'DIVIDED_KINGDOM','EXILE','SECOND_TEMPLE','GOSPELS','APOSTOLIC'
+            )`,
+        ),
+        confCheck: check(
+            "bp_time_span_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+    }),
+);
+
+export const bpTimelineAnchor = sqliteTable(
+    "bp_timeline_anchor",
+    {
+        anchorId: text("anchor_id").primaryKey(), // uuid
+        rangeId: text("range_id").notNull(),
+        timeSpanId: text("time_span_id").notNull(),
+        kind: text("kind").notNull(),
+        source: text("source").notNull(),
+        confidence: real("confidence"),
+    },
+    (t) => ({
+        rangeIdx: index("bp_timeline_anchor_range_idx").on(t.rangeId),
+        timeIdx: index("bp_timeline_anchor_time_idx").on(t.timeSpanId),
+        kindCheck: check(
+            "bp_timeline_anchor_kind_check",
+            sql`${t.kind} in ('SETTING','EVENT_WINDOW','REIGN','JOURNEY_WINDOW')`,
+        ),
+        confCheck: check(
+            "bp_timeline_anchor_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+    }),
+);
+
+/* ------------------------------ 7) Events ---------------------------------- */
+
+export const bpEvent = sqliteTable(
+    "bp_event",
+    {
+        eventId: text("event_id").primaryKey(), // uuid
+        canonicalTitle: text("canonical_title").notNull(),
+        kind: text("kind").notNull(),
+        primaryRangeId: text("primary_range_id").notNull(),
+        timeSpanId: text("time_span_id"),
+        primaryPlaceId: text("primary_place_id"), // entity_id (place)
+        source: text("source").notNull(),
+        confidence: real("confidence"),
+    },
+    (t) => ({
+        kindCheck: check(
+            "bp_event_kind_check",
+            sql`${t.kind} in (
+    'BIRTH','DEATH','BATTLE','COVENANT','EXODUS','MIGRATION','SPEECH','MIRACLE','PROPHECY',
+        'CAPTIVITY','RETURN','CRUCIFIXION','RESURRECTION','MISSION_JOURNEY','COUNCIL','LETTER_WRITTEN','OTHER'
+)`,
+        ),
+        rangeIdx: index("bp_event_range_idx").on(t.primaryRangeId),
+        confCheck: check(
+            "bp_event_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+    }),
+);
+
+export const bpEventParticipant = sqliteTable(
+    "bp_event_participant",
+    {
+        eventParticipantId: text("event_participant_id").primaryKey(), // uuid
+        eventId: text("event_id").notNull(),
+        entityId: text("entity_id").notNull(),
+        role: text("role").notNull(),
+        confidence: real("confidence"),
+    },
+    (t) => ({
+        eventIdx: index("bp_event_participant_event_idx").on(t.eventId),
+        entityIdx: index("bp_event_participant_entity_idx").on(t.entityId),
+        roleCheck: check(
+            "bp_event_participant_role_check",
+            sql`${t.role} in ('SUBJECT','AGENT','WITNESS','OPPONENT','RULER','PEOPLE','OTHER')`,
+        ),
+        confCheck: check(
+            "bp_event_participant_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+    }),
+);
+
+/* -------------------- 8) Link Layer (Orientation Graph) --------------------- */
+
+export const bpLink = sqliteTable(
+    "bp_link",
+    {
+        linkId: text("link_id").primaryKey(), // uuid
+        rangeId: text("range_id").notNull(),
+        targetKind: text("target_kind").notNull(),
+        targetId: text("target_id").notNull(),
+        linkKind: text("link_kind").notNull(),
+        weight: integer("weight").notNull().default(1),
+        source: text("source").notNull(),
+        confidence: real("confidence"),
+    },
+    (t) => ({
+        rangeIdx: index("bp_link_range_idx").on(t.rangeId),
+        targetIdx: index("bp_link_target_idx").on(t.targetKind, t.targetId),
+        kindIdx: index("bp_link_kind_idx").on(t.linkKind),
+        targetKindCheck: check("bp_link_target_kind_check", sql`${t.targetKind} in ('ENTITY','EVENT','ROUTE','PLACE_GEO')`),
+        linkKindCheck: check(
+            "bp_link_link_kind_check",
+            sql`${t.linkKind} in (
+    'MENTIONS','PRIMARY_SUBJECT','LOCATION','SETTING','JOURNEY_STEP',
+        'PARALLEL_ACCOUNT','QUOTE_SOURCE','QUOTE_TARGET'
+)`,
+        ),
+        weightCheck: check("bp_link_weight_check", sql`${t.weight} >= 1`),
+        confCheck: check(
+            "bp_link_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+    }),
+);
+
+export const bpCrossref = sqliteTable(
+    "bp_crossref",
+    {
+        crossrefId: text("crossref_id").primaryKey(), // uuid
+        fromRangeId: text("from_range_id").notNull(),
+        toRangeId: text("to_range_id").notNull(),
+        kind: text("kind").notNull(),
+        source: text("source").notNull(),
+        confidence: real("confidence"),
+    },
+    (t) => ({
+        fromIdx: index("bp_crossref_from_idx").on(t.fromRangeId),
+        toIdx: index("bp_crossref_to_idx").on(t.toRangeId),
+        kindCheck: check("bp_crossref_kind_check", sql`${t.kind} in ('PARALLEL','QUOTE','ALLUSION','TOPICAL')`),
+        confCheck: check(
+            "bp_crossref_conf_check",
+            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+    }),
+);
+
+/* ------------------------- 9) Search & Retrieval (Optional) ----------------- */
+
+export const bpSearchQueryLog = sqliteTable(
+    "bp_search_query_log",
+    {
+        queryId: text("query_id").primaryKey(), // uuid
+        anonId: text("anon_id"),
+        query: text("query").notNull(),
+        queryNorm: text("query_norm").notNull(),
+        translationId: text("translation_id"),
+        hits: integer("hits").notNull().default(0),
+        createdAt: text("created_at").notNull().default(nowIso),
+    },
+    (t) => ({
+        normIdx: index("bp_search_query_log_norm_idx").on(t.queryNorm),
+        createdIdx: index("bp_search_query_log_created_idx").on(t.createdAt),
+        hitsCheck: check("bp_search_query_log_hits_check", sql`${t.hits} >= 0`),
+    }),
+);
+
+/* -------------------------- 10) Reader Telemetry (Optional) ----------------- */
+
+export const bpReaderEvent = sqliteTable(
+    "bp_reader_event",
+    {
+        readerEventId: text("reader_event_id").primaryKey(), // uuid
+        anonId: text("anon_id").notNull(),
+        eventType: text("event_type").notNull(),
+        translationId: text("translation_id"),
+        verseKey: text("verse_key"),
+        rangeId: text("range_id"),
+        entityId: text("entity_id"),
+        durationMs: integer("duration_ms"),
+        createdAt: text("created_at").notNull().default(nowIso),
+    },
+    (t) => ({
+        anonIdx: index("bp_reader_event_anon_idx").on(t.anonId, t.createdAt),
         typeCheck: check(
-            "drawer_history_type_check",
-            sql`${t.entityType} in ('person','place','event')`,
+            "bp_reader_event_type_check",
+            sql`${t.eventType} in (
+    'VIEW_VERSE','VIEW_CHAPTER','SCROLL_BACK','COPY_TEXT','OPEN_ENTITY','OPEN_MAP','OPEN_TIMELINE','SEARCH'
+)`,
         ),
-        refCheck: check(
-            "drawer_history_ref_check",
-            sql`(${t.chapter} is null and ${t.verse} is null) or (${t.chapter} > 0 and ${t.verse} > 0)`,
-        ),
+        durCheck: check("bp_reader_event_duration_check", sql`${t.durationMs} is null or ${t.durationMs} >= 0`),
+    }),
+);
+
+/* --------------------- 11) Provenance & Integrity (Optional) ---------------- */
+
+export const bpSource = sqliteTable(
+    "bp_source",
+    {
+        sourceId: text("source_id").primaryKey(), // uuid
+        name: text("name").notNull(),
+        kind: text("kind").notNull(),
+        version: text("version"),
+        url: text("url"),
+        license: text("license"),
+        notes: text("notes"),
+    },
+    (t) => ({
+        kindCheck: check("bp_source_kind_check", sql`${t.kind} in ('IMPORT','MANUAL','DATASET')`),
+    }),
+);
+
+export const bpAudit = sqliteTable(
+    "bp_audit",
+    {
+        auditId: text("audit_id").primaryKey(), // uuid
+        entityKind: text("entity_kind").notNull(),
+        entityId: text("entity_id").notNull(),
+        action: text("action").notNull(),
+        before: text("before"), // JSON
+        after: text("after"), // JSON
+        sourceId: text("source_id"),
+        createdAt: text("created_at").notNull().default(nowIso),
+    },
+    (t) => ({
+        entIdx: index("bp_audit_entity_idx").on(t.entityKind, t.entityId, t.createdAt),
+        actionCheck: check("bp_audit_action_check", sql`${t.action} in ('INSERT','UPDATE','DELETE')`),
     }),
 );
 
 /* ------------------------------------ FTS ----------------------------------- */
-
+/**
+ * Optional FTS5 extras for verse text search.
+ * Applied by migrate.ts (extras runner), not by Drizzle schema.
+ */
 export const FTS_MIGRATION_SQL = `
--- FTS5 for verse text search
-CREATE VIRTUAL TABLE IF NOT EXISTS verse_text_fts USING fts5(
-  translation_revision_id UNINDEXED,
-  canon_id UNINDEXED,
-  book_id UNINDEXED,
-  chapter UNINDEXED,
-  verse UNINDEXED,
+-- FTS5 over bp_verse_text.text (translation-aware)
+CREATE VIRTUAL TABLE IF NOT EXISTS bp_verse_text_fts USING fts5(
+  translation_id UNINDEXED,
+  verse_key UNINDEXED,
   text,
-  content='verse_text',
+  content='bp_verse_text',
   content_rowid='rowid'
 );
 
--- Sync triggers (optional but recommended)
-CREATE TRIGGER IF NOT EXISTS verse_text_ai AFTER INSERT ON verse_text BEGIN
-  INSERT INTO verse_text_fts(rowid, translation_revision_id, canon_id, book_id, chapter, verse, text)
-  VALUES (new.rowid, new.translation_revision_id, new.canon_id, new.book_id, new.chapter, new.verse, new.text);
+-- Sync triggers (recommended)
+CREATE TRIGGER IF NOT EXISTS bp_verse_text_ai AFTER INSERT ON bp_verse_text BEGIN
+  INSERT INTO bp_verse_text_fts(rowid, translation_id, verse_key, text)
+  VALUES (new.rowid, new.translation_id, new.verse_key, new.text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS verse_text_ad AFTER DELETE ON verse_text BEGIN
-  INSERT INTO verse_text_fts(verse_text_fts, rowid, translation_revision_id, canon_id, book_id, chapter, verse, text)
-  VALUES ('delete', old.rowid, old.translation_revision_id, old.canon_id, old.book_id, old.chapter, old.verse, old.text);
+CREATE TRIGGER IF NOT EXISTS bp_verse_text_ad AFTER DELETE ON bp_verse_text BEGIN
+  INSERT INTO bp_verse_text_fts(bp_verse_text_fts, rowid, translation_id, verse_key, text)
+  VALUES ('delete', old.rowid, old.translation_id, old.verse_key, old.text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS verse_text_au AFTER UPDATE ON verse_text BEGIN
-  INSERT INTO verse_text_fts(verse_text_fts, rowid, translation_revision_id, canon_id, book_id, chapter, verse, text)
-  VALUES ('delete', old.rowid, old.translation_revision_id, old.canon_id, old.book_id, old.chapter, old.verse, old.text);
+CREATE TRIGGER IF NOT EXISTS bp_verse_text_au AFTER UPDATE ON bp_verse_text BEGIN
+  INSERT INTO bp_verse_text_fts(bp_verse_text_fts, rowid, translation_id, verse_key, text)
+  VALUES ('delete', old.rowid, old.translation_id, old.verse_key, old.text);
 
-  INSERT INTO verse_text_fts(rowid, translation_revision_id, canon_id, book_id, chapter, verse, text)
-  VALUES (new.rowid, new.translation_revision_id, new.canon_id, new.book_id, new.chapter, new.verse, new.text);
+  INSERT INTO bp_verse_text_fts(rowid, translation_id, verse_key, text)
+  VALUES (new.rowid, new.translation_id, new.verse_key, new.text);
 END;
 `;
 
-/* ----------------------------- Export convenience --------------------------- */
+/* ---------------------------- Export convenience ---------------------------- */
 
 export const schema = {
-    canonBook,
-    chapter,
-    verse,
+    bpBook,
+    bpVerse,
+    bpChapter,
 
-    translation,
-    translationRevision,
-    translationDefaultRevision,
+    bpTranslation,
+    bpVerseText,
+    bpToken,
 
-    verseText,
-    verseMark,
-    footnote,
-    crossRef,
-    verseMention,
+    bpRange,
+    bpPericope,
+    bpParagraph,
+    bpDocUnit,
 
-    asset,
-    person,
-    personAlias,
-    personRelationship,
-    place,
-    placeAlias,
-    personPlace,
+    bpEntity,
+    bpEntityName,
+    bpEntityRelation,
 
-    journey,
-    journeyStop,
-    journeyPath,
+    bpPlaceGeo,
+    bpRoute,
+    bpRouteStep,
 
-    event,
-    eventParticipant,
-    eventRef,
+    bpTimeSpan,
+    bpTimelineAnchor,
 
-    entitySource,
+    bpEvent,
+    bpEventParticipant,
 
-    // chrono/geo engine
-    sourceDoc,
-    placeGeo,
-    chronoSpan,
-    chronoRelation,
+    bpLink,
+    bpCrossref,
 
-    tag,
-    personTag,
-    placeTag,
+    bpSearchQueryLog,
+    bpReaderEvent,
 
-    user,
-    bookmark,
-    highlight,
-    note,
-    readingProgress,
-    settings,
-    drawerHistory,
-};
+    bpSource,
+    bpAudit,
+} as const;

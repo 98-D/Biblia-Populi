@@ -8,7 +8,7 @@
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
   <component name="ProblemsViewState">
-    <option name="selectedTabId" value="CurrentFile" />
+    <option name="selectedTabId" value="ProjectErrors" />
   </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 7
@@ -33,6 +33,7 @@
 }</component>
   <component name="RecentsManager">
     <key name="MoveFile.RECENT_KEYS">
+      <recent name="C:\Users\dannydekker\Desktop\Biblia-Populi\apps\api\scripts" />
       <recent name="C:\Users\dannydekker\Desktop\Biblia-Populi\apps\api" />
       <recent name="C:\Users\dannydekker\Desktop\Biblia-Populi\apps\web\public" />
       <recent name="C:\Users\dannydekker\Desktop\Biblia-Populi\apps\web\src\assets" />
@@ -56,6 +57,8 @@
       <workItem from="1772217603743" duration="1923000" />
       <workItem from="1772221463091" duration="2347000" />
       <workItem from="1772224586896" duration="9475000" />
+      <workItem from="1772236338109" duration="639000" />
+      <workItem from="1772396050423" duration="7891000" />
     </task>
     <servers />
   </component>

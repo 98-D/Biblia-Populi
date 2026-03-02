@@ -1,31 +1,29 @@
 // apps/api/src/server.ts
 // Biblia Populi — Production API server (Bun + Hono + Drizzle + bun:sqlite)
 //
-// Goals:
-// - Fast, calm, minimal API for the reader app
-// - Reading-first endpoints:
-//    - /health
-//    - /meta (current translation + revision)
-//    - /books
-//    - /chapters/:bookId
-//    - /chapter/:bookId/:chapter (verses + marks + mentions + footnotes)
-//    - /search?q=...
-//    - /people/:id, /places/:id, /events/:id
-// - Strict JSON responses, stable shapes
-// - No framework magic; easy to extend
+// Upgraded to match the **current bp_* schema** (orientation-only):
+// - No canon_id
+// - No translation revisions
+// - Verse identity is bp_verse (verse_key + verse_ord)
+// - Text is bp_verse_text keyed by (translation_id, verse_key)
+// - Entities are bp_entity (+ bp_entity_name / bp_entity_relation)
+// - Events are bp_event (+ bp_event_participant)
+// - Optional search uses FTS5 table: bp_verse_text_fts (created by migrate.ts extras)
+//
+// Endpoints (stable, reading-first):
+//   GET  /health
+//   GET  /meta
+//   GET  /books
+//   GET  /chapters/:bookId
+//   GET  /chapter/:bookId/:chapter
+//   GET  /search?q=...
+//   GET  /people/:id
+//   GET  /places/:id
+//   GET  /events/:id
 //
 // Notes:
-// - This file assumes:
-//    - apps/api/src/db/client.ts exports `db` (Drizzle client) and `sqlite`
-//    - apps/api/src/db/schema.ts exports tables and `FTS_MIGRATION_SQL` (used by migrate.ts)
-// - If you’re developing locally, use bun --watch src/server.ts
-//
-// Env vars:
-// - PORT (default 3000)
-// - BP_DB_PATH (optional; default apps/api/data/biblia.sqlite)
-// - BP_CANON_ID (default "protestant_66")
-// - BP_TRANSLATION_ID (default "biblia_populi")
-// - BP_REVISION_PURPOSE (default "reading")
+// - /chapter returns { verses, ranges, links, crossrefs } and keeps legacy fields
+//   { marks, mentions, footnotes } as empty arrays for transition safety.
 
 import { Hono } from "hono";
 import { cors } from "hono/cors";
@@ -33,62 +31,61 @@ import { logger } from "hono/logger";
 import { compress } from "hono/compress";
 import { etag } from "hono/etag";
 import { z } from "zod";
-import { and, asc, eq, like, sql as dsql } from "drizzle-orm";
+import { and, asc, eq, like, sql as dsql, inArray } from "drizzle-orm";
 
 import { db, sqlite } from "./db/client";
 import {
-    canonBook,
-    chapter as chapterTable,
-    translationDefaultRevision,
-    verseText,
-    verseMark,
-    verseMention,
-    footnote,
-    person,
-    place,
-    event,
+    bpBook,
+    bpChapter,
+    bpVerse,
+    bpVerseText,
+    bpTranslation,
+    bpRange,
+    bpLink,
+    bpCrossref,
+    bpEntity,
+    bpEntityName,
+    bpEntityRelation,
+    bpPlaceGeo,
+    bpEvent,
+    bpEventParticipant,
 } from "./db/schema";
 
 /* --------------------------------- Config --------------------------------- */
 
 const PORT = Number(process.env.PORT ?? "3000");
-const CANON_ID = (process.env.BP_CANON_ID ?? "protestant_66").trim();
-const TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "biblia_populi").trim();
-const REVISION_PURPOSE = (process.env.BP_REVISION_PURPOSE ?? "reading").trim(); // reading|editing
+
+// Prefer explicit env, else fall back to DB default translation (bp_translation.is_default)
+const ENV_TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "").trim();
 
 /* --------------------------------- Helpers -------------------------------- */
+
+type JsonOk<T> = Readonly<{ ok: true; data: T }>;
+type JsonErr = Readonly<{ ok: false; error: { code: string; message: string } }>;
 
 function jsonOk<T>(c: any, data: T, extraHeaders?: Record<string, string>) {
     if (extraHeaders) {
         for (const [k, v] of Object.entries(extraHeaders)) c.header(k, v);
     }
-    return c.json({ ok: true as const, data });
+    const body: JsonOk<T> = { ok: true, data };
+    return c.json(body);
 }
 
 function jsonErr(c: any, status: number, code: string, message: string) {
-    return c.json({ ok: false as const, error: { code, message } }, status);
+    const body: JsonErr = { ok: false, error: { code, message } };
+    return c.json(body, status);
 }
 
 function clamp(n: number, lo: number, hi: number) {
     return Math.max(lo, Math.min(hi, n));
 }
 
-async function getActiveRevisionId(): Promise<string | null> {
-    const rows = await db
-        .select({
-            translationRevisionId: translationDefaultRevision.translationRevisionId,
-        })
-        .from(translationDefaultRevision)
-        .where(
-            and(
-                eq(translationDefaultRevision.translationId, TRANSLATION_ID),
-                eq(translationDefaultRevision.canonId, CANON_ID),
-                eq(translationDefaultRevision.purpose, REVISION_PURPOSE),
-            ),
-        )
-        .limit(1);
+function cacheNoStore(c: any) {
+    c.header("Cache-Control", "no-store");
+}
 
-    return rows[0]?.translationRevisionId ?? null;
+function cachePublic(c: any, seconds: number) {
+    c.header("Cache-Control", `public, max-age=${seconds}`);
 }
 
 const RefBookIdSchema = z
@@ -98,14 +95,85 @@ const RefBookIdSchema = z
     .regex(/^[A-Z0-9_]+$/);
 
 const ChapterNumSchema = z.coerce.number().int().min(1).max(200);
-const VerseNumSchema = z.coerce.number().int().min(1).max(300);
 
-function cacheNoStore(c: any) {
-    c.header("Cache-Control", "no-store");
+const SearchQuerySchema = z.string().trim().min(1).max(200);
+
+let _resolvedTranslationId: string | null = null;
+
+async function resolveTranslationId(): Promise<string | null> {
+    if (_resolvedTranslationId) return _resolvedTranslationId;
+
+    if (ENV_TRANSLATION_ID) {
+        _resolvedTranslationId = ENV_TRANSLATION_ID;
+        return _resolvedTranslationId;
+    }
+
+    const rows = await db
+        .select({ translationId: bpTranslation.translationId })
+        .from(bpTranslation)
+        .where(eq(bpTranslation.isDefault, true))
+        .limit(1);
+
+    _resolvedTranslationId = rows[0]?.translationId ?? null;
+    return _resolvedTranslationId;
 }
 
-function cachePublic(c: any, seconds: number) {
-    c.header("Cache-Control", `public, max-age=${seconds}`);
+function hasFts(): boolean {
+    const row = sqlite
+        .query(`SELECT 1 AS one FROM sqlite_master WHERE type='table' AND name='bp_verse_text_fts' LIMIT 1;`)
+        .get() as { one?: number } | undefined;
+
+    return row != null;
+}
+
+type ChapterBounds = Readonly<{
+    startVerseOrd: number;
+    endVerseOrd: number;
+    verseCount?: number;
+    source: "bp_chapter" | "computed";
+}>;
+
+async function getChapterBounds(bookId: string, chapter: number): Promise<ChapterBounds | null> {
+    // Prefer bp_chapter if present
+    const byChapter = await db
+        .select({
+            startVerseOrd: bpChapter.startVerseOrd,
+            endVerseOrd: bpChapter.endVerseOrd,
+            verseCount: bpChapter.verseCount,
+        })
+        .from(bpChapter)
+        .where(and(eq(bpChapter.bookId, bookId), eq(bpChapter.chapter, chapter)))
+        .limit(1);
+
+    if (byChapter[0]) {
+        return {
+            startVerseOrd: byChapter[0].startVerseOrd,
+            endVerseOrd: byChapter[0].endVerseOrd,
+            verseCount: byChapter[0].verseCount,
+            source: "bp_chapter",
+        };
+    }
+
+    // Fallback: compute from bp_verse
+    const agg = await db
+        .select({
+            startVerseOrd: dsql<number>`min(${bpVerse.verseOrd})`.as("start_verse_ord"),
+            endVerseOrd: dsql<number>`max(${bpVerse.verseOrd})`.as("end_verse_ord"),
+            verseCount: dsql<number>`count(*)`.as("verse_count"),
+        })
+        .from(bpVerse)
+        .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapter)))
+        .limit(1);
+
+    const row = agg[0];
+    if (!row || row.startVerseOrd == null || row.endVerseOrd == null) return null;
+
+    return {
+        startVerseOrd: Number(row.startVerseOrd),
+        endVerseOrd: Number(row.endVerseOrd),
+        verseCount: Number(row.verseCount ?? 0),
+        source: "computed",
+    };
 }
 
 /* ----------------------------------- App ---------------------------------- */
@@ -131,59 +199,113 @@ app.get("/health", (c) => {
     return c.text("ok");
 });
 
-// Meta: active revision
+// Meta: translation + search capability
 app.get("/meta", async (c) => {
     cacheNoStore(c);
-    const rev = await getActiveRevisionId();
-    if (!rev) return jsonErr(c, 404, "NO_ACTIVE_REVISION", "No active translation revision configured.");
+
+    const translationId = await resolveTranslationId();
+    if (!translationId) {
+        return jsonErr(
+            c,
+            404,
+            "NO_TRANSLATION",
+            "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
+        );
+    }
+
+    const t = await db
+        .select({
+            translationId: bpTranslation.translationId,
+            name: bpTranslation.name,
+            language: bpTranslation.language,
+            derivedFrom: bpTranslation.derivedFrom,
+            licenseKind: bpTranslation.licenseKind,
+            licenseText: bpTranslation.licenseText,
+            sourceUrl: bpTranslation.sourceUrl,
+            isDefault: bpTranslation.isDefault,
+            createdAt: bpTranslation.createdAt,
+        })
+        .from(bpTranslation)
+        .where(eq(bpTranslation.translationId, translationId))
+        .limit(1);
+
     return jsonOk(c, {
-        canonId: CANON_ID,
-        translationId: TRANSLATION_ID,
-        revisionPurpose: REVISION_PURPOSE,
-        translationRevisionId: rev,
+        translation: t[0] ?? { translationId },
+        ftsEnabled: hasFts(),
     });
 });
 
-// Books in canon
+// Books (canonical order)
 app.get("/books", async (c) => {
     cachePublic(c, 60);
+
     const books = await db
         .select({
-            bookId: canonBook.bookId,
-            ordinal: canonBook.ordinal,
-            name: canonBook.name,
-            nameShort: canonBook.nameShort,
-            testament: canonBook.testament,
-            chaptersCount: canonBook.chaptersCount,
+            bookId: bpBook.bookId,
+            ordinal: bpBook.ordinal,
+            testament: bpBook.testament,
+            name: bpBook.name,
+            nameShort: bpBook.nameShort,
+            chapters: bpBook.chapters,
+            osised: bpBook.osised,
+            abbrs: bpBook.abbrs,
         })
-        .from(canonBook)
-        .where(eq(canonBook.canonId, CANON_ID))
-        .orderBy(asc(canonBook.ordinal));
+        .from(bpBook)
+        .orderBy(asc(bpBook.ordinal));
 
-    return jsonOk(c, { canonId: CANON_ID, books });
+    return jsonOk(c, { books });
 });
 
-// Chapters meta for a book (optional titles)
+// Chapters meta for a book
 app.get("/chapters/:bookId", async (c) => {
     cachePublic(c, 60);
 
-    const bookId = RefBookIdSchema.safeParse(c.req.param("bookId"));
-    if (!bookId.success) return jsonErr(c, 400, "BAD_BOOK", "Invalid bookId.");
+    const bookIdP = RefBookIdSchema.safeParse(c.req.param("bookId"));
+    if (!bookIdP.success) return jsonErr(c, 400, "BAD_BOOK", "Invalid bookId.");
 
+    const bookId = bookIdP.data;
+
+    // Prefer bp_chapter rows if present for this book
+    const rows = await db
+        .select({
+            chapter: bpChapter.chapter,
+            startVerseOrd: bpChapter.startVerseOrd,
+            endVerseOrd: bpChapter.endVerseOrd,
+            verseCount: bpChapter.verseCount,
+        })
+        .from(bpChapter)
+        .where(eq(bpChapter.bookId, bookId))
+        .orderBy(asc(bpChapter.chapter));
+
+    if (rows.length > 0) {
+        return jsonOk(c, { bookId, chapters: rows });
+    }
+
+    // Fallback: compute distinct chapters from bp_verse
     const chapters = await db
         .select({
-            chapter: chapterTable.chapter,
-            title: chapterTable.title,
-            summary: chapterTable.summary,
+            chapter: bpVerse.chapter,
+            startVerseOrd: dsql<number>`min(${bpVerse.verseOrd})`.as("start_verse_ord"),
+            endVerseOrd: dsql<number>`max(${bpVerse.verseOrd})`.as("end_verse_ord"),
+            verseCount: dsql<number>`count(*)`.as("verse_count"),
         })
-        .from(chapterTable)
-        .where(and(eq(chapterTable.canonId, CANON_ID), eq(chapterTable.bookId, bookId.data)))
-        .orderBy(asc(chapterTable.chapter));
+        .from(bpVerse)
+        .where(eq(bpVerse.bookId, bookId))
+        .groupBy(bpVerse.chapter)
+        .orderBy(asc(bpVerse.chapter));
 
-    return jsonOk(c, { canonId: CANON_ID, bookId: bookId.data, chapters });
+    return jsonOk(c, {
+        bookId,
+        chapters: chapters.map((r) => ({
+            chapter: Number(r.chapter),
+            startVerseOrd: Number(r.startVerseOrd),
+            endVerseOrd: Number(r.endVerseOrd),
+            verseCount: Number(r.verseCount),
+        })),
+    });
 });
 
-// Fetch a chapter: verse text + marks + mentions + footnotes
+// Fetch a chapter: verse text + (optional) ranges/links/crossrefs
 app.get("/chapter/:bookId/:chapter", async (c) => {
     cachePublic(c, 30);
 
@@ -193,254 +315,345 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
     const chapterP = ChapterNumSchema.safeParse(c.req.param("chapter"));
     if (!chapterP.success) return jsonErr(c, 400, "BAD_CHAPTER", "Invalid chapter number.");
 
-    const translationRevisionId = await getActiveRevisionId();
-    if (!translationRevisionId)
-        return jsonErr(c, 404, "NO_ACTIVE_REVISION", "No active translation revision configured.");
+    const translationId = await resolveTranslationId();
+    if (!translationId) {
+        return jsonErr(
+            c,
+            404,
+            "NO_TRANSLATION",
+            "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
+        );
+    }
 
     const bookId = bookIdP.data;
     const chapterNum = chapterP.data;
 
+    const bounds = await getChapterBounds(bookId, chapterNum);
+    if (!bounds) return jsonErr(c, 404, "CHAPTER_NOT_FOUND", "Chapter not found in bp_verse.");
+
+    // Verses (join bp_verse -> bp_verse_text)
     const verses = await db
         .select({
-            chapter: verseText.chapter,
-            verse: verseText.verse,
-            text: verseText.text,
-            updatedAt: verseText.updatedAt,
+            verseKey: bpVerse.verseKey,
+            verseOrd: bpVerse.verseOrd,
+            chapter: bpVerse.chapter,
+            verse: bpVerse.verse,
+            text: bpVerseText.text,
+            updatedAt: bpVerseText.updatedAt,
         })
-        .from(verseText)
-        .where(
-            and(
-                eq(verseText.translationRevisionId, translationRevisionId),
-                eq(verseText.canonId, CANON_ID),
-                eq(verseText.bookId, bookId),
-                eq(verseText.chapter, chapterNum),
-            ),
+        .from(bpVerse)
+        .leftJoin(
+            bpVerseText,
+            and(eq(bpVerseText.verseKey, bpVerse.verseKey), eq(bpVerseText.translationId, translationId)),
         )
-        .orderBy(asc(verseText.verse));
+        .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapterNum)))
+        .orderBy(asc(bpVerse.verse));
 
-    const marks = await db
+    // Optional: ranges intersecting this chapter (for orientation graph)
+    const ranges = await db
         .select({
-            id: verseMark.id,
-            chapter: verseMark.chapter,
-            verse: verseMark.verse,
-            kind: verseMark.kind,
-            ord: verseMark.ord,
-            payload: verseMark.payload,
+            rangeId: bpRange.rangeId,
+            startVerseOrd: bpRange.startVerseOrd,
+            endVerseOrd: bpRange.endVerseOrd,
+            startVerseKey: bpRange.startVerseKey,
+            endVerseKey: bpRange.endVerseKey,
+            label: bpRange.label,
         })
-        .from(verseMark)
-        .where(
-            and(
-                eq(verseMark.translationRevisionId, translationRevisionId),
-                eq(verseMark.canonId, CANON_ID),
-                eq(verseMark.bookId, bookId),
-                eq(verseMark.chapter, chapterNum),
-            ),
-        )
-        .orderBy(asc(verseMark.verse), asc(verseMark.ord));
+        .from(bpRange)
+        .where(and(dsql`${bpRange.startVerseOrd} <= ${bounds.endVerseOrd}`, dsql`${bpRange.endVerseOrd} >= ${bounds.startVerseOrd}`))
+        .orderBy(asc(bpRange.startVerseOrd), asc(bpRange.endVerseOrd));
 
-    const mentions = await db
-        .select({
-            id: verseMention.id,
-            chapter: verseMention.chapter,
-            verse: verseMention.verse,
-            entityType: verseMention.entityType,
-            entityId: verseMention.entityId,
-            start: verseMention.start,
-            end: verseMention.end,
-            surface: verseMention.surface,
-            ord: verseMention.ord,
-        })
-        .from(verseMention)
-        .where(
-            and(
-                eq(verseMention.translationRevisionId, translationRevisionId),
-                eq(verseMention.canonId, CANON_ID),
-                eq(verseMention.bookId, bookId),
-                eq(verseMention.chapter, chapterNum),
-            ),
-        )
-        .orderBy(asc(verseMention.verse), asc(verseMention.start), asc(verseMention.end), asc(verseMention.ord));
+    const rangeIds = ranges.map((r) => r.rangeId);
 
-    const footnotes = await db
-        .select({
-            id: footnote.id,
-            chapter: footnote.chapter,
-            verse: footnote.verse,
-            marker: footnote.marker,
-            content: footnote.content,
-            ord: footnote.ord,
-        })
-        .from(footnote)
-        .where(
-            and(
-                eq(footnote.translationRevisionId, translationRevisionId),
-                eq(footnote.canonId, CANON_ID),
-                eq(footnote.bookId, bookId),
-                eq(footnote.chapter, chapterNum),
-            ),
-        )
-        .orderBy(asc(footnote.verse), asc(footnote.ord));
+    const links =
+        rangeIds.length === 0
+            ? []
+            : await db
+                .select({
+                    linkId: bpLink.linkId,
+                    rangeId: bpLink.rangeId,
+                    targetKind: bpLink.targetKind,
+                    targetId: bpLink.targetId,
+                    linkKind: bpLink.linkKind,
+                    weight: bpLink.weight,
+                    source: bpLink.source,
+                    confidence: bpLink.confidence,
+                })
+                .from(bpLink)
+                .where(inArray(bpLink.rangeId, rangeIds))
+                .orderBy(asc(bpLink.rangeId), asc(bpLink.linkKind));
+
+    const crossrefs =
+        rangeIds.length === 0
+            ? []
+            : await db
+                .select({
+                    crossrefId: bpCrossref.crossrefId,
+                    fromRangeId: bpCrossref.fromRangeId,
+                    toRangeId: bpCrossref.toRangeId,
+                    kind: bpCrossref.kind,
+                    source: bpCrossref.source,
+                    confidence: bpCrossref.confidence,
+                })
+                .from(bpCrossref)
+                .where(inArray(bpCrossref.fromRangeId, rangeIds))
+                .orderBy(asc(bpCrossref.fromRangeId));
 
     return jsonOk(c, {
-        canonId: CANON_ID,
-        translationId: TRANSLATION_ID,
-        translationRevisionId,
+        translationId,
         bookId,
         chapter: chapterNum,
+        chapterBounds: bounds,
         verses,
-        marks,
-        mentions,
-        footnotes,
+
+        // Upgraded orientation surfaces:
+        ranges,
+        links,
+        crossrefs,
+
+        // Legacy placeholders (old client expectations; safe-empty):
+        marks: [] as unknown[],
+        mentions: [] as unknown[],
+        footnotes: [] as unknown[],
     });
 });
 
-// Entity endpoints (for drawer)
+// Entity endpoints (drawer)
+
+// PERSON
 app.get("/people/:id", async (c) => {
     cachePublic(c, 60);
     const id = c.req.param("id");
 
-    const rows = await db
+    const ent = await db
         .select({
-            id: person.id,
-            displayName: person.displayName,
-            sortName: person.sortName,
-            sex: person.sex,
-            title: person.title,
-            summary: person.summary,
-            bio: person.bio,
-            era: person.era,
-            imageAssetId: person.imageAssetId,
+            entityId: bpEntity.entityId,
+            kind: bpEntity.kind,
+            canonicalName: bpEntity.canonicalName,
+            slug: bpEntity.slug,
+            summaryNeutral: bpEntity.summaryNeutral,
+            confidence: bpEntity.confidence,
+            createdAt: bpEntity.createdAt,
         })
-        .from(person)
-        .where(eq(person.id, id))
+        .from(bpEntity)
+        .where(and(eq(bpEntity.entityId, id), eq(bpEntity.kind, "PERSON")))
         .limit(1);
 
-    return jsonOk(c, rows[0] ?? null);
+    if (!ent[0]) return jsonOk(c, null);
+
+    const names = await db
+        .select({
+            entityNameId: bpEntityName.entityNameId,
+            name: bpEntityName.name,
+            language: bpEntityName.language,
+            isPrimary: bpEntityName.isPrimary,
+            source: bpEntityName.source,
+            confidence: bpEntityName.confidence,
+        })
+        .from(bpEntityName)
+        .where(eq(bpEntityName.entityId, id))
+        .orderBy(asc(bpEntityName.name));
+
+    const relFrom = await db
+        .select({
+            relationId: bpEntityRelation.relationId,
+            fromEntityId: bpEntityRelation.fromEntityId,
+            toEntityId: bpEntityRelation.toEntityId,
+            kind: bpEntityRelation.kind,
+            timeSpanId: bpEntityRelation.timeSpanId,
+            source: bpEntityRelation.source,
+            confidence: bpEntityRelation.confidence,
+            noteNeutral: bpEntityRelation.noteNeutral,
+        })
+        .from(bpEntityRelation)
+        .where(eq(bpEntityRelation.fromEntityId, id));
+
+    const relTo = await db
+        .select({
+            relationId: bpEntityRelation.relationId,
+            fromEntityId: bpEntityRelation.fromEntityId,
+            toEntityId: bpEntityRelation.toEntityId,
+            kind: bpEntityRelation.kind,
+            timeSpanId: bpEntityRelation.timeSpanId,
+            source: bpEntityRelation.source,
+            confidence: bpEntityRelation.confidence,
+            noteNeutral: bpEntityRelation.noteNeutral,
+        })
+        .from(bpEntityRelation)
+        .where(eq(bpEntityRelation.toEntityId, id));
+
+    return jsonOk(c, {
+        entity: ent[0],
+        names,
+        relations: { from: relFrom, to: relTo },
+    });
 });
 
+// PLACE (+ geo)
 app.get("/places/:id", async (c) => {
     cachePublic(c, 60);
     const id = c.req.param("id");
 
-    const rows = await db
+    const ent = await db
         .select({
-            id: place.id,
-            name: place.name,
-            kind: place.kind,
-            lat: place.lat,
-            lon: place.lon,
-            geojson: place.geojson,
-            summary: place.summary,
-            description: place.description,
-            era: place.era,
-            imageAssetId: place.imageAssetId,
+            entityId: bpEntity.entityId,
+            kind: bpEntity.kind,
+            canonicalName: bpEntity.canonicalName,
+            slug: bpEntity.slug,
+            summaryNeutral: bpEntity.summaryNeutral,
+            confidence: bpEntity.confidence,
+            createdAt: bpEntity.createdAt,
         })
-        .from(place)
-        .where(eq(place.id, id))
+        .from(bpEntity)
+        .where(and(eq(bpEntity.entityId, id), eq(bpEntity.kind, "PLACE")))
         .limit(1);
 
-    return jsonOk(c, rows[0] ?? null);
+    if (!ent[0]) return jsonOk(c, null);
+
+    const names = await db
+        .select({
+            entityNameId: bpEntityName.entityNameId,
+            name: bpEntityName.name,
+            language: bpEntityName.language,
+            isPrimary: bpEntityName.isPrimary,
+            source: bpEntityName.source,
+            confidence: bpEntityName.confidence,
+        })
+        .from(bpEntityName)
+        .where(eq(bpEntityName.entityId, id))
+        .orderBy(asc(bpEntityName.name));
+
+    const geos = await db
+        .select({
+            placeGeoId: bpPlaceGeo.placeGeoId,
+            geoType: bpPlaceGeo.geoType,
+            lat: bpPlaceGeo.lat,
+            lng: bpPlaceGeo.lng,
+            bbox: bpPlaceGeo.bbox,
+            polygon: bpPlaceGeo.polygon,
+            precisionM: bpPlaceGeo.precisionM,
+            source: bpPlaceGeo.source,
+            confidence: bpPlaceGeo.confidence,
+        })
+        .from(bpPlaceGeo)
+        .where(eq(bpPlaceGeo.entityId, id));
+
+    return jsonOk(c, { entity: ent[0], names, geos });
 });
 
+// EVENT (+ participants)
 app.get("/events/:id", async (c) => {
     cachePublic(c, 60);
     const id = c.req.param("id");
 
-    const rows = await db
+    const ev = await db
         .select({
-            id: event.id,
-            title: event.title,
-            summary: event.summary,
-            placeId: event.placeId,
-            era: event.era,
-            timeHint: event.timeHint,
+            eventId: bpEvent.eventId,
+            canonicalTitle: bpEvent.canonicalTitle,
+            kind: bpEvent.kind,
+            primaryRangeId: bpEvent.primaryRangeId,
+            timeSpanId: bpEvent.timeSpanId,
+            primaryPlaceId: bpEvent.primaryPlaceId,
+            source: bpEvent.source,
+            confidence: bpEvent.confidence,
         })
-        .from(event)
-        .where(eq(event.id, id))
+        .from(bpEvent)
+        .where(eq(bpEvent.eventId, id))
         .limit(1);
 
-    return jsonOk(c, rows[0] ?? null);
+    if (!ev[0]) return jsonOk(c, null);
+
+    const participants = await db
+        .select({
+            eventParticipantId: bpEventParticipant.eventParticipantId,
+            entityId: bpEventParticipant.entityId,
+            role: bpEventParticipant.role,
+            confidence: bpEventParticipant.confidence,
+        })
+        .from(bpEventParticipant)
+        .where(eq(bpEventParticipant.eventId, id));
+
+    return jsonOk(c, { event: ev[0], participants });
 });
 
-// Search (FTS5 preferred; fallback to LIKE if FTS not installed)
+// Search (FTS5 preferred; fallback to LIKE)
 app.get("/search", async (c) => {
     cachePublic(c, 10);
 
-    const q = (c.req.query("q") ?? "").trim();
-    if (!q) return jsonOk(c, { q, results: [] as any[] });
+    const qRaw = (c.req.query("q") ?? "").trim();
+    const qP = SearchQuerySchema.safeParse(qRaw);
+    if (!qP.success) return jsonOk(c, { q: qRaw, mode: "none" as const, results: [] as unknown[] });
 
+    const q = qP.data;
     const limit = clamp(Number(c.req.query("limit") ?? "30"), 1, 100);
 
-    const translationRevisionId = await getActiveRevisionId();
-    if (!translationRevisionId)
-        return jsonErr(c, 404, "NO_ACTIVE_REVISION", "No active translation revision configured.");
+    const translationId = await resolveTranslationId();
+    if (!translationId) {
+        return jsonErr(
+            c,
+            404,
+            "NO_TRANSLATION",
+            "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
+        );
+    }
 
-    // Prefer FTS virtual table if present
-    // We'll probe once per request (cheap).
-    const hasFts =
-        (sqlite
-            .query(
-                `SELECT 1 FROM sqlite_master WHERE type='table' AND name='verse_text_fts' LIMIT 1`,
-            )
-            .get() as any) != null;
-
-    if (hasFts) {
-        // FTS query returns rowid; we join back to verse_text rowid via the content table
-        // but since our content is verse_text, rowid maps directly.
-        //
-        // Use parameter binding to avoid injection.
+    if (hasFts()) {
+        // Join FTS rowid -> bp_verse_text.rowid -> bp_verse by verse_key
+        // snippet column index: 2 (text)
         const rows = sqlite
             .query(
                 `
         SELECT
-          canon_id as canonId,
-          book_id as bookId,
-          chapter as chapter,
-          verse as verse,
-          snippet(verse_text_fts, 5, '‹', '›', '…', 24) as snippet
-        FROM verse_text_fts
-        WHERE verse_text_fts MATCH ?
-          AND translation_revision_id = ?
-          AND canon_id = ?
+          v.book_id  AS bookId,
+          v.chapter  AS chapter,
+          v.verse    AS verse,
+          v.verse_key AS verseKey,
+          v.verse_ord AS verseOrd,
+          snippet(bp_verse_text_fts, 2, '‹', '›', '…', 24) AS snippet
+        FROM bp_verse_text_fts
+        JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
+        JOIN bp_verse v ON v.verse_key = t.verse_key
+        WHERE bp_verse_text_fts MATCH ?
+          AND t.translation_id = ?
+        ORDER BY bm25(bp_verse_text_fts)
         LIMIT ?;
       `,
             )
-            .all(q, translationRevisionId, CANON_ID, limit) as Array<{
-            canonId: string;
+            .all(q, translationId, limit) as Array<{
             bookId: string;
             chapter: number;
             verse: number;
+            verseKey: string;
+            verseOrd: number;
             snippet: string;
         }>;
 
         return jsonOk(c, { q, mode: "fts" as const, results: rows });
     }
 
-    // Fallback: LIKE
+    // LIKE fallback
+    const likeQ = `%${q}%`;
     const rows = await db
         .select({
-            canonId: verseText.canonId,
-            bookId: verseText.bookId,
-            chapter: verseText.chapter,
-            verse: verseText.verse,
-            text: verseText.text,
+            verseKey: bpVerse.verseKey,
+            bookId: bpVerse.bookId,
+            chapter: bpVerse.chapter,
+            verse: bpVerse.verse,
+            verseOrd: bpVerse.verseOrd,
+            text: bpVerseText.text,
         })
-        .from(verseText)
-        .where(
-            and(
-                eq(verseText.translationRevisionId, translationRevisionId),
-                eq(verseText.canonId, CANON_ID),
-                like(verseText.text, `%${q}%`),
-            ),
-        )
+        .from(bpVerseText)
+        .innerJoin(bpVerse, eq(bpVerse.verseKey, bpVerseText.verseKey))
+        .where(and(eq(bpVerseText.translationId, translationId), like(bpVerseText.text, likeQ)))
         .limit(limit);
 
     const results = rows.map((r) => ({
-        canonId: r.canonId,
         bookId: r.bookId,
         chapter: r.chapter,
         verse: r.verse,
-        snippet: r.text.length > 180 ? r.text.slice(0, 177) + "…" : r.text,
+        verseKey: r.verseKey,
+        verseOrd: r.verseOrd,
+        snippet: r.text.length > 200 ? r.text.slice(0, 197) + "…" : r.text,
     }));
 
     return jsonOk(c, { q, mode: "like" as const, results });
@@ -458,4 +671,4 @@ export default {
 };
 
 console.log(`[api] listening on http://localhost:${PORT}`);
-console.log(`[api] canon=${CANON_ID} translation=${TRANSLATION_ID} purpose=${REVISION_PURPOSE}`);
+console.log(`[api] translation=${ENV_TRANSLATION_ID || "(db default)"} fts=${hasFts() ? "on" : "off"}`);

@@ -1,7 +1,7 @@
-// apps/web/src/App.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { LearnMorePage } from "./LearnMorePage";
 import { Reader } from "./Reader";
+import { Search, type ReaderLocation } from "./Search";
 
 type Mode = "light" | "dark";
 
@@ -32,6 +32,7 @@ type Page = "home" | "learn" | "reader";
 export default function App() {
   const { mode, toggle } = useTheme();
   const [page, setPage] = useState<Page>("home");
+  const [readerLoc, setReaderLoc] = useState<ReaderLocation | null>(null);
 
   const themeVars = useMemo(() => getThemeVars(mode), [mode]);
 
@@ -42,12 +43,23 @@ export default function App() {
                 mode={mode}
                 onToggleTheme={toggle}
                 onLearnMore={() => setPage("learn")}
-                onStartReading={() => setPage("reader")}
+                onStartReading={() => {
+                  setReaderLoc({ bookId: "GEN", chapter: 1 });
+                  setPage("reader");
+                }}
+                onNavigate={(loc) => {
+                  setReaderLoc(loc);
+                  setPage("reader");
+                }}
             />
         ) : page === "learn" ? (
             <LearnMorePage mode={mode} onToggleTheme={toggle} onBack={() => setPage("home")} styles={styles} />
         ) : (
-            <Reader styles={styles} onBackHome={() => setPage("home")} />
+            <Reader
+                styles={styles}
+                initialLocation={readerLoc ?? undefined}
+                onBackHome={() => setPage("home")}
+            />
         )}
       </div>
   );
@@ -60,38 +72,14 @@ function Home(props: {
   onToggleTheme: () => void;
   onLearnMore: () => void;
   onStartReading: () => void;
+  onNavigate: (loc: ReaderLocation) => void;
 }) {
-  const { mode, onToggleTheme, onLearnMore, onStartReading } = props;
+  const { mode, onToggleTheme, onLearnMore, onStartReading, onNavigate } = props;
 
-  const inputRef = useRef<HTMLInputElement | null>(null);
-  const [q, setQ] = useState("");
-  const [isFocused, setIsFocused] = useState(false);
   const [pressingPrimary, setPressingPrimary] = useState(false);
   const [pressingLearn, setPressingLearn] = useState(false);
 
-  // Keep Ctrl+K behavior (hidden affordance)
-  useEffect(() => {
-    function onKeyDown(e: KeyboardEvent) {
-      const meta = e.metaKey || e.ctrlKey;
-      if (meta && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        inputRef.current?.focus();
-      }
-      if (e.key === "Escape" && document.activeElement === inputRef.current) {
-        if (q) setQ("");
-        else inputRef.current?.blur();
-      }
-      if (e.key === "Enter" && document.activeElement === inputRef.current) {
-        // “Enter to read” is a nice quiet UX default (even before search is wired)
-        onStartReading();
-      }
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [q, onStartReading]);
-
   const crossSrc = "/cross.png";
-  const hasQuery = q.trim().length > 0;
 
   const primaryStyle: React.CSSProperties = {
     ...styles.primaryBtnButton,
@@ -122,16 +110,13 @@ function Home(props: {
               A public, open-access Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen.
             </p>
 
-            <SearchBar
-                q={q}
-                setQ={setQ}
-                inputRef={inputRef}
-                focused={isFocused}
-                onFocus={() => setIsFocused(true)}
-                onBlur={() => setIsFocused(false)}
+            <Search
+                styles={styles}
+                onNavigate={onNavigate}
+                onStartReading={onStartReading}
+                enableHotkey={true}
+                hint="Type a word or a reference."
             />
-
-            {!hasQuery && !isFocused && <div style={styles.microHint}>Type a word or reference.</div>}
 
             <div style={styles.ctaRow}>
               <button
@@ -164,38 +149,6 @@ function Home(props: {
           </div>
         </div>
       </main>
-  );
-}
-
-function SearchBar(props: {
-  q: string;
-  setQ: (v: string) => void;
-  inputRef: React.RefObject<HTMLInputElement | null>;
-  focused: boolean;
-  onFocus: () => void;
-  onBlur: () => void;
-}) {
-  const { q, setQ, inputRef, focused, onFocus, onBlur } = props;
-
-  return (
-      <div style={{ ...styles.searchRow, ...(focused ? styles.searchRowFocused : null) }} aria-label="Search">
-      <span style={styles.searchIcon} aria-hidden>
-        ⌕
-      </span>
-
-        <input
-            ref={inputRef}
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Search…"
-            style={styles.searchInput}
-            aria-label="Search scripture"
-            spellCheck={false}
-            inputMode="search"
-            onFocus={onFocus}
-            onBlur={onBlur}
-        />
-      </div>
   );
 }
 
@@ -376,15 +329,6 @@ export const styles: Record<string, React.CSSProperties> = {
     padding: "8px 0",
   },
 
-  microHint: {
-    marginTop: 8,
-    fontSize: 10,
-    letterSpacing: "0.12em",
-    color: "var(--muted)",
-    opacity: 0.85,
-    userSelect: "none",
-  },
-
   ctaRow: {
     marginTop: 18,
     display: "flex",
@@ -410,7 +354,6 @@ export const styles: Record<string, React.CSSProperties> = {
     transition: "transform 140ms ease, box-shadow 140ms ease, opacity 140ms ease",
   },
 
-  // pressed states (subtle interaction)
   btnPressed: {
     transform: "translateY(1px) scale(0.99)",
     opacity: 0.95,

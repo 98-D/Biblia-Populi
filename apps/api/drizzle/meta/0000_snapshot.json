@@ -1,0 +1,3706 @@
+{
+  "version": "6",
+  "dialect": "sqlite",
+  "id": "c49f4b1c-1405-477f-bace-15ff03ab0e21",
+  "prevId": "00000000-0000-0000-0000-000000000000",
+  "tables": {
+    "asset": {
+      "name": "asset",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "mime": {
+          "name": "mime",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "path": {
+          "name": "path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "data": {
+          "name": "data",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "asset_kind_check": {
+          "name": "asset_kind_check",
+          "value": "\"asset\".\"kind\" in ('image','icon','svg')"
+        },
+        "asset_mime_check": {
+          "name": "asset_mime_check",
+          "value": "length(\"asset\".\"mime\") > 0"
+        },
+        "asset_has_path_or_data_check": {
+          "name": "asset_has_path_or_data_check",
+          "value": "\"asset\".\"path\" is not null or \"asset\".\"data\" is not null"
+        }
+      }
+    },
+    "bookmark": {
+      "name": "bookmark",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "label": {
+          "name": "label",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "bookmark_user_idx": {
+          "name": "bookmark_user_idx",
+          "columns": [
+            "user_id",
+            "created_at"
+          ],
+          "isUnique": false
+        },
+        "bookmark_ref_idx": {
+          "name": "bookmark_ref_idx",
+          "columns": [
+            "user_id",
+            "canon_id",
+            "book_id",
+            "chapter",
+            "verse"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bookmark_chapter_check": {
+          "name": "bookmark_chapter_check",
+          "value": "\"bookmark\".\"chapter\" > 0"
+        },
+        "bookmark_verse_check": {
+          "name": "bookmark_verse_check",
+          "value": "\"bookmark\".\"verse\" > 0"
+        }
+      }
+    },
+    "canon_book": {
+      "name": "canon_book",
+      "columns": {
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name_short": {
+          "name": "name_short",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "testament": {
+          "name": "testament",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chapters_count": {
+          "name": "chapters_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "canon_book_unique_ordinal": {
+          "name": "canon_book_unique_ordinal",
+          "columns": [
+            "canon_id",
+            "ordinal"
+          ],
+          "isUnique": true
+        },
+        "canon_book_testament_idx": {
+          "name": "canon_book_testament_idx",
+          "columns": [
+            "canon_id",
+            "testament"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "canon_book_canon_id_book_id_pk": {
+          "columns": [
+            "canon_id",
+            "book_id"
+          ],
+          "name": "canon_book_canon_id_book_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "canon_book_chapters_count_check": {
+          "name": "canon_book_chapters_count_check",
+          "value": "\"canon_book\".\"chapters_count\" > 0"
+        },
+        "canon_book_ordinal_check": {
+          "name": "canon_book_ordinal_check",
+          "value": "\"canon_book\".\"ordinal\" > 0"
+        },
+        "canon_book_testament_check": {
+          "name": "canon_book_testament_check",
+          "value": "\"canon_book\".\"testament\" in ('OT','NT','DC')"
+        },
+        "canon_book_book_id_check": {
+          "name": "canon_book_book_id_check",
+          "value": "length(\"canon_book\".\"book_id\") between 2 and 8"
+        }
+      }
+    },
+    "chapter": {
+      "name": "chapter",
+      "columns": {
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "title": {
+          "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "summary": {
+          "name": "summary",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "chapter_canon_id_book_id_chapter_pk": {
+          "columns": [
+            "canon_id",
+            "book_id",
+            "chapter"
+          ],
+          "name": "chapter_canon_id_book_id_chapter_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "chapter_chapter_check": {
+          "name": "chapter_chapter_check",
+          "value": "\"chapter\".\"chapter\" > 0"
+        }
+      }
+    },
+    "chrono_relation": {
+      "name": "chrono_relation",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "from_entity_type": {
+          "name": "from_entity_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "from_entity_id": {
+          "name": "from_entity_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "to_entity_type": {
+          "name": "to_entity_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "to_entity_id": {
+          "name": "to_entity_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "confidence": {
+          "name": "confidence",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source_doc_id": {
+          "name": "source_doc_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source_ref": {
+          "name": "source_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "chrono_relation_from_idx": {
+          "name": "chrono_relation_from_idx",
+          "columns": [
+            "from_entity_type",
+            "from_entity_id",
+            "kind"
+          ],
+          "isUnique": false
+        },
+        "chrono_relation_to_idx": {
+          "name": "chrono_relation_to_idx",
+          "columns": [
+            "to_entity_type",
+            "to_entity_id",
+            "kind"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "chrono_relation_kind_check": {
+          "name": "chrono_relation_kind_check",
+          "value": "\"chrono_relation\".\"kind\" in ('before','after','during','overlaps','same_time','unknown')"
+        },
+        "chrono_relation_conf_check": {
+          "name": "chrono_relation_conf_check",
+          "value": "\"chrono_relation\".\"confidence\" is null or (\"chrono_relation\".\"confidence\" >= 0 and \"chrono_relation\".\"confidence\" <= 1)"
+        },
+        "chrono_relation_not_self_check": {
+          "name": "chrono_relation_not_self_check",
+          "value": "not (\"chrono_relation\".\"from_entity_type\" = \"chrono_relation\".\"to_entity_type\" and \"chrono_relation\".\"from_entity_id\" = \"chrono_relation\".\"to_entity_id\")"
+        }
+      }
+    },
+    "chrono_span": {
+      "name": "chrono_span",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_type": {
+          "name": "entity_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_id": {
+          "name": "entity_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "precision": {
+          "name": "precision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'uncertain'"
+        },
+        "start_year": {
+          "name": "start_year",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "start_month": {
+          "name": "start_month",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "start_day": {
+          "name": "start_day",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "end_year": {
+          "name": "end_year",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "end_month": {
+          "name": "end_month",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "end_day": {
+          "name": "end_day",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source_doc_id": {
+          "name": "source_doc_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source_ref": {
+          "name": "source_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "confidence": {
+          "name": "confidence",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "chrono_span_entity_idx": {
+          "name": "chrono_span_entity_idx",
+          "columns": [
+            "entity_type",
+            "entity_id",
+            "kind",
+            "ord"
+          ],
+          "isUnique": false
+        },
+        "chrono_span_kind_idx": {
+          "name": "chrono_span_kind_idx",
+          "columns": [
+            "kind"
+          ],
+          "isUnique": false
+        },
+        "chrono_span_range_idx": {
+          "name": "chrono_span_range_idx",
+          "columns": [
+            "start_year",
+            "end_year"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "chrono_span_entity_type_check": {
+          "name": "chrono_span_entity_type_check",
+          "value": "\"chrono_span\".\"entity_type\" in ('person','place','event','journey')"
+        },
+        "chrono_span_kind_check": {
+          "name": "chrono_span_kind_check",
+          "value": "\"chrono_span\".\"kind\" in ('life','reign','ministry','journey','event_window','composition','other')"
+        },
+        "chrono_span_precision_check": {
+          "name": "chrono_span_precision_check",
+          "value": "\"chrono_span\".\"precision\" in ('exact','approx','uncertain')"
+        },
+        "chrono_span_start_month_check": {
+          "name": "chrono_span_start_month_check",
+          "value": "\"chrono_span\".\"start_month\" is null or (\"chrono_span\".\"start_month\" >= 1 and \"chrono_span\".\"start_month\" <= 12)"
+        },
+        "chrono_span_end_month_check": {
+          "name": "chrono_span_end_month_check",
+          "value": "\"chrono_span\".\"end_month\" is null or (\"chrono_span\".\"end_month\" >= 1 and \"chrono_span\".\"end_month\" <= 12)"
+        },
+        "chrono_span_start_day_check": {
+          "name": "chrono_span_start_day_check",
+          "value": "\"chrono_span\".\"start_day\" is null or (\"chrono_span\".\"start_day\" >= 1 and \"chrono_span\".\"start_day\" <= 31)"
+        },
+        "chrono_span_end_day_check": {
+          "name": "chrono_span_end_day_check",
+          "value": "\"chrono_span\".\"end_day\" is null or (\"chrono_span\".\"end_day\" >= 1 and \"chrono_span\".\"end_day\" <= 31)"
+        },
+        "chrono_span_conf_check": {
+          "name": "chrono_span_conf_check",
+          "value": "\"chrono_span\".\"confidence\" is null or (\"chrono_span\".\"confidence\" >= 0 and \"chrono_span\".\"confidence\" <= 1)"
+        },
+        "chrono_span_ord_check": {
+          "name": "chrono_span_ord_check",
+          "value": "\"chrono_span\".\"ord\" >= 0"
+        }
+      }
+    },
+    "cross_ref": {
+      "name": "cross_ref",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "to_canon_id": {
+          "name": "to_canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "to_book_id": {
+          "name": "to_book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "to_chapter": {
+          "name": "to_chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "to_verse": {
+          "name": "to_verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'see_also'"
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "cross_ref_from_idx": {
+          "name": "cross_ref_from_idx",
+          "columns": [
+            "canon_id",
+            "book_id",
+            "chapter",
+            "verse",
+            "ord"
+          ],
+          "isUnique": false
+        },
+        "cross_ref_to_idx": {
+          "name": "cross_ref_to_idx",
+          "columns": [
+            "to_canon_id",
+            "to_book_id",
+            "to_chapter",
+            "to_verse"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "cross_ref_kind_check": {
+          "name": "cross_ref_kind_check",
+          "value": "length(\"cross_ref\".\"kind\") > 0"
+        },
+        "cross_ref_span_check": {
+          "name": "cross_ref_span_check",
+          "value": "\"cross_ref\".\"chapter\" > 0 and \"cross_ref\".\"verse\" > 0 and \"cross_ref\".\"to_chapter\" > 0 and \"cross_ref\".\"to_verse\" > 0"
+        }
+      }
+    },
+    "drawer_history": {
+      "name": "drawer_history",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "entity_type": {
+          "name": "entity_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_id": {
+          "name": "entity_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "drawer_history_user_idx": {
+          "name": "drawer_history_user_idx",
+          "columns": [
+            "user_id",
+            "created_at"
+          ],
+          "isUnique": false
+        },
+        "drawer_history_entity_idx": {
+          "name": "drawer_history_entity_idx",
+          "columns": [
+            "entity_type",
+            "entity_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "drawer_history_type_check": {
+          "name": "drawer_history_type_check",
+          "value": "\"drawer_history\".\"entity_type\" in ('person','place','event')"
+        },
+        "drawer_history_ref_check": {
+          "name": "drawer_history_ref_check",
+          "value": "(\"drawer_history\".\"chapter\" is null and \"drawer_history\".\"verse\" is null) or (\"drawer_history\".\"chapter\" > 0 and \"drawer_history\".\"verse\" > 0)"
+        }
+      }
+    },
+    "entity_source": {
+      "name": "entity_source",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_type": {
+          "name": "entity_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_id": {
+          "name": "entity_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "start_chapter": {
+          "name": "start_chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "start_verse": {
+          "name": "start_verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "end_chapter": {
+          "name": "end_chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "end_verse": {
+          "name": "end_verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "entity_source_entity_idx": {
+          "name": "entity_source_entity_idx",
+          "columns": [
+            "entity_type",
+            "entity_id",
+            "ord"
+          ],
+          "isUnique": false
+        },
+        "entity_source_range_idx": {
+          "name": "entity_source_range_idx",
+          "columns": [
+            "canon_id",
+            "book_id",
+            "start_chapter",
+            "start_verse"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "entity_source_type_check": {
+          "name": "entity_source_type_check",
+          "value": "\"entity_source\".\"entity_type\" in ('person','place','event')"
+        },
+        "entity_source_span_check": {
+          "name": "entity_source_span_check",
+          "value": "\"entity_source\".\"start_chapter\" > 0 and \"entity_source\".\"start_verse\" > 0 and \"entity_source\".\"end_chapter\" > 0 and \"entity_source\".\"end_verse\" > 0"
+        }
+      }
+    },
+    "event": {
+      "name": "event",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "title": {
+          "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "summary": {
+          "name": "summary",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "place_id": {
+          "name": "place_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "era": {
+          "name": "era",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "time_hint": {
+          "name": "time_hint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "event_title_idx": {
+          "name": "event_title_idx",
+          "columns": [
+            "title"
+          ],
+          "isUnique": false
+        },
+        "event_place_idx": {
+          "name": "event_place_idx",
+          "columns": [
+            "place_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "event_title_check": {
+          "name": "event_title_check",
+          "value": "length(\"event\".\"title\") > 0"
+        }
+      }
+    },
+    "event_participant": {
+      "name": "event_participant",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "event_id": {
+          "name": "event_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "person_id": {
+          "name": "person_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "role": {
+          "name": "role",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "event_participant_event_idx": {
+          "name": "event_participant_event_idx",
+          "columns": [
+            "event_id",
+            "ord"
+          ],
+          "isUnique": false
+        },
+        "event_participant_person_idx": {
+          "name": "event_participant_person_idx",
+          "columns": [
+            "person_id"
+          ],
+          "isUnique": false
+        },
+        "event_participant_unique": {
+          "name": "event_participant_unique",
+          "columns": [
+            "event_id",
+            "person_id",
+            "role"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "event_ref": {
+      "name": "event_ref",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "event_id": {
+          "name": "event_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "start_chapter": {
+          "name": "start_chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "start_verse": {
+          "name": "start_verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "end_chapter": {
+          "name": "end_chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "end_verse": {
+          "name": "end_verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "event_ref_event_idx": {
+          "name": "event_ref_event_idx",
+          "columns": [
+            "event_id",
+            "ord"
+          ],
+          "isUnique": false
+        },
+        "event_ref_range_idx": {
+          "name": "event_ref_range_idx",
+          "columns": [
+            "canon_id",
+            "book_id",
+            "start_chapter",
+            "start_verse"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "event_ref_span_check": {
+          "name": "event_ref_span_check",
+          "value": "\"event_ref\".\"start_chapter\" > 0 and \"event_ref\".\"start_verse\" > 0 and \"event_ref\".\"end_chapter\" > 0 and \"event_ref\".\"end_verse\" > 0"
+        }
+      }
+    },
+    "footnote": {
+      "name": "footnote",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "translation_revision_id": {
+          "name": "translation_revision_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "marker": {
+          "name": "marker",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "content": {
+          "name": "content",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "footnote_verse_idx": {
+          "name": "footnote_verse_idx",
+          "columns": [
+            "translation_revision_id",
+            "canon_id",
+            "book_id",
+            "chapter",
+            "verse",
+            "ord"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "footnote_nonempty_check": {
+          "name": "footnote_nonempty_check",
+          "value": "length(\"footnote\".\"content\") > 0"
+        }
+      }
+    },
+    "highlight": {
+      "name": "highlight",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "start": {
+          "name": "start",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "end": {
+          "name": "end",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "color": {
+          "name": "color",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "highlight_user_idx": {
+          "name": "highlight_user_idx",
+          "columns": [
+            "user_id",
+            "created_at"
+          ],
+          "isUnique": false
+        },
+        "highlight_ref_idx": {
+          "name": "highlight_ref_idx",
+          "columns": [
+            "user_id",
+            "canon_id",
+            "book_id",
+            "chapter",
+            "verse"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "highlight_color_check": {
+          "name": "highlight_color_check",
+          "value": "\"highlight\".\"color\" in ('gray','yellow','green','blue','purple','red')"
+        },
+        "highlight_span_check": {
+          "name": "highlight_span_check",
+          "value": "(\"highlight\".\"start\" is null and \"highlight\".\"end\" is null) or (\"highlight\".\"start\" >= 0 and \"highlight\".\"end\" > \"highlight\".\"start\")"
+        }
+      }
+    },
+    "journey": {
+      "name": "journey",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "person_id": {
+          "name": "person_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "label": {
+          "name": "label",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "summary": {
+          "name": "summary",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "era": {
+          "name": "era",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "journey_person_idx": {
+          "name": "journey_person_idx",
+          "columns": [
+            "person_id",
+            "ord"
+          ],
+          "isUnique": false
+        },
+        "journey_label_idx": {
+          "name": "journey_label_idx",
+          "columns": [
+            "label"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "journey_label_check": {
+          "name": "journey_label_check",
+          "value": "length(\"journey\".\"label\") > 0"
+        }
+      }
+    },
+    "journey_path": {
+      "name": "journey_path",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "journey_id": {
+          "name": "journey_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "seq": {
+          "name": "seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "geojson": {
+          "name": "geojson",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "source_doc_id": {
+          "name": "source_doc_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source_ref": {
+          "name": "source_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "confidence": {
+          "name": "confidence",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "journey_path_unique_seq": {
+          "name": "journey_path_unique_seq",
+          "columns": [
+            "journey_id",
+            "seq"
+          ],
+          "isUnique": true
+        },
+        "journey_path_journey_idx": {
+          "name": "journey_path_journey_idx",
+          "columns": [
+            "journey_id",
+            "seq"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "journey_path_geojson_check": {
+          "name": "journey_path_geojson_check",
+          "value": "length(\"journey_path\".\"geojson\") > 0"
+        },
+        "journey_path_conf_check": {
+          "name": "journey_path_conf_check",
+          "value": "\"journey_path\".\"confidence\" is null or (\"journey_path\".\"confidence\" >= 0 and \"journey_path\".\"confidence\" <= 1)"
+        }
+      }
+    },
+    "journey_stop": {
+      "name": "journey_stop",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "journey_id": {
+          "name": "journey_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "seq": {
+          "name": "seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "place_id": {
+          "name": "place_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "journey_stop_unique_seq": {
+          "name": "journey_stop_unique_seq",
+          "columns": [
+            "journey_id",
+            "seq"
+          ],
+          "isUnique": true
+        },
+        "journey_stop_journey_idx": {
+          "name": "journey_stop_journey_idx",
+          "columns": [
+            "journey_id",
+            "seq"
+          ],
+          "isUnique": false
+        },
+        "journey_stop_place_idx": {
+          "name": "journey_stop_place_idx",
+          "columns": [
+            "place_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "journey_stop_seq_check": {
+          "name": "journey_stop_seq_check",
+          "value": "\"journey_stop\".\"seq\" >= 0"
+        },
+        "journey_stop_ref_check": {
+          "name": "journey_stop_ref_check",
+          "value": "(\"journey_stop\".\"chapter\" is null and \"journey_stop\".\"verse\" is null) or (\"journey_stop\".\"chapter\" > 0 and \"journey_stop\".\"verse\" > 0)"
+        }
+      }
+    },
+    "note": {
+      "name": "note",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "entity_type": {
+          "name": "entity_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "entity_id": {
+          "name": "entity_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "title": {
+          "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "body": {
+          "name": "body",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "note_user_idx": {
+          "name": "note_user_idx",
+          "columns": [
+            "user_id",
+            "created_at"
+          ],
+          "isUnique": false
+        },
+        "note_verse_idx": {
+          "name": "note_verse_idx",
+          "columns": [
+            "user_id",
+            "canon_id",
+            "book_id",
+            "chapter",
+            "verse"
+          ],
+          "isUnique": false
+        },
+        "note_entity_idx": {
+          "name": "note_entity_idx",
+          "columns": [
+            "user_id",
+            "entity_type",
+            "entity_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "note_entity_type_check": {
+          "name": "note_entity_type_check",
+          "value": "\"note\".\"entity_type\" is null or \"note\".\"entity_type\" in ('person','place','event')"
+        },
+        "note_body_nonempty_check": {
+          "name": "note_body_nonempty_check",
+          "value": "length(\"note\".\"body\") > 0"
+        }
+      }
+    },
+    "person": {
+      "name": "person",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "display_name": {
+          "name": "display_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "sort_name": {
+          "name": "sort_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "sex": {
+          "name": "sex",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "title": {
+          "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "summary": {
+          "name": "summary",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "bio": {
+          "name": "bio",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "era": {
+          "name": "era",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "image_asset_id": {
+          "name": "image_asset_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "person_display_name_idx": {
+          "name": "person_display_name_idx",
+          "columns": [
+            "display_name"
+          ],
+          "isUnique": false
+        },
+        "person_sort_name_idx": {
+          "name": "person_sort_name_idx",
+          "columns": [
+            "sort_name"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "person_sex_check": {
+          "name": "person_sex_check",
+          "value": "\"person\".\"sex\" is null or \"person\".\"sex\" in ('male','female')"
+        }
+      }
+    },
+    "person_alias": {
+      "name": "person_alias",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "person_id": {
+          "name": "person_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "alias": {
+          "name": "alias",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "lang": {
+          "name": "lang",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "person_alias_alias_idx": {
+          "name": "person_alias_alias_idx",
+          "columns": [
+            "alias"
+          ],
+          "isUnique": false
+        },
+        "person_alias_person_idx": {
+          "name": "person_alias_person_idx",
+          "columns": [
+            "person_id",
+            "ord"
+          ],
+          "isUnique": false
+        },
+        "person_alias_unique": {
+          "name": "person_alias_unique",
+          "columns": [
+            "person_id",
+            "alias"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "person_alias_nonempty_check": {
+          "name": "person_alias_nonempty_check",
+          "value": "length(\"person_alias\".\"alias\") > 0"
+        }
+      }
+    },
+    "person_place": {
+      "name": "person_place",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "person_id": {
+          "name": "person_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "place_id": {
+          "name": "place_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "time_hint": {
+          "name": "time_hint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source_ref": {
+          "name": "source_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "person_place_person_idx": {
+          "name": "person_place_person_idx",
+          "columns": [
+            "person_id",
+            "kind",
+            "ord"
+          ],
+          "isUnique": false
+        },
+        "person_place_place_idx": {
+          "name": "person_place_place_idx",
+          "columns": [
+            "place_id",
+            "kind"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "person_place_kind_check": {
+          "name": "person_place_kind_check",
+          "value": "\"person_place\".\"kind\" in ('born_in','died_in','lived_in','traveled_to','ministered_in','exiled_to','battle_at','imprisoned_in')"
+        }
+      }
+    },
+    "person_relationship": {
+      "name": "person_relationship",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "from_person_id": {
+          "name": "from_person_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "to_person_id": {
+          "name": "to_person_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "confidence": {
+          "name": "confidence",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "person_relationship_from_idx": {
+          "name": "person_relationship_from_idx",
+          "columns": [
+            "from_person_id",
+            "kind"
+          ],
+          "isUnique": false
+        },
+        "person_relationship_to_idx": {
+          "name": "person_relationship_to_idx",
+          "columns": [
+            "to_person_id",
+            "kind"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "person_relationship_kind_check": {
+          "name": "person_relationship_kind_check",
+          "value": "\"person_relationship\".\"kind\" in ('parent','child','spouse','sibling','teacher_of','disciple_of','king_of','prophet_to','enemy_of','covenant_with')"
+        },
+        "person_relationship_conf_check": {
+          "name": "person_relationship_conf_check",
+          "value": "\"person_relationship\".\"confidence\" is null or (\"person_relationship\".\"confidence\" >= 0 and \"person_relationship\".\"confidence\" <= 1)"
+        },
+        "person_relationship_not_self_check": {
+          "name": "person_relationship_not_self_check",
+          "value": "\"person_relationship\".\"from_person_id\" != \"person_relationship\".\"to_person_id\""
+        }
+      }
+    },
+    "person_tag": {
+      "name": "person_tag",
+      "columns": {
+        "person_id": {
+          "name": "person_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "tag_id": {
+          "name": "tag_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "person_tag_person_idx": {
+          "name": "person_tag_person_idx",
+          "columns": [
+            "person_id",
+            "ord"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "person_tag_person_id_tag_id_pk": {
+          "columns": [
+            "person_id",
+            "tag_id"
+          ],
+          "name": "person_tag_person_id_tag_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "place": {
+      "name": "place",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'other'"
+        },
+        "lat": {
+          "name": "lat",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "lon": {
+          "name": "lon",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "geojson": {
+          "name": "geojson",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "summary": {
+          "name": "summary",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "description": {
+          "name": "description",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "era": {
+          "name": "era",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "image_asset_id": {
+          "name": "image_asset_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "place_name_idx": {
+          "name": "place_name_idx",
+          "columns": [
+            "name"
+          ],
+          "isUnique": false
+        },
+        "place_coord_idx": {
+          "name": "place_coord_idx",
+          "columns": [
+            "lat",
+            "lon"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "place_kind_check": {
+          "name": "place_kind_check",
+          "value": "\"place\".\"kind\" in ('city','region','river','mountain','sea','desert','route','other')"
+        },
+        "place_lat_check": {
+          "name": "place_lat_check",
+          "value": "\"place\".\"lat\" is null or (\"place\".\"lat\" >= -90 and \"place\".\"lat\" <= 90)"
+        },
+        "place_lon_check": {
+          "name": "place_lon_check",
+          "value": "\"place\".\"lon\" is null or (\"place\".\"lon\" >= -180 and \"place\".\"lon\" <= 180)"
+        }
+      }
+    },
+    "place_alias": {
+      "name": "place_alias",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "place_id": {
+          "name": "place_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "alias": {
+          "name": "alias",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "lang": {
+          "name": "lang",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "place_alias_alias_idx": {
+          "name": "place_alias_alias_idx",
+          "columns": [
+            "alias"
+          ],
+          "isUnique": false
+        },
+        "place_alias_place_idx": {
+          "name": "place_alias_place_idx",
+          "columns": [
+            "place_id",
+            "ord"
+          ],
+          "isUnique": false
+        },
+        "place_alias_unique": {
+          "name": "place_alias_unique",
+          "columns": [
+            "place_id",
+            "alias"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "place_alias_nonempty_check": {
+          "name": "place_alias_nonempty_check",
+          "value": "length(\"place_alias\".\"alias\") > 0"
+        }
+      }
+    },
+    "place_geo": {
+      "name": "place_geo",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "place_id": {
+          "name": "place_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "lat": {
+          "name": "lat",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "lon": {
+          "name": "lon",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "min_lat": {
+          "name": "min_lat",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "min_lon": {
+          "name": "min_lon",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "max_lat": {
+          "name": "max_lat",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "max_lon": {
+          "name": "max_lon",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "geojson": {
+          "name": "geojson",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source_doc_id": {
+          "name": "source_doc_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source_ref": {
+          "name": "source_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "confidence": {
+          "name": "confidence",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "place_geo_place_idx": {
+          "name": "place_geo_place_idx",
+          "columns": [
+            "place_id",
+            "ord"
+          ],
+          "isUnique": false
+        },
+        "place_geo_kind_idx": {
+          "name": "place_geo_kind_idx",
+          "columns": [
+            "place_id",
+            "kind"
+          ],
+          "isUnique": false
+        },
+        "place_geo_bbox_idx": {
+          "name": "place_geo_bbox_idx",
+          "columns": [
+            "min_lat",
+            "min_lon",
+            "max_lat",
+            "max_lon"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "place_geo_kind_check": {
+          "name": "place_geo_kind_check",
+          "value": "\"place_geo\".\"kind\" in ('point','bbox','polygon','polyline')"
+        },
+        "place_geo_lat_check": {
+          "name": "place_geo_lat_check",
+          "value": "\"place_geo\".\"lat\" is null or (\"place_geo\".\"lat\" >= -90 and \"place_geo\".\"lat\" <= 90)"
+        },
+        "place_geo_lon_check": {
+          "name": "place_geo_lon_check",
+          "value": "\"place_geo\".\"lon\" is null or (\"place_geo\".\"lon\" >= -180 and \"place_geo\".\"lon\" <= 180)"
+        },
+        "place_geo_bbox_check": {
+          "name": "place_geo_bbox_check",
+          "value": "(\"place_geo\".\"min_lat\" is null and \"place_geo\".\"min_lon\" is null and \"place_geo\".\"max_lat\" is null and \"place_geo\".\"max_lon\" is null)\n          or (\"place_geo\".\"min_lat\" <= \"place_geo\".\"max_lat\" and \"place_geo\".\"min_lon\" <= \"place_geo\".\"max_lon\")"
+        },
+        "place_geo_conf_check": {
+          "name": "place_geo_conf_check",
+          "value": "\"place_geo\".\"confidence\" is null or (\"place_geo\".\"confidence\" >= 0 and \"place_geo\".\"confidence\" <= 1)"
+        },
+        "place_geo_ord_check": {
+          "name": "place_geo_ord_check",
+          "value": "\"place_geo\".\"ord\" >= 0"
+        }
+      }
+    },
+    "place_tag": {
+      "name": "place_tag",
+      "columns": {
+        "place_id": {
+          "name": "place_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "tag_id": {
+          "name": "tag_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "place_tag_place_idx": {
+          "name": "place_tag_place_idx",
+          "columns": [
+            "place_id",
+            "ord"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "place_tag_place_id_tag_id_pk": {
+          "columns": [
+            "place_id",
+            "tag_id"
+          ],
+          "name": "place_tag_place_id_tag_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "reading_progress": {
+      "name": "reading_progress",
+      "columns": {
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "reading_progress_user_id_canon_id_book_id_pk": {
+          "columns": [
+            "user_id",
+            "canon_id",
+            "book_id"
+          ],
+          "name": "reading_progress_user_id_canon_id_book_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "reading_progress_chapter_check": {
+          "name": "reading_progress_chapter_check",
+          "value": "\"reading_progress\".\"chapter\" > 0"
+        },
+        "reading_progress_verse_check": {
+          "name": "reading_progress_verse_check",
+          "value": "\"reading_progress\".\"verse\" > 0"
+        }
+      }
+    },
+    "settings": {
+      "name": "settings",
+      "columns": {
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "key": {
+          "name": "key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "value": {
+          "name": "value",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "settings_user_id_key_pk": {
+          "columns": [
+            "user_id",
+            "key"
+          ],
+          "name": "settings_user_id_key_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "settings_key_check": {
+          "name": "settings_key_check",
+          "value": "length(\"settings\".\"key\") > 0"
+        },
+        "settings_value_check": {
+          "name": "settings_value_check",
+          "value": "length(\"settings\".\"value\") > 0"
+        }
+      }
+    },
+    "source_doc": {
+      "name": "source_doc",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "title": {
+          "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "author": {
+          "name": "author",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "year": {
+          "name": "year",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "url": {
+          "name": "url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "license": {
+          "name": "license",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "citation": {
+          "name": "citation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "source_doc_kind_idx": {
+          "name": "source_doc_kind_idx",
+          "columns": [
+            "kind"
+          ],
+          "isUnique": false
+        },
+        "source_doc_title_idx": {
+          "name": "source_doc_title_idx",
+          "columns": [
+            "title"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "source_doc_kind_check": {
+          "name": "source_doc_kind_check",
+          "value": "\"source_doc\".\"kind\" in ('scripture','gazetteer','atlas','academic','tradition','other')"
+        },
+        "source_doc_title_check": {
+          "name": "source_doc_title_check",
+          "value": "length(\"source_doc\".\"title\") > 0"
+        },
+        "source_doc_year_check": {
+          "name": "source_doc_year_check",
+          "value": "\"source_doc\".\"year\" is null or (\"source_doc\".\"year\" >= 0 and \"source_doc\".\"year\" <= 3000)"
+        }
+      }
+    },
+    "tag": {
+      "name": "tag",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "slug": {
+          "name": "slug",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "label": {
+          "name": "label",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'general'"
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "tag_unique_slug": {
+          "name": "tag_unique_slug",
+          "columns": [
+            "slug"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "tag_kind_check": {
+          "name": "tag_kind_check",
+          "value": "\"tag\".\"kind\" in ('general','role','era','topic')"
+        },
+        "tag_slug_check": {
+          "name": "tag_slug_check",
+          "value": "length(\"tag\".\"slug\") > 0"
+        },
+        "tag_label_check": {
+          "name": "tag_label_check",
+          "value": "length(\"tag\".\"label\") > 0"
+        }
+      }
+    },
+    "translation": {
+      "name": "translation",
+      "columns": {
+        "translation_id": {
+          "name": "translation_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "language": {
+          "name": "language",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "description": {
+          "name": "description",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "translation_language_idx": {
+          "name": "translation_language_idx",
+          "columns": [
+            "language"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "translation_id_check": {
+          "name": "translation_id_check",
+          "value": "length(\"translation\".\"translation_id\") > 0"
+        }
+      }
+    },
+    "translation_default_revision": {
+      "name": "translation_default_revision",
+      "columns": {
+        "translation_id": {
+          "name": "translation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "purpose": {
+          "name": "purpose",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "translation_revision_id": {
+          "name": "translation_revision_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "translation_default_revision_translation_id_canon_id_purpose_pk": {
+          "columns": [
+            "translation_id",
+            "canon_id",
+            "purpose"
+          ],
+          "name": "translation_default_revision_translation_id_canon_id_purpose_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "translation_default_revision_purpose_check": {
+          "name": "translation_default_revision_purpose_check",
+          "value": "\"translation_default_revision\".\"purpose\" in ('reading','editing')"
+        }
+      }
+    },
+    "translation_revision": {
+      "name": "translation_revision",
+      "columns": {
+        "translation_revision_id": {
+          "name": "translation_revision_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "translation_id": {
+          "name": "translation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "label": {
+          "name": "label",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "based_on_revision_id": {
+          "name": "based_on_revision_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "published_at": {
+          "name": "published_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "translation_revision_translation_idx": {
+          "name": "translation_revision_translation_idx",
+          "columns": [
+            "translation_id",
+            "status"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "translation_revision_status_check": {
+          "name": "translation_revision_status_check",
+          "value": "\"translation_revision\".\"status\" in ('draft','published','archived')"
+        },
+        "translation_revision_label_check": {
+          "name": "translation_revision_label_check",
+          "value": "length(\"translation_revision\".\"label\") > 0"
+        }
+      }
+    },
+    "user": {
+      "name": "user",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "display_name": {
+          "name": "display_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "verse": {
+      "name": "verse",
+      "columns": {
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "verse_ordinal": {
+          "name": "verse_ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "verse_unique_ordinal": {
+          "name": "verse_unique_ordinal",
+          "columns": [
+            "canon_id",
+            "verse_ordinal"
+          ],
+          "isUnique": true
+        },
+        "verse_book_idx": {
+          "name": "verse_book_idx",
+          "columns": [
+            "canon_id",
+            "book_id",
+            "chapter",
+            "verse"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "verse_canon_id_book_id_chapter_verse_pk": {
+          "columns": [
+            "canon_id",
+            "book_id",
+            "chapter",
+            "verse"
+          ],
+          "name": "verse_canon_id_book_id_chapter_verse_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "verse_chapter_check": {
+          "name": "verse_chapter_check",
+          "value": "\"verse\".\"chapter\" > 0"
+        },
+        "verse_verse_check": {
+          "name": "verse_verse_check",
+          "value": "\"verse\".\"verse\" > 0"
+        },
+        "verse_ordinal_check": {
+          "name": "verse_ordinal_check",
+          "value": "\"verse\".\"verse_ordinal\" > 0"
+        }
+      }
+    },
+    "verse_mark": {
+      "name": "verse_mark",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "translation_revision_id": {
+          "name": "translation_revision_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "payload": {
+          "name": "payload",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "verse_mark_verse_idx": {
+          "name": "verse_mark_verse_idx",
+          "columns": [
+            "translation_revision_id",
+            "canon_id",
+            "book_id",
+            "chapter",
+            "verse",
+            "ord"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "verse_mark_kind_check": {
+          "name": "verse_mark_kind_check",
+          "value": "\"verse_mark\".\"kind\" in ('heading','subheading','paragraph_break','poetry_line','speaker','red_letter','selah')"
+        },
+        "verse_mark_ord_check": {
+          "name": "verse_mark_ord_check",
+          "value": "\"verse_mark\".\"ord\" >= 0"
+        }
+      }
+    },
+    "verse_mention": {
+      "name": "verse_mention",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "translation_revision_id": {
+          "name": "translation_revision_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_type": {
+          "name": "entity_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_id": {
+          "name": "entity_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "start": {
+          "name": "start",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "end": {
+          "name": "end",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "surface": {
+          "name": "surface",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ord": {
+          "name": "ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "verse_mention_verse_idx": {
+          "name": "verse_mention_verse_idx",
+          "columns": [
+            "translation_revision_id",
+            "canon_id",
+            "book_id",
+            "chapter",
+            "verse",
+            "start",
+            "end"
+          ],
+          "isUnique": false
+        },
+        "verse_mention_entity_idx": {
+          "name": "verse_mention_entity_idx",
+          "columns": [
+            "entity_type",
+            "entity_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "verse_mention_type_check": {
+          "name": "verse_mention_type_check",
+          "value": "\"verse_mention\".\"entity_type\" in ('person','place','event')"
+        },
+        "verse_mention_span_check": {
+          "name": "verse_mention_span_check",
+          "value": "\"verse_mention\".\"start\" >= 0 and \"verse_mention\".\"end\" > \"verse_mention\".\"start\""
+        },
+        "verse_mention_surface_check": {
+          "name": "verse_mention_surface_check",
+          "value": "length(\"verse_mention\".\"surface\") > 0"
+        }
+      }
+    },
+    "verse_text": {
+      "name": "verse_text",
+      "columns": {
+        "translation_revision_id": {
+          "name": "translation_revision_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "canon_id": {
+          "name": "canon_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chapter": {
+          "name": "chapter",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "verse": {
+          "name": "verse",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "text": {
+          "name": "text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "verse_text_book_read_idx": {
+          "name": "verse_text_book_read_idx",
+          "columns": [
+            "translation_revision_id",
+            "canon_id",
+            "book_id",
+            "chapter",
+            "verse"
+          ],
+          "isUnique": false
+        },
+        "verse_text_revision_idx": {
+          "name": "verse_text_revision_idx",
+          "columns": [
+            "translation_revision_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "verse_text_translation_revision_id_canon_id_book_id_chapter_verse_pk": {
+          "columns": [
+            "translation_revision_id",
+            "canon_id",
+            "book_id",
+            "chapter",
+            "verse"
+          ],
+          "name": "verse_text_translation_revision_id_canon_id_book_id_chapter_verse_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "verse_text_nonempty_check": {
+          "name": "verse_text_nonempty_check",
+          "value": "length(\"verse_text\".\"text\") > 0"
+        },
+        "verse_text_chapter_check": {
+          "name": "verse_text_chapter_check",
+          "value": "\"verse_text\".\"chapter\" > 0"
+        },
+        "verse_text_verse_check": {
+          "name": "verse_text_verse_check",
+          "value": "\"verse_text\".\"verse\" > 0"
+        }
+      }
+    }
+  },
+  "views": {},
+  "enums": {},
+  "_meta": {
+    "schemas": {},
+    "tables": {},
+    "columns": {}
+  },
+  "internal": {
+    "indexes": {}
+  }
+}

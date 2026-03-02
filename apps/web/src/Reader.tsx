@@ -1,18 +1,22 @@
-// apps/web/src/Reader.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { apiGetBooks, apiGetChapter, type BookRow, type ChapterPayload } from "./api";
+import type { ReaderLocation } from "./Search";
 
 type Props = {
     styles: Record<string, React.CSSProperties>;
     onBackHome: () => void;
+    initialLocation?: ReaderLocation;
 };
 
 export function Reader(props: Props) {
-    const { styles } = props;
+    const { styles, initialLocation } = props;
 
     const [books, setBooks] = useState<BookRow[] | null>(null);
-    const [bookId, setBookId] = useState<string>("GEN");
-    const [chapter, setChapter] = useState<number>(1);
+
+    const [bookId, setBookId] = useState<string>(initialLocation?.bookId ?? "GEN");
+    const [chapter, setChapter] = useState<number>(initialLocation?.chapter ?? 1);
+
+    const [focusVerse, setFocusVerse] = useState<number | null>(initialLocation?.verse ?? null);
 
     const [data, setData] = useState<ChapterPayload | null>(null);
     const [loading, setLoading] = useState(false);
@@ -23,6 +27,14 @@ export function Reader(props: Props) {
     const [pressNext, setPressNext] = useState(false);
 
     const contentRef = useRef<HTMLDivElement | null>(null);
+
+    // Apply navigation updates when parent changes initialLocation
+    useEffect(() => {
+        if (!initialLocation) return;
+        setBookId(initialLocation.bookId);
+        setChapter(initialLocation.chapter);
+        setFocusVerse(initialLocation.verse ?? null);
+    }, [initialLocation?.bookId, initialLocation?.chapter, initialLocation?.verse]);
 
     // Load books once
     useEffect(() => {
@@ -35,6 +47,12 @@ export function Reader(props: Props) {
         };
     }, []);
 
+    const book = useMemo(() => books?.find((b) => b.bookId === bookId) ?? null, [books, bookId]);
+    const maxChapters = book?.chapters ?? null;
+
+    const canPrev = chapter > 1;
+    const canNext = maxChapters ? chapter < maxChapters : true;
+
     // Load chapter
     useEffect(() => {
         let alive = true;
@@ -46,7 +64,16 @@ export function Reader(props: Props) {
                 if (!alive) return;
                 setData(r);
                 setLoading(false);
+
                 requestAnimationFrame(() => {
+                    if (focusVerse != null) {
+                        const id = verseDomId(bookId, chapter, focusVerse);
+                        const el = document.getElementById(id);
+                        if (el) {
+                            el.scrollIntoView({ block: "center", behavior: "auto" });
+                            return;
+                        }
+                    }
                     contentRef.current?.scrollIntoView({ block: "start", behavior: "auto" });
                 });
             })
@@ -59,12 +86,13 @@ export function Reader(props: Props) {
         return () => {
             alive = false;
         };
-    }, [bookId, chapter]);
+    }, [bookId, chapter, focusVerse]);
 
-    const book = useMemo(() => books?.find((b) => b.bookId === bookId) ?? null, [books, bookId]);
-
-    const canPrev = chapter > 1;
-    const canNext = book ? chapter < book.chaptersCount : true;
+    // Clamp chapter if book changes
+    useEffect(() => {
+        if (!maxChapters) return;
+        if (chapter > maxChapters) setChapter(maxChapters);
+    }, [maxChapters, chapter]);
 
     const backStyle: React.CSSProperties = { ...r.backBtn, ...(pressBack ? styles.btnPressed : null) };
     const prevStyle: React.CSSProperties = { ...r.navBtn, ...(pressPrev ? styles.btnPressed : null) };
@@ -72,7 +100,6 @@ export function Reader(props: Props) {
 
     return (
         <main style={r.page}>
-            {/* Centered / narrower bars (uses your new base.css container-reading width) */}
             <div className="container-reading">
                 <div style={r.topBar}>
                     <button
@@ -95,6 +122,7 @@ export function Reader(props: Props) {
                         onChange={(e) => {
                             setBookId(e.target.value);
                             setChapter(1);
+                            setFocusVerse(null);
                         }}
                         style={r.select}
                         aria-label="Book"
@@ -111,7 +139,10 @@ export function Reader(props: Props) {
                             type="button"
                             style={{ ...prevStyle, ...(canPrev ? null : r.disabledBtn) }}
                             disabled={!canPrev}
-                            onClick={() => setChapter((c) => Math.max(1, c - 1))}
+                            onClick={() => {
+                                setChapter((c) => Math.max(1, c - 1));
+                                setFocusVerse(null);
+                            }}
                             onMouseDown={() => setPressPrev(true)}
                             onMouseUp={() => setPressPrev(false)}
                             onMouseLeave={() => setPressPrev(false)}
@@ -125,6 +156,7 @@ export function Reader(props: Props) {
                         <div style={r.chapterPill} aria-label="Current chapter">
               <span style={r.chapterPillText}>
                 {bookId} {chapter}
+                  {maxChapters ? ` / ${maxChapters}` : ""}
               </span>
                         </div>
 
@@ -132,7 +164,10 @@ export function Reader(props: Props) {
                             type="button"
                             style={{ ...nextStyle, ...(canNext ? null : r.disabledBtn) }}
                             disabled={!canNext}
-                            onClick={() => setChapter((c) => c + 1)}
+                            onClick={() => {
+                                setChapter((c) => (maxChapters ? Math.min(maxChapters, c + 1) : c + 1));
+                                setFocusVerse(null);
+                            }}
                             onMouseDown={() => setPressNext(true)}
                             onMouseUp={() => setPressNext(false)}
                             onMouseLeave={() => setPressNext(false)}
@@ -157,15 +192,19 @@ export function Reader(props: Props) {
 
                     <div ref={contentRef} />
 
-                    {data && <ChapterView data={data} />}
+                    {data && <ChapterView data={data} focusVerse={focusVerse} />}
                 </div>
             </div>
         </main>
     );
 }
 
-function ChapterView(props: { data: ChapterPayload }) {
-    const { data } = props;
+function verseDomId(bookId: string, chapter: number, verse: number): string {
+    return `v-${bookId}-${chapter}-${verse}`;
+}
+
+function ChapterView(props: { data: ChapterPayload; focusVerse: number | null }) {
+    const { data, focusVerse } = props;
 
     return (
         <article style={r.chapter}>
@@ -174,25 +213,36 @@ function ChapterView(props: { data: ChapterPayload }) {
                 <h1 style={r.chapterTitle}>
                     {data.bookId} {data.chapter}
                 </h1>
+                <div style={r.chapterSub}>
+          <span style={r.chapterSubText}>
+            Translation: <strong>{data.translationId}</strong>
+          </span>
+                </div>
             </header>
 
             <div style={r.verses}>
                 {data.verses.map((v) => (
-                    <VerseRow key={`${v.chapter}:${v.verse}`} verse={v.verse} text={v.text} />
+                    <VerseRow
+                        key={v.verseKey ?? `${v.chapter}:${v.verse}`}
+                        id={verseDomId(data.bookId, data.chapter, v.verse)}
+                        verse={v.verse}
+                        text={v.text}
+                        active={focusVerse === v.verse}
+                    />
                 ))}
             </div>
         </article>
     );
 }
 
-function VerseRow(props: { verse: number; text: string }) {
-    const { verse, text } = props;
+function VerseRow(props: { id: string; verse: number; text: string | null; active: boolean }) {
+    const { id, verse, text, active } = props;
+
     return (
-        <div style={r.verseRow}>
+        <div id={id} style={{ ...r.verseRow, ...(active ? r.verseRowActive : null) }}>
             <div style={r.verseNum}>{verse}</div>
-            {/* Slightly more “book” feel: serif + calmer size */}
             <div style={r.verseText} className="scripture">
-                {text}
+                {text ?? ""}
             </div>
         </div>
     );
@@ -201,7 +251,7 @@ function VerseRow(props: { verse: number; text: string }) {
 const r: Record<string, React.CSSProperties> = {
     page: {
         minHeight: "100vh",
-        padding: "16px 0 80px", // let container handle horizontal padding
+        padding: "16px 0 80px",
         color: "var(--fg)",
     },
 
@@ -231,7 +281,7 @@ const r: Record<string, React.CSSProperties> = {
         background: "var(--panel)",
         color: "inherit",
         outline: "none",
-        maxWidth: 240, // less wide
+        maxWidth: 240,
     },
 
     chapterNav: {
@@ -330,18 +380,32 @@ const r: Record<string, React.CSSProperties> = {
         letterSpacing: "-0.02em",
         lineHeight: 1.1,
     },
+    chapterSub: {
+        marginTop: 8,
+    },
+    chapterSubText: {
+        fontSize: 11,
+        color: "var(--muted)",
+        letterSpacing: "0.03em",
+    },
 
     verses: {
         marginTop: 14,
         display: "flex",
         flexDirection: "column",
-        gap: 12, // slightly more breathing room for reading
+        gap: 12,
     },
     verseRow: {
         display: "grid",
         gridTemplateColumns: "30px 1fr",
         gap: 12,
         alignItems: "start",
+        borderRadius: 12,
+        padding: "6px 6px",
+    },
+    verseRowActive: {
+        background: "rgba(255,255,255,0.04)",
+        outline: "1px solid var(--hairline)",
     },
     verseNum: {
         fontSize: 10,
@@ -352,7 +416,7 @@ const r: Record<string, React.CSSProperties> = {
         userSelect: "none",
     },
     verseText: {
-        fontSize: 0, // let .scripture set font-size; keep this as override hook if needed
+        fontSize: 0,
         lineHeight: 0,
         color: "var(--fg)",
     },
