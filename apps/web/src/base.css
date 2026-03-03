@@ -11,8 +11,8 @@
     "Apple Color Emoji", "Segoe UI Emoji";
     --font-serif: "Literata Variable", Literata, ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
     "Times New Roman", Times, serif;
-    --font-rounded: "Quicksand Variable", Quicksand, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans",
-    "Apple Color Emoji", "Segoe UI Emoji";
+    --font-rounded: "Quicksand Variable", Quicksand, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial,
+    "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
 
     /* Reader typography (scripture text only) */
     --bpScriptureFont: var(--font-serif);
@@ -23,16 +23,6 @@
     /* Reader column width (scripture + chrome alignment) */
     --bpReaderMeasure: 840px;
 
-    /* Default (Light) */
-    --bg: #ffffff;
-    --fg: #0b0b0b;
-    --muted: rgba(11, 11, 11, 0.60);
-    --hairline: rgba(11, 11, 11, 0.10);
-    --focus: rgba(11, 11, 11, 0.25);
-
-    /* Subtle surfaces */
-    --panel: rgba(0, 0, 0, 0.02);
-
     --radius: 16px;
     --radius-sm: 12px;
 
@@ -42,37 +32,90 @@
     /* Layout widths */
     --container: 980px; /* general */
     --reading: 720px;   /* learn page / prose */
+
+    /* ------------------------------------------------------------
+       Theme tokens (DEFAULT = softened Light)
+       NOTE: no color-mix / oklab to avoid tooling “typo” warnings.
+    ------------------------------------------------------------ */
+
+    /* softened light (less intense than pure white) */
+    --bg: #f6f4f0;
+    --fg: #0b0b0c;
+    --muted: rgba(11, 11, 12, 0.58);
+    --hairline: rgba(0, 0, 0, 0.11);
+
+    /* Surfaces */
+    --panel: rgba(0, 0, 0, 0.026);
+
+    /* Shadows (subtle, reusable) */
+    --shadow: 0 18px 60px rgba(0, 0, 0, 0.12);
+    --shadowSoft: 0 10px 34px rgba(0, 0, 0, 0.10);
+    --shadowPop: 0 24px 90px rgba(0, 0, 0, 0.20);
+
+    /* Focus */
+    --focus: rgba(0, 0, 0, 0.14);
+    --focusRing: rgba(0, 0, 0, 0.08);
+
+    /* Selection */
+    --selection: rgba(0, 0, 0, 0.12);
 }
 
 /* System preference (only when user has NOT manually set a theme) */
 @media (prefers-color-scheme: dark) {
     html:not([data-theme]) {
-        --bg: #070707;
-        --fg: #f4f4f4;
-        --muted: rgba(244, 244, 244, 0.70);
-        --hairline: rgba(244, 244, 244, 0.12);
-        --focus: rgba(244, 244, 244, 0.28);
-        --panel: rgba(255, 255, 255, 0.03);
+        --bg: #0b0b0c;
+        --fg: #f4f3f1;
+        --muted: rgba(244, 243, 241, 0.62);
+        --hairline: rgba(255, 255, 255, 0.10);
+
+        --panel: rgba(255, 255, 255, 0.045);
+
+        --shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+        --shadowSoft: 0 10px 34px rgba(0, 0, 0, 0.34);
+        --shadowPop: 0 26px 110px rgba(0, 0, 0, 0.56);
+
+        --focus: rgba(255, 255, 255, 0.22);
+        --focusRing: rgba(255, 255, 255, 0.12);
+
+        --selection: rgba(255, 255, 255, 0.14);
     }
 }
 
 /* Manual override (wins over system preference) */
 html[data-theme="light"] {
-    --bg: #ffffff;
-    --fg: #0b0b0b;
-    --muted: rgba(11, 11, 11, 0.60);
-    --hairline: rgba(11, 11, 11, 0.10);
-    --focus: rgba(11, 11, 11, 0.25);
-    --panel: rgba(0, 0, 0, 0.02);
+    --bg: #f6f4f0;
+    --fg: #0b0b0c;
+    --muted: rgba(11, 11, 12, 0.58);
+    --hairline: rgba(0, 0, 0, 0.11);
+
+    --panel: rgba(0, 0, 0, 0.026);
+
+    --shadow: 0 18px 60px rgba(0, 0, 0, 0.12);
+    --shadowSoft: 0 10px 34px rgba(0, 0, 0, 0.10);
+    --shadowPop: 0 24px 90px rgba(0, 0, 0, 0.20);
+
+    --focus: rgba(0,  0,  0,  0.14);
+    --focusRing: rgba(0, 0, 0, 0.08);
+
+    --selection: rgba(0, 0, 0, 0.12);
 }
 
 html[data-theme="dark"] {
-    --bg: #070707;
-    --fg: #f4f4f4;
-    --muted: rgba(244, 244, 244, 0.70);
-    --hairline: rgba(244, 244, 244, 0.12);
-    --focus: rgba(244, 244, 244, 0.28);
-    --panel: rgba(255, 255, 255, 0.03);
+    --bg: #0b0b0c;
+    --fg: #f4f3f1;
+    --muted: rgba(244, 243, 241, 0.62);
+    --hairline: rgba(255, 255, 255, 0.10);
+
+    --panel: rgba(255, 255, 255, 0.045);
+
+    --shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+    --shadowSoft: 0 10px 34px rgba(0, 0, 0, 0.34);
+    --shadowPop: 0 26px 110px rgba(0, 0, 0, 0.56);
+
+    --focus: rgba(255, 255, 255, 0.22);
+    --focusRing: rgba(255, 255, 255, 0.12);
+
+    --selection: rgba(255, 255, 255, 0.14);
 }
 
 *,
@@ -91,6 +134,9 @@ html {
     -webkit-text-size-adjust: 100%;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+
+    /* Helps scroll/overscroll feel clean; safe for a reader app */
+    scroll-behavior: auto;
 }
 
 body {
@@ -122,7 +168,7 @@ a:hover {
 }
 
 ::selection {
-    background: color-mix(in oklab, var(--fg) 14%, transparent);
+    background: var(--selection);
 }
 
 /* form controls inherit */
@@ -136,9 +182,21 @@ select {
 
 /* focus (calm, consistent) */
 :focus-visible {
-    outline: 2px solid var(--focus);
+    outline: 2px solid var(--focusRing);
     outline-offset: 2px;
     border-radius: 10px;
+}
+
+/* Reduce motion for people who request it */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+        scroll-behavior: auto !important;
+    }
 }
 
 /* ---------------- Layout utilities ---------------- */
@@ -175,16 +233,27 @@ select {
     line-height: var(--bpScriptureLeading);
     font-weight: var(--bpScriptureWeight);
     color: var(--fg);
+
+    /* Small improvements for reading */
+    text-rendering: optimizeLegibility;
+    font-kerning: normal;
+    font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
 }
 
+/* Mobile tweaks */
 @media (max-width: 480px) {
     :root {
         --bpScriptureSize: 17px;
         --bpReaderMeasure: 100%;
+        --text: 15.5px;
     }
 
     .prose {
         font-size: 17px;
+    }
+
+    .container {
+        width: calc(100% - 24px);
     }
 }
 
@@ -192,5 +261,16 @@ select {
 @media (max-width: 860px) {
     .container [data-landing-grid] {
         grid-template-columns: 1fr !important;
+    }
+}
+
+@keyframes panelPop {
+    from {
+        opacity: 0;
+        transform: scale(0.92) translateY(6px);
+    }
+    to {
+        opacity: 1;
+        transform: scale(1) translateY(0);
     }
 }

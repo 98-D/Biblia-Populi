@@ -1,3 +1,4 @@
+// apps/web/src/PositionPill.tsx
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { apiGetChapters, type BookRow, type ChaptersPayload } from "./api";
@@ -13,8 +14,8 @@ type Props = {
 const SCALE = 0.88;
 const S = (n: number) => Math.round(n * SCALE);
 
-const POPOVER_W = S(465);        // narrower overall
-const COL_NARROW_W = S(99);      // each column visibly slimmer
+const POPOVER_W = S(465);
+const COL_NARROW_W = S(99);
 const POPOVER_MAX_H = S(352);
 const POPOVER_MARGIN = 16;
 const LIST_PAD = S(14);
@@ -22,6 +23,18 @@ const LIST_PAD = S(14);
 const ACCENT = "#d10b2f";
 const ACCENT_SOFT = "rgba(209, 11, 47, 0.11)";
 const ACCENT_RING = "rgba(209, 11, 47, 0.28)";
+
+// Pill stability: sensible fixed width (no jitter while scrubbing).
+// “Sensible” here means: narrow enough to look tight, wide enough for most book names.
+const PILL_W_CLOSED = S(232);
+const PILL_W_OPEN = S(244);
+
+// Keep numeric column stable but slimmer (reduces empty runway).
+const NUM_COL_W = S(66);
+
+// Smaller internal air (without changing overall pill height).
+const PILL_PAD_X = S(9);
+const PILL_GAP = S(6);
 
 function pressedStyle(styles: Record<string, React.CSSProperties>): React.CSSProperties | null {
     return (styles as any).btnPressed ?? (styles as any).buttonPressed ?? null;
@@ -63,43 +76,54 @@ function computePopoverPos(anchor: DOMRect, desiredWidth: number): PopPos {
     return { left, top, height: Math.min(cap, Math.max(220, aboveAvail)), width };
 }
 
-function setRefInMap(map: Map<string, HTMLButtonElement | null>, key: string, el: HTMLButtonElement | null): void {
-    map.set(key, el);
-}
-
+// Optimized ListItem: memoizable, stable ref-map registration
 const ListItem = React.memo(
     ({
          active,
          onClick,
          children,
          tight = false,
-         refCb,
+         mapRef,
+         itemKey,
          ariaLabel,
      }: {
         active: boolean;
         onClick: () => void;
         children: React.ReactNode;
         tight?: boolean;
-        refCb?: (el: HTMLButtonElement | null) => void;
+        mapRef?: React.RefObject<Map<string, HTMLButtonElement | null>>;
+        itemKey?: string;
         ariaLabel?: string;
     }) => {
+        const ref = useRef<HTMLButtonElement>(null);
         const baseStyle = tight ? sx.itemTight : sx.item;
+
+        useEffect(() => {
+            if (!mapRef || !itemKey) return;
+            mapRef.current?.set(itemKey, ref.current);
+            return () => {
+                if (mapRef.current?.get(itemKey) === ref.current) mapRef.current?.set(itemKey, null);
+            };
+        }, [mapRef, itemKey]);
+
         return (
             <button
                 type="button"
                 className="bp-row"
-                ref={refCb}
+                ref={ref}
                 style={{ ...baseStyle, ...(active ? sx.itemActive : null) }}
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={onClick}
                 aria-label={ariaLabel}
+                role="option"
+                aria-selected={active}
             >
                 {active ? <span style={sx.activeBar} aria-hidden /> : null}
                 {children}
                 <span style={{ ...sx.selDot, ...(active ? sx.selDotOn : null) }} aria-hidden />
             </button>
         );
-    }
+    },
 );
 
 export function PositionPill({ styles, books, current, onJump }: Props) {
@@ -110,12 +134,11 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     const [popoverEntered, setPopoverEntered] = useState(false);
     const [pressPill, setPressPill] = useState(false);
     const [pressGo, setPressGo] = useState(false);
-
     const [popPos, setPopPos] = useState<PopPos | null>(null);
 
-    const bookBtnRefs = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-    const chapBtnRefs = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-    const verseBtnRefs = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+    const bookBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+    const chapBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+    const verseBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
 
     const bookNameById = useMemo(() => {
         const m = new Map<string, string>();
@@ -153,6 +176,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
             setChaptersMeta(cached);
             return;
         }
+
         let alive = true;
         apiGetChapters(bookId)
             .then((p) => {
@@ -161,7 +185,10 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                 setChaptersMeta(p);
             })
             .catch(() => alive && setChaptersMeta(null));
-        return () => { alive = false; };
+
+        return () => {
+            alive = false;
+        };
     }, [open, bookId]);
 
     useEffect(() => {
@@ -179,6 +206,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
         setVerse((v) => (v == null ? null : clampInt(v, 1, verseMax)));
     }, [verseMax]);
 
+    // Reset internal state when popover closes
     useEffect(() => {
         if (open) return;
         setBookId(currentBookId);
@@ -212,6 +240,26 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
         closePopover();
     }, [bookId, chapter, verse, pendingChapter, pendingVerse, onJump, closePopover]);
 
+    const onPickBook = useCallback((nextBookId: string) => {
+        setBookId(nextBookId);
+        setPendingChapter(true);
+        setPendingVerse(true);
+        setChapter(1);
+        setVerse(null);
+    }, []);
+
+    const onPickChapter = useCallback((nextChapter: number) => {
+        setPendingChapter(false);
+        setChapter(nextChapter);
+        setPendingVerse(true);
+        setVerse(null);
+    }, []);
+
+    const onPickVerse = useCallback((nextVerse: number) => {
+        setPendingVerse(false);
+        setVerse(nextVerse);
+    }, []);
+
     useLayoutEffect(() => {
         if (!open) return;
         const a = anchorRef.current;
@@ -231,9 +279,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     }, [open]);
 
     useEffect(() => {
-        if (open) {
-            requestAnimationFrame(() => setPopoverEntered(true));
-        }
+        if (open) requestAnimationFrame(() => setPopoverEntered(true));
     }, [open]);
 
     useEffect(() => {
@@ -273,15 +319,17 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     useEffect(() => {
         if (!open) return;
         requestAnimationFrame(() => {
-            bookBtnRefs.current.get(bookId)?.focus();
-            bookBtnRefs.current.get(bookId)?.scrollIntoView({ block: "center", behavior: "smooth" });
-            if (!pendingChapter) chapBtnRefs.current.get(`c:${chapter}`)?.scrollIntoView({ block: "center", behavior: "smooth" });
-            if (!pendingVerse && verse != null) verseBtnRefs.current.get(`v:${verse}`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+            bookBtnMapRef.current.get(bookId)?.focus();
+            bookBtnMapRef.current.get(bookId)?.scrollIntoView({ block: "center" });
+            if (!pendingChapter) chapBtnMapRef.current.get(`c:${chapter}`)?.scrollIntoView({ block: "center" });
+            if (!pendingVerse && verse != null) verseBtnMapRef.current.get(`v:${verse}`)?.scrollIntoView({ block: "center" });
         });
     }, [open, bookId, chapter, verse, pendingChapter, pendingVerse]);
 
+    // --- Pill polish: stable, narrow, no inherited centering ---
     const pillStyle: React.CSSProperties = {
         ...sx.pill,
+        width: open ? PILL_W_OPEN : PILL_W_CLOSED,
         ...(pressPill ? pressedStyle(styles) ?? sx.pillPressedFallback : null),
         ...(open ? sx.pillOpen : null),
     };
@@ -292,182 +340,167 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
         ...(pendingChapter ? sx.goBtnDim : null),
     };
 
-    function onPickBook(nextBookId: string): void {
-        setBookId(nextBookId);
-        setPendingChapter(true);
-        setPendingVerse(true);
-        setChapter(1);
-        setVerse(null);
-    }
+    const popover =
+        open && popPos
+            ? createPortal(
+                <div
+                    id="bp-pos-popover"
+                    style={{
+                        ...sx.popover,
+                        left: popPos.left,
+                        top: popPos.top,
+                        width: popPos.width,
+                        height: popPos.height,
+                        opacity: popoverEntered ? 1 : 0,
+                        transform: popoverEntered ? "scale(1)" : "scale(0.965) translateY(10px)",
+                        transition:
+                            "opacity 180ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 180ms cubic-bezier(0.23, 1.0, 0.32, 1.0)",
+                        ["--bpAccent" as any]: ACCENT,
+                        ["--bpAccentSoft" as any]: ACCENT_SOFT,
+                        ["--bpAccentRing" as any]: ACCENT_RING,
+                    }}
+                    role="dialog"
+                    aria-label="Jump"
+                >
+                    <style>{`
+#bp-pos-popover .bp-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--hairline) transparent;
+}
+#bp-pos-popover .bp-scroll::-webkit-scrollbar {
+  width: 10px; height: 10px;
+}
+#bp-pos-popover .bp-scroll::-webkit-scrollbar-track { background: transparent !important; }
+#bp-pos-popover .bp-scroll::-webkit-scrollbar-thumb {
+  background: var(--hairline);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+#bp-pos-popover .bp-scroll::-webkit-scrollbar-thumb:hover { background: var(--focusRing); }
 
-    function onPickChapter(nextChapter: number): void {
-        setPendingChapter(false);
-        setChapter(nextChapter);
-        setPendingVerse(true);
-        setVerse(null);
-    }
+#bp-pos-popover button.bp-row {
+  transition: background 140ms ease, box-shadow 140ms ease, transform 90ms ease;
+}
+#bp-pos-popover button.bp-row:active { transform: scale(0.982); }
+#bp-pos-popover button.bp-row:hover { background: rgba(209, 11, 47, 0.040); }
+#bp-pos-popover button.bp-row:focus-visible,
+#bp-pos-popover button.bp-pill:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--bpAccentRing);
+}
 
-    function onPickVerse(nextVerse: number): void {
-        setPendingVerse(false);
-        setVerse(nextVerse);
-    }
+#bp-pos-popover button.bp-go {
+  transition: all 140ms cubic-bezier(0.23, 1.0, 0.32, 1.0);
+}
+#bp-pos-popover button.bp-go:active { transform: scale(0.96) translateY(1px); }
+`}</style>
 
-    const popover = open && popPos ? (
-        createPortal(
-            <div
-                id="bp-pos-popover"
-                style={{
-                    ...sx.popover,
-                    left: popPos.left,
-                    top: popPos.top,
-                    width: popPos.width,
-                    height: popPos.height,
-                    opacity: popoverEntered ? 1 : 0,
-                    transform: popoverEntered ? "scale(1)" : "scale(0.965) translateY(10px)",
-                    transition: "opacity 180ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 180ms cubic-bezier(0.23, 1.0, 0.32, 1.0)",
-                    ["--bpAccent" as any]: ACCENT,
-                    ["--bpAccentSoft" as any]: ACCENT_SOFT,
-                    ["--bpAccentRing" as any]: ACCENT_RING,
-                }}
-                role="dialog"
-                aria-label="Jump"
-            >
-                <style>{`
-          #bp-pos-popover .bp-scroll {
-            scrollbar-width: thin;
-            scrollbar-color: var(--hairline) transparent;
-          }
-          #bp-pos-popover .bp-scroll::-webkit-scrollbar {
-            width: 10px; height: 10px;
-          }
-          #bp-pos-popover .bp-scroll::-webkit-scrollbar-track { background: transparent !important; }
-          #bp-pos-popover .bp-scroll::-webkit-scrollbar-thumb {
-            background: var(--hairline);
-            border-radius: 999px;
-            border: 3px solid transparent;
-            background-clip: padding-box;
-          }
-          #bp-pos-popover .bp-scroll::-webkit-scrollbar-thumb:hover { background: var(--focusRing); }
-
-          #bp-pos-popover button.bp-row {
-            transition: background 140ms ease, box-shadow 140ms ease, transform 90ms ease;
-          }
-          #bp-pos-popover button.bp-row:active { transform: scale(0.982); }
-          #bp-pos-popover button.bp-row:hover { background: rgba(209, 11, 47, 0.040); }
-          #bp-pos-popover button.bp-row:focus-visible,
-          #bp-pos-popover button.bp-pill:focus-visible {
-            outline: none;
-            box-shadow: inset 0 0 0 1px var(--bpAccentRing);
-          }
-
-          #bp-pos-popover button.bp-go {
-            transition: all 140ms cubic-bezier(0.23, 1.0, 0.32, 1.0);
-          }
-          #bp-pos-popover button.bp-go:active { transform: scale(0.96) translateY(1px); }
-        `}</style>
-
-                <div style={sx.topRow}>
-                    <div style={sx.titleWrap} aria-label="Selection summary" title={`${titleBookPart}${titleNumPart}${titleTagPart}`}>
-                        <span style={sx.titleBook}>{titleBookPart}</span>
-                        {titleNumPart && <span style={sx.titleNum}>{titleNumPart}</span>}
-                        {titleTagPart && <span style={sx.titleTag}>{titleTagPart}</span>}
-                    </div>
-                    <button
-                        type="button"
-                        className="bp-go"
-                        style={goStyle}
-                        onClick={commit}
-                        onMouseDown={() => setPressGo(true)}
-                        onMouseUp={() => setPressGo(false)}
-                        onMouseLeave={() => setPressGo(false)}
-                        onTouchStart={() => setPressGo(true)}
-                        onTouchEnd={() => setPressGo(false)}
-                        aria-label="Confirm jump"
-                        title="Confirm"
-                    >
-                        →
-                    </button>
-                </div>
-
-                <div style={sx.bodyRow}>
-                    {/* Books – no OT/NT tags, narrower column */}
-                    <div style={sx.col}>
-                        <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
-                            {list.map((b) => {
-                                const active = b.bookId === bookId;
-                                return (
-                                    <ListItem
-                                        key={b.bookId}
-                                        active={active}
-                                        onClick={() => onPickBook(b.bookId)}
-                                        refCb={(el) => setRefInMap(bookBtnRefs.current, b.bookId, el)}
-                                        ariaLabel={`Select ${b.name}`}
-                                    >
-                    <span style={sx.itemLine}>
-                      <span style={{ ...sx.itemTextBook, ...(active ? sx.itemTextActive : null) }}>{b.name}</span>
-                    </span>
-                                    </ListItem>
-                                );
-                            })}
+                    <div style={sx.topRow}>
+                        <div style={sx.titleWrap} aria-label="Selection summary" title={`${titleBookPart}${titleNumPart}${titleTagPart}`}>
+                            <span style={sx.titleBook}>{titleBookPart}</span>
+                            {titleNumPart ? <span style={sx.titleNum}>{titleNumPart}</span> : null}
+                            {titleTagPart ? <span style={sx.titleTag}>{titleTagPart}</span> : null}
                         </div>
+                        <button
+                            type="button"
+                            className="bp-go"
+                            style={goStyle}
+                            onClick={commit}
+                            onMouseDown={() => setPressGo(true)}
+                            onMouseUp={() => setPressGo(false)}
+                            onMouseLeave={() => setPressGo(false)}
+                            onTouchStart={() => setPressGo(true)}
+                            onTouchEnd={() => setPressGo(false)}
+                            aria-label="Confirm jump"
+                            title="Confirm"
+                        >
+                            →
+                        </button>
                     </div>
 
-                    {/* Chapters */}
-                    <div style={sx.colNarrow}>
-                        <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
-                            {chapterOptions.map((o) => {
-                                const n = o.value;
-                                const active = !pendingChapter && n === chapter;
-                                return (
-                                    <ListItem
-                                        key={o.key}
-                                        active={active}
-                                        onClick={() => onPickChapter(n)}
-                                        tight
-                                        refCb={(el) => setRefInMap(chapBtnRefs.current, `c:${n}`, el)}
-                                        ariaLabel={`Chapter ${n}`}
-                                    >
-                    <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
-                      <span style={sx.prefixLabel}>CH</span> {n}
-                    </span>
-                                    </ListItem>
-                                );
-                            })}
+                    <div style={sx.bodyRow}>
+                        {/* Books */}
+                        <div style={sx.col}>
+                            <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
+                                {list.map((b) => {
+                                    const active = b.bookId === bookId;
+                                    return (
+                                        <ListItem
+                                            key={b.bookId}
+                                            active={active}
+                                            onClick={() => onPickBook(b.bookId)}
+                                            mapRef={bookBtnMapRef}
+                                            itemKey={b.bookId}
+                                            ariaLabel={`Select ${b.name}`}
+                                        >
+                                              <span style={sx.itemLine}>
+                                                  <span style={{ ...sx.itemTextBook, ...(active ? sx.itemTextActive : null) }}>{b.name}</span>
+                                              </span>
+                                        </ListItem>
+                                    );
+                                })}
+                            </div>
                         </div>
-                    </div>
 
-                    {/* Verses */}
-                    <div style={sx.colNarrow}>
-                        <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Verses">
-                            {!chaptersMeta ? (
-                                <div style={sx.loadingBox}>Loading…</div>
-                            ) : (
-                                verseOptions.map((o) => {
+                        {/* Chapters */}
+                        <div style={sx.colNarrow}>
+                            <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
+                                {chapterOptions.map((o) => {
                                     const n = o.value;
-                                    const active = !pendingVerse && verse === n;
+                                    const active = !pendingChapter && n === chapter;
                                     return (
                                         <ListItem
                                             key={o.key}
                                             active={active}
-                                            onClick={() => onPickVerse(n)}
+                                            onClick={() => onPickChapter(n)}
                                             tight
-                                            refCb={(el) => setRefInMap(verseBtnRefs.current, `v:${n}`, el)}
-                                            ariaLabel={`Verse ${n}`}
+                                            mapRef={chapBtnMapRef}
+                                            itemKey={`c:${n}`}
+                                            ariaLabel={`Chapter ${n}`}
                                         >
-                      <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
-                        <span style={sx.prefixLabel}>V</span> {n}
-                      </span>
+                                              <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
+                                                  <span style={sx.prefixLabel}>CH</span> {n}
+                                              </span>
                                         </ListItem>
                                     );
-                                })
-                            )}
+                                })}
+                            </div>
+                        </div>
+
+                        {/* Verses */}
+                        <div style={sx.colNarrow}>
+                            <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Verses">
+                                {!chaptersMeta ? (
+                                    <div style={sx.loadingBox}>Loading…</div>
+                                ) : (
+                                    verseOptions.map((o) => {
+                                        const n = o.value;
+                                        const active = !pendingVerse && verse === n;
+                                        return (
+                                            <ListItem
+                                                key={o.key}
+                                                active={active}
+                                                onClick={() => onPickVerse(n)}
+                                                tight
+                                                mapRef={verseBtnMapRef}
+                                                itemKey={`v:${n}`}
+                                                ariaLabel={`Verse ${n}`}
+                                            >
+                                                  <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
+                                                      <span style={sx.prefixLabel}>V</span> {n}
+                                                  </span>
+                                            </ListItem>
+                                        );
+                                    })
+                                )}
+                            </div>
                         </div>
                     </div>
-                </div>
-            </div>,
-            document.body
-        )
-    ) : null;
+                </div>,
+                document.body,
+            )
+            : null;
 
     return (
         <div style={sx.root}>
@@ -488,12 +521,10 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                 title={pillLabel}
             >
                 <span style={sx.pillTextStrong}>{currentBookName}</span>
-                <span style={sx.pillTextMuted}>
-          {currentVerse == null ? `${currentChap}` : `${currentChap}:${currentVerse}`}
-        </span>
+                <span style={sx.pillTextMuted}>{currentVerse == null ? `${currentChap}` : `${currentChap}:${currentVerse}`}</span>
                 <span style={sx.caret} aria-hidden>
-          ▾
-        </span>
+                    ▾
+                </span>
             </button>
             {popover}
         </div>
@@ -504,51 +535,64 @@ const sx: Record<string, React.CSSProperties> = {
     root: { position: "relative", display: "flex", alignItems: "center" },
 
     pill: {
+        display: "inline-grid",
+        gridTemplateColumns: `minmax(0, 1fr) ${NUM_COL_W}px auto`,
+        alignItems: "center",
         height: S(36),
-        padding: `0 ${S(13)}px`,
+        padding: `0 ${PILL_PAD_X}px`,
         borderRadius: 999,
         border: "1px solid var(--hairline)",
         background: "var(--panel)",
-        display: "inline-flex",
-        alignItems: "center",
-        gap: S(8),
+        gap: PILL_GAP,
         cursor: "pointer",
         userSelect: "none",
         color: "inherit",
         lineHeight: 1,
         boxShadow: "0 10px 32px rgba(0,0,0,0.08)",
-        transition: "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease",
+        transition:
+            "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease",
         whiteSpace: "nowrap",
+
+        // crucial: prevents centering when parent containers are centered
+        textAlign: "left",
     },
-    pillPressedFallback: { transform: "scale(0.96)" },
+    pillPressedFallback: { transform: "scale(0.965)" },
     pillOpen: {
         boxShadow: "0 18px 60px rgba(0,0,0,0.14)",
         transform: "translateY(-1px)",
         borderColor: "var(--focus)",
     },
 
+    // Bigger and more “filled” than before
     pillTextStrong: {
-        fontSize: 13.6 * SCALE,
-        fontWeight: 640,
-        letterSpacing: "-0.01em",
+        fontSize: 16.6 * SCALE,
+        fontWeight: 720,
+        letterSpacing: "-0.012em",
         color: "var(--fg)",
-        opacity: 0.93,
-        maxWidth: S(200),
+        opacity: 0.94,
         overflow: "hidden",
         textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        minWidth: 0,
+        justifySelf: "start",
     },
     pillTextMuted: {
-        fontSize: 13.6 * SCALE,
-        letterSpacing: "-0.01em",
+        width: "100%",
+        fontSize: 16.6 * SCALE,
+        letterSpacing: "-0.012em",
         color: "var(--muted)",
         opacity: 0.94,
+        whiteSpace: "nowrap",
+        textAlign: "right",
+        fontVariantNumeric: "tabular-nums",
+        justifySelf: "end",
     },
     caret: {
-        fontSize: 11 * SCALE,
+        fontSize: 11.5 * SCALE,
         color: "var(--muted)",
         opacity: 0.78,
         transform: "translateY(-0.5px)",
-        marginLeft: S(2),
+        justifySelf: "center",
     },
 
     popover: {
@@ -585,7 +629,6 @@ const sx: Record<string, React.CSSProperties> = {
         gap: S(3),
     },
 
-    // Proper cascading weights (heaviest → lightest) + slightly lighter overall
     titleBook: {
         fontSize: 14.2 * SCALE,
         fontWeight: 750,
@@ -593,6 +636,9 @@ const sx: Record<string, React.CSSProperties> = {
         color: "var(--fg)",
         opacity: 0.96,
         whiteSpace: "nowrap",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        minWidth: 0,
     },
     titleNum: {
         fontSize: 14.2 * SCALE,
@@ -723,6 +769,7 @@ const sx: Record<string, React.CSSProperties> = {
         color: "var(--fg)",
         opacity: 0.91,
         fontWeight: 540,
+        fontVariantNumeric: "tabular-nums",
     },
     numTextActive: { opacity: 1, fontWeight: 640 },
 

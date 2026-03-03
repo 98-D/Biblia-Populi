@@ -1,27 +1,19 @@
 // apps/web/src/api.ts
 // Biblia Populi — tiny typed client (bp_* API)
 //
-// Goals:
+// Upgraded:
+// - Translation selection support (global + per-call override)
+// - /translations endpoint support
+// - MetaPayload includes translations[]
+// - All relevant endpoints accept ?t=... (alias ?translationId=... server-side)
+//
+// Philosophy:
 // - Calm, explicit, traceable
 // - Same-origin by default (Vite proxy / production reverse-proxy)
 // - Optional VITE_API_BASE override for remote API
 // - Consistent errors with codes
 // - Request timeouts + AbortSignal support
 // - Safe JSON parsing + better diagnostics
-//
-// Server endpoints:
-// - GET /health
-// - GET /meta
-// - GET /spine
-// - GET /slice?fromOrd=...&limit=...
-// - GET /loc?bookId=...&chapter=...[&verse=...]
-// - GET /books
-// - GET /chapters/:bookId
-// - GET /chapter/:bookId/:chapter
-// - GET /search?q=...&limit=...
-// - GET /people/:id
-// - GET /places/:id
-// - GET /events/:id
 
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: { code: string; message: string } };
@@ -34,6 +26,12 @@ export type ApiRequestOptions = {
     headers?: Record<string, string>;
     /** Optional caller-provided AbortSignal (merged with timeout) */
     signal?: AbortSignal;
+
+    /**
+     * Optional translationId override for this request.
+     * If omitted, api uses the global translation selection (if set) or server default.
+     */
+    translationId?: string | null;
 };
 
 export type ApiErrorCode =
@@ -65,14 +63,14 @@ export class ApiError extends Error {
 
 export type TranslationMeta = {
     translationId: string;
-    name?: string;
-    language?: string;
+    name?: string | null;
+    language?: string | null;
     derivedFrom?: string | null;
-    licenseKind?: string;
+    licenseKind?: string | null;
     licenseText?: string | null;
     sourceUrl?: string | null;
     isDefault?: boolean;
-    createdAt?: string;
+    createdAt?: string | null;
 };
 
 export type SpineStats = {
@@ -83,6 +81,7 @@ export type SpineStats = {
 
 export type MetaPayload = {
     translation: TranslationMeta;
+    translations?: TranslationMeta[];
     ftsEnabled: boolean;
     spine?: SpineStats;
 };
@@ -325,6 +324,10 @@ export type LocPayload =
     verse: number;
 };
 
+export type TranslationsPayload = {
+    translations: TranslationMeta[];
+};
+
 /* --------------------------------- Base URL -------------------------------- */
 
 // If VITE_API_BASE is set, use it. Otherwise same-origin (works with Vite proxy).
@@ -335,6 +338,80 @@ function joinUrl(base: string, p: string): string {
     if (!base) return pathname;
     const b = base.endsWith("/") ? base.slice(0, -1) : base;
     return `${b}${pathname}`;
+}
+
+/* ------------------------- Translation selection (client) ------------------- */
+
+const TRANSLATION_STORAGE_KEY = "bp_translation_id_v1";
+
+let _translationIdMem: string | null = null;
+
+function safeLocalStorageGet(key: string): string | null {
+    if (typeof window === "undefined") return null;
+    try {
+        return window.localStorage.getItem(key);
+    } catch {
+        return null;
+    }
+}
+
+function safeLocalStorageSet(key: string, value: string): void {
+    if (typeof window === "undefined") return;
+    try {
+        window.localStorage.setItem(key, value);
+    } catch {
+        // ignore
+    }
+}
+
+function safeLocalStorageRemove(key: string): void {
+    if (typeof window === "undefined") return;
+    try {
+        window.localStorage.removeItem(key);
+    } catch {
+        // ignore
+    }
+}
+
+/**
+ * Get the current translationId selection.
+ * - If setTranslationId() has been called this session, returns that.
+ * - Else attempts localStorage.
+ * - Else returns null (server default).
+ */
+export function getTranslationId(): string | null {
+    if (_translationIdMem != null) return _translationIdMem;
+    const v = safeLocalStorageGet(TRANSLATION_STORAGE_KEY);
+    _translationIdMem = v && v.trim() ? v.trim() : null;
+    return _translationIdMem;
+}
+
+/**
+ * Set translationId selection for subsequent requests.
+ * - Pass null to clear (use server default).
+ */
+export function setTranslationId(id: string | null): void {
+    const v = id && id.trim() ? id.trim() : null;
+    _translationIdMem = v;
+
+    if (!v) safeLocalStorageRemove(TRANSLATION_STORAGE_KEY);
+    else safeLocalStorageSet(TRANSLATION_STORAGE_KEY, v);
+}
+
+/**
+ * Append ?t=... to a URL path (keeps existing query intact).
+ * - Respects per-request override in opts.translationId.
+ * - Otherwise uses global getTranslationId().
+ */
+function withTranslation(path: string, opts?: ApiRequestOptions): string {
+    const t = (opts?.translationId ?? getTranslationId())?.trim() || "";
+    if (!t) return path;
+
+    // if path already has t= or translationId=, do nothing
+    if (/[?&](t|translationId)=/i.test(path)) return path;
+
+    const sep = path.includes("?") ? "&" : "?";
+    return `${path}${sep}t=${encodeURIComponent(t)}`;
 }
 
 /* ------------------------------ JSON / Errors ------------------------------ */
@@ -378,7 +455,9 @@ function classifyFetchError(e: unknown): ApiError {
 }
 
 async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T> {
-    const url = joinUrl(API_BASE, path);
+    // Attach translation selection unless caller says otherwise.
+    const pathWithT = withTranslation(path, opts);
+    const url = joinUrl(API_BASE, pathWithT);
 
     const timeoutMs = opts.timeoutMs ?? 12_000;
     const timeoutCtrl = new AbortController();
@@ -439,7 +518,13 @@ async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T
 /* -------------------------------- API ------------------------------------- */
 
 export function apiGetMeta(opts?: ApiRequestOptions): Promise<MetaPayload> {
+    // Meta should include translation selection; this is where we can also reconcile
+    // stored translation against server list (caller can do that).
     return getJson("/meta", opts);
+}
+
+export function apiGetTranslations(opts?: ApiRequestOptions): Promise<TranslationsPayload> {
+    return getJson("/translations", opts);
 }
 
 export function apiGetBooks(opts?: ApiRequestOptions): Promise<{ books: BookRow[] }> {
@@ -490,6 +575,8 @@ export function apiResolveLoc(
     verse: number | null,
     opts?: ApiRequestOptions,
 ): Promise<LocPayload> {
+    // /loc does not depend on translation (verse_ord is canonical), but allowing
+    // the wrapper to attach ?t doesn’t hurt — server ignores it for /loc.
     const b = encodeURIComponent(bookId);
     const c = encodeURIComponent(String(chapter));
     const v = verse != null ? `&verse=${encodeURIComponent(String(verse))}` : "";

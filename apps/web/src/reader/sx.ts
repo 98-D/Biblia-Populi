@@ -1,6 +1,14 @@
 // apps/web/src/reader/sx.ts
 import type React from "react";
 
+/**
+ * Reader UI tokens (inline styles)
+ * Goals:
+ * - crisp sticky header without “heavy bar” feel
+ * - center area should never force child centering weirdness
+ * - stable scroll + measure-driven column
+ * - verse rows: calmer spacing, less “boxy”, better rhythm
+ */
 export const sx: Record<string, React.CSSProperties> = {
     page: {
         height: "100vh",
@@ -16,15 +24,15 @@ export const sx: Record<string, React.CSSProperties> = {
         top: 0,
         zIndex: 10,
         display: "grid",
-        gridTemplateColumns: "1fr auto 1fr",
+        gridTemplateColumns: "minmax(92px, 1fr) auto minmax(92px, 1fr)",
         alignItems: "center",
         gap: 12,
-        padding: "12px 16px",
+        padding: "10px 14px",
         borderBottom: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--bg) 88%, transparent)",
-        backdropFilter: "blur(10px)",
-        WebkitBackdropFilter: "blur(10px)",
-        boxShadow: "0 10px 30px rgba(0, 0, 0, 0.06)",
+        background: "color-mix(in oklab, var(--bg) 86%, transparent)",
+        backdropFilter: "blur(12px)",
+        WebkitBackdropFilter: "blur(12px)",
+        boxShadow: "0 8px 26px rgba(0, 0, 0, 0.05)",
     },
 
     topLeft: {
@@ -32,6 +40,7 @@ export const sx: Record<string, React.CSSProperties> = {
         alignItems: "center",
         justifyContent: "flex-start",
         minWidth: 92,
+        minHeight: 40,
     },
 
     topCenter: {
@@ -39,6 +48,11 @@ export const sx: Record<string, React.CSSProperties> = {
         alignItems: "center",
         justifyContent: "center",
         minWidth: 0,
+
+        // IMPORTANT:
+        // Center wrapper should NOT force text-align center on children.
+        // Some controls (PositionPill) use inline-grid and can inherit text-align.
+        textAlign: "initial",
     },
 
     topRight: {
@@ -46,18 +60,19 @@ export const sx: Record<string, React.CSSProperties> = {
         alignItems: "center",
         justifyContent: "flex-end",
         minWidth: 92,
+        minHeight: 40,
     },
 
     rightCluster: {
         display: "flex",
         alignItems: "center",
         justifyContent: "flex-end",
-        gap: 12,
+        gap: 10,
         minWidth: 0,
     },
 
     searchWrap: {
-        width: "clamp(170px, 22vw, 260px)",
+        width: "clamp(160px, 21vw, 248px)",
         minWidth: 0,
     },
 
@@ -102,8 +117,9 @@ export const sx: Record<string, React.CSSProperties> = {
     },
 
     // Reader column width is driven by --bpReaderMeasure (controlled by typography UI).
+    // Keep padding here minimal so measure feels consistent.
     container: {
-        paddingInline: 18,
+        paddingInline: 16,
         maxWidth: "var(--bpReaderMeasure, 840px)",
         marginInline: "auto",
     },
@@ -159,13 +175,14 @@ export const sx: Record<string, React.CSSProperties> = {
         lineHeight: 1.2,
     },
 
+    // Verse rows should feel like “air + alignment”, not a box.
     verseRow: {
         display: "grid",
-        gridTemplateColumns: "34px 1fr",
+        gridTemplateColumns: "36px 1fr",
         gap: 12,
         alignItems: "start",
         borderRadius: 14,
-        padding: "10px 8px",
+        padding: "9px 6px",
         transition: "background 140ms ease, transform 140ms ease",
     },
 
@@ -174,7 +191,7 @@ export const sx: Record<string, React.CSSProperties> = {
         color: "var(--muted)",
         letterSpacing: "0.14em",
         textAlign: "right",
-        paddingTop: 5,
+        paddingTop: 6,
         userSelect: "none",
         fontVariantNumeric: "tabular-nums",
         opacity: 0.9,
@@ -186,11 +203,11 @@ export const sx: Record<string, React.CSSProperties> = {
 
     skelRow: {
         display: "grid",
-        gridTemplateColumns: "34px 1fr",
+        gridTemplateColumns: "36px 1fr",
         gap: 12,
         alignItems: "start",
         borderRadius: 14,
-        padding: "10px 8px",
+        padding: "9px 6px",
         opacity: 0.55,
     },
 

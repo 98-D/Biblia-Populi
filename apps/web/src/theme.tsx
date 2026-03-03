@@ -64,16 +64,17 @@ export function getThemeVars(mode: Mode): CssVarStyle {
         };
     }
 
+    // softened (less intense white)
     return {
-        ["--bg" as any]: "#fbfbfc",
-        ["--panel" as any]: "rgba(0,0,0,0.028)",
+        ["--bg" as any]: "#f6f4f0",
+        ["--panel" as any]: "rgba(0,0,0,0.026)",
         ["--fg" as any]: "#0b0b0c",
-        ["--muted" as any]: "rgba(11,11,12,0.56)",
-        ["--hairline" as any]: "rgba(0,0,0,0.10)",
+        ["--muted" as any]: "rgba(11,11,12,0.58)",
+        ["--hairline" as any]: "rgba(0,0,0,0.11)",
         ["--shadow" as any]: "0 18px 60px rgba(0,0,0,0.12)",
         ["--shadowSoft" as any]: "0 10px 34px rgba(0,0,0,0.10)",
-        ["--focus" as any]: "rgba(0,0,0,0.16)",
-        ["--focusRing" as any]: "rgba(0,0,0,0.10)",
+        ["--focus" as any]: "rgba(0,0,0,0.14)",
+        ["--focusRing" as any]: "rgba(0,0,0,0.08)",
     };
 }
 
@@ -85,7 +86,7 @@ export function ThemeProvider(props: {
 }) {
     const config: ThemeConfig = {
         storageKey: props.storageKey ?? "bp_theme",
-        metaThemeColorLight: props.metaThemeColorLight ?? "#fbfbfc",
+        metaThemeColorLight: props.metaThemeColorLight ?? "#f6f4f0",
         metaThemeColorDark: props.metaThemeColorDark ?? "#0b0b0c",
     };
 
@@ -194,11 +195,7 @@ export function ThemeToggleSwitch(props: {
 }
 
 /** Backwards-compatible name if you’re already using it everywhere. */
-export function ThemeTogglePill(props: {
-    styles?: Record<string, React.CSSProperties>;
-    mode?: Mode;
-    onToggle?: () => void;
-}) {
+export function ThemeTogglePill(props: { styles?: Record<string, React.CSSProperties>; mode?: Mode; onToggle?: () => void }) {
     return <ThemeToggleSwitch styles={props.styles} mode={props.mode} onToggle={props.onToggle} />;
 }
 

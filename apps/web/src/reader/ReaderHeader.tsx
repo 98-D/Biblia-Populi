@@ -3,9 +3,9 @@ import React, { useMemo, useState } from "react";
 import type { BookRow } from "../api";
 import type { ReaderLocation } from "../Search";
 import { PositionPill } from "../PositionPill";
-import { ThemeToggleSwitch, type Mode } from "../theme";
 import { sx } from "./sx";
 import { ReaderHeaderSearch } from "./ReaderHeaderSearch";
+import { ReaderTypographyControl } from "./ReaderTypographyControl";
 
 type CurrentPos = {
     label: string;
@@ -26,12 +26,13 @@ type Props = {
 
     onNavigate: (loc: ReaderLocation) => void;
 
-    mode?: Mode;
+    // kept for compatibility (toggle is global now)
+    mode?: "light" | "dark";
     onToggleTheme?: () => void;
 };
 
 export function ReaderHeader(props: Props) {
-    const { styles, books, onBackHome, current, onJumpRef, onNavigate, mode, onToggleTheme } = props;
+    const { styles, books, onBackHome, current, onJumpRef, onNavigate } = props;
 
     const [pressBack, setPressBack] = useState(false);
 
@@ -39,9 +40,16 @@ export function ReaderHeader(props: Props) {
         ((styles as any).btnPressed as React.CSSProperties | undefined) ??
         ((styles as any).buttonPressed as React.CSSProperties | undefined);
 
-    const backStyle = useMemo(
-        () => ({ ...sx.backBtn, ...(pressBack ? pressed : null) }),
-        [pressBack, pressed],
+    const backStyle = useMemo(() => ({ ...sx.backBtn, ...(pressBack ? pressed : null) }), [pressBack, pressed]);
+
+    const backHandlers = useMemo(
+        () => ({
+            onPointerDown: () => setPressBack(true),
+            onPointerUp: () => setPressBack(false),
+            onPointerCancel: () => setPressBack(false),
+            onPointerLeave: () => setPressBack(false),
+        }),
+        [],
     );
 
     return (
@@ -51,29 +59,21 @@ export function ReaderHeader(props: Props) {
                     type="button"
                     style={backStyle}
                     onClick={onBackHome}
-                    onMouseDown={() => setPressBack(true)}
-                    onMouseUp={() => setPressBack(false)}
-                    onMouseLeave={() => setPressBack(false)}
-                    onTouchStart={() => setPressBack(true)}
-                    onTouchEnd={() => setPressBack(false)}
                     aria-label="Back to home"
                     title="Back to home"
+                    {...backHandlers}
                 >
                     ← Home
                 </button>
             </div>
 
             <div style={sx.topCenter}>
-                <PositionPill
-                    styles={styles}
-                    books={books}
-                    current={current}
-                    onJump={(b, c, v) => onJumpRef(b, c, v)}
-                />
+                <PositionPill styles={styles} books={books} current={current} onJump={(b, c, v) => onJumpRef(b, c, v)} />
             </div>
 
             <div style={sx.topRight}>
-                <div style={sx.rightCluster}>
+                {/* give the fixed global toggle room so it never sits on top of header chrome */}
+                <div style={{ ...sx.rightCluster, paddingRight: 54 }}>
                     <div style={sx.searchWrap}>
                         <ReaderHeaderSearch
                             books={books}
@@ -84,13 +84,7 @@ export function ReaderHeader(props: Props) {
                         />
                     </div>
 
-                    <div style={sx.themeWrap}>
-                        {onToggleTheme ? (
-                            <ThemeToggleSwitch mode={mode ?? "light"} onToggle={onToggleTheme} size="sm" />
-                        ) : (
-                            <div style={{ width: 40, height: 24 }} />
-                        )}
-                    </div>
+                    <ReaderTypographyControl />
                 </div>
             </div>
         </div>

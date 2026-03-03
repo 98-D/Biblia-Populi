@@ -6,7 +6,6 @@ import type { Mode } from "../theme";
 import type { ReaderPosition, SpineStats } from "./types";
 import { ReaderHeader } from "./ReaderHeader";
 import { ReaderViewport, type ReaderViewportHandle } from "./ReaderViewport";
-import { ReaderControlsBar } from "./ReaderControlsBar";
 import { sx } from "./sx";
 
 type CurrentPos = {
@@ -72,20 +71,15 @@ export function ReaderShell(props: Props) {
                 onToggleTheme={onToggleTheme}
             />
 
-            {/* Reader chrome lives outside the scrollable viewport */}
-            <ReaderControlsBar
-                left={
-                    <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                        <div style={{ fontSize: 12, fontWeight: 650, letterSpacing: "-0.01em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                            {current.label}
-                        </div>
-                    </div>
-                }
-            />
-
             {err ? (
                 <div style={{ borderBottom: "1px solid var(--hairline)", background: "var(--bg)" }}>
-                    <div style={{ maxWidth: "var(--bpReaderMeasure, 840px)", marginInline: "auto", padding: "8px 18px" }}>
+                    <div
+                        style={{
+                            maxWidth: "var(--bpReaderMeasure, 840px)",
+                            marginInline: "auto",
+                            padding: "8px 18px",
+                        }}
+                    >
                         <div style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "pre-wrap" }}>{err}</div>
                     </div>
                 </div>

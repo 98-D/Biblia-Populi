@@ -1,18 +1,19 @@
 // apps/api/src/server.ts
 // Biblia Populi — Production API server (Bun + Hono + Drizzle + bun:sqlite)
 //
-// Upgraded for reading-first + infinite scroll primitives:
+// Upgraded for translation selection + reader controls (and fixes TS narrowing issues).
 //
 // Endpoints:
 //   GET  /health
 //   GET  /meta
-//   GET  /spine                       -> global verse_ord bounds + count (for virtualization)
-//   GET  /slice?fromOrd=1&limit=240   -> contiguous verse_ord window (cross-book; perfect for infinite scroll)
-//   GET  /loc?bookId=GEN&chapter=1&verse=1 -> resolve a reference to verse_ord (chapter-only supported)
+//   GET  /translations
+//   GET  /spine
+//   GET  /slice?fromOrd=...&limit=...[&t=KJV]              (alias: translationId)
+//   GET  /loc?bookId=GEN&chapter=1&verse=1
 //   GET  /books
 //   GET  /chapters/:bookId
-//   GET  /chapter/:bookId/:chapter    -> legacy chapter payload (still supported)
-//   GET  /search?q=...
+//   GET  /chapter/:bookId/:chapter[?t=KJV]                (alias: translationId)
+//   GET  /search?q=...&limit=...[&t=KJV]                  (alias: translationId)
 //   GET  /people/:id
 //   GET  /places/:id
 //   GET  /events/:id
@@ -20,7 +21,7 @@
 // Notes:
 // - verse_ord in bp_verse is the global canonical scroll axis.
 // - /slice is designed for @tanstack/react-virtual: index = verseOrd - 1.
-// - /chapter still returns { ranges, links, crossrefs } + legacy placeholders.
+// - Translation selection: ?t=KJV or ?translationId=KJV (qparam wins over env/db default).
 
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
@@ -52,7 +53,7 @@ import {
 
 const PORT = Number(process.env.PORT ?? "3000");
 
-// Prefer explicit env, else fall back to DB default translation (bp_translation.is_default)
+// Prefer explicit env default, else fall back to DB default translation (bp_translation.is_default)
 const ENV_TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "").trim();
 
 // CORS (dev-friendly default). In practice, Vite proxy means CORS is rarely used in dev.
@@ -66,7 +67,6 @@ type ApiErr = Readonly<{ ok: false; error: { code: string; message: string } }>;
 function jsonOk<T>(c: Context, data: T, extraHeaders?: Record<string, string>) {
     if (extraHeaders) for (const [k, v] of Object.entries(extraHeaders)) c.header(k, v);
     const body: ApiOk<T> = { ok: true, data };
-    // Cast keeps Hono happy without triggering TS deep-instantiation on huge payload types.
     return c.json(body as any);
 }
 
@@ -88,6 +88,8 @@ function cachePublic(c: Context, seconds: number) {
     c.header("Cache-Control", `public, max-age=${seconds}`);
 }
 
+/* --------------------------------- Schemas -------------------------------- */
+
 const RefBookIdSchema = z.string().min(2).max(8).regex(/^[A-Z0-9_]+$/);
 const ChapterNumSchema = z.coerce.number().int().min(1).max(200);
 const VerseNumSchema = z.coerce.number().int().min(1).max(200);
@@ -96,12 +98,123 @@ const SearchQuerySchema = z.string().trim().min(1).max(200);
 const SliceFromSchema = z.coerce.number().int().min(1).max(1_000_000);
 const SliceLimitSchema = z.coerce.number().int().min(1).max(2_000);
 
+// Translation ids are generally short stable keys: "KJV", "KJV_1769", "BP_DEV", etc.
+const TranslationIdSchema = z
+    .string()
+    .trim()
+    .min(1)
+    .max(64)
+    .regex(/^[A-Za-z0-9._-]+$/);
+
+/* ---------------------------- Translation metadata -------------------------- */
+
+type TranslationRow = Readonly<{
+    translationId: string;
+    name: string | null;
+    language: string | null;
+    derivedFrom: string | null;
+    licenseKind: string | null;
+    licenseText: string | null;
+    sourceUrl: string | null;
+    isDefault: number; // 0/1
+    createdAt: string | null;
+}>;
+
+type TranslationMeta = Readonly<{
+    translationId: string;
+    name: string | null;
+    language: string | null;
+    derivedFrom: string | null;
+    licenseKind: string | null;
+    licenseText: string | null;
+    sourceUrl: string | null;
+    isDefault: boolean;
+    createdAt: string | null;
+}>;
+
+function toTranslationMeta(r: TranslationRow): TranslationMeta {
+    return {
+        translationId: r.translationId,
+        name: r.name,
+        language: r.language,
+        derivedFrom: r.derivedFrom,
+        licenseKind: r.licenseKind,
+        licenseText: r.licenseText,
+        sourceUrl: r.sourceUrl,
+        isDefault: !!r.isDefault,
+        createdAt: r.createdAt,
+    };
+}
+
+/* ------------------------ Translation selection cache ----------------------- */
+
+const TRANSLATIONS_CACHE_MS = 30_000;
+
+let _translationsCache:
+    | null
+    | Readonly<{
+    at: number;
+    rows: TranslationRow[];
+    byId: Map<string, TranslationRow>;
+    defaultId: string | null;
+}> = null;
+
+function readTranslationsRaw(): TranslationRow[] {
+    // Raw sqlite keeps TS/Drizzle types tiny. Column names are snake_case in SQLite.
+    const rows = sqlite
+        .query(
+            `
+                SELECT
+                    translation_id AS translationId,
+                    name           AS name,
+                    language       AS language,
+                    derived_from   AS derivedFrom,
+                    license_kind   AS licenseKind,
+                    license_text   AS licenseText,
+                    source_url     AS sourceUrl,
+                    is_default     AS isDefault,
+                    created_at     AS createdAt
+                FROM bp_translation
+                ORDER BY is_default DESC, name ASC, translation_id ASC;
+            `,
+        )
+        .all() as TranslationRow[];
+
+    return rows ?? [];
+}
+
+function getTranslationsCached(): Readonly<{
+    rows: TranslationRow[];
+    byId: Map<string, TranslationRow>;
+    defaultId: string | null;
+}> {
+    const now = Date.now();
+    const hit = _translationsCache;
+    if (hit && now - hit.at < TRANSLATIONS_CACHE_MS) return hit;
+
+    const rows = readTranslationsRaw();
+    const byId = new Map<string, TranslationRow>();
+    for (const r of rows) byId.set(r.translationId, r);
+
+    const defaultId = rows.find((r) => r.isDefault)?.translationId ?? null;
+
+    _translationsCache = Object.freeze({ at: now, rows, byId, defaultId });
+    return _translationsCache;
+}
+
 let _resolvedTranslationId: string | null = null;
-async function resolveTranslationId(): Promise<string | null> {
+async function resolveDefaultTranslationId(): Promise<string | null> {
     if (_resolvedTranslationId) return _resolvedTranslationId;
 
     if (ENV_TRANSLATION_ID) {
         _resolvedTranslationId = ENV_TRANSLATION_ID;
+        return _resolvedTranslationId;
+    }
+
+    // Prefer cached default (fast), fallback to Drizzle query if cache empty.
+    const cached = getTranslationsCached();
+    if (cached.defaultId) {
+        _resolvedTranslationId = cached.defaultId;
         return _resolvedTranslationId;
     }
 
@@ -114,6 +227,57 @@ async function resolveTranslationId(): Promise<string | null> {
     _resolvedTranslationId = rows[0]?.translationId ?? null;
     return _resolvedTranslationId;
 }
+
+function getQueryTranslationId(c: Context): string | null {
+    const raw = (c.req.query("translationId") ?? c.req.query("t") ?? "").trim();
+    return raw ? raw : null;
+}
+
+type PickedTranslation = Readonly<{ translationId: string; row: TranslationRow }>;
+
+/**
+ * Pick translation based on:
+ * 1) query param (t/translationId)
+ * 2) env BP_TRANSLATION_ID
+ * 3) db default (bp_translation.is_default)
+ *
+ * Returns Response on error so callers can `return picked;` without TS union fuss.
+ */
+async function pickTranslation(c: Context): Promise<PickedTranslation | Response> {
+    const q = getQueryTranslationId(c);
+
+    if (q) {
+        const p = TranslationIdSchema.safeParse(q);
+        if (!p.success) return jsonErr(c, 400, "BAD_TRANSLATION", "Invalid translationId.");
+
+        const cached = getTranslationsCached();
+        const row = cached.byId.get(p.data);
+        if (!row) return jsonErr(c, 404, "NO_TRANSLATION_ID", `Unknown translationId '${p.data}'.`);
+
+        return { translationId: row.translationId, row };
+    }
+
+    const def = await resolveDefaultTranslationId();
+    if (!def) {
+        return jsonErr(
+            c,
+            404,
+            "NO_TRANSLATION",
+            "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
+        );
+    }
+
+    const cached = getTranslationsCached();
+    const row = cached.byId.get(def);
+    if (!row) {
+        // Env may point to something that no longer exists; give a clearer error.
+        return jsonErr(c, 404, "NO_TRANSLATION_ID", `Unknown translationId '${def}'.`);
+    }
+
+    return { translationId: row.translationId, row };
+}
+
+/* ----------------------------- Other fast caches ---------------------------- */
 
 let _hasFts: boolean | null = null;
 function hasFts(): boolean {
@@ -136,12 +300,12 @@ function getSpineStats(): SpineStats {
     const row = sqlite
         .query(
             `
-                SELECT
-                    MIN(verse_ord) AS mn,
-                    MAX(verse_ord) AS mx,
-                    COUNT(*)       AS c
-                FROM bp_verse;
-            `,
+            SELECT
+                MIN(verse_ord) AS mn,
+                MAX(verse_ord) AS mx,
+                COUNT(*)       AS c
+            FROM bp_verse;
+        `,
         )
         .get() as { mn?: number; mx?: number; c?: number } | undefined;
 
@@ -271,38 +435,25 @@ app.get("/health", (c) => {
     return c.text("ok");
 });
 
-// Meta: translation + fts + spine stats
+// List available translations
+app.get("/translations", (c) => {
+    cachePublic(c, 60);
+    const cached = getTranslationsCached();
+    return jsonOk(c, { translations: cached.rows.map(toTranslationMeta) });
+});
+
+// Meta: selected translation + all translations + fts + spine stats
 app.get("/meta", async (c) => {
     cacheNoStore(c);
 
-    const translationId = await resolveTranslationId();
-    if (!translationId) {
-        return jsonErr(
-            c,
-            404,
-            "NO_TRANSLATION",
-            "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
-        );
-    }
+    const picked = await pickTranslation(c);
+    if (picked instanceof Response) return picked;
 
-    const t = await db
-        .select({
-            translationId: bpTranslation.translationId,
-            name: bpTranslation.name,
-            language: bpTranslation.language,
-            derivedFrom: bpTranslation.derivedFrom,
-            licenseKind: bpTranslation.licenseKind,
-            licenseText: bpTranslation.licenseText,
-            sourceUrl: bpTranslation.sourceUrl,
-            isDefault: bpTranslation.isDefault,
-            createdAt: bpTranslation.createdAt,
-        })
-        .from(bpTranslation)
-        .where(eq(bpTranslation.translationId, translationId))
-        .limit(1);
+    const cached = getTranslationsCached();
 
     return jsonOk(c, {
-        translation: t[0] ?? { translationId },
+        translation: toTranslationMeta(picked.row),
+        translations: cached.rows.map(toTranslationMeta),
         ftsEnabled: hasFts(),
         spine: getSpineStats(),
     });
@@ -315,18 +466,13 @@ app.get("/spine", (c) => {
 });
 
 // Contiguous verse window (cross-book), keyed by global verse_ord.
+// Accepts ?translationId=... (alias: ?t=...)
 app.get("/slice", async (c) => {
     cachePublic(c, 10);
 
-    const translationId = await resolveTranslationId();
-    if (!translationId) {
-        return jsonErr(
-            c,
-            404,
-            "NO_TRANSLATION",
-            "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
-        );
-    }
+    const picked = await pickTranslation(c);
+    if (picked instanceof Response) return picked;
+    const translationId = picked.translationId;
 
     const fromP = SliceFromSchema.safeParse(c.req.query("fromOrd") ?? "1");
     if (!fromP.success) return jsonErr(c, 400, "BAD_FROM", "Invalid fromOrd.");
@@ -350,26 +496,26 @@ app.get("/slice", async (c) => {
     const fromOrd = clamp(fromP.data, spine.verseOrdMin, spine.verseOrdMax);
     const limit = clamp(limitP.data, 1, 2000);
 
-    // Use raw sqlite here: avoids Drizzle TS type-instantiation blowups on joins.
+    // Raw sqlite avoids Drizzle TS type-instantiation blowups on joins.
     const verses = sqlite
         .query(
             `
-      SELECT
-        v.verse_key  AS verseKey,
-        v.verse_ord  AS verseOrd,
-        v.book_id    AS bookId,
-        v.chapter    AS chapter,
-        v.verse      AS verse,
-        t.text       AS text,
-        t.updated_at AS updatedAt
-      FROM bp_verse v
-      LEFT JOIN bp_verse_text t
-        ON t.verse_key = v.verse_key
-       AND t.translation_id = ?
-      WHERE v.verse_ord >= ?
-      ORDER BY v.verse_ord
-      LIMIT ?;
-    `,
+            SELECT
+                v.verse_key  AS verseKey,
+                v.verse_ord  AS verseOrd,
+                v.book_id    AS bookId,
+                v.chapter    AS chapter,
+                v.verse      AS verse,
+                t.text       AS text,
+                t.updated_at AS updatedAt
+            FROM bp_verse v
+            LEFT JOIN bp_verse_text t
+              ON t.verse_key = v.verse_key
+             AND t.translation_id = ?
+            WHERE v.verse_ord >= ?
+            ORDER BY v.verse_ord
+            LIMIT ?;
+        `,
         )
         .all(translationId, fromOrd, limit) as Array<{
         verseKey: string;
@@ -411,18 +557,18 @@ app.get("/loc", async (c) => {
         const row = sqlite
             .query(
                 `
-        SELECT
-          verse_key AS verseKey,
-          verse_ord AS verseOrd,
-          book_id   AS bookId,
-          chapter   AS chapter,
-          verse     AS verse
-        FROM bp_verse
-        WHERE book_id = ?
-          AND chapter = ?
-          AND verse = ?
-        LIMIT 1;
-      `,
+                SELECT
+                    verse_key AS verseKey,
+                    verse_ord AS verseOrd,
+                    book_id   AS bookId,
+                    chapter   AS chapter,
+                    verse     AS verse
+                FROM bp_verse
+                WHERE book_id = ?
+                  AND chapter = ?
+                  AND verse = ?
+                LIMIT 1;
+            `,
             )
             .get(bookId, chapter, verse) as
             | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
@@ -435,18 +581,18 @@ app.get("/loc", async (c) => {
     const first = sqlite
         .query(
             `
-      SELECT
-        verse_key AS verseKey,
-        verse_ord AS verseOrd,
-        book_id   AS bookId,
-        chapter   AS chapter,
-        verse     AS verse
-      FROM bp_verse
-      WHERE book_id = ?
-        AND chapter = ?
-      ORDER BY verse
-      LIMIT 1;
-    `,
+            SELECT
+                verse_key AS verseKey,
+                verse_ord AS verseOrd,
+                book_id   AS bookId,
+                chapter   AS chapter,
+                verse     AS verse
+            FROM bp_verse
+            WHERE book_id = ?
+              AND chapter = ?
+            ORDER BY verse
+            LIMIT 1;
+        `,
         )
         .get(bookId, chapter) as
         | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
@@ -500,6 +646,7 @@ app.get("/chapters/:bookId", async (c) => {
 });
 
 // Legacy chapter payload (still useful for orientation graph later)
+// Accepts ?translationId=... (alias: ?t=...)
 app.get("/chapter/:bookId/:chapter", async (c) => {
     cachePublic(c, 30);
 
@@ -509,15 +656,9 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
     const chapterP = ChapterNumSchema.safeParse(c.req.param("chapter"));
     if (!chapterP.success) return jsonErr(c, 400, "BAD_CHAPTER", "Invalid chapter number.");
 
-    const translationId = await resolveTranslationId();
-    if (!translationId) {
-        return jsonErr(
-            c,
-            404,
-            "NO_TRANSLATION",
-            "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
-        );
-    }
+    const picked = await pickTranslation(c);
+    if (picked instanceof Response) return picked;
+    const translationId = picked.translationId;
 
     const bookId = bookIdP.data;
     const chapterNum = chapterP.data;
@@ -535,7 +676,10 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
             updatedAt: bpVerseText.updatedAt,
         })
         .from(bpVerse)
-        .leftJoin(bpVerseText, and(eq(bpVerseText.verseKey, bpVerse.verseKey), eq(bpVerseText.translationId, translationId)))
+        .leftJoin(
+            bpVerseText,
+            and(eq(bpVerseText.verseKey, bpVerse.verseKey), eq(bpVerseText.translationId, translationId)),
+        )
         .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapterNum)))
         .orderBy(asc(bpVerse.verse));
 
@@ -709,6 +853,7 @@ app.get("/events/:id", async (c) => {
 });
 
 // Search (FTS5 preferred; fallback to LIKE)
+// Accepts ?translationId=... (alias: ?t=...)
 app.get("/search", async (c) => {
     cachePublic(c, 10);
 
@@ -719,35 +864,29 @@ app.get("/search", async (c) => {
     const q = qP.data;
     const limit = clamp(Number(c.req.query("limit") ?? "30"), 1, 100);
 
-    const translationId = await resolveTranslationId();
-    if (!translationId) {
-        return jsonErr(
-            c,
-            404,
-            "NO_TRANSLATION",
-            "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
-        );
-    }
+    const picked = await pickTranslation(c);
+    if (picked instanceof Response) return picked;
+    const translationId = picked.translationId;
 
     if (hasFts()) {
         const rows = sqlite
             .query(
                 `
-        SELECT
-          v.book_id    AS bookId,
-          v.chapter    AS chapter,
-          v.verse      AS verse,
-          v.verse_key  AS verseKey,
-          v.verse_ord  AS verseOrd,
-          snippet(bp_verse_text_fts, 2, '‹', '›', '…', 24) AS snippet
-        FROM bp_verse_text_fts
-        JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
-        JOIN bp_verse v      ON v.verse_key = t.verse_key
-        WHERE bp_verse_text_fts MATCH ?
-          AND t.translation_id = ?
-        ORDER BY bm25(bp_verse_text_fts)
-        LIMIT ?;
-      `,
+                SELECT
+                    v.book_id    AS bookId,
+                    v.chapter    AS chapter,
+                    v.verse      AS verse,
+                    v.verse_key  AS verseKey,
+                    v.verse_ord  AS verseOrd,
+                    snippet(bp_verse_text_fts, 2, '‹', '›', '…', 24) AS snippet
+                FROM bp_verse_text_fts
+                JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
+                JOIN bp_verse v      ON v.verse_key = t.verse_key
+                WHERE bp_verse_text_fts MATCH ?
+                  AND t.translation_id = ?
+                ORDER BY bm25(bp_verse_text_fts)
+                LIMIT ?;
+            `,
             )
             .all(q, translationId, limit) as Array<{
             bookId: string;
@@ -791,15 +930,23 @@ app.get("/search", async (c) => {
 
 app.notFound((c) => jsonErr(c, 404, "NOT_FOUND", "Route not found."));
 
-export default {
-    port: PORT,
-    fetch: app.fetch,
-};
+/* ------------------------------ Bun entrypoint ----------------------------- */
 
-const spine = getSpineStats();
-// eslint-disable-next-line no-console
-console.log(`[api] listening on http://localhost:${PORT}`);
-// eslint-disable-next-line no-console
-console.log(
-    `[api] translation=${ENV_TRANSLATION_ID || "(db default)"} fts=${hasFts() ? "on" : "off"} verses=${spine.verseCount} ordMax=${spine.verseOrdMax}`,
-);
+if (import.meta.main) {
+    const spine = getSpineStats();
+    const cachedTranslations = getTranslationsCached();
+
+    const server = Bun.serve({ port: PORT, fetch: app.fetch });
+
+    // eslint-disable-next-line no-console
+    console.log(`[api] listening on http://localhost:${server.port}`);
+    // eslint-disable-next-line no-console
+    console.log(
+        `[api] translation=${ENV_TRANSLATION_ID || cachedTranslations.defaultId || "(none)"} fts=${
+            hasFts() ? "on" : "off"
+        } verses=${spine.verseCount} ordMax=${spine.verseOrdMax}`,
+    );
+}
+
+// Optional: exported fetch handler for tests/embedding
+export const fetch = app.fetch;

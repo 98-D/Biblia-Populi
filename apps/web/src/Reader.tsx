@@ -6,6 +6,7 @@ import type { Mode } from "./theme";
 import { ReaderShell } from "./reader/ReaderShell";
 import type { ReaderPosition, SpineStats } from "./reader/types";
 import type { ReaderViewportHandle } from "./reader/ReaderViewport";
+import { applyReaderTypographyFromStorage } from "./reader/typography";
 
 type Props = {
     styles: Record<string, React.CSSProperties>;
@@ -15,6 +16,23 @@ type Props = {
     mode?: Mode;
     onToggleTheme?: () => void;
 };
+
+const LS_LAST_ORD = "bp_last_pos_ord";
+
+function safeGetLS(key: string): string | null {
+    try {
+        return localStorage.getItem(key);
+    } catch {
+        return null;
+    }
+}
+function safeSetLS(key: string, value: string): void {
+    try {
+        localStorage.setItem(key, value);
+    } catch {
+        // ignore
+    }
+}
 
 export function Reader(props: Props) {
     const { styles, onBackHome, initialLocation, mode, onToggleTheme } = props;
@@ -27,7 +45,14 @@ export function Reader(props: Props) {
 
     const viewportRef = useRef<ReaderViewportHandle | null>(null);
     const [viewportReady, setViewportReady] = useState(false);
+
     const pendingJumpRef = useRef<{ ord: number; behavior: "auto" | "smooth" } | null>(null);
+    const didRestoreRef = useRef(false);
+
+    // Apply typography ASAP on mount (prevents “flash”)
+    useEffect(() => {
+        applyReaderTypographyFromStorage();
+    }, []);
 
     // Load books + spine once
     useEffect(() => {
@@ -65,21 +90,21 @@ export function Reader(props: Props) {
         return `${bookName} ${pos.verse.chapter}:${pos.verse.verse}`;
     }, [spine, pos]);
 
-    async function jumpToRef(bookId: string, chapter: number, verse: number | null): Promise<void> {
+    async function jumpToRef(bookId: string, chapter: number, verse: number | null, behavior: "auto" | "smooth") {
         try {
             setErr(null);
             const loc = await apiResolveLoc(bookId, chapter, verse);
             if (!loc?.verseOrd) return;
 
-            if (viewportRef.current) viewportRef.current.jumpToOrd(loc.verseOrd, "smooth");
-            else pendingJumpRef.current = { ord: loc.verseOrd, behavior: "smooth" };
+            if (viewportRef.current && viewportReady) viewportRef.current.jumpToOrd(loc.verseOrd, behavior);
+            else pendingJumpRef.current = { ord: loc.verseOrd, behavior };
         } catch (e: unknown) {
             const msg = e instanceof Error ? e.message : String(e);
             setErr(msg);
         }
     }
 
-    // Resolve incoming ReaderLocation -> verseOrd, then jump (auto)
+    // Deep-link / incoming location -> jump (auto)
     useEffect(() => {
         const loc = initialLocation;
         if (!loc) return;
@@ -103,6 +128,31 @@ export function Reader(props: Props) {
         };
     }, [initialLocation?.bookId, initialLocation?.chapter, initialLocation?.verse, viewportReady]);
 
+    // Restore last position if no initialLocation
+    useEffect(() => {
+        if (!spine) return;
+        if (initialLocation) return;
+        if (didRestoreRef.current) return;
+
+        const raw = safeGetLS(LS_LAST_ORD);
+        if (!raw) {
+            didRestoreRef.current = true;
+            return;
+        }
+
+        const ord = Number(raw);
+        if (!Number.isFinite(ord)) {
+            didRestoreRef.current = true;
+            return;
+        }
+
+        const clamped = Math.max(spine.verseOrdMin, Math.min(spine.verseOrdMax, Math.floor(ord)));
+        didRestoreRef.current = true;
+
+        if (viewportRef.current && viewportReady) viewportRef.current.jumpToOrd(clamped, "auto");
+        else pendingJumpRef.current = { ord: clamped, behavior: "auto" };
+    }, [spine, viewportReady, initialLocation]);
+
     // If we had a pending jump and now we’re ready, perform it once.
     useEffect(() => {
         if (!spine) return;
@@ -114,6 +164,18 @@ export function Reader(props: Props) {
         pendingJumpRef.current = null;
         viewportRef.current.jumpToOrd(p.ord, p.behavior);
     }, [spine, viewportReady]);
+
+    // Persist current position (debounced)
+    useEffect(() => {
+        if (!spine) return;
+        if (!Number.isFinite(pos.ord)) return;
+
+        const id = window.setTimeout(() => {
+            safeSetLS(LS_LAST_ORD, String(pos.ord));
+        }, 220);
+
+        return () => window.clearTimeout(id);
+    }, [pos.ord, spine]);
 
     return (
         <ReaderShell
@@ -127,8 +189,8 @@ export function Reader(props: Props) {
                 chapter: pos.verse?.chapter ?? null,
                 verse: pos.verse?.verse ?? null,
             }}
-            onJumpRef={(b, c, v) => void jumpToRef(b, c, v)}
-            onNavigate={(loc) => void jumpToRef(loc.bookId, loc.chapter, loc.verse ?? null)}
+            onJumpRef={(b, c, v) => void jumpToRef(b, c, v, "smooth")}
+            onNavigate={(loc) => void jumpToRef(loc.bookId, loc.chapter, loc.verse ?? null, "smooth")}
             mode={mode}
             onToggleTheme={onToggleTheme}
             spine={spine}
