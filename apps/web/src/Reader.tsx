@@ -49,6 +49,11 @@ function parseFiniteInt(s: string | null): number | null {
 
 type PendingJump = { ord: number; behavior: "auto" | "smooth" };
 
+function makeLocKey(loc?: ReaderLocation): string {
+    if (!loc) return "";
+    return `${loc.bookId}:${loc.chapter}:${loc.verse ?? ""}`;
+}
+
 export function Reader(props: Props) {
     const { styles, onBackHome, initialLocation, mode, onToggleTheme } = props;
 
@@ -58,12 +63,14 @@ export function Reader(props: Props) {
     const [err, setErr] = useState<string | null>(null);
     const [pos, setPos] = useState<ReaderPosition>(() => ({ ord: 1, verse: null, book: null }));
 
-    const viewportRef = useRef<ReaderViewportHandle | null>(null);
+    const viewportHandleRef = useRef<ReaderViewportHandle | null>(null);
     const [viewportReady, setViewportReady] = useState(false);
 
     const pendingJumpRef = useRef<PendingJump | null>(null);
-    const didApplyInitialJumpRef = useRef(false);
+
+    // Guards
     const didRestoreRef = useRef(false);
+    const appliedInitialKeyRef = useRef<string>("");
 
     // If multiple async resolves race (rapid navigation), ignore stale results.
     const resolveSeqRef = useRef(0);
@@ -81,7 +88,6 @@ export function Reader(props: Props) {
             try {
                 const [b, s] = await Promise.all([apiGetBooks(), apiGetSpine()]);
                 if (!alive) return;
-
                 setBooks(b.books);
                 setSpine(s);
             } catch (e: unknown) {
@@ -109,15 +115,20 @@ export function Reader(props: Props) {
         return `${bookName} ${pos.verse.chapter}:${pos.verse.verse}`;
     }, [spine, pos]);
 
-    const canJumpNow = !!(spine && viewportReady && viewportRef.current);
+    const canJumpNow = !!(spine && viewportReady && viewportHandleRef.current);
+
+    const setViewportRef = useCallback((h: ReaderViewportHandle | null) => {
+        viewportHandleRef.current = h;
+    }, []);
 
     const jumpToOrd = useCallback(
         (ord: number, behavior: "auto" | "smooth") => {
             if (!spine) return;
             const clamped = clampOrd(ord, spine);
 
-            if (viewportRef.current && viewportReady) {
-                viewportRef.current.jumpToOrd(clamped, behavior);
+            const h = viewportHandleRef.current;
+            if (h && viewportReady) {
+                h.jumpToOrd(clamped, behavior);
             } else {
                 pendingJumpRef.current = { ord: clamped, behavior };
             }
@@ -136,11 +147,10 @@ export function Reader(props: Props) {
             try {
                 const loc = await apiResolveLoc(bookId, chapter, verse);
                 if (seq !== resolveSeqRef.current) return; // stale
-
                 if (!loc?.verseOrd) return;
+
                 jumpToOrd(loc.verseOrd, behavior);
 
-                // Optional: persist last semantic loc (useful for future “resume by ref” UX)
                 safeSetLS(
                     LS_LAST_LOC,
                     JSON.stringify({
@@ -158,42 +168,31 @@ export function Reader(props: Props) {
         [jumpToOrd],
     );
 
-    // Deep-link / incoming location -> jump (auto). Do this ONCE per mount + change.
+    // Apply deep-link / incoming location once per distinct loc key.
     useEffect(() => {
         if (!spine) return;
 
-        const loc = initialLocation;
-        if (!loc) return;
+        const key = makeLocKey(initialLocation);
+        if (!key) return;
 
-        // If initialLocation changes, allow new initial jump (but still once per distinct loc)
-        didApplyInitialJumpRef.current = false;
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [spine, initialLocation?.bookId, initialLocation?.chapter, initialLocation?.verse]);
+        if (appliedInitialKeyRef.current === key) return;
+        appliedInitialKeyRef.current = key;
 
-    useEffect(() => {
-        if (!spine) return;
-
-        const loc = initialLocation;
-        if (!loc) return;
-        if (didApplyInitialJumpRef.current) return;
-
-        didApplyInitialJumpRef.current = true;
+        const loc = initialLocation!;
         void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "auto");
     }, [spine, initialLocation, resolveAndJump]);
 
-    // Restore last position if no initialLocation (only once)
+    // Restore last position if no initialLocation (only once).
     useEffect(() => {
         if (!spine) return;
         if (initialLocation) return;
         if (didRestoreRef.current) return;
 
-        const ordRaw = parseFiniteInt(safeGetLS(LS_LAST_ORD));
-        if (ordRaw == null) {
-            didRestoreRef.current = true;
-            return;
-        }
-
         didRestoreRef.current = true;
+
+        const ordRaw = parseFiniteInt(safeGetLS(LS_LAST_ORD));
+        if (ordRaw == null) return;
+
         jumpToOrd(ordRaw, "auto");
     }, [spine, initialLocation, jumpToOrd]);
 
@@ -203,14 +202,16 @@ export function Reader(props: Props) {
 
         const p = pendingJumpRef.current;
         if (!p) return;
+
         pendingJumpRef.current = null;
-        viewportRef.current!.jumpToOrd(p.ord, p.behavior);
+        viewportHandleRef.current!.jumpToOrd(p.ord, p.behavior);
     }, [canJumpNow]);
 
-    // Persist current position (debounced)
+    // Persist current position (debounced).
     useEffect(() => {
         if (!spine) return;
         if (!Number.isFinite(pos.ord)) return;
+        if (typeof window === "undefined") return;
 
         const id = window.setTimeout(() => {
             safeSetLS(LS_LAST_ORD, String(clampOrd(pos.ord, spine)));
@@ -218,6 +219,33 @@ export function Reader(props: Props) {
 
         return () => window.clearTimeout(id);
     }, [pos.ord, spine]);
+
+    const handleReady = useCallback(() => {
+        // idempotent
+        setViewportReady(true);
+    }, []);
+
+    const handleError = useCallback((m: string) => {
+        setErr(m);
+    }, []);
+
+    const handlePosition = useCallback((p: ReaderPosition) => {
+        setPos(p);
+    }, []);
+
+    const handleJumpRef = useCallback(
+        (b: string, c: number, v: number | null) => {
+            void resolveAndJump(b, c, v, "smooth");
+        },
+        [resolveAndJump],
+    );
+
+    const handleNavigate = useCallback(
+        (loc: ReaderLocation) => {
+            void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "smooth");
+        },
+        [resolveAndJump],
+    );
 
     return (
         <ReaderShell
@@ -231,18 +259,16 @@ export function Reader(props: Props) {
                 chapter: pos.verse?.chapter ?? null,
                 verse: pos.verse?.verse ?? null,
             }}
-            onJumpRef={(b, c, v) => void resolveAndJump(b, c, v, "smooth")}
-            onNavigate={(loc) => void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "smooth")}
+            onJumpRef={handleJumpRef}
+            onNavigate={handleNavigate}
             mode={mode}
             onToggleTheme={onToggleTheme}
             spine={spine}
             bookById={bookById}
-            viewportRef={(h) => {
-                viewportRef.current = h;
-            }}
-            onPosition={setPos}
-            onError={(m) => setErr(m)}
-            onReady={() => setViewportReady(true)}
+            viewportRef={setViewportRef}
+            onPosition={handlePosition}
+            onError={handleError}
+            onReady={handleReady}
             err={err}
         />
     );

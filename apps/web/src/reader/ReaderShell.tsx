@@ -42,6 +42,19 @@ type Props = {
     err?: string | null;
 };
 
+const MeasureWrap = memo(function MeasureWrap(props: { children: React.ReactNode }) {
+    const style = useMemo<React.CSSProperties>(
+        () => ({
+            maxWidth: "var(--bpReaderMeasure, 840px)",
+            marginInline: "auto",
+            paddingInline: 18,
+        }),
+        [],
+    );
+
+    return <div style={style}>{props.children}</div>;
+});
+
 const ErrBanner = memo(function ErrBanner(props: { msg: string }) {
     const outer = useMemo<React.CSSProperties>(
         () => ({
@@ -51,20 +64,13 @@ const ErrBanner = memo(function ErrBanner(props: { msg: string }) {
         [],
     );
 
-    const inner = useMemo<React.CSSProperties>(
-        () => ({
-            maxWidth: "var(--bpReaderMeasure, 840px)",
-            marginInline: "auto",
-            padding: "9px 18px",
-        }),
-        [],
-    );
-
     return (
         <div role="status" aria-live="polite" style={outer}>
-            <div style={inner}>
-                <div style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "pre-wrap" }}>{props.msg}</div>
-            </div>
+            <MeasureWrap>
+                <div style={{ paddingBlock: 9 }}>
+                    <div style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "pre-wrap" }}>{props.msg}</div>
+                </div>
+            </MeasureWrap>
         </div>
     );
 });
@@ -72,11 +78,11 @@ const ErrBanner = memo(function ErrBanner(props: { msg: string }) {
 const LoadingBody = memo(function LoadingBody() {
     return (
         <div style={sx.body}>
-            <div style={{ maxWidth: "var(--bpReaderMeasure, 840px)", marginInline: "auto", padding: "0 18px" }}>
+            <MeasureWrap>
                 <div style={sx.msg} role="status" aria-live="polite">
                     Loading…
                 </div>
-            </div>
+            </MeasureWrap>
         </div>
     );
 });
@@ -100,8 +106,10 @@ export function ReaderShell(props: Props) {
         err,
     } = props;
 
+    const hasData = !!spine;
+
     return (
-        <main style={sx.page}>
+        <main style={sx.page} aria-busy={!hasData}>
             <ReaderHeader
                 styles={styles}
                 books={books}
