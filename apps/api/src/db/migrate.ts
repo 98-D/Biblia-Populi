@@ -4,6 +4,7 @@
 // 1) Opens Bun SQLite (via openDb)
 // 2) Runs Drizzle migrations from ./drizzle
 // 3) Applies "extras" SQL (FTS5 + triggers) with an idempotency stamp
+// 4) Sanity-checks key canon + auth tables exist (auth is optional-but-expected for app infra)
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -42,7 +43,7 @@ function findApiRootFromCwd(): string {
     const cwd = process.cwd();
 
     let cur = cwd;
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 10; i++) {
         const direct = cur;
         const nested = path.join(cur, "apps", "api");
 
@@ -86,11 +87,11 @@ type SqliteLike = {
 };
 
 const EXTRAS_TABLE_SQL = `
-CREATE TABLE IF NOT EXISTS __bp_extras (
-  key TEXT PRIMARY KEY,
-  sha TEXT NOT NULL,
-  applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
+    CREATE TABLE IF NOT EXISTS __bp_extras (
+                                               key TEXT PRIMARY KEY,
+                                               sha TEXT NOT NULL,
+                                               applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
 `;
 
 function shaLike(s: string): string {
@@ -106,8 +107,8 @@ function getScalarText(sqlite: SqliteLike, q: string, args: any[] = []): string 
     return v == null ? null : String(v);
 }
 
-function getScalarInt(sqlite: SqliteLike, q: string): number {
-    const s = getScalarText(sqlite, q);
+function getScalarInt(sqlite: SqliteLike, q: string, args: any[] = []): number {
+    const s = getScalarText(sqlite, q, args);
     const n = s == null ? NaN : Number(s);
     return Number.isFinite(n) ? Math.trunc(n) : 0;
 }
@@ -195,30 +196,42 @@ function applyExtras(sqlite: SqliteLike): void {
 
 /* ------------------------------ Canon sanity -------------------------------- */
 
-function verifyCanonTablesExist(sqlite: SqliteLike): void {
-    const bookCount = getScalarInt(
+function tableExists(sqlite: SqliteLike, name: string): boolean {
+    const n = getScalarInt(
         sqlite,
-        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='table' AND name='bp_book'`,
+        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='table' AND name=?`,
+        [name],
     );
-    const verseCount = getScalarInt(
-        sqlite,
-        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='table' AND name='bp_verse'`,
-    );
-    const rangeCount = getScalarInt(
-        sqlite,
-        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='table' AND name='bp_range'`,
-    );
-    const linkCount = getScalarInt(
-        sqlite,
-        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='table' AND name='bp_link'`,
-    );
+    return n === 1;
+}
 
-    if (bookCount !== 1 || verseCount !== 1 || rangeCount !== 1 || linkCount !== 1) {
-        fatal(
-            "canon tables missing after migrations:",
-            JSON.stringify({ bp_book: bookCount, bp_verse: verseCount, bp_range: rangeCount, bp_link: linkCount }),
-        );
+function verifyCanonTablesExist(sqlite: SqliteLike): void {
+    const required = ["bp_book", "bp_verse", "bp_range", "bp_link"] as const;
+
+    const missing = required.filter((t) => !tableExists(sqlite, t));
+    if (missing.length > 0) {
+        fatal("canon tables missing after migrations:", JSON.stringify({ missing }));
     }
+}
+
+function verifyAuthTablesExist(sqlite: SqliteLike): void {
+    // We expect these once auth is enabled. If you want them optional (dev), set BP_AUTH_OPTIONAL=1.
+    const optional = (process.env.BP_AUTH_OPTIONAL ?? "").trim() === "1";
+
+    const required = ["bp_user", "bp_auth_account", "bp_session"] as const;
+    const missing = required.filter((t) => !tableExists(sqlite, t));
+
+    if (missing.length === 0) return;
+
+    if (optional) {
+        log("auth tables missing (optional mode):", JSON.stringify({ missing }));
+        return;
+    }
+
+    fatal(
+        "auth tables missing after migrations (expected with OAuth/identity enabled):",
+        JSON.stringify({ missing, hint: "Did you generate/apply drizzle migrations after adding authSchema.ts?" }),
+    );
 }
 
 /* ---------------------------------- Main ----------------------------------- */
@@ -237,9 +250,12 @@ async function main() {
         migrate(db, { migrationsFolder });
         log("drizzle migrations complete.");
 
-        verifyCanonTablesExist(sqlite as unknown as SqliteLike);
+        const s = sqlite as unknown as SqliteLike;
 
-        applyExtras(sqlite as unknown as SqliteLike);
+        verifyCanonTablesExist(s);
+        verifyAuthTablesExist(s);
+
+        applyExtras(s);
 
         if (!isMemoryDb(dbPath)) {
             requireFileExists(dbPath, "db file");

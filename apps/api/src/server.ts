@@ -1,35 +1,44 @@
 // apps/api/src/server.ts
 // Biblia Populi — Production API server (Bun + Hono + Drizzle + bun:sqlite)
 //
-// Upgraded for translation selection + reader controls (and fixes TS narrowing issues).
-//
 // Endpoints:
-//   GET  /health
-//   GET  /meta
-//   GET  /translations
-//   GET  /spine
-//   GET  /slice?fromOrd=...&limit=...[&t=KJV]              (alias: translationId)
-//   GET  /loc?bookId=GEN&chapter=1&verse=1
-//   GET  /books
-//   GET  /chapters/:bookId
-//   GET  /chapter/:bookId/:chapter[?t=KJV]                (alias: translationId)
-//   GET  /search?q=...&limit=...[&t=KJV]                  (alias: translationId)
-//   GET  /people/:id
-//   GET  /places/:id
-//   GET  /events/:id
+//   GET   /health
+//   GET   /meta
+//   GET   /translations
+//   GET   /spine
+//   GET   /slice?fromOrd=...&limit=...[&t=KJV]              (alias: translationId)
+//   GET   /loc?bookId=GEN&chapter=1&verse=1
+//   GET   /books
+//   GET   /chapters/:bookId
+//   GET   /chapter/:bookId/:chapter[?t=KJV]                (alias: translationId)
+//   GET   /search?q=...&limit=...[&t=KJV]                  (alias: translationId)
+//   GET   /people/:id
+//   GET   /places/:id
+//   GET   /events/:id
+//
+// Auth (DB sessions + Google OAuth):
+//   GET   /auth/google/start
+//   GET   /auth/google/callback
+//   POST  /auth/logout
+//   GET   /auth/me
 //
 // Notes:
 // - verse_ord in bp_verse is the global canonical scroll axis.
 // - /slice is designed for @tanstack/react-virtual: index = verseOrd - 1.
-// - Translation selection: ?t=KJV or ?translationId=KJV (qparam wins over env/db default).
+// - Translation selection: ?t=KJV or ?translationId=KJV (query param wins over env/db default).
+// - Orientation-only: no commentary/doctrine storage.
 
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { compress } from "hono/compress";
 import { etag } from "hono/etag";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
+import type { CookieOptions } from "hono/utils/cookie";
+
 import { z } from "zod";
 import { and, asc, desc, eq, like, sql as dsql, inArray } from "drizzle-orm";
+import * as crypto from "node:crypto";
 
 import { db, sqlite } from "./db/client";
 import {
@@ -48,32 +57,86 @@ import {
     bpEvent,
     bpEventParticipant,
 } from "./db/schema";
+import { bpUser, bpAuthAccount, bpSession } from "./db/authSchema";
 
 /* --------------------------------- Config --------------------------------- */
 
 const PORT = Number(process.env.PORT ?? "3000");
 
+// Public URLs (use the actual env keys you gave)
+const BP_PUBLIC_URL = (process.env.BP_PUBLIC_URL ?? `http://localhost:${PORT}`).trim().replace(/\/+$/g, "");
+const BP_WEB_ORIGIN = (process.env.BP_WEB_ORIGIN ?? process.env.BP_CORS_ORIGIN ?? "*").trim();
+
 // Prefer explicit env default, else fall back to DB default translation (bp_translation.is_default)
 const ENV_TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "").trim();
 
-// CORS (dev-friendly default). In practice, Vite proxy means CORS is rarely used in dev.
-const CORS_ORIGIN = (process.env.BP_CORS_ORIGIN ?? "*").trim();
+// CORS: allow comma-separated list; cookies require non-wildcard
+const CORS_RAW = BP_WEB_ORIGIN || "*";
+const CORS_LIST = CORS_RAW.split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+const CORS_WILDCARD = CORS_LIST.length === 0 || CORS_LIST.includes("*");
+
+// Auth
+const AUTH_ENABLED = (process.env.BP_AUTH_ENABLED ?? "1").trim() !== "0";
+const AUTH_COOKIE = (process.env.BP_AUTH_COOKIE ?? "bp_session").trim();
+const AUTH_COOKIE_DOMAIN = (process.env.BP_AUTH_COOKIE_DOMAIN ?? "").trim() || undefined;
+const AUTH_COOKIE_PATH = (process.env.BP_AUTH_COOKIE_PATH ?? "/").trim() || "/";
+const AUTH_COOKIE_SECURE = (process.env.BP_AUTH_COOKIE_SECURE ?? "").trim()
+    ? (process.env.BP_AUTH_COOKIE_SECURE ?? "").trim() === "1"
+    : (process.env.NODE_ENV ?? "").trim().toLowerCase() === "production";
+const AUTH_SESSION_DAYS = Number(process.env.BP_AUTH_SESSION_DAYS ?? "30");
+
+// Cookie signing (you provided BP_AUTH_COOKIE_SECRET)
+const AUTH_COOKIE_SECRET = (process.env.BP_AUTH_COOKIE_SECRET ?? "").trim();
+
+// Google OAuth (use your BP_* keys; keep legacy fallbacks)
+const GOOGLE_CLIENT_ID = (process.env.BP_GOOGLE_CLIENT_ID ?? process.env.GOOGLE_CLIENT_ID ?? "").trim();
+const GOOGLE_CLIENT_SECRET = (process.env.BP_GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_CLIENT_SECRET ?? "").trim();
+const GOOGLE_REDIRECT_URI = (
+    process.env.BP_GOOGLE_REDIRECT_URI ??
+    process.env.GOOGLE_REDIRECT_URI ??
+    `${BP_PUBLIC_URL}/auth/google/callback`
+).trim();
+const GOOGLE_SCOPES = ["openid", "email", "profile"] as const;
+
+// Where to send the user after login (your web app)
+const AUTH_AFTER_LOGIN_URL = (process.env.BP_AUTH_AFTER_LOGIN_URL ?? `${BP_WEB_ORIGIN}/reader`).trim();
+const AUTH_AFTER_LOGOUT_URL = (process.env.BP_AUTH_AFTER_LOGOUT_URL ?? `${BP_WEB_ORIGIN}/`).trim();
+
+// Start the Bun server unless disabled (useful for tests)
+const LISTEN = (process.env.BP_API_LISTEN ?? "1").trim() !== "0";
 
 /* --------------------------------- Helpers -------------------------------- */
 
 type ApiOk<T> = Readonly<{ ok: true; data: T }>;
 type ApiErr = Readonly<{ ok: false; error: { code: string; message: string } }>;
 
+type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500;
+
+function toJsonStatus(n: number): JsonStatus {
+    if (n === 200) return 200;
+    if (n === 201) return 201;
+    if (n === 400) return 400;
+    if (n === 401) return 401;
+    if (n === 403) return 403;
+    if (n === 404) return 404;
+    if (n === 409) return 409;
+    if (n === 422) return 422;
+    if (n === 429) return 429;
+    return 500;
+}
+
 function jsonOk<T>(c: Context, data: T, extraHeaders?: Record<string, string>) {
     if (extraHeaders) for (const [k, v] of Object.entries(extraHeaders)) c.header(k, v);
     const body: ApiOk<T> = { ok: true, data };
-    return c.json(body as any);
+    return c.json(body);
 }
 
+// IMPORTANT: use the init overload so Hono accepts our union status cleanly.
 function jsonErr(c: Context, status: number, code: string, message: string) {
     const body: ApiErr = { ok: false, error: { code, message } };
-    // @ts-ignore
-    return c.json(body as any, status);
+    return c.json(body, { status: toJsonStatus(status) });
 }
 
 function clamp(n: number, lo: number, hi: number) {
@@ -88,6 +151,98 @@ function cachePublic(c: Context, seconds: number) {
     c.header("Cache-Control", `public, max-age=${seconds}`);
 }
 
+function qstr(c: Context, key: string): string | null {
+    const v = (c.req.query(key) ?? "").trim();
+    return v ? v : null;
+}
+
+function b64url(bytes: Uint8Array): string {
+    return Buffer.from(bytes)
+        .toString("base64")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "");
+}
+
+function randId(bytes = 18): string {
+    return b64url(crypto.randomBytes(bytes));
+}
+
+function nowDate(): Date {
+    return new Date();
+}
+
+function daysMs(days: number): number {
+    const d = Number.isFinite(days) ? days : 30;
+    return Math.max(1, Math.trunc(d)) * 24 * 60 * 60 * 1000;
+}
+
+function addDays(d: Date, days: number): Date {
+    return new Date(d.getTime() + daysMs(days));
+}
+
+function cookieOpts(expiresAt?: Date): CookieOptions {
+    const base: CookieOptions = {
+        httpOnly: true,
+        sameSite: "Lax",
+        secure: AUTH_COOKIE_SECURE,
+        path: AUTH_COOKIE_PATH,
+    };
+    if (AUTH_COOKIE_DOMAIN) base.domain = AUTH_COOKIE_DOMAIN;
+    if (expiresAt) base.expires = expiresAt;
+    return base;
+}
+
+/* ------------------------------ Cookie signing ----------------------------- */
+/**
+ * Prevents trivial cookie tampering; session ids are still DB-validated.
+ * Format: <value>.<sig> where sig = base64url(hmacSha256(secret, value)).
+ * If secret is empty, we fall back to raw cookie values (dev).
+ */
+
+function hmacSig(value: string): string {
+    if (!AUTH_COOKIE_SECRET) return "";
+    const h = crypto.createHmac("sha256", AUTH_COOKIE_SECRET).update(value, "utf8").digest();
+    return b64url(h);
+}
+
+function safeEqual(a: string, b: string): boolean {
+    try {
+        const aa = Buffer.from(a, "utf8");
+        const bb = Buffer.from(b, "utf8");
+        if (aa.length !== bb.length) return false;
+        return crypto.timingSafeEqual(aa, bb);
+    } catch {
+        return false;
+    }
+}
+
+function packCookieValue(value: string): string {
+    if (!AUTH_COOKIE_SECRET) return value;
+    return `${value}.${hmacSig(value)}`;
+}
+
+function unpackCookieValue(packed: string): string | null {
+    const s = packed.trim();
+    if (!s) return null;
+
+    // dev / legacy
+    if (!AUTH_COOKIE_SECRET) return s;
+
+    const dot = s.lastIndexOf(".");
+    if (dot <= 0) {
+        // allow legacy raw sid during transition; DB validation still applies
+        return s;
+    }
+
+    const value = s.slice(0, dot);
+    const sig = s.slice(dot + 1);
+    const expected = hmacSig(value);
+    if (!sig || !expected) return null;
+    if (!safeEqual(sig, expected)) return null;
+    return value;
+}
+
 /* --------------------------------- Schemas -------------------------------- */
 
 const RefBookIdSchema = z.string().min(2).max(8).regex(/^[A-Z0-9_]+$/);
@@ -98,13 +253,7 @@ const SearchQuerySchema = z.string().trim().min(1).max(200);
 const SliceFromSchema = z.coerce.number().int().min(1).max(1_000_000);
 const SliceLimitSchema = z.coerce.number().int().min(1).max(2_000);
 
-// Translation ids are generally short stable keys: "KJV", "KJV_1769", "BP_DEV", etc.
-const TranslationIdSchema = z
-    .string()
-    .trim()
-    .min(1)
-    .max(64)
-    .regex(/^[A-Za-z0-9._-]+$/);
+const TranslationIdSchema = z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9._-]+$/);
 
 /* ---------------------------- Translation metadata -------------------------- */
 
@@ -160,7 +309,6 @@ let _translationsCache:
 }> = null;
 
 function readTranslationsRaw(): TranslationRow[] {
-    // Raw sqlite keeps TS/Drizzle types tiny. Column names are snake_case in SQLite.
     const rows = sqlite
         .query(
             `
@@ -211,7 +359,6 @@ async function resolveDefaultTranslationId(): Promise<string | null> {
         return _resolvedTranslationId;
     }
 
-    // Prefer cached default (fast), fallback to Drizzle query if cache empty.
     const cached = getTranslationsCached();
     if (cached.defaultId) {
         _resolvedTranslationId = cached.defaultId;
@@ -229,20 +376,11 @@ async function resolveDefaultTranslationId(): Promise<string | null> {
 }
 
 function getQueryTranslationId(c: Context): string | null {
-    const raw = (c.req.query("translationId") ?? c.req.query("t") ?? "").trim();
-    return raw ? raw : null;
+    return (qstr(c, "translationId") ?? qstr(c, "t") ?? "").trim() || null;
 }
 
 type PickedTranslation = Readonly<{ translationId: string; row: TranslationRow }>;
 
-/**
- * Pick translation based on:
- * 1) query param (t/translationId)
- * 2) env BP_TRANSLATION_ID
- * 3) db default (bp_translation.is_default)
- *
- * Returns Response on error so callers can `return picked;` without TS union fuss.
- */
 async function pickTranslation(c: Context): Promise<PickedTranslation | Response> {
     const q = getQueryTranslationId(c);
 
@@ -269,10 +407,7 @@ async function pickTranslation(c: Context): Promise<PickedTranslation | Response
 
     const cached = getTranslationsCached();
     const row = cached.byId.get(def);
-    if (!row) {
-        // Env may point to something that no longer exists; give a clearer error.
-        return jsonErr(c, 404, "NO_TRANSLATION_ID", `Unknown translationId '${def}'.`);
-    }
+    if (!row) return jsonErr(c, 404, "NO_TRANSLATION_ID", `Unknown translationId '${def}'.`);
 
     return { translationId: row.translationId, row };
 }
@@ -300,12 +435,12 @@ function getSpineStats(): SpineStats {
     const row = sqlite
         .query(
             `
-            SELECT
-                MIN(verse_ord) AS mn,
-                MAX(verse_ord) AS mx,
-                COUNT(*)       AS c
-            FROM bp_verse;
-        `,
+                SELECT
+                    MIN(verse_ord) AS mn,
+                    MAX(verse_ord) AS mx,
+                    COUNT(*)       AS c
+                FROM bp_verse;
+            `,
         )
         .get() as { mn?: number; mx?: number; c?: number } | undefined;
 
@@ -330,7 +465,6 @@ type ChapterBounds = Readonly<{
 }>;
 
 async function getChapterBounds(bookId: string, chapter: number): Promise<ChapterBounds | null> {
-    // Prefer bp_chapter if present
     const byChapter = await db
         .select({
             startVerseOrd: bpChapter.startVerseOrd,
@@ -350,7 +484,6 @@ async function getChapterBounds(bookId: string, chapter: number): Promise<Chapte
         };
     }
 
-    // Fallback: compute from bp_verse
     const agg = await db
         .select({
             startVerseOrd: dsql<number>`min(${bpVerse.verseOrd})`.as("start_verse_ord"),
@@ -405,21 +538,341 @@ async function fetchEntityBase(kind: "PERSON" | "PLACE", id: string) {
     return { entity: ent[0], names };
 }
 
+/* ------------------------------ Auth helpers -------------------------------- */
+
+type AuthedUser = Readonly<{
+    id: string;
+    displayName: string | null;
+    email: string | null;
+    emailVerifiedAt: Date | null;
+    disabledAt: Date | null;
+}>;
+
+type AppVars = {
+    user: AuthedUser | null;
+    sessionId: string | null;
+};
+
+/* ------------------------------- Sessions ---------------------------------- */
+
+async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null> {
+    const now = nowDate();
+
+    const sess = await db
+        .select({
+            id: bpSession.id,
+            userId: bpSession.userId,
+            expiresAt: bpSession.expiresAt,
+        })
+        .from(bpSession)
+        .where(eq(bpSession.id, sessionId))
+        .limit(1);
+
+    const s = sess[0];
+    if (!s) return null;
+
+    if (s.expiresAt <= now) {
+        // best-effort cleanup
+        db.delete(bpSession).where(eq(bpSession.id, sessionId)).run();
+        return null;
+    }
+
+    const rows = await db
+        .select({
+            id: bpUser.id,
+            displayName: bpUser.displayName,
+            email: bpUser.email,
+            emailVerifiedAt: bpUser.emailVerifiedAt,
+            disabledAt: bpUser.disabledAt,
+        })
+        .from(bpUser)
+        .where(eq(bpUser.id, s.userId))
+        .limit(1);
+
+    const u = rows[0];
+    if (!u) return null;
+    if (u.disabledAt != null) return null;
+
+    return {
+        id: u.id,
+        displayName: u.displayName ?? null,
+        email: u.email ?? null,
+        emailVerifiedAt: u.emailVerifiedAt ?? null,
+        disabledAt: u.disabledAt ?? null,
+    };
+}
+
+async function createSessionForUser(c: Context, userId: string): Promise<string> {
+    const sid = randId(24);
+    const createdAt = nowDate();
+    const expiresAt = addDays(createdAt, AUTH_SESSION_DAYS);
+
+    await db.insert(bpSession).values({
+        id: sid,
+        createdAt,
+        expiresAt,
+        userId,
+        ip: c.req.header("x-forwarded-for") ?? c.req.header("x-real-ip") ?? null,
+        ua: c.req.header("user-agent") ?? null,
+    });
+
+    setCookie(c, AUTH_COOKIE, packCookieValue(sid), cookieOpts(expiresAt));
+    return sid;
+}
+
+async function destroySession(c: Context, sessionId: string | null): Promise<void> {
+    if (sessionId) {
+        db.delete(bpSession).where(eq(bpSession.id, sessionId)).run();
+    }
+    deleteCookie(c, AUTH_COOKIE, cookieOpts());
+}
+
+/* ------------------------- Google OAuth minimal flow ------------------------ */
+/**
+ * Minimal OAuth 2.0 Authorization Code + PKCE:
+ * - /auth/google/start generates state + verifier, stores both in short cookies, redirects to Google
+ * - /auth/google/callback validates state, exchanges code for tokens, fetches userinfo, upserts user+account, issues session cookie
+ *
+ * Requirements (your env keys):
+ * - BP_GOOGLE_CLIENT_ID, BP_GOOGLE_CLIENT_SECRET
+ * - BP_PUBLIC_URL (or BP_GOOGLE_REDIRECT_URI)
+ * - BP_WEB_ORIGIN for CORS + redirects
+ */
+
+const OAUTH_STATE_COOKIE = "bp_oauth_state";
+const OAUTH_VERIFIER_COOKIE = "bp_oauth_verifier";
+const OAUTH_TMP_MS = 10 * 60 * 1000;
+
+function oauthTmpCookieOpts(): CookieOptions {
+    const exp = new Date(Date.now() + OAUTH_TMP_MS);
+    const base: CookieOptions = {
+        ...cookieOpts(exp),
+        httpOnly: true,
+        sameSite: "Lax",
+        secure: AUTH_COOKIE_SECURE,
+        path: "/",
+    };
+    return base;
+}
+
+function sha256Base64Url(s: string): string {
+    const h = crypto.createHash("sha256").update(s, "utf8").digest();
+    return b64url(h);
+}
+
+function googleAuthUrl(state: string, codeChallenge: string): string {
+    const u = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+    u.searchParams.set("client_id", GOOGLE_CLIENT_ID);
+    u.searchParams.set("redirect_uri", GOOGLE_REDIRECT_URI);
+    u.searchParams.set("response_type", "code");
+    u.searchParams.set("scope", GOOGLE_SCOPES.join(" "));
+    u.searchParams.set("state", state);
+    u.searchParams.set("code_challenge", codeChallenge);
+    u.searchParams.set("code_challenge_method", "S256");
+    u.searchParams.set("access_type", "offline");
+    u.searchParams.set("prompt", "consent");
+    return u.toString();
+}
+
+type GoogleTokenResponse = {
+    access_token: string;
+    expires_in: number;
+    scope?: string;
+    token_type: string;
+    id_token?: string;
+    refresh_token?: string;
+};
+
+async function googleExchangeCode(code: string, codeVerifier: string): Promise<GoogleTokenResponse> {
+    const form = new URLSearchParams();
+    form.set("client_id", GOOGLE_CLIENT_ID);
+    form.set("client_secret", GOOGLE_CLIENT_SECRET);
+    form.set("redirect_uri", GOOGLE_REDIRECT_URI);
+    form.set("grant_type", "authorization_code");
+    form.set("code", code);
+    form.set("code_verifier", codeVerifier);
+
+    const res = await globalThis.fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+    });
+
+    if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`google token exchange failed: ${res.status} ${text}`);
+    }
+
+    return (await res.json()) as GoogleTokenResponse;
+}
+
+type GoogleUserInfo = {
+    sub: string;
+    email?: string;
+    email_verified?: boolean;
+    name?: string;
+};
+
+async function googleFetchUserInfo(accessToken: string): Promise<GoogleUserInfo> {
+    const res = await globalThis.fetch("https://openidconnect.googleapis.com/v1/userinfo", {
+        headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`google userinfo failed: ${res.status} ${text}`);
+    }
+    return (await res.json()) as GoogleUserInfo;
+}
+
+async function upsertGoogleUser(
+    info: GoogleUserInfo,
+    tokens: GoogleTokenResponse,
+): Promise<{ userId: string; displayName: string | null; email: string | null }> {
+    const now = nowDate();
+    const provider = "google";
+    const providerUserId = info.sub;
+
+    const existingAcc = await db
+        .select({ id: bpAuthAccount.id, userId: bpAuthAccount.userId })
+        .from(bpAuthAccount)
+        .where(and(eq(bpAuthAccount.provider, provider), eq(bpAuthAccount.providerUserId, providerUserId)))
+        .limit(1);
+
+    let userId: string | null = existingAcc[0]?.userId ?? null;
+
+    const email = info.email?.trim() ? info.email.trim() : null;
+    const displayName = info.name?.trim() ? info.name.trim() : null;
+    const emailVerifiedAt: Date | null = info.email_verified ? now : null;
+
+    if (!userId && email) {
+        const byEmail = await db.select({ id: bpUser.id }).from(bpUser).where(eq(bpUser.email, email)).limit(1);
+        userId = byEmail[0]?.id ?? null;
+    }
+
+    if (!userId) {
+        userId = randId(18);
+        await db.insert(bpUser).values({
+            id: userId,
+            createdAt: now,
+            updatedAt: now,
+            displayName,
+            email,
+            emailVerifiedAt,
+            passwordHash: null,
+            disabledAt: null,
+        });
+    } else {
+        await db
+            .update(bpUser)
+            .set({
+                updatedAt: now,
+                displayName: displayName ?? null,
+                email: email ?? null,
+                emailVerifiedAt: emailVerifiedAt ?? null,
+            })
+            .where(eq(bpUser.id, userId));
+    }
+
+    const accId = existingAcc[0]?.id ?? randId(18);
+    await db
+        .insert(bpAuthAccount)
+        .values({
+            id: accId,
+            createdAt: now,
+            updatedAt: now,
+            userId,
+            provider,
+            providerUserId,
+            accessToken: tokens.access_token ?? null,
+            refreshToken: tokens.refresh_token ?? null,
+            accessTokenExpiresAt: tokens.expires_in ? new Date(now.getTime() + tokens.expires_in * 1000) : null,
+            scope: tokens.scope ?? null,
+        })
+        .onConflictDoUpdate({
+            target: bpAuthAccount.id,
+            set: {
+                updatedAt: now,
+                userId,
+                accessToken: tokens.access_token ?? null,
+                refreshToken: tokens.refresh_token ?? null,
+                accessTokenExpiresAt: tokens.expires_in ? new Date(now.getTime() + tokens.expires_in * 1000) : null,
+                scope: tokens.scope ?? null,
+            },
+        });
+
+    return { userId, displayName, email };
+}
+
+function authMisconfigured(): boolean {
+    return !!(AUTH_ENABLED && (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI));
+}
+
 /* ----------------------------------- App ---------------------------------- */
 
-const app = new Hono();
+const app = new Hono<{ Variables: AppVars }>();
+
+app.use("*", async (c, next) => {
+    c.header("Vary", "Origin, Accept-Encoding");
+    c.header("X-Content-Type-Options", "nosniff");
+    c.header("Referrer-Policy", "no-referrer");
+    await next();
+});
 
 app.use("*", logger());
 app.use("*", compress());
 app.use("*", etag());
+
 app.use(
     "*",
     cors({
-        origin: CORS_ORIGIN,
+        origin: CORS_WILDCARD
+            ? "*"
+            : (origin: string) => {
+                if (!origin) return null;
+                return CORS_LIST.includes(origin) ? origin : null;
+            },
         allowHeaders: ["Content-Type"],
-        allowMethods: ["GET", "OPTIONS"],
+        allowMethods: ["GET", "POST", "OPTIONS"],
+        credentials: !CORS_WILDCARD,
     }),
 );
+
+app.use("*", async (c, next) => {
+    // session middleware
+    if (!AUTH_ENABLED) {
+        c.set("user", null);
+        c.set("sessionId", null);
+        return next();
+    }
+
+    const raw = (getCookie(c, AUTH_COOKIE) ?? "").trim();
+    const sid = raw ? unpackCookieValue(raw) : null;
+
+    if (!sid) {
+        c.set("user", null);
+        c.set("sessionId", null);
+        return next();
+    }
+
+    try {
+        const u = await loadUserFromSession(sid);
+        c.set("user", u);
+        c.set("sessionId", u ? sid : null);
+
+        // If invalid session, clear cookie
+        if (!u) {
+            deleteCookie(c, AUTH_COOKIE, cookieOpts());
+        } else if (AUTH_COOKIE_SECRET && raw !== packCookieValue(sid)) {
+            // upgrade legacy cookie to signed
+            setCookie(c, AUTH_COOKIE, packCookieValue(sid), cookieOpts());
+        }
+    } catch {
+        c.set("user", null);
+        c.set("sessionId", null);
+    }
+
+    return next();
+});
 
 app.onError((err, c) => {
     // eslint-disable-next-line no-console
@@ -429,10 +882,104 @@ app.onError((err, c) => {
 
 /* ---------------------------------- Routes -------------------------------- */
 
+// Root
+app.get("/", (c) => {
+    cacheNoStore(c);
+    return c.redirect("/health", 302);
+});
+
 // Health
 app.get("/health", (c) => {
     cacheNoStore(c);
     return c.text("ok");
+});
+
+// Auth: me
+app.get("/auth/me", (c) => {
+    cacheNoStore(c);
+    return jsonOk(c, { user: c.get("user") });
+});
+
+// Auth: start google
+app.get("/auth/google/start", (c) => {
+    cacheNoStore(c);
+
+    if (authMisconfigured()) {
+        return jsonErr(
+            c,
+            500,
+            "AUTH_MISCONFIGURED",
+            "Google OAuth is not configured. Set BP_GOOGLE_CLIENT_ID/BP_GOOGLE_CLIENT_SECRET (and BP_PUBLIC_URL or BP_GOOGLE_REDIRECT_URI) and enable auth.",
+        );
+    }
+
+    const state = randId(18);
+    const verifier = randId(32);
+    const challenge = sha256Base64Url(verifier);
+
+    setCookie(c, OAUTH_STATE_COOKIE, packCookieValue(state), oauthTmpCookieOpts());
+    setCookie(c, OAUTH_VERIFIER_COOKIE, packCookieValue(verifier), oauthTmpCookieOpts());
+
+    return c.redirect(googleAuthUrl(state, challenge), 302);
+});
+
+// Auth: callback
+app.get("/auth/google/callback", async (c) => {
+    cacheNoStore(c);
+
+    if (authMisconfigured()) {
+        return jsonErr(
+            c,
+            500,
+            "AUTH_MISCONFIGURED",
+            "Google OAuth is not configured. Set BP_GOOGLE_CLIENT_ID/BP_GOOGLE_CLIENT_SECRET (and BP_PUBLIC_URL or BP_GOOGLE_REDIRECT_URI) and enable auth.",
+        );
+    }
+
+    const code = (c.req.query("code") ?? "").trim();
+    const state = (c.req.query("state") ?? "").trim();
+
+    if (!code || !state) {
+        return jsonErr(c, 400, "BAD_OAUTH_CALLBACK", "Missing code/state.");
+    }
+
+    const stateCookieRaw = (getCookie(c, OAUTH_STATE_COOKIE) ?? "").trim();
+    const verifierCookieRaw = (getCookie(c, OAUTH_VERIFIER_COOKIE) ?? "").trim();
+
+    const stateCookie = stateCookieRaw ? unpackCookieValue(stateCookieRaw) : null;
+    const verifierCookie = verifierCookieRaw ? unpackCookieValue(verifierCookieRaw) : null;
+
+    // clear temp cookies regardless (one-shot)
+    deleteCookie(c, OAUTH_STATE_COOKIE, { ...oauthTmpCookieOpts(), expires: new Date(0) });
+    deleteCookie(c, OAUTH_VERIFIER_COOKIE, { ...oauthTmpCookieOpts(), expires: new Date(0) });
+
+    if (!stateCookie || stateCookie !== state || !verifierCookie) {
+        return jsonErr(c, 401, "OAUTH_STATE_MISMATCH", "Invalid OAuth state.");
+    }
+
+    try {
+        const tokens = await googleExchangeCode(code, verifierCookie);
+        const info = await googleFetchUserInfo(tokens.access_token);
+
+        if (!info.sub) return jsonErr(c, 401, "OAUTH_NO_SUB", "Provider did not return a user id.");
+
+        const { userId } = await upsertGoogleUser(info, tokens);
+        await createSessionForUser(c, userId);
+
+        return c.redirect(AUTH_AFTER_LOGIN_URL, 302);
+    } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error("[auth] google callback error:", e);
+        return jsonErr(c, 500, "OAUTH_FAILED", "OAuth exchange failed.");
+    }
+});
+
+// Auth: logout
+app.post("/auth/logout", async (c) => {
+    cacheNoStore(c);
+    const sid = c.get("sessionId");
+    await destroySession(c, sid);
+    return jsonOk(c, { redirect: AUTH_AFTER_LOGOUT_URL });
 });
 
 // List available translations
@@ -456,6 +1003,10 @@ app.get("/meta", async (c) => {
         translations: cached.rows.map(toTranslationMeta),
         ftsEnabled: hasFts(),
         spine: getSpineStats(),
+        auth: {
+            enabled: AUTH_ENABLED,
+            user: c.get("user"),
+        },
     });
 });
 
@@ -465,8 +1016,7 @@ app.get("/spine", (c) => {
     return jsonOk(c, getSpineStats());
 });
 
-// Contiguous verse window (cross-book), keyed by global verse_ord.
-// Accepts ?translationId=... (alias: ?t=...)
+// Contiguous verse window keyed by global verse_ord
 app.get("/slice", async (c) => {
     cachePublic(c, 10);
 
@@ -496,26 +1046,25 @@ app.get("/slice", async (c) => {
     const fromOrd = clamp(fromP.data, spine.verseOrdMin, spine.verseOrdMax);
     const limit = clamp(limitP.data, 1, 2000);
 
-    // Raw sqlite avoids Drizzle TS type-instantiation blowups on joins.
     const verses = sqlite
         .query(
             `
-            SELECT
-                v.verse_key  AS verseKey,
-                v.verse_ord  AS verseOrd,
-                v.book_id    AS bookId,
-                v.chapter    AS chapter,
-                v.verse      AS verse,
-                t.text       AS text,
-                t.updated_at AS updatedAt
-            FROM bp_verse v
-            LEFT JOIN bp_verse_text t
-              ON t.verse_key = v.verse_key
-             AND t.translation_id = ?
-            WHERE v.verse_ord >= ?
-            ORDER BY v.verse_ord
-            LIMIT ?;
-        `,
+                SELECT
+                    v.verse_key  AS verseKey,
+                    v.verse_ord  AS verseOrd,
+                    v.book_id    AS bookId,
+                    v.chapter    AS chapter,
+                    v.verse      AS verse,
+                    t.text       AS text,
+                    t.updated_at AS updatedAt
+                FROM bp_verse v
+                         LEFT JOIN bp_verse_text t
+                                   ON t.verse_key = v.verse_key
+                                       AND t.translation_id = ?
+                WHERE v.verse_ord >= ?
+                ORDER BY v.verse_ord
+                    LIMIT ?;
+            `,
         )
         .all(translationId, fromOrd, limit) as Array<{
         verseKey: string;
@@ -557,6 +1106,29 @@ app.get("/loc", async (c) => {
         const row = sqlite
             .query(
                 `
+                    SELECT
+                        verse_key AS verseKey,
+                        verse_ord AS verseOrd,
+                        book_id   AS bookId,
+                        chapter   AS chapter,
+                        verse     AS verse
+                    FROM bp_verse
+                    WHERE book_id = ?
+                      AND chapter = ?
+                      AND verse = ?
+                        LIMIT 1;
+                `,
+            )
+            .get(bookId, chapter, verse) as
+            | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
+            | undefined;
+
+        return jsonOk(c, row ?? null);
+    }
+
+    const first = sqlite
+        .query(
+            `
                 SELECT
                     verse_key AS verseKey,
                     verse_ord AS verseOrd,
@@ -566,33 +1138,9 @@ app.get("/loc", async (c) => {
                 FROM bp_verse
                 WHERE book_id = ?
                   AND chapter = ?
-                  AND verse = ?
-                LIMIT 1;
+                ORDER BY verse
+                    LIMIT 1;
             `,
-            )
-            .get(bookId, chapter, verse) as
-            | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
-            | undefined;
-
-        return jsonOk(c, row ?? null);
-    }
-
-    // Chapter-only -> first verse in chapter
-    const first = sqlite
-        .query(
-            `
-            SELECT
-                verse_key AS verseKey,
-                verse_ord AS verseOrd,
-                book_id   AS bookId,
-                chapter   AS chapter,
-                verse     AS verse
-            FROM bp_verse
-            WHERE book_id = ?
-              AND chapter = ?
-            ORDER BY verse
-            LIMIT 1;
-        `,
         )
         .get(bookId, chapter) as
         | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
@@ -645,8 +1193,7 @@ app.get("/chapters/:bookId", async (c) => {
     return jsonOk(c, { bookId, chapters: rows });
 });
 
-// Legacy chapter payload (still useful for orientation graph later)
-// Accepts ?translationId=... (alias: ?t=...)
+// Chapter payload (+ orientation overlays)
 app.get("/chapter/:bookId/:chapter", async (c) => {
     cachePublic(c, 30);
 
@@ -853,7 +1400,6 @@ app.get("/events/:id", async (c) => {
 });
 
 // Search (FTS5 preferred; fallback to LIKE)
-// Accepts ?translationId=... (alias: ?t=...)
 app.get("/search", async (c) => {
     cachePublic(c, 10);
 
@@ -872,21 +1418,21 @@ app.get("/search", async (c) => {
         const rows = sqlite
             .query(
                 `
-                SELECT
-                    v.book_id    AS bookId,
-                    v.chapter    AS chapter,
-                    v.verse      AS verse,
-                    v.verse_key  AS verseKey,
-                    v.verse_ord  AS verseOrd,
-                    snippet(bp_verse_text_fts, 2, '‹', '›', '…', 24) AS snippet
-                FROM bp_verse_text_fts
-                JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
-                JOIN bp_verse v      ON v.verse_key = t.verse_key
-                WHERE bp_verse_text_fts MATCH ?
-                  AND t.translation_id = ?
-                ORDER BY bm25(bp_verse_text_fts)
-                LIMIT ?;
-            `,
+                    SELECT
+                        v.book_id    AS bookId,
+                        v.chapter    AS chapter,
+                        v.verse      AS verse,
+                        v.verse_key  AS verseKey,
+                        v.verse_ord  AS verseOrd,
+                        snippet(bp_verse_text_fts, 2, '‹', '›', '…', 24) AS snippet
+                    FROM bp_verse_text_fts
+                             JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
+                             JOIN bp_verse v      ON v.verse_key = t.verse_key
+                    WHERE bp_verse_text_fts MATCH ?
+                      AND t.translation_id = ?
+                    ORDER BY bm25(bp_verse_text_fts)
+                        LIMIT ?;
+                `,
             )
             .all(q, translationId, limit) as Array<{
             bookId: string;
@@ -916,14 +1462,17 @@ app.get("/search", async (c) => {
         .orderBy(desc(bpVerse.verseOrd))
         .limit(limit);
 
-    const results = rows.map((r) => ({
-        bookId: r.bookId,
-        chapter: r.chapter,
-        verse: r.verse,
-        verseKey: r.verseKey,
-        verseOrd: r.verseOrd,
-        snippet: (r.text ?? "").length > 200 ? (r.text ?? "").slice(0, 197) + "…" : (r.text ?? ""),
-    }));
+    const results = rows.map((r) => {
+        const text = r.text ?? "";
+        return {
+            bookId: r.bookId,
+            chapter: r.chapter,
+            verse: r.verse,
+            verseKey: r.verseKey,
+            verseOrd: r.verseOrd,
+            snippet: text.length > 200 ? text.slice(0, 197) + "…" : text,
+        };
+    });
 
     return jsonOk(c, { q, mode: "like" as const, results });
 });
@@ -932,21 +1481,46 @@ app.notFound((c) => jsonErr(c, 404, "NOT_FOUND", "Route not found."));
 
 /* ------------------------------ Bun entrypoint ----------------------------- */
 
-if (import.meta.main) {
+export const apiFetch = app.fetch;
+
+if (LISTEN) {
     const spine = getSpineStats();
     const cachedTranslations = getTranslationsCached();
 
-    const server = Bun.serve({ port: PORT, fetch: app.fetch });
+    const server = Bun.serve({ port: PORT, fetch: apiFetch });
 
     // eslint-disable-next-line no-console
     console.log(`[api] listening on http://localhost:${server.port}`);
+
     // eslint-disable-next-line no-console
     console.log(
         `[api] translation=${ENV_TRANSLATION_ID || cachedTranslations.defaultId || "(none)"} fts=${
             hasFts() ? "on" : "off"
-        } verses=${spine.verseCount} ordMax=${spine.verseOrdMax}`,
+        } verses=${spine.verseCount} ordMax=${spine.verseOrdMax} auth=${AUTH_ENABLED ? "on" : "off"}`,
     );
+
+    if (AUTH_ENABLED && CORS_WILDCARD) {
+        // eslint-disable-next-line no-console
+        console.warn(
+            "[api] WARNING: BP_WEB_ORIGIN/BP_CORS_ORIGIN is '*' while auth is enabled. Cookies require a specific origin + credentials.",
+        );
+    }
+
+    const shutdown = () => {
+        try {
+            sqlite.close();
+        } catch {
+            // ignore
+        }
+        try {
+            server.stop(true);
+        } catch {
+            // ignore
+        }
+    };
+
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
 }
 
-// Optional: exported fetch handler for tests/embedding
-export const fetch = app.fetch;
+export { app };

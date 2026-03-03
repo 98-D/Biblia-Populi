@@ -1,13 +1,13 @@
 // apps/api/src/db/seed.ts
 // Biblia Populi — Seed / Bootstrap (Bun + Drizzle + bun:sqlite)
 //
-// What it seeds (idempotent, metadata-only):
+// Seeds (idempotent, metadata-only):
 // - bp_book (66-book canon spine: ids, ordinals, testament, chapter counts)
-// - bp_translation (default translation row, marks it is_default)
+// - bp_translation (default translation row, marks is_default)
 //
-// What it does NOT seed:
-// - bp_verse_text (you already import full KJV)
-// - bp_verse / bp_chapter / verse_ord spine (handle via importer / dedicated builder)
+// Does NOT seed:
+// - bp_verse_text (you import full KJV)
+// - bp_verse / bp_chapter / verse_ord spine (importer / builder)
 //
 // Usage:
 //   bun run db:seed
@@ -18,12 +18,20 @@
 
 import { sql } from "drizzle-orm";
 import { openDb } from "./client";
-import { bpBook, bpTranslation, bpVerseText } from "./schema";
+import { bpBook, bpTranslation } from "./schema";
 
 const TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "KJV").trim();
-const TRANSLATION_NAME =
-    (process.env.BP_TRANSLATION_NAME ?? (TRANSLATION_ID.toUpperCase() === "KJV" ? "King James Version" : TRANSLATION_ID)).trim();
+const TRANSLATION_NAME = (
+    process.env.BP_TRANSLATION_NAME ??
+    (TRANSLATION_ID.toUpperCase() === "KJV" ? "King James Version" : TRANSLATION_ID)
+).trim();
 const TRANSLATION_LANG = (process.env.BP_TRANSLATION_LANG ?? "en").trim();
+
+// optional: mark KJV-derived translations or custom license text
+const TRANSLATION_LICENSE_KIND = (process.env.BP_TRANSLATION_LICENSE_KIND ?? "PUBLIC_DOMAIN").trim();
+const TRANSLATION_LICENSE_TEXT = (process.env.BP_TRANSLATION_LICENSE_TEXT ??
+    (TRANSLATION_ID.toUpperCase() === "KJV" ? "Public domain (US)" : "")).trim() || null;
+const TRANSLATION_SOURCE_URL = (process.env.BP_TRANSLATION_SOURCE_URL ?? "").trim() || null;
 
 function log(...args: unknown[]) {
     // eslint-disable-next-line no-console
@@ -34,6 +42,7 @@ function fatal(...args: unknown[]): never {
     // eslint-disable-next-line no-console
     console.error("[db:seed]", ...args);
     process.exit(1);
+    throw new Error("unreachable");
 }
 
 /* --------------------------------- Data ----------------------------------- */
@@ -46,6 +55,7 @@ type BookSeed = Readonly<{
     nameShort: string;
     chapters: number;
     osised?: string;
+    abbrs?: readonly string[];
 }>;
 
 const PROTESTANT_66: readonly BookSeed[] = [
@@ -122,7 +132,10 @@ const PROTESTANT_66: readonly BookSeed[] = [
 
 /* ----------------------------- Seed Operations ----------------------------- */
 
-async function seedBooks(db: ReturnType<typeof openDb>["db"]) {
+type Db = ReturnType<typeof openDb>["db"];
+type Sqlite = ReturnType<typeof openDb>["sqlite"];
+
+async function seedBooks(db: Db) {
     log("upserting bp_book (66) …");
 
     await db
@@ -136,7 +149,7 @@ async function seedBooks(db: ReturnType<typeof openDb>["db"]) {
                 nameShort: b.nameShort,
                 chapters: b.chapters,
                 osised: b.osised ?? null,
-                abbrs: null,
+                abbrs: b.abbrs ? JSON.stringify(b.abbrs) : null,
             })),
         )
         .onConflictDoUpdate({
@@ -153,11 +166,14 @@ async function seedBooks(db: ReturnType<typeof openDb>["db"]) {
         });
 }
 
-async function seedTranslation(db: ReturnType<typeof openDb>["db"]) {
+async function seedTranslation(db: Db) {
     log("upserting bp_translation …", TRANSLATION_ID);
 
-    // Ensure single default translation (optional, but keeps things sane)
-    await db.update(bpTranslation).set({ isDefault: false }).run();
+    // Only touch defaults if requested (prevents wiping defaults in multi-translation DBs)
+    const forceDefault = (process.env.BP_SEED_FORCE_DEFAULT_TRANSLATION ?? "1").trim() !== "0";
+    if (forceDefault) {
+        await db.update(bpTranslation).set({ isDefault: false }).run();
+    }
 
     await db
         .insert(bpTranslation)
@@ -166,9 +182,9 @@ async function seedTranslation(db: ReturnType<typeof openDb>["db"]) {
             name: TRANSLATION_NAME,
             language: TRANSLATION_LANG,
             derivedFrom: null,
-            licenseKind: "PUBLIC_DOMAIN",
-            licenseText: TRANSLATION_ID.toUpperCase() === "KJV" ? "Public domain (US)" : null,
-            sourceUrl: null,
+            licenseKind: TRANSLATION_LICENSE_KIND as any,
+            licenseText: TRANSLATION_LICENSE_TEXT,
+            sourceUrl: TRANSLATION_SOURCE_URL,
             isDefault: true,
             // createdAt default
         })
@@ -178,15 +194,15 @@ async function seedTranslation(db: ReturnType<typeof openDb>["db"]) {
                 name: TRANSLATION_NAME,
                 language: TRANSLATION_LANG,
                 derivedFrom: null,
-                licenseKind: "PUBLIC_DOMAIN",
-                licenseText: TRANSLATION_ID.toUpperCase() === "KJV" ? "Public domain (US)" : null,
-                sourceUrl: null,
+                licenseKind: TRANSLATION_LICENSE_KIND as any,
+                licenseText: TRANSLATION_LICENSE_TEXT,
+                sourceUrl: TRANSLATION_SOURCE_URL,
                 isDefault: true,
             },
         });
 }
 
-function getVerseTextCount(sqlite: ReturnType<typeof openDb>["sqlite"]): number {
+function getVerseTextCount(sqlite: Sqlite): number {
     const row = sqlite
         .prepare(`SELECT COUNT(*) AS c FROM bp_verse_text WHERE translation_id = ?`)
         .get(TRANSLATION_ID) as { c?: number } | undefined;
@@ -200,25 +216,34 @@ async function main() {
     const { sqlite, db, dbPath, close } = openDb();
     log("dbPath:", dbPath);
 
-    sqlite.exec("BEGIN;");
     try {
+        sqlite.exec("BEGIN;");
         await seedBooks(db);
         await seedTranslation(db);
-
         sqlite.exec("COMMIT;");
     } catch (e) {
-        sqlite.exec("ROLLBACK;");
+        try {
+            sqlite.exec("ROLLBACK;");
+        } catch {
+            // ignore
+        }
         throw e;
     } finally {
         close();
     }
 
-    const verseTextCount = getVerseTextCount(openDb().sqlite); // quick read-only count; openDb is cheap in Bun
-    log(`bp_verse_text rows for ${TRANSLATION_ID}:`, verseTextCount);
+    // Read-only post-check (use a fresh connection and close it)
+    const check = openDb();
+    try {
+        const verseTextCount = getVerseTextCount(check.sqlite);
+        log(`bp_verse_text rows for ${TRANSLATION_ID}:`, verseTextCount);
 
-    if (verseTextCount === 0) {
-        log("NOTE: no verse text found for this translation_id.");
-        log("Run your KJV importer (or set BP_TRANSLATION_ID to match the imported translation_id).");
+        if (verseTextCount === 0) {
+            log("NOTE: no verse text found for this translation_id.");
+            log("Run your KJV importer (or set BP_TRANSLATION_ID to match the imported translation_id).");
+        }
+    } finally {
+        check.close();
     }
 
     log("seed complete.");

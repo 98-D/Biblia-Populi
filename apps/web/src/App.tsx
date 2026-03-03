@@ -34,7 +34,12 @@ function isPage(v: unknown): v is Page {
 }
 
 function toInt(v: unknown): number | null {
-    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+    const n =
+        typeof v === "number"
+            ? v
+            : typeof v === "string" && v.trim() !== ""
+                ? Number(v)
+                : NaN;
     return Number.isFinite(n) ? Math.trunc(n) : null;
 }
 
@@ -42,8 +47,8 @@ function normalizeLoc(loc: Partial<ReaderLocation> | null | undefined): ReaderLo
     if (!loc || typeof loc.bookId !== "string" || !loc.bookId.trim()) return null;
 
     const bookId = loc.bookId.trim().toUpperCase();
-    const chapter = toInt((loc as any).chapter);
-    const verseRaw = (loc as any).verse;
+    const chapter = toInt((loc as { chapter?: unknown }).chapter);
+    const verseRaw = (loc as { verse?: unknown }).verse;
 
     if (chapter == null || chapter < 1) return null;
 
@@ -154,7 +159,7 @@ export default function App() {
 
 /**
  * HomeFx drives the home -> reader “opening” motion.
- * NOTE: phase is *part of the type* (fixes TS2339: Property 'phase' does not exist on type 'HomeFx'.)
+ * phase is part of the type (prevents TS2339).
  */
 type HomeFx =
     | null
@@ -192,6 +197,16 @@ function AppInner() {
 
     const writingUrl = useRef(false);
 
+    // refs to avoid re-binding global listeners (prevents flicker/glitch on nav)
+    const pageRef = useRef<Page>(page);
+    const fxRef = useRef<HomeFx>(homeFx);
+    useEffect(() => {
+        pageRef.current = page;
+    }, [page]);
+    useEffect(() => {
+        fxRef.current = homeFx;
+    }, [homeFx]);
+
     useEffect(() => {
         safeSet(LS_LAST_PAGE, page);
     }, [page]);
@@ -219,17 +234,18 @@ function AppInner() {
         }, 0);
     }, [page, readerLoc, homeFx]);
 
+    // URL -> state (bind once; uses refs)
     useEffect(() => {
         if (typeof window === "undefined") return;
 
         const onNav = () => {
             if (writingUrl.current) return;
 
-            // ignore nav churn mid fx (prevents flicker / double mounts)
-            if (homeFx) return;
+            // ignore nav churn mid fx (prevents double mounts)
+            if (fxRef.current) return;
 
             const intent = readUrlIntent();
-            if (intent.page && intent.page !== page) setPage(intent.page);
+            if (intent.page && intent.page !== pageRef.current) setPage(intent.page);
             if (intent.loc) setReaderLoc(intent.loc);
         };
 
@@ -239,7 +255,7 @@ function AppInner() {
             window.removeEventListener("hashchange", onNav);
             window.removeEventListener("popstate", onNav);
         };
-    }, [page, homeFx]);
+    }, []);
 
     useEffect(() => {
         return () => {
@@ -263,11 +279,6 @@ function AppInner() {
         setPage("learn");
     }, [cancelFx]);
 
-    const goReader = useCallback(() => {
-        cancelFx();
-        setPage("reader");
-    }, [cancelFx]);
-
     const beginHomeToReader = useCallback(
         (loc: ReaderLocation) => {
             const clean = normalizeLoc(loc) ?? { bookId: "GEN", chapter: 1, verse: 1 };
@@ -275,8 +286,9 @@ function AppInner() {
             // commit target loc immediately (Reader can mount and warm cache)
             setReaderLoc(clean);
 
-            if (reducedMotion || page !== "home") {
+            if (reducedMotion || pageRef.current !== "home") {
                 cancelFx();
+                setHomeFx(null);
                 setPage("reader");
                 return;
             }
@@ -298,11 +310,12 @@ function AppInner() {
             });
 
             fxTimerRef.current = window.setTimeout(() => {
+                fxTimerRef.current = null;
                 setHomeFx(null);
                 setPage("reader");
             }, durationMs);
         },
-        [cancelFx, page, reducedMotion],
+        [cancelFx, reducedMotion],
     );
 
     const startReading = useCallback(() => {
@@ -424,14 +437,13 @@ function HomeToReaderTransition(props: {
 }
 
 const tStyles: Record<string, React.CSSProperties> = {
-    root: { position: "relative", minHeight: "100vh" },
+    root: { position: "relative", minHeight: "100vh", height: "100vh", overflow: "hidden" },
     layer: { position: "absolute", inset: 0, willChange: "transform, opacity, filter" },
     curtain: {
         position: "absolute",
         inset: 0,
         zIndex: 2,
-        background:
-            "radial-gradient(1200px 600px at 50% 10%, rgba(0,0,0,0.06), transparent 55%), var(--bg)",
+        background: "radial-gradient(1200px 600px at 50% 10%, rgba(0,0,0,0.06), transparent 55%), var(--bg)",
         boxShadow: "inset 0 1px 0 rgba(255,255,255,0.35)",
         pointerEvents: "none",
     },
@@ -467,7 +479,14 @@ function Home(props: {
         <main style={styles.centerStage} aria-label="Landing">
             <div style={styles.centerBlock}>
                 <div style={styles.crossWrap} aria-hidden>
-                    <img src="/cross.png" alt="" style={styles.crossImg} draggable={false} decoding="async" loading="eager" />
+                    <img
+                        src="/cross.png"
+                        alt=""
+                        style={styles.crossImg}
+                        draggable={false}
+                        decoding="async"
+                        loading="eager"
+                    />
                 </div>
 
                 <h1 style={styles.h1}>Biblia Populi</h1>
@@ -596,7 +615,7 @@ export const styles: Record<string, React.CSSProperties> = {
         justifyContent: "center",
     },
 
-    // Search reads these (and now also reads searchWrap/searchPanel for sizing)
+    // Search reads these
     searchWrap: {
         width: "100%",
         maxWidth: 660,
@@ -641,7 +660,7 @@ export const styles: Record<string, React.CSSProperties> = {
         width: "100%",
     },
 
-    // optional hook for Search panel (keeps things consistent)
+    // optional hook for Search panel
     searchPanel: {},
 
     ctaRow: {

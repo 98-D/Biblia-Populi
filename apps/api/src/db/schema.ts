@@ -7,6 +7,9 @@
 // - All links target ranges (ordinals), never strings
 // - Uncertainty is first-class (time + geo precision/confidence)
 // - No interpretation layer in canon (no commentary, no devotional "summary", etc.)
+//
+// NOTE: Auth/Identity tables live in ./authSchema.ts and are re-exported here,
+// so the rest of the app can import everything from one surface.
 
 import { sql } from "drizzle-orm";
 import {
@@ -19,6 +22,9 @@ import {
     primaryKey,
     check,
 } from "drizzle-orm/sqlite-core";
+
+// Re-export auth/identity tables from a dedicated module.
+export * from "./authSchema";
 
 const nowIso = sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`;
 
@@ -362,10 +368,7 @@ export const bpParagraph = sqliteTable(
     },
     (t) => ({
         rangeIdx: index("bp_paragraph_range_idx").on(t.translationId, t.rangeId),
-        styleCheck: check(
-            "bp_paragraph_style_check",
-            sql`${t.style} in ('PROSE','POETRY','LIST','QUOTE','LETTER')`,
-        ),
+        styleCheck: check("bp_paragraph_style_check", sql`${t.style} in ('PROSE','POETRY','LIST','QUOTE','LETTER')`),
         indentCheck: check("bp_paragraph_indent_check", sql`${t.indent} >= 0`),
     }),
 );
@@ -576,10 +579,7 @@ export const bpTimelineAnchor = sqliteTable(
     (t) => ({
         rangeIdx: index("bp_timeline_anchor_range_idx").on(t.rangeId),
         timeIdx: index("bp_timeline_anchor_time_idx").on(t.timeSpanId),
-        kindCheck: check(
-            "bp_timeline_anchor_kind_check",
-            sql`${t.kind} in ('SETTING','EVENT_WINDOW','REIGN','JOURNEY_WINDOW')`,
-        ),
+        kindCheck: check("bp_timeline_anchor_kind_check", sql`${t.kind} in ('SETTING','EVENT_WINDOW','REIGN','JOURNEY_WINDOW')`),
         confCheck: check(
             "bp_timeline_anchor_conf_check",
             sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
@@ -606,7 +606,7 @@ export const bpEvent = sqliteTable(
             "bp_event_kind_check",
             sql`${t.kind} in (
     'BIRTH','DEATH','BATTLE','COVENANT','EXODUS','MIGRATION','SPEECH','MIRACLE','PROPHECY',
-        'CAPTIVITY','RETURN','CRUCIFIXION','RESURRECTION','MISSION_JOURNEY','COUNCIL','LETTER_WRITTEN','OTHER'
+    'CAPTIVITY','RETURN','CRUCIFIXION','RESURRECTION','MISSION_JOURNEY','COUNCIL','LETTER_WRITTEN','OTHER'
 )`,
         ),
         rangeIdx: index("bp_event_range_idx").on(t.primaryRangeId),
@@ -629,10 +629,7 @@ export const bpEventParticipant = sqliteTable(
     (t) => ({
         eventIdx: index("bp_event_participant_event_idx").on(t.eventId),
         entityIdx: index("bp_event_participant_entity_idx").on(t.entityId),
-        roleCheck: check(
-            "bp_event_participant_role_check",
-            sql`${t.role} in ('SUBJECT','AGENT','WITNESS','OPPONENT','RULER','PEOPLE','OTHER')`,
-        ),
+        roleCheck: check("bp_event_participant_role_check", sql`${t.role} in ('SUBJECT','AGENT','WITNESS','OPPONENT','RULER','PEOPLE','OTHER')`),
         confCheck: check(
             "bp_event_participant_conf_check",
             sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
@@ -663,7 +660,7 @@ export const bpLink = sqliteTable(
             "bp_link_link_kind_check",
             sql`${t.linkKind} in (
     'MENTIONS','PRIMARY_SUBJECT','LOCATION','SETTING','JOURNEY_STEP',
-        'PARALLEL_ACCOUNT','QUOTE_SOURCE','QUOTE_TARGET'
+    'PARALLEL_ACCOUNT','QUOTE_SOURCE','QUOTE_TARGET'
 )`,
         ),
         weightCheck: check("bp_link_weight_check", sql`${t.weight} >= 1`),
