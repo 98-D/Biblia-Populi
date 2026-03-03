@@ -5,7 +5,7 @@
 // Prints:
 // - bp_book count
 // - bp_verse count + min/max verse_ord
-// - bp_chapter count
+// - bp_chapter count (if present)
 // - bp_translation count + default translation
 // - bp_verse_text count for active translation_id
 // - FTS presence + row count (bp_verse_text_fts)
@@ -48,6 +48,7 @@ function getScalar(sqlite: SqliteLike, sql: string, params: any[] = []): unknown
 }
 
 function getCount(sqlite: SqliteLike, table: string): number {
+    // table is internal constant in this script; not user input
     return asNum(getScalar(sqlite, `SELECT COUNT(*) AS c FROM ${table};`));
 }
 
@@ -94,20 +95,29 @@ function getFtsCount(sqlite: SqliteLike): number {
     return asNum(getScalar(sqlite, `SELECT COUNT(*) AS c FROM bp_verse_text_fts;`));
 }
 
-function getSample(sqlite: SqliteLike, translationId: string): { verseKey: string; text: string } | null {
+function getSample(
+    sqlite: SqliteLike,
+    translationId: string,
+    verseKey = "GEN.1.1",
+): { verseKey: string; text: string } | null {
     const row = sqlite
         .query(
             `
-      SELECT t.verse_key AS verseKey, t.text AS text
-      FROM bp_verse_text t
-      WHERE t.translation_id = ? AND t.verse_key = 'GEN.1.1'
-      LIMIT 1;
-    `,
+                SELECT t.verse_key AS verseKey, t.text AS text
+                FROM bp_verse_text t
+                WHERE t.translation_id = ? AND t.verse_key = ?
+                    LIMIT 1;
+            `,
         )
-        .get(translationId) as { verseKey?: string; text?: string } | undefined;
+        .get(translationId, verseKey) as { verseKey?: string; text?: string } | undefined;
 
     if (!row?.verseKey || !row?.text) return null;
     return { verseKey: row.verseKey, text: row.text };
+}
+
+function fmtSample(text: string, n = 90): string {
+    const s = text.replace(/\s+/g, " ").trim();
+    return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
 async function main() {
@@ -117,7 +127,7 @@ async function main() {
     try {
         log("dbPath:", dbPath);
 
-        // Basic presence checks (avoid weird errors)
+        // Basic presence checks (avoid confusing errors)
         const required = ["bp_book", "bp_translation", "bp_verse", "bp_verse_text"];
         for (const t of required) {
             if (!hasTable(s, t)) fatal(`missing table "${t}". Run db:migrate first.`);
@@ -149,10 +159,11 @@ async function main() {
             log("active translationId:", translationId);
             log("bp_verse_text:", textCount, `(translation_id=${translationId})`);
 
-            const sample = getSample(s, translationId);
-            if (sample) log("sample:", sample.verseKey, "=>", sample.text.slice(0, 90) + (sample.text.length > 90 ? "…" : ""));
-            else log("sample:", "GEN.1.1 not found for this translation_id (could be a different translation id)");
-            if (verseCount > 0 && textCount > 0) {
+            const sample = getSample(s, translationId, "GEN.1.1");
+            if (sample) log("sample:", sample.verseKey, "=>", fmtSample(sample.text));
+            else log("sample:", "GEN.1.1 not found for this translation_id (maybe different translation_id was imported)");
+
+            if (verseCount > 0) {
                 const ratio = Math.round((textCount / Math.max(1, verseCount)) * 10000) / 100;
                 log("coverage:", `${ratio}% (bp_verse_text / bp_verse)`);
             }
@@ -162,11 +173,11 @@ async function main() {
 
         // Friendly warnings (non-fatal)
         if (bookCount !== 66) log("WARN: expected 66 bp_book rows (seed may not have run).");
-        if (verseCount === 0) log("WARN: bp_verse is empty (import-osis likely not run, or CLEAR_SPINE was used then import failed).");
+        if (verseCount === 0) log("WARN: bp_verse is empty (import/builder likely not run, or import failed).");
         if (!defaultT && !process.env.BP_TRANSLATION_ID) {
             log("WARN: no default translation and BP_TRANSLATION_ID not set -> /meta will 404.");
         }
-        if (!ftsPresent) log("NOTE: FTS is optional. Run db:migrate (extras) if you want /search to use FTS mode.");
+        if (!ftsPresent) log("NOTE: FTS is optional. Ensure your migrate creates bp_verse_text_fts if you want /search to use FTS mode.");
 
         log("ok.");
     } finally {

@@ -3,6 +3,7 @@ import React, { useMemo, useState } from "react";
 import type { BookRow } from "../api";
 import type { ReaderLocation } from "../Search";
 import { PositionPill } from "../PositionPill";
+import { ThemeTogglePill } from "../theme";
 import { sx } from "./sx";
 import { ReaderHeaderSearch } from "./ReaderHeaderSearch";
 import { ReaderTypographyControl } from "./ReaderTypographyControl";
@@ -26,7 +27,7 @@ type Props = {
 
     onNavigate: (loc: ReaderLocation) => void;
 
-    // kept for compatibility (toggle is global now)
+    // legacy: keep props but header uses global ThemeTogglePill now
     mode?: "light" | "dark";
     onToggleTheme?: () => void;
 };
@@ -72,8 +73,7 @@ export function ReaderHeader(props: Props) {
             </div>
 
             <div style={sx.topRight}>
-                {/* give the fixed global toggle room so it never sits on top of header chrome */}
-                <div style={{ ...sx.rightCluster, paddingRight: 54 }}>
+                <div style={sx.rightCluster}>
                     <div style={sx.searchWrap}>
                         <ReaderHeaderSearch
                             books={books}
@@ -85,6 +85,11 @@ export function ReaderHeader(props: Props) {
                     </div>
 
                     <ReaderTypographyControl />
+
+                    {/* use our theme toggle pill (no fixed overlay assumptions) */}
+                    <div style={{ marginLeft: 10, display: "flex", alignItems: "center" }}>
+                        <ThemeTogglePill />
+                    </div>
                 </div>
             </div>
         </div>

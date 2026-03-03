@@ -10,11 +10,13 @@
 // Extras:
 // - Ensures API DB is bootstrapped (migrate + seed) unless BP_DEV_SKIP_DB=1
 // - Optionally runs OSIS import if BP_DEV_IMPORT_OSIS points to a file
+// - Optional: verify DB after bootstrap/import if apps/api has db:verify script
 // - Clean shutdown on Ctrl+C / SIGTERM
 //
 // Notes:
-// - Uses Bun.spawn (global). No Node child_process.
+// - Uses Bun.spawn only (no Node child_process).
 // - Uses Bun.which to locate bun if needed.
+// - Better logs, env toggles, and stronger shutdown behavior.
 
 import * as path from "node:path";
 import * as process from "node:process";
@@ -30,19 +32,50 @@ const WEB_CWD = path.join(ROOT, "apps", "web");
 const procs: Proc[] = [];
 let shuttingDown = false;
 
+/* --------------------------------- helpers -------------------------------- */
+
+function envStr(name: string, fallback = ""): string {
+    const v = (process.env[name] ?? "").trim();
+    return v || fallback;
+}
+
 function envBool(name: string): boolean {
     const v = (process.env[name] ?? "").trim().toLowerCase();
     return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
+function nowStamp(): string {
+    const d = new Date();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    return `${hh}:${mm}:${ss}`;
+}
+
+function log(...args: unknown[]) {
+    // eslint-disable-next-line no-console
+    console.log(`[dev ${nowStamp()}]`, ...args);
+}
+
+function warn(...args: unknown[]) {
+    // eslint-disable-next-line no-console
+    console.warn(`[dev ${nowStamp()}]`, ...args);
+}
+
+function errlog(...args: unknown[]) {
+    // eslint-disable-next-line no-console
+    console.error(`[dev ${nowStamp()}]`, ...args);
+}
+
 function bunBin(): string {
     // Usually bun is the current execPath, but if not, resolve via PATH.
-    if (process.execPath.toLowerCase().includes("bun")) return process.execPath;
+    const ep = (process.execPath ?? "").toLowerCase();
+    if (ep.includes("bun")) return process.execPath;
     return Bun.which("bun") ?? "bun";
 }
 
 async function runOnce(name: string, cwd: string, cmd: string[], extraEnv?: Record<string, string>): Promise<void> {
-    console.log(`[dev] > (${name}) ${cmd.join(" ")}`);
+    log(`> (${name}) ${cmd.join(" ")}`);
 
     const p = Bun.spawn({
         cmd,
@@ -52,14 +85,12 @@ async function runOnce(name: string, cwd: string, cmd: string[], extraEnv?: Reco
         env: { ...process.env, ...(extraEnv ?? {}) },
     });
 
-    const code: number = await p.exited;
-    if (code !== 0) {
-        throw new Error(`[dev] ${name} failed (exit ${code})`);
-    }
+    const code = await p.exited;
+    if (code !== 0) throw new Error(`${name} failed (exit ${code})`);
 }
 
 function runLong(name: string, cwd: string, cmd: string[], extraEnv?: Record<string, string>): Proc {
-    console.log(`[dev] + (${name}) ${cmd.join(" ")}`);
+    log(`+ (${name}) ${cmd.join(" ")}`);
 
     const p = Bun.spawn({
         cmd,
@@ -70,9 +101,9 @@ function runLong(name: string, cwd: string, cmd: string[], extraEnv?: Record<str
     });
 
     // If any long-running process exits unexpectedly, shut everything down.
-    p.exited.then((code: number) => {
+    p.exited.then((code) => {
         if (shuttingDown) return;
-        console.error(`\n[dev] ${name} exited (exit ${code})`);
+        errlog(`${name} exited (exit ${code})`);
         shutdown(code === 0 ? 0 : 1);
     });
 
@@ -83,84 +114,133 @@ function shutdown(exitCode = 0): void {
     if (shuttingDown) return;
     shuttingDown = true;
 
+    // Try graceful first
     for (const p of procs) {
         try {
-            p.proc.kill();
+            p.proc.kill("SIGTERM");
         } catch {
             // ignore
         }
     }
 
-    setTimeout(() => process.exit(exitCode), 200);
+    // Then hard-kill if still around
+    setTimeout(() => {
+        for (const p of procs) {
+            try {
+                p.proc.kill("SIGKILL");
+            } catch {
+                // ignore
+            }
+        }
+        process.exit(exitCode);
+    }, 300);
 }
 
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
+process.on("uncaughtException", (e) => {
+    errlog("uncaughtException:", e);
+    shutdown(1);
+});
+process.on("unhandledRejection", (e) => {
+    errlog("unhandledRejection:", e);
+    shutdown(1);
+});
+
+function readJsonFile<T>(filePath: string): T | null {
+    try {
+        const txt = fs.readFileSync(filePath, "utf8");
+        return JSON.parse(txt) as T;
+    } catch {
+        return null;
+    }
+}
 
 function apiHasScript(scriptName: string): boolean {
-    // check apps/api/package.json scripts
+    const pjPath = path.join(API_CWD, "package.json");
+    const json = readJsonFile<{ scripts?: Record<string, string> }>(pjPath);
+    return Boolean(json?.scripts && Object.prototype.hasOwnProperty.call(json.scripts, scriptName));
+}
+
+function fileExists(p: string): boolean {
     try {
-        const pjPath = path.join(API_CWD, "package.json");
-        const txt = fs.readFileSync(pjPath, "utf8");
-        const json = JSON.parse(txt) as { scripts?: Record<string, string> };
-        return Boolean(json.scripts && Object.prototype.hasOwnProperty.call(json.scripts, scriptName));
+        return fs.existsSync(p);
     } catch {
         return false;
     }
 }
 
+/* -------------------------------- bootstrap -------------------------------- */
+
 async function bootstrapDb(bunPath: string): Promise<void> {
     if (envBool("BP_DEV_SKIP_DB")) {
-        console.log("[dev] BP_DEV_SKIP_DB=1 -> skipping db bootstrap");
+        log("BP_DEV_SKIP_DB=1 -> skipping db bootstrap");
         return;
     }
 
-    await runOnce("api:db:bootstrap", API_CWD, [bunPath, "run", "db:bootstrap"]);
+    // Prefer db:bootstrap if present; otherwise migrate+seed.
+    if (apiHasScript("db:bootstrap")) {
+        await runOnce("api:db:bootstrap", API_CWD, [bunPath, "run", "db:bootstrap"]);
+    } else {
+        warn("apps/api has no db:bootstrap script; falling back to db:migrate + db:seed");
+        if (apiHasScript("db:migrate")) await runOnce("api:db:migrate", API_CWD, [bunPath, "run", "db:migrate"]);
+        if (apiHasScript("db:seed")) await runOnce("api:db:seed", API_CWD, [bunPath, "run", "db:seed"]);
+    }
 
-    const osisPath = (process.env.BP_DEV_IMPORT_OSIS ?? "").trim();
+    // Optional OSIS import
+    const osisPath = envStr("BP_DEV_IMPORT_OSIS", "");
     if (osisPath) {
-        await runOnce("api:import:osis", API_CWD, [bunPath, "run", "import:osis", osisPath], {
-            // If you want import to set KJV default automatically:
-            // BP_IMPORT_SET_DEFAULT: "1",
-        });
-
-        if (apiHasScript("db:verify")) {
-            await runOnce("api:db:verify", API_CWD, [bunPath, "run", "db:verify"]);
+        if (!fileExists(osisPath)) {
+            warn("BP_DEV_IMPORT_OSIS was set but file does not exist:", osisPath);
+        } else if (apiHasScript("import:osis")) {
+            // Prefer script; if it expects a path argument, pass it.
+            await runOnce("api:import:osis", API_CWD, [bunPath, "run", "import:osis", osisPath], {
+                // Optional knobs:
+                // BP_IMPORT_SET_DEFAULT: "1",
+            });
         } else {
-            console.log("[dev] (note) apps/api has no db:verify script; skipping");
+            warn("apps/api has no import:osis script; skipping import");
         }
     }
+
+    // Optional verify
+    if (envBool("BP_DEV_VERIFY_DB") && apiHasScript("db:verify")) {
+        await runOnce("api:db:verify", API_CWD, [bunPath, "run", "db:verify"]);
+    }
 }
+
+/* ---------------------------------- main ---------------------------------- */
 
 async function main(): Promise<void> {
     const bunPath = bunBin();
 
-    console.log("\n=== Biblia Populi Dev ===");
-    console.log("ROOT:", ROOT);
-    console.log("API :", API_CWD);
-    console.log("WEB :", WEB_CWD);
-    console.log("BUN :", bunPath);
-    console.log("");
+    log("=== Biblia Populi Dev ===");
+    log("ROOT:", ROOT);
+    log("API :", API_CWD);
+    log("WEB :", WEB_CWD);
+    log("BUN :", bunPath);
 
-    try {
-        await bootstrapDb(bunPath);
-    } catch (e) {
-        console.error(String(e));
-        process.exit(1);
+    // Basic sanity (helps when run from wrong folder)
+    if (!fileExists(path.join(API_CWD, "package.json"))) {
+        throw new Error(`apps/api not found at ${API_CWD} (run from repo root)`);
+    }
+    if (!fileExists(path.join(WEB_CWD, "package.json"))) {
+        throw new Error(`apps/web not found at ${WEB_CWD} (run from repo root)`);
     }
 
-    procs.push(runLong("api", API_CWD, [bunPath, "run", "dev"]));
-    procs.push(
-        runLong("web", WEB_CWD, [bunPath, "run", "dev"], {
-            // Optional:
-            // VITE_API_BASE: "http://localhost:3000",
-        }),
-    );
+    await bootstrapDb(bunPath);
 
-    console.log("\n[dev] running. Ctrl+C to stop.\n");
+    // Optional env overrides for web dev server (handy for remote api)
+    const viteApiBase = envStr("BP_DEV_VITE_API_BASE", "");
+    const webEnv = viteApiBase ? { VITE_API_BASE: viteApiBase } : undefined;
+
+    procs.push(runLong("api", API_CWD, [bunPath, "run", "dev"]));
+    procs.push(runLong("web", WEB_CWD, [bunPath, "run", "dev"], webEnv));
+
+    log("running. Ctrl+C to stop.");
 }
 
 main().catch((e) => {
-    console.error("[dev] fatal:", e);
+    errlog("fatal:", e);
     shutdown(1);
 });

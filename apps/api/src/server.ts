@@ -168,17 +168,17 @@ function randId(bytes = 18): string {
     return b64url(crypto.randomBytes(bytes));
 }
 
-function nowDate(): Date {
-    return new Date();
+// Use ms timestamps for DB columns (drizzle sqlite { mode: "timestamp_ms" } => number).
+function nowMs(): number {
+    return Date.now();
+}
+function msToDate(ms: number): Date {
+    return new Date(ms);
 }
 
 function daysMs(days: number): number {
     const d = Number.isFinite(days) ? days : 30;
     return Math.max(1, Math.trunc(d)) * 24 * 60 * 60 * 1000;
-}
-
-function addDays(d: Date, days: number): Date {
-    return new Date(d.getTime() + daysMs(days));
 }
 
 function cookieOpts(expiresAt?: Date): CookieOptions {
@@ -556,13 +556,13 @@ type AppVars = {
 /* ------------------------------- Sessions ---------------------------------- */
 
 async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null> {
-    const now = nowDate();
+    const now = nowMs();
 
     const sess = await db
         .select({
             id: bpSession.id,
             userId: bpSession.userId,
-            expiresAt: bpSession.expiresAt,
+            expiresAt: bpSession.expiresAt, // number (timestamp_ms)
         })
         .from(bpSession)
         .where(eq(bpSession.id, sessionId))
@@ -571,7 +571,7 @@ async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null
     const s = sess[0];
     if (!s) return null;
 
-    if (s.expiresAt <= now) {
+    if (Number(s.expiresAt) <= now) {
         // best-effort cleanup
         db.delete(bpSession).where(eq(bpSession.id, sessionId)).run();
         return null;
@@ -582,8 +582,8 @@ async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null
             id: bpUser.id,
             displayName: bpUser.displayName,
             email: bpUser.email,
-            emailVerifiedAt: bpUser.emailVerifiedAt,
-            disabledAt: bpUser.disabledAt,
+            emailVerifiedAt: bpUser.emailVerifiedAt, // number | null
+            disabledAt: bpUser.disabledAt, // number | null
         })
         .from(bpUser)
         .where(eq(bpUser.id, s.userId))
@@ -597,26 +597,29 @@ async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null
         id: u.id,
         displayName: u.displayName ?? null,
         email: u.email ?? null,
-        emailVerifiedAt: u.emailVerifiedAt ?? null,
-        disabledAt: u.disabledAt ?? null,
+        emailVerifiedAt: u.emailVerifiedAt != null ? msToDate(Number(u.emailVerifiedAt)) : null,
+        disabledAt: u.disabledAt != null ? msToDate(Number(u.disabledAt)) : null,
     };
 }
 
 async function createSessionForUser(c: Context, userId: string): Promise<string> {
     const sid = randId(24);
-    const createdAt = nowDate();
-    const expiresAt = addDays(createdAt, AUTH_SESSION_DAYS);
+    const createdAt = nowMs();
+    const expiresAt = createdAt + daysMs(AUTH_SESSION_DAYS);
 
-    await db.insert(bpSession).values({
-        id: sid,
-        createdAt,
-        expiresAt,
-        userId,
-        ip: c.req.header("x-forwarded-for") ?? c.req.header("x-real-ip") ?? null,
-        ua: c.req.header("user-agent") ?? null,
-    });
+    // NOTE: drizzle sqlite insert typing in some versions prefers array-form.
+    await db.insert(bpSession).values([
+        {
+            id: sid,
+            createdAt,
+            expiresAt,
+            userId,
+            ip: c.req.header("x-forwarded-for") ?? c.req.header("x-real-ip") ?? null,
+            ua: c.req.header("user-agent") ?? null,
+        },
+    ]);
 
-    setCookie(c, AUTH_COOKIE, packCookieValue(sid), cookieOpts(expiresAt));
+    setCookie(c, AUTH_COOKIE, packCookieValue(sid), cookieOpts(msToDate(expiresAt)));
     return sid;
 }
 
@@ -728,7 +731,7 @@ async function upsertGoogleUser(
     info: GoogleUserInfo,
     tokens: GoogleTokenResponse,
 ): Promise<{ userId: string; displayName: string | null; email: string | null }> {
-    const now = nowDate();
+    const now = nowMs();
     const provider = "google";
     const providerUserId = info.sub;
 
@@ -742,7 +745,7 @@ async function upsertGoogleUser(
 
     const email = info.email?.trim() ? info.email.trim() : null;
     const displayName = info.name?.trim() ? info.name.trim() : null;
-    const emailVerifiedAt: Date | null = info.email_verified ? now : null;
+    const emailVerifiedAt: number | null = info.email_verified ? now : null;
 
     if (!userId && email) {
         const byEmail = await db.select({ id: bpUser.id }).from(bpUser).where(eq(bpUser.email, email)).limit(1);
@@ -751,16 +754,18 @@ async function upsertGoogleUser(
 
     if (!userId) {
         userId = randId(18);
-        await db.insert(bpUser).values({
-            id: userId,
-            createdAt: now,
-            updatedAt: now,
-            displayName,
-            email,
-            emailVerifiedAt,
-            passwordHash: null,
-            disabledAt: null,
-        });
+        await db.insert(bpUser).values([
+            {
+                id: userId,
+                createdAt: now,
+                updatedAt: now,
+                displayName,
+                email,
+                emailVerifiedAt,
+                passwordHash: null,
+                disabledAt: null,
+            },
+        ]);
     } else {
         await db
             .update(bpUser)
@@ -774,20 +779,24 @@ async function upsertGoogleUser(
     }
 
     const accId = existingAcc[0]?.id ?? randId(18);
+    const accessTokenExpiresAt: number | null = tokens.expires_in ? now + tokens.expires_in * 1000 : null;
+
     await db
         .insert(bpAuthAccount)
-        .values({
-            id: accId,
-            createdAt: now,
-            updatedAt: now,
-            userId,
-            provider,
-            providerUserId,
-            accessToken: tokens.access_token ?? null,
-            refreshToken: tokens.refresh_token ?? null,
-            accessTokenExpiresAt: tokens.expires_in ? new Date(now.getTime() + tokens.expires_in * 1000) : null,
-            scope: tokens.scope ?? null,
-        })
+        .values([
+            {
+                id: accId,
+                createdAt: now,
+                updatedAt: now,
+                userId,
+                provider,
+                providerUserId,
+                accessToken: tokens.access_token ?? null,
+                refreshToken: tokens.refresh_token ?? null,
+                accessTokenExpiresAt,
+                scope: tokens.scope ?? null,
+            },
+        ])
         .onConflictDoUpdate({
             target: bpAuthAccount.id,
             set: {
@@ -795,7 +804,7 @@ async function upsertGoogleUser(
                 userId,
                 accessToken: tokens.access_token ?? null,
                 refreshToken: tokens.refresh_token ?? null,
-                accessTokenExpiresAt: tokens.expires_in ? new Date(now.getTime() + tokens.expires_in * 1000) : null,
+                accessTokenExpiresAt,
                 scope: tokens.scope ?? null,
             },
         });

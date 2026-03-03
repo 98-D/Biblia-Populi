@@ -1,11 +1,15 @@
 // apps/web/src/api.ts
 // Biblia Populi — tiny typed client (bp_* API)
 //
-// Upgraded:
-// - Translation selection support (global + per-call override)
-// - /translations endpoint support
-// - MetaPayload includes translations[]
-// - All relevant endpoints accept ?t=... (alias ?translationId=... server-side)
+// Upgraded (vNext):
+// - Robust base URL resolution (same-origin by default; supports absolute or path-base VITE_API_BASE)
+// - Translation selection: global + per-call override + reconciliation helpers (as before)
+// - Proper ETag/304 handling with in-memory response cache (fixes “freeze on 304”)
+// - Optional cache control knobs per request (no-store / bypass / ttl)
+// - GET + POST helpers with AbortSignal + timeout merge
+// - Safer JSON parsing (handles 204/304/empty body), clearer classification
+// - Better diagnostics: requestId, method, statusText, url, body snippet
+// - Credentials policy: same-origin by default; can override
 //
 // Philosophy:
 // - Calm, explicit, traceable
@@ -19,6 +23,16 @@ export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: { code: string; message: string } };
 export type ApiRes<T> = ApiOk<T> | ApiErr;
 
+export type ApiCacheMode = "default" | "no-store" | "reload";
+
+/**
+ * Request options:
+ * - cacheMode:
+ *   - "default": allow ETag caching (client-side in-memory) + normal fetch
+ *   - "no-store": bypass client cache and send Cache-Control: no-store
+ *   - "reload": bypass client cache and send Cache-Control: no-cache
+ * - cacheTtlMs: client-side TTL for cached entries (default 30s). Set 0 to disable TTL expiry.
+ */
 export type ApiRequestOptions = {
     /** Abort after N ms (default 12s). Set 0 to disable timeout. */
     timeoutMs?: number;
@@ -27,11 +41,17 @@ export type ApiRequestOptions = {
     /** Optional caller-provided AbortSignal (merged with timeout) */
     signal?: AbortSignal;
 
-    /**
-     * Optional translationId override for this request.
-     * If omitted, api uses the global translation selection (if set) or server default.
-     */
+    /** Optional translationId override for this request. */
     translationId?: string | null;
+
+    /** Fetch credentials (default "same-origin") */
+    credentials?: RequestCredentials;
+
+    /** Client cache mode (default "default") */
+    cacheMode?: ApiCacheMode;
+
+    /** Client cache TTL (ms). Default 30s. */
+    cacheTtlMs?: number;
 };
 
 export type ApiErrorCode =
@@ -41,21 +61,30 @@ export type ApiErrorCode =
     | "BAD_RESPONSE"
     | "NOT_JSON"
     | "API_ERROR"
-    | "ABORTED";
+    | "ABORTED"
+    | "CACHE_MISS";
 
 export class ApiError extends Error {
     readonly code: ApiErrorCode;
     readonly status?: number;
     readonly url?: string;
+    readonly method?: string;
     readonly bodyText?: string;
+    readonly requestId?: string;
 
-    constructor(code: ApiErrorCode, message: string, init?: { status?: number; url?: string; bodyText?: string }) {
+    constructor(
+        code: ApiErrorCode,
+        message: string,
+        init?: { status?: number; url?: string; method?: string; bodyText?: string; requestId?: string },
+    ) {
         super(`${code}: ${message}`);
         this.name = "ApiError";
         this.code = code;
         this.status = init?.status;
         this.url = init?.url;
+        this.method = init?.method;
         this.bodyText = init?.bodyText;
+        this.requestId = init?.requestId;
     }
 }
 
@@ -84,6 +113,7 @@ export type MetaPayload = {
     translations?: TranslationMeta[];
     ftsEnabled: boolean;
     spine?: SpineStats;
+    auth?: { enabled: boolean; user: unknown | null };
 };
 
 export type BookRow = {
@@ -119,7 +149,7 @@ export type VerseRow = {
     verseOrd: number;
     chapter: number;
     verse: number;
-    text: string | null; // left join => null if missing
+    text: string | null;
     updatedAt: string | null;
 };
 
@@ -173,7 +203,6 @@ export type ChapterPayload = {
     links: LinkRow[];
     crossrefs: CrossrefRow[];
 
-    // legacy placeholders
     marks: unknown[];
     mentions: unknown[];
     footnotes: unknown[];
@@ -333,17 +362,31 @@ export type TranslationsPayload = {
 // If VITE_API_BASE is set, use it. Otherwise same-origin (works with Vite proxy).
 const API_BASE = (import.meta.env?.VITE_API_BASE ?? "") as string;
 
+function stripTrailingSlashes(s: string): string {
+    return s.replace(/\/+$/g, "");
+}
+
+function isAbsoluteUrl(s: string): boolean {
+    return /^https?:\/\//i.test(s);
+}
+
 function joinUrl(base: string, p: string): string {
     const pathname = p.startsWith("/") ? p : `/${p}`;
     if (!base) return pathname;
-    const b = base.endsWith("/") ? base.slice(0, -1) : base;
-    return `${b}${pathname}`;
+
+    const b = stripTrailingSlashes(base);
+
+    // absolute base: https://example.com/api
+    if (isAbsoluteUrl(b)) return `${b}${pathname}`;
+
+    // path-base: /api
+    const bb = b.startsWith("/") ? b : `/${b}`;
+    return `${stripTrailingSlashes(bb)}${pathname}`;
 }
 
 /* ------------------------- Translation selection (client) ------------------- */
 
-const TRANSLATION_STORAGE_KEY = "bp_translation_id_v1";
-
+const TRANSLATION_STORAGE_KEY = "bp_translation_id_v2";
 let _translationIdMem: string | null = null;
 
 function safeLocalStorageGet(key: string): string | null {
@@ -373,45 +416,74 @@ function safeLocalStorageRemove(key: string): void {
     }
 }
 
-/**
- * Get the current translationId selection.
- * - If setTranslationId() has been called this session, returns that.
- * - Else attempts localStorage.
- * - Else returns null (server default).
- */
-export function getTranslationId(): string | null {
-    if (_translationIdMem != null) return _translationIdMem;
-    const v = safeLocalStorageGet(TRANSLATION_STORAGE_KEY);
-    _translationIdMem = v && v.trim() ? v.trim() : null;
-    return _translationIdMem;
+function normalizeTranslationId(id: string): string {
+    return id.trim();
 }
 
-/**
- * Set translationId selection for subsequent requests.
- * - Pass null to clear (use server default).
- */
+export function getTranslationId(): string | null {
+    if (_translationIdMem != null) return _translationIdMem;
+
+    const v2 = safeLocalStorageGet(TRANSLATION_STORAGE_KEY);
+    if (v2 && v2.trim()) {
+        _translationIdMem = normalizeTranslationId(v2);
+        return _translationIdMem;
+    }
+    const v1 = safeLocalStorageGet("bp_translation_id_v1");
+    if (v1 && v1.trim()) {
+        _translationIdMem = normalizeTranslationId(v1);
+        safeLocalStorageSet(TRANSLATION_STORAGE_KEY, _translationIdMem);
+        safeLocalStorageRemove("bp_translation_id_v1");
+        return _translationIdMem;
+    }
+
+    _translationIdMem = null;
+    return null;
+}
+
 export function setTranslationId(id: string | null): void {
-    const v = id && id.trim() ? id.trim() : null;
+    const v = id && id.trim() ? normalizeTranslationId(id) : null;
     _translationIdMem = v;
 
     if (!v) safeLocalStorageRemove(TRANSLATION_STORAGE_KEY);
     else safeLocalStorageSet(TRANSLATION_STORAGE_KEY, v);
 }
 
-/**
- * Append ?t=... to a URL path (keeps existing query intact).
- * - Respects per-request override in opts.translationId.
- * - Otherwise uses global getTranslationId().
- */
+export function reconcileTranslationId(translations: TranslationMeta[] | undefined | null): string | null {
+    const list = translations ?? [];
+    if (list.length === 0) return getTranslationId();
+
+    const current = getTranslationId();
+    if (current && list.some((t) => t.translationId === current)) return current;
+
+    const def = list.find((t) => !!t.isDefault)?.translationId ?? null;
+    const next = def ?? list[0]!.translationId ?? null;
+    setTranslationId(next);
+    return next;
+}
+
 function withTranslation(path: string, opts?: ApiRequestOptions): string {
     const t = (opts?.translationId ?? getTranslationId())?.trim() || "";
     if (!t) return path;
 
-    // if path already has t= or translationId=, do nothing
     if (/[?&](t|translationId)=/i.test(path)) return path;
 
     const sep = path.includes("?") ? "&" : "?";
     return `${path}${sep}t=${encodeURIComponent(t)}`;
+}
+
+/* ------------------------------ Query helpers ------------------------------ */
+
+type QueryValue = string | number | boolean | null | undefined;
+
+function addQuery(path: string, params: Record<string, QueryValue>): string {
+    const url = new URL(path, "http://local");
+    for (const [k, v] of Object.entries(params)) {
+        if (v == null) continue;
+        url.searchParams.set(k, String(v));
+    }
+    const q = url.search.toString();
+    if (!q) return url.pathname;
+    return `${url.pathname}${q}`;
 }
 
 /* ------------------------------ JSON / Errors ------------------------------ */
@@ -454,25 +526,133 @@ function classifyFetchError(e: unknown): ApiError {
     return new ApiError("NETWORK", msg || "Network error.");
 }
 
-async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T> {
-    // Attach translation selection unless caller says otherwise.
+function isLikelyJson(res: Response): boolean {
+    const ct = (res.headers.get("content-type") ?? "").toLowerCase();
+    return ct.includes("application/json") || ct.includes("+json");
+}
+
+function formatHttpMessage(res: Response): string {
+    const s = res.statusText?.trim();
+    return s ? s : `HTTP ${res.status}`;
+}
+
+function getRequestId(res: Response): string | undefined {
+    const v = res.headers.get("x-request-id") ?? res.headers.get("cf-ray") ?? undefined;
+    return v ? v : undefined;
+}
+
+/* ----------------------------- ETag 304 cache ------------------------------ */
+
+type CacheEntry = Readonly<{
+    at: number;
+    etag: string;
+    data: unknown;
+}>;
+
+const DEFAULT_CACHE_TTL_MS = 30_000;
+const _cache = new Map<string, CacheEntry>();
+
+function cacheKey(method: string, url: string): string {
+    // method is part of key (POST responses should not be cached by default)
+    return `${method} ${url}`;
+}
+
+function cacheGet(key: string, ttlMs: number): CacheEntry | null {
+    const hit = _cache.get(key);
+    if (!hit) return null;
+    if (ttlMs <= 0) return hit;
+    if (Date.now() - hit.at > ttlMs) {
+        _cache.delete(key);
+        return null;
+    }
+    return hit;
+}
+
+function cachePut(key: string, etag: string, data: unknown): void {
+    if (!etag) return;
+    _cache.set(key, Object.freeze({ at: Date.now(), etag, data }));
+}
+
+function shouldCacheResponse(method: string, res: Response): boolean {
+    if (method !== "GET") return false;
+    if (res.status !== 200) return false;
+    const etag = (res.headers.get("etag") ?? "").trim();
+    return !!etag;
+}
+
+/* ------------------------------- Request core ------------------------------ */
+
+async function requestJson<T>(
+    method: "GET" | "POST",
+    path: string,
+    body: unknown | undefined,
+    opts: ApiRequestOptions,
+): Promise<T> {
     const pathWithT = withTranslation(path, opts);
     const url = joinUrl(API_BASE, pathWithT);
 
     const timeoutMs = opts.timeoutMs ?? 12_000;
     const timeoutCtrl = new AbortController();
     const timeoutOn = Number.isFinite(timeoutMs) && timeoutMs > 0;
-
-    const t = timeoutOn ? setTimeout(() => timeoutCtrl.abort(), timeoutMs) : null;
+    const timer = timeoutOn ? setTimeout(() => timeoutCtrl.abort(), timeoutMs) : null;
 
     const signal = mergeSignals(opts.signal, timeoutCtrl.signal);
 
+    const cacheMode: ApiCacheMode = opts.cacheMode ?? "default";
+    const cacheTtlMs = opts.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+
+    const headers: Record<string, string> = {
+        Accept: "application/json",
+        ...(opts.headers ?? {}),
+    };
+
+    // Client-side cache control preferences
+    if (cacheMode === "no-store") headers["Cache-Control"] = headers["Cache-Control"] ?? "no-store";
+    if (cacheMode === "reload") headers["Cache-Control"] = headers["Cache-Control"] ?? "no-cache";
+
+    const key = cacheKey(method, url);
+    const prior = cacheMode === "default" ? cacheGet(key, cacheTtlMs) : null;
+
+    // If we have an ETag, send conditional request (unless caller forced bypass)
+    if (prior?.etag && cacheMode === "default") {
+        headers["If-None-Match"] = prior.etag;
+    }
+
     try {
+        let payload: string | undefined;
+        if (method === "POST") {
+            headers["Content-Type"] = headers["Content-Type"] ?? "application/json";
+            payload = body === undefined ? undefined : JSON.stringify(body);
+        }
+
         const res = await fetch(url, {
-            method: "GET",
-            headers: { Accept: "application/json", ...(opts.headers ?? {}) },
+            method,
+            headers,
+            body: payload,
             signal,
+            credentials: opts.credentials ?? "same-origin",
         });
+
+        const requestId = getRequestId(res);
+
+        // 304 => return cached data (must exist)
+        if (res.status === 304) {
+            if (!prior) {
+                throw new ApiError("CACHE_MISS", "Server returned 304 but client has no cached body.", {
+                    status: 304,
+                    url,
+                    method,
+                    requestId,
+                });
+            }
+            return prior.data as T;
+        }
+
+        // 204 => no content (treat as null)
+        if (res.status === 204) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            return null as any as T;
+        }
 
         const bodyText = await res.text();
         const parsed = tryParseJson(bodyText);
@@ -480,46 +660,98 @@ async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T
         if (!res.ok) {
             if (parsed.ok && isObj(parsed.value) && (parsed.value as any).ok === false) {
                 const v = parsed.value as ApiErr;
-                throw new ApiError("API_ERROR", v.error?.message ?? res.statusText, { status: res.status, url, bodyText });
+                throw new ApiError("API_ERROR", v.error?.message ?? formatHttpMessage(res), {
+                    status: res.status,
+                    url,
+                    method,
+                    bodyText,
+                    requestId,
+                });
             }
-            throw new ApiError("HTTP_ERROR", res.statusText || `HTTP ${res.status}`, { status: res.status, url, bodyText });
+            throw new ApiError("HTTP_ERROR", formatHttpMessage(res), {
+                status: res.status,
+                url,
+                method,
+                bodyText,
+                requestId,
+            });
         }
 
+        // If server says JSON but parse failed: treat as NOT_JSON with diagnostics
         if (!parsed.ok) {
-            throw new ApiError("NOT_JSON", "Expected JSON response but got non-JSON.", { status: res.status, url, bodyText });
+            const code: ApiErrorCode = isLikelyJson(res) ? "NOT_JSON" : "BAD_RESPONSE";
+            throw new ApiError(code, "Expected JSON response but got non-JSON.", {
+                status: res.status,
+                url,
+                method,
+                bodyText,
+                requestId,
+            });
         }
 
         if (!isObj(parsed.value)) {
-            throw new ApiError("BAD_RESPONSE", "Expected JSON object envelope.", { status: res.status, url, bodyText });
+            throw new ApiError("BAD_RESPONSE", "Expected JSON object envelope.", {
+                status: res.status,
+                url,
+                method,
+                bodyText,
+                requestId,
+            });
         }
 
         const env = parsed.value as ApiRes<T>;
         if ((env as any).ok === false) {
             const e = env as ApiErr;
-            throw new ApiError("API_ERROR", e.error?.message ?? "API error.", { status: res.status, url, bodyText });
+            throw new ApiError("API_ERROR", e.error?.message ?? "API error.", {
+                status: res.status,
+                url,
+                method,
+                bodyText,
+                requestId,
+            });
         }
 
         if ((env as any).ok !== true) {
-            throw new ApiError("BAD_RESPONSE", "Missing ok:true in response envelope.", { status: res.status, url, bodyText });
+            throw new ApiError("BAD_RESPONSE", "Missing ok:true in response envelope.", {
+                status: res.status,
+                url,
+                method,
+                bodyText,
+                requestId,
+            });
         }
 
-        return (env as ApiOk<T>).data;
+        const data = (env as ApiOk<T>).data as unknown;
+
+        // Cache successful GET responses with ETag
+        if (shouldCacheResponse(method, res)) {
+            const etag = (res.headers.get("etag") ?? "").trim();
+            cachePut(key, etag, data);
+        }
+
+        return data as T;
     } catch (e) {
         if (e && typeof e === "object" && (e as any).name === "AbortError") {
-            if (timeoutOn) throw new ApiError("TIMEOUT", "Request took too long.", { url });
-            throw new ApiError("ABORTED", "Request aborted.", { url });
+            if (timeoutOn) throw new ApiError("TIMEOUT", "Request took too long.", { url, method });
+            throw new ApiError("ABORTED", "Request aborted.", { url, method });
         }
         throw classifyFetchError(e);
     } finally {
-        if (t) clearTimeout(t);
+        if (timer) clearTimeout(timer);
     }
+}
+
+async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T> {
+    return requestJson("GET", path, undefined, opts);
+}
+
+async function postJson<T>(path: string, body?: unknown, opts: ApiRequestOptions = {}): Promise<T> {
+    return requestJson("POST", path, body, opts);
 }
 
 /* -------------------------------- API ------------------------------------- */
 
 export function apiGetMeta(opts?: ApiRequestOptions): Promise<MetaPayload> {
-    // Meta should include translation selection; this is where we can also reconcile
-    // stored translation against server list (caller can do that).
     return getJson("/meta", opts);
 }
 
@@ -540,9 +772,8 @@ export function apiGetChapter(bookId: string, chapter: number, opts?: ApiRequest
 }
 
 export function apiSearch(q: string, limit = 30, opts?: ApiRequestOptions): Promise<SearchPayload> {
-    const qq = encodeURIComponent(q);
-    const lim = encodeURIComponent(String(limit));
-    return getJson(`/search?q=${qq}&limit=${lim}`, opts);
+    const path = addQuery("/search", { q, limit });
+    return getJson(path, opts);
 }
 
 export function apiGetPerson(id: string, opts?: ApiRequestOptions): Promise<PersonPayload> {
@@ -564,9 +795,8 @@ export function apiGetSpine(opts?: ApiRequestOptions): Promise<SpineStats> {
 }
 
 export function apiGetSlice(fromOrd: number, limit = 240, opts?: ApiRequestOptions): Promise<SlicePayload> {
-    const f = encodeURIComponent(String(fromOrd));
-    const l = encodeURIComponent(String(limit));
-    return getJson(`/slice?fromOrd=${f}&limit=${l}`, opts);
+    const path = addQuery("/slice", { fromOrd, limit });
+    return getJson(path, opts);
 }
 
 export function apiResolveLoc(
@@ -575,10 +805,38 @@ export function apiResolveLoc(
     verse: number | null,
     opts?: ApiRequestOptions,
 ): Promise<LocPayload> {
-    // /loc does not depend on translation (verse_ord is canonical), but allowing
-    // the wrapper to attach ?t doesn’t hurt — server ignores it for /loc.
-    const b = encodeURIComponent(bookId);
-    const c = encodeURIComponent(String(chapter));
-    const v = verse != null ? `&verse=${encodeURIComponent(String(verse))}` : "";
-    return getJson(`/loc?bookId=${b}&chapter=${c}${v}`, opts);
+    const path = addQuery("/loc", { bookId, chapter, ...(verse != null ? { verse } : {}) });
+    return getJson(path, opts);
+}
+
+/* ------------------------------ Auth endpoints ----------------------------- */
+
+export function apiAuthMe(opts?: ApiRequestOptions): Promise<{ user: unknown | null }> {
+    return getJson("/auth/me", opts);
+}
+
+export function apiAuthLogout(opts?: ApiRequestOptions): Promise<{ redirect: string }> {
+    return postJson("/auth/logout", undefined, opts);
+}
+
+/* -------------------------- Convenience / Debug ----------------------------- */
+
+export function formatApiError(e: unknown): string {
+    if (!(e instanceof ApiError)) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return msg || "Unknown error.";
+    }
+    const parts: string[] = [];
+    parts.push(e.code);
+    if (typeof e.status === "number") parts.push(String(e.status));
+    if (e.method) parts.push(e.method);
+    if (e.url) parts.push(e.url);
+    if (e.requestId) parts.push(`req:${e.requestId}`);
+
+    if (e.bodyText) {
+        const t = e.bodyText.trim();
+        if (t) parts.push(t.length > 240 ? `${t.slice(0, 240)}…` : t);
+    }
+
+    return parts.join(" · ");
 }

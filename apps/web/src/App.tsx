@@ -134,20 +134,6 @@ function formatHash(page: Page, loc: ReaderLocation | null): string {
     return "#/home";
 }
 
-/* ---------------- Motion prefs ---------------- */
-function usePrefersReducedMotion(): boolean {
-    const [reduced, setReduced] = useState(false);
-    useEffect(() => {
-        if (typeof window === "undefined" || !window.matchMedia) return;
-        const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-        const onChange = () => setReduced(mq.matches);
-        onChange();
-        mq.addEventListener?.("change", onChange);
-        return () => mq.removeEventListener?.("change", onChange);
-    }, []);
-    return reduced;
-}
-
 /* ---------------- App ---------------- */
 export default function App() {
     return (
@@ -157,23 +143,8 @@ export default function App() {
     );
 }
 
-/**
- * HomeFx drives the home -> reader “opening” motion.
- * phase is part of the type (prevents TS2339).
- */
-type HomeFx =
-    | null
-    | {
-    kind: "homeToReader";
-    phase: "prep" | "go";
-    durationMs: number;
-    from: { page: Page; loc: ReaderLocation | null };
-    to: { page: Page; loc: ReaderLocation | null };
-};
-
 function AppInner() {
     const { mode, toggle } = useTheme();
-    const reducedMotion = usePrefersReducedMotion();
 
     const initialNav = useMemo(() => {
         const url = typeof window === "undefined" ? {} : readUrlIntent();
@@ -183,7 +154,11 @@ function AppInner() {
 
         const savedLoc = parseLoc(safeGet(LS_LAST_LOC));
 
-        const page: Page = (url.page as Page | undefined) ?? savedPage ?? "home";
+        // Default to HOME unless URL explicitly asked for reader.
+        const page: Page =
+            (url.page as Page | undefined) ??
+            (savedPage && savedPage !== "reader" ? savedPage : "home");
+
         const loc: ReaderLocation | null = url.loc ?? savedLoc;
 
         return { page, loc };
@@ -192,21 +167,10 @@ function AppInner() {
     const [page, setPage] = useState<Page>(initialNav.page);
     const [readerLoc, setReaderLoc] = useState<ReaderLocation | null>(initialNav.loc);
 
-    const [homeFx, setHomeFx] = useState<HomeFx>(null);
-    const fxTimerRef = useRef<number | null>(null);
-
+    // Whether *we* are currently writing to the URL (so popstate/hashchange doesn't bounce back)
     const writingUrl = useRef(false);
 
-    // refs to avoid re-binding global listeners (prevents flicker/glitch on nav)
-    const pageRef = useRef<Page>(page);
-    const fxRef = useRef<HomeFx>(homeFx);
-    useEffect(() => {
-        pageRef.current = page;
-    }, [page]);
-    useEffect(() => {
-        fxRef.current = homeFx;
-    }, [homeFx]);
-
+    // Keep last page + loc
     useEffect(() => {
         safeSet(LS_LAST_PAGE, page);
     }, [page]);
@@ -217,14 +181,13 @@ function AppInner() {
         else safeDel(LS_LAST_LOC);
     }, [readerLoc]);
 
-    // Keep URL in sync (during fx, reflect target immediately).
+    // Keep URL in sync
     useEffect(() => {
         if (typeof window === "undefined") return;
 
-        const effectivePage = homeFx?.to.page ?? page;
-        const effectiveLoc = effectivePage === "reader" ? homeFx?.to.loc ?? readerLoc : null;
+        const effectiveLoc = page === "reader" ? readerLoc : null;
+        const nextHash = formatHash(page, effectiveLoc);
 
-        const nextHash = formatHash(effectivePage, effectivePage === "reader" ? effectiveLoc : null);
         if (window.location.hash === nextHash) return;
 
         writingUrl.current = true;
@@ -232,20 +195,20 @@ function AppInner() {
         window.setTimeout(() => {
             writingUrl.current = false;
         }, 0);
-    }, [page, readerLoc, homeFx]);
+    }, [page, readerLoc]);
 
-    // URL -> state (bind once; uses refs)
+    // URL -> state
     useEffect(() => {
         if (typeof window === "undefined") return;
 
         const onNav = () => {
             if (writingUrl.current) return;
 
-            // ignore nav churn mid fx (prevents double mounts)
-            if (fxRef.current) return;
-
             const intent = readUrlIntent();
-            if (intent.page && intent.page !== pageRef.current) setPage(intent.page);
+
+            if (intent.page) setPage(intent.page);
+
+            // Only set reader loc when URL provides one explicitly.
             if (intent.loc) setReaderLoc(intent.loc);
         };
 
@@ -257,79 +220,26 @@ function AppInner() {
         };
     }, []);
 
-    useEffect(() => {
-        return () => {
-            if (fxTimerRef.current != null) window.clearTimeout(fxTimerRef.current);
-        };
+    const goHome = useCallback(() => setPage("home"), []);
+    const goLearn = useCallback(() => setPage("learn"), []);
+
+    const beginReader = useCallback((loc: ReaderLocation) => {
+        const clean = normalizeLoc(loc) ?? { bookId: "GEN", chapter: 1, verse: 1 };
+        setReaderLoc(clean);
+        setPage("reader");
     }, []);
-
-    const cancelFx = useCallback(() => {
-        if (fxTimerRef.current != null) window.clearTimeout(fxTimerRef.current);
-        fxTimerRef.current = null;
-        setHomeFx(null);
-    }, []);
-
-    const goHome = useCallback(() => {
-        cancelFx();
-        setPage("home");
-    }, [cancelFx]);
-
-    const goLearn = useCallback(() => {
-        cancelFx();
-        setPage("learn");
-    }, [cancelFx]);
-
-    const beginHomeToReader = useCallback(
-        (loc: ReaderLocation) => {
-            const clean = normalizeLoc(loc) ?? { bookId: "GEN", chapter: 1, verse: 1 };
-
-            // commit target loc immediately (Reader can mount and warm cache)
-            setReaderLoc(clean);
-
-            if (reducedMotion || pageRef.current !== "home") {
-                cancelFx();
-                setHomeFx(null);
-                setPage("reader");
-                return;
-            }
-
-            if (fxTimerRef.current != null) window.clearTimeout(fxTimerRef.current);
-
-            const durationMs = 520;
-
-            setHomeFx({
-                kind: "homeToReader",
-                phase: "prep",
-                durationMs,
-                from: { page: "home", loc: null },
-                to: { page: "reader", loc: clean },
-            });
-
-            requestAnimationFrame(() => {
-                setHomeFx((fx) => (fx && fx.kind === "homeToReader" ? { ...fx, phase: "go" } : fx));
-            });
-
-            fxTimerRef.current = window.setTimeout(() => {
-                fxTimerRef.current = null;
-                setHomeFx(null);
-                setPage("reader");
-            }, durationMs);
-        },
-        [cancelFx, reducedMotion],
-    );
 
     const startReading = useCallback(() => {
-        const loc = readerLoc ?? { bookId: "GEN", chapter: 1, verse: 1 };
-        beginHomeToReader(loc);
-    }, [readerLoc, beginHomeToReader]);
+        beginReader(readerLoc ?? { bookId: "GEN", chapter: 1, verse: 1 });
+    }, [readerLoc, beginReader]);
 
     const navigateTo = useCallback(
         (loc: ReaderLocation) => {
             const clean = normalizeLoc(loc);
             if (!clean) return;
-            beginHomeToReader(clean);
+            beginReader(clean);
         },
-        [beginHomeToReader],
+        [beginReader],
     );
 
     const renderPage = useCallback(
@@ -353,117 +263,18 @@ function AppInner() {
         [goHome, goLearn, mode, toggle, startReading, navigateTo],
     );
 
-    const showFx = homeFx?.kind === "homeToReader";
-
     return (
         <ThemeShell style={styles.page}>
-            {/* GLOBAL: same toggle, same position, all pages */}
             <div style={styles.cornerControls} aria-label="App controls">
                 <ThemeTogglePill mode={mode} onToggle={toggle} />
             </div>
 
-            <div style={styles.stage}>
-                {showFx && homeFx ? (
-                    <HomeToReaderTransition
-                        phase={homeFx.phase}
-                        durationMs={homeFx.durationMs}
-                        from={renderPage(homeFx.from.page, homeFx.from.loc)}
-                        to={renderPage(homeFx.to.page, homeFx.to.loc)}
-                    />
-                ) : (
-                    renderPage(page, page === "reader" ? readerLoc : null)
-                )}
-            </div>
+            <div style={styles.stage}>{renderPage(page, page === "reader" ? readerLoc : null)}</div>
         </ThemeShell>
     );
 }
 
-/* ---------------- Transition component ---------------- */
-
-function HomeToReaderTransition(props: {
-    phase: "prep" | "go";
-    durationMs: number;
-    from: React.ReactNode;
-    to: React.ReactNode;
-}) {
-    const { phase, durationMs, from, to } = props;
-
-    const t = `${durationMs}ms`;
-    const ease = "cubic-bezier(0.22, 1, 0.32, 1)";
-    const go = phase === "go";
-
-    return (
-        <div style={tStyles.root} aria-label="Transition">
-            {/* HOME layer */}
-            <div
-                style={{
-                    ...tStyles.layer,
-                    zIndex: 1,
-                    opacity: go ? 0 : 1,
-                    transform: go ? "translateY(-10px) scale(0.985)" : "translateY(0) scale(1)",
-                    transition: `opacity ${t} ${ease}, transform ${t} ${ease}, filter ${t} ${ease}`,
-                    filter: go ? "blur(6px)" : "blur(0px)",
-                    pointerEvents: "none",
-                }}
-            >
-                {from}
-            </div>
-
-            {/* Paper curtain */}
-            <div
-                style={{
-                    ...tStyles.curtain,
-                    opacity: go ? 1 : 0,
-                    transition: `opacity ${t} ${ease}`,
-                }}
-                aria-hidden
-            />
-
-            {/* READER layer */}
-            <div
-                style={{
-                    ...tStyles.layer,
-                    zIndex: 3,
-                    opacity: go ? 1 : 0,
-                    transform: go ? "translateY(0) scale(1)" : "translateY(18px) scale(0.995)",
-                    transition: `opacity ${t} ${ease}, transform ${t} ${ease}`,
-                    pointerEvents: go ? "auto" : "none",
-                }}
-            >
-                {to}
-            </div>
-        </div>
-    );
-}
-
-const tStyles: Record<string, React.CSSProperties> = {
-    root: { position: "relative", minHeight: "100vh", height: "100vh", overflow: "hidden" },
-    layer: { position: "absolute", inset: 0, willChange: "transform, opacity, filter" },
-    curtain: {
-        position: "absolute",
-        inset: 0,
-        zIndex: 2,
-        background: "radial-gradient(1200px 600px at 50% 10%, rgba(0,0,0,0.06), transparent 55%), var(--bg)",
-        boxShadow: "inset 0 1px 0 rgba(255,255,255,0.35)",
-        pointerEvents: "none",
-    },
-};
-
 /* ---------------- Home ---------------- */
-
-function usePressing() {
-    const [down, setDown] = useState(false);
-    const handlers = useMemo(
-        () => ({
-            onPointerDown: () => setDown(true),
-            onPointerUp: () => setDown(false),
-            onPointerCancel: () => setDown(false),
-            onPointerLeave: () => setDown(false),
-        }),
-        [],
-    );
-    return { down, handlers };
-}
 
 function Home(props: {
     onLearnMore: () => void;
@@ -471,9 +282,6 @@ function Home(props: {
     onNavigate: (loc: ReaderLocation) => void;
 }) {
     const { onLearnMore, onStartReading, onNavigate } = props;
-
-    const primary = usePressing();
-    const learn = usePressing();
 
     return (
         <main style={styles.centerStage} aria-label="Landing">
@@ -491,7 +299,8 @@ function Home(props: {
 
                 <h1 style={styles.h1}>Biblia Populi</h1>
                 <p style={styles.lede}>
-                    A public, open-access KJV Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen.
+                    A public, open-access KJV Scripture platform centered on <strong>Jesus Christ</strong>, crucified and
+                    risen.
                 </p>
 
                 <div style={styles.searchContainer}>
@@ -504,29 +313,12 @@ function Home(props: {
                 </div>
 
                 <div style={styles.ctaRow}>
-                    <button
-                        type="button"
-                        onClick={onStartReading}
-                        style={{
-                            ...styles.primaryBtnButton,
-                            ...(primary.down ? styles.btnPressed : null),
-                        }}
-                        aria-label="Start reading"
-                        {...primary.handlers}
-                    >
+                    <button type="button" onClick={onStartReading} style={styles.primaryBtnButton} aria-label="Start reading">
                         Start reading
                     </button>
                 </div>
 
-                <button
-                    type="button"
-                    onClick={onLearnMore}
-                    style={{
-                        ...styles.learnMoreBtn,
-                        ...(learn.down ? styles.linkPressed : null),
-                    }}
-                    {...learn.handlers}
-                >
+                <button type="button" onClick={onLearnMore} style={styles.learnMoreBtn}>
                     Learn more
                 </button>
             </div>
@@ -544,13 +336,11 @@ export const styles: Record<string, React.CSSProperties> = {
         MozOsxFontSmoothing: "grayscale",
     },
 
-    // isolate page content so we can stack it for transitions
     stage: {
         position: "relative",
         minHeight: "100vh",
     },
 
-    // global, consistent for all pages
     cornerControls: {
         position: "fixed",
         top: 16,
@@ -615,7 +405,6 @@ export const styles: Record<string, React.CSSProperties> = {
         justifyContent: "center",
     },
 
-    // Search reads these
     searchWrap: {
         width: "100%",
         maxWidth: 660,
@@ -633,10 +422,8 @@ export const styles: Record<string, React.CSSProperties> = {
         maxWidth: 660,
         width: "100%",
         boxShadow: "0 8px 24px rgba(0,0,0,0.07)",
-        transition: "box-shadow 180ms ease, border-color 180ms ease",
     },
 
-    // (typo fix) keep the official spelling: "oklab"
     searchRowFocused: {
         borderColor: "var(--focus)",
         boxShadow: "0 12px 36px rgba(0,0,0,0.12), 0 0 0 3px var(--focusRing)",
@@ -660,7 +447,6 @@ export const styles: Record<string, React.CSSProperties> = {
         width: "100%",
     },
 
-    // optional hook for Search panel
     searchPanel: {},
 
     ctaRow: {
@@ -683,13 +469,7 @@ export const styles: Record<string, React.CSSProperties> = {
         boxShadow: "0 10px 28px rgba(0,0,0,0.09)",
         border: "none",
         cursor: "pointer",
-        transition: "all 140ms cubic-bezier(0.23, 1, 0.32, 1)",
         WebkitTapHighlightColor: "transparent",
-    },
-
-    btnPressed: {
-        transform: "translateY(1px) scale(0.985)",
-        opacity: 0.96,
     },
 
     learnMoreBtn: {
@@ -703,14 +483,9 @@ export const styles: Record<string, React.CSSProperties> = {
         borderRadius: 10,
         letterSpacing: "0.08em",
         textTransform: "uppercase",
-        transition: "opacity 160ms ease",
-        opacity: 0.9,
         WebkitTapHighlightColor: "transparent",
     },
 
-    linkPressed: { opacity: 0.7 },
-
-    // handy for LearnMorePage (optional)
     backBtn: {
         display: "inline-flex",
         alignItems: "center",

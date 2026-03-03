@@ -1,34 +1,26 @@
 /* apps/web/src/base.css — Biblia Populi (minimal, reading-first) */
-/*
-  Goals:
-  - Paper-soft light mode (less harsh than pure white)
-  - Ink-like dark mode
-  - Stable layout (no scrollbar jump) + calm focus
-  - Premium transitions (theme swap without jitter)
-  - Search overlays supported (--overlay, --overlay2, --activeBg)
-  - Ambient primitives for “soft particles” pages (optional)
-*/
 
-/* ---------------- Root tokens ---------------- */
+/* =========================================================
+   Root Tokens
+========================================================= */
 :root {
     /* ---------------- Fonts ---------------- */
     --font-sans: "Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans",
     "Apple Color Emoji", "Segoe UI Emoji";
+
     --font-serif: "Literata Variable", Literata, ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
     "Times New Roman", Times, serif;
-    --font-rounded: "Quicksand Variable", Quicksand, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial,
-    "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
 
-    /* ---------------- Reader typography ---------------- */
+    --font-rounded: "Quicksand Variable", Quicksand, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial;
+
+    /* ---------------- Reader Typography ---------------- */
     --bpScriptureFont: var(--font-serif);
     --bpScriptureSize: 18px;
     --bpScriptureLeading: 1.75;
     --bpScriptureWeight: 400;
-
-    /* Reader column width (scripture + chrome alignment) */
     --bpReaderMeasure: 840px;
 
-    /* ---------------- Layout widths ---------------- */
+    /* ---------------- Layout ---------------- */
     --container: 980px;
     --reading: 720px;
 
@@ -36,219 +28,148 @@
     --radius: 16px;
     --radius-sm: 12px;
 
-    /* ---------------- App text defaults ---------------- */
+    /* ---------------- Text ---------------- */
     --text: 16px;
     --leading: 1.6;
 
-    /* ---------------- Transition timings ---------------- */
+    /* ---------------- Theme transition ---------------- */
     --themeDur: 320ms;
     --themeEase: cubic-bezier(0.2, 0.8, 0.2, 1);
 
-    /* Micro transition (buttons/hover) */
-    --microDur: 160ms;
-    --microEase: cubic-bezier(0.23, 1, 0.32, 1);
+    /* ---------------- Light Theme (Paper) ---------------- */
+    --bg: #f6f4f0;
+    --fg: #101012;
+    --muted: rgba(16,16,18,0.58);
+    --hairline: rgba(16,16,18,0.11);
+    --focus: rgba(16,16,18,0.14);
+    --focusRing: rgba(16,16,18,0.1);
 
-    /* ---------------- Light (paper) — default ----------------
-       Slight warm paper + ink. Avoid pure white and pure black. */
-    --bg: #f6f4f0; /* paper */
-    --fg: #101012; /* ink */
-    --muted: rgba(16, 16, 18, 0.58);
-    --hairline: rgba(16, 16, 18, 0.11);
-    --focus: rgba(16, 16, 18, 0.14);
-    --focusRing: rgba(16, 16, 18, 0.1);
+    --panel: rgba(16,16,18,0.025);
 
-    --panel: rgba(16, 16, 18, 0.025);
+    --overlay: rgba(246,244,240,0.9);
+    --overlay2: rgba(246,244,240,0.96);
+    --activeBg: rgba(16,16,18,0.045);
 
-    /* overlay surfaces (search popovers etc) */
-    --overlay: rgba(246, 244, 240, 0.9);
-    --overlay2: rgba(246, 244, 240, 0.96);
-    --activeBg: rgba(16, 16, 18, 0.045);
+    --selectionBg: rgba(16,16,18,0.12);
 
-    /* selections */
-    --selectionBg: rgba(16, 16, 18, 0.12);
+    --shadowSoft: 0 10px 32px rgba(0,0,0,0.1);
+    --shadowPop: 0 24px 90px rgba(0,0,0,0.18);
 
-    /* Shadows (light) */
-    --shadowSoft: 0 10px 32px rgba(0, 0, 0, 0.1);
-    --shadowPop: 0 24px 90px rgba(0, 0, 0, 0.18);
-
-    /* ---------------- Ambient primitives ----------------
-       Use these in components if you want “soft particles / glow” */
-    --ambientInk: color-mix(in oklab, var(--fg) 6%, transparent);
-    --ambientInk2: color-mix(in oklab, var(--fg) 4%, transparent);
-    --ambientParticle: color-mix(in oklab, var(--fg) 70%, transparent);
-
-    /* focus shadow helper */
-    --focusShadow: 0 0 0 6px color-mix(in oklab, var(--focusRing) 70%, transparent);
+    /* Fallback ambient */
+    --ambientInk: rgba(16,16,18,0.06);
+    --ambientInk2: rgba(16,16,18,0.04);
+    --ambientParticle: rgba(16,16,18,0.30);
+    --focusShadow: 0 0 0 6px rgba(16,16,18,0.08);
 }
 
-/* ---------------- Dark (ink) theme vars ---------------- */
-@media (prefers-color-scheme: dark) {
-    html:not([data-theme]) {
-        --bg: #0b0b0c;
-        --fg: #f4f3f1;
-        --muted: rgba(244, 243, 241, 0.66);
-        --hairline: rgba(255, 255, 255, 0.1);
-        --focus: rgba(255, 255, 255, 0.22);
-        --focusRing: rgba(255, 255, 255, 0.13);
-
-        --panel: rgba(255, 255, 255, 0.045);
-
-        --overlay: rgba(11, 11, 12, 0.76);
-        --overlay2: rgba(11, 11, 12, 0.88);
-        --activeBg: rgba(255, 255, 255, 0.065);
-
-        --selectionBg: rgba(244, 243, 241, 0.18);
-
-        --shadowSoft: 0 10px 36px rgba(0, 0, 0, 0.36);
-        --shadowPop: 0 26px 110px rgba(0, 0, 0, 0.58);
-
-        --ambientInk: color-mix(in oklab, var(--fg) 7%, transparent);
-        --ambientInk2: color-mix(in oklab, var(--fg) 5%, transparent);
-        --ambientParticle: color-mix(in oklab, var(--fg) 75%, transparent);
-
-        --focusShadow: 0 0 0 7px color-mix(in oklab, var(--focusRing) 70%, transparent);
+/* Enable color-mix when supported */
+@supports (color: color-mix(in oklab, white, black)) {
+    :root {
+        --ambientInk: color-mix(in oklab, var(--fg) 6%, transparent);
+        --ambientInk2: color-mix(in oklab, var(--fg) 4%, transparent);
+        --ambientParticle: color-mix(in oklab, var(--fg) 70%, transparent);
+        --focusShadow: 0 0 0 6px color-mix(in oklab, var(--focusRing) 70%, transparent);
     }
 }
 
-/* Manual override (wins over system preference) */
-html[data-theme="light"] {
-    --bg: #f6f4f0;
-    --fg: #101012;
-    --muted: rgba(16, 16, 18, 0.58);
-    --hairline: rgba(16, 16, 18, 0.11);
-    --focus: rgba(16, 16, 18, 0.14);
-    --focusRing: rgba(16, 16, 18, 0.1);
-
-    --panel: rgba(16, 16, 18, 0.025);
-
-    --overlay: rgba(246, 244, 240, 0.9);
-    --overlay2: rgba(246, 244, 240, 0.96);
-    --activeBg: rgba(16, 16, 18, 0.045);
-
-    --selectionBg: rgba(16, 16, 18, 0.12);
-
-    --shadowSoft: 0 10px 32px rgba(0, 0, 0, 0.1);
-    --shadowPop: 0 24px 90px rgba(0, 0, 0, 0.18);
-
-    --ambientInk: color-mix(in oklab, var(--fg) 6%, transparent);
-    --ambientInk2: color-mix(in oklab, var(--fg) 4%, transparent);
-    --ambientParticle: color-mix(in oklab, var(--fg) 70%, transparent);
-    --focusShadow: 0 0 0 6px color-mix(in oklab, var(--focusRing) 70%, transparent);
-}
-
+/* =========================================================
+   Dark Theme
+========================================================= */
 html[data-theme="dark"] {
     --bg: #0b0b0c;
     --fg: #f4f3f1;
-    --muted: rgba(244, 243, 241, 0.66);
-    --hairline: rgba(255, 255, 255, 0.1);
-    --focus: rgba(255, 255, 255, 0.22);
-    --focusRing: rgba(255, 255, 255, 0.13);
+    --muted: rgba(244,243,241,0.66);
+    --hairline: rgba(255,255,255,0.1);
+    --focus: rgba(255,255,255,0.22);
+    --focusRing: rgba(255,255,255,0.13);
 
-    --panel: rgba(255, 255, 255, 0.045);
+    --panel: rgba(255,255,255,0.045);
 
-    --overlay: rgba(11, 11, 12, 0.76);
-    --overlay2: rgba(11, 11, 12, 0.88);
-    --activeBg: rgba(255, 255, 255, 0.065);
+    --overlay: rgba(11,11,12,0.76);
+    --overlay2: rgba(11,11,12,0.88);
+    --activeBg: rgba(255,255,255,0.065);
 
-    --selectionBg: rgba(244, 243, 241, 0.18);
+    --selectionBg: rgba(244,243,241,0.18);
 
-    --shadowSoft: 0 10px 36px rgba(0, 0, 0, 0.36);
-    --shadowPop: 0 26px 110px rgba(0, 0, 0, 0.58);
+    --shadowSoft: 0 10px 36px rgba(0,0,0,0.36);
+    --shadowPop: 0 26px 110px rgba(0,0,0,0.58);
 
-    --ambientInk: color-mix(in oklab, var(--fg) 7%, transparent);
-    --ambientInk2: color-mix(in oklab, var(--fg) 5%, transparent);
-    --ambientParticle: color-mix(in oklab, var(--fg) 75%, transparent);
-    --focusShadow: 0 0 0 7px color-mix(in oklab, var(--focusRing) 70%, transparent);
+    --ambientInk: rgba(244,243,241,0.07);
+    --ambientInk2: rgba(244,243,241,0.05);
+    --ambientParticle: rgba(244,243,241,0.75);
+    --focusShadow: 0 0 0 7px rgba(255,255,255,0.08);
 }
 
-/* ---------------- Theme transition (smooth, no layout jitter) ----------------
-   Apply transitions only to paint properties; avoid transform/layout. */
+/* =========================================================
+   Core HTML / Body
+========================================================= */
 html {
-    /* prevents horizontal “jump” when popovers alter scrollability */
     scrollbar-gutter: stable;
-
     font-family: var(--font-sans);
     font-size: var(--text);
     line-height: var(--leading);
     background: var(--bg);
     color: var(--fg);
     text-size-adjust: 100%;
-    -webkit-text-size-adjust: 100%;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-
-    scroll-behavior: auto;
-
-    /* smoother scrollbars */
     color-scheme: light dark;
 }
 
-/* Paint-only transitions across the app */
-html,
-body,
-#root,
-button,
-input,
-textarea,
-select {
+body {
+    margin: 0;
+    min-height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+}
+
+#root {
+    min-height: 100dvh;
+}
+
+/* =========================================================
+   Theme Transition (ONLY when toggling)
+========================================================= */
+html.bp-theme-swap,
+html.bp-theme-swap body,
+html.bp-theme-swap #root,
+html.bp-theme-swap button,
+html.bp-theme-swap input,
+html.bp-theme-swap textarea,
+html.bp-theme-swap select {
     transition:
             background-color var(--themeDur) var(--themeEase),
             color var(--themeDur) var(--themeEase),
             border-color var(--themeDur) var(--themeEase),
             outline-color var(--themeDur) var(--themeEase),
-            box-shadow var(--themeDur) var(--themeEase),
-            fill var(--themeDur) var(--themeEase),
-            stroke var(--themeDur) var(--themeEase);
+            box-shadow var(--themeDur) var(--themeEase);
 }
 
-/* Reduce motion */
+/* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
-    html,
-    body,
-    #root,
-    button,
-    input,
-    textarea,
-    select,
     * {
         transition: none !important;
-        animation-duration: 0.001ms !important;
-        animation-iteration-count: 1 !important;
+        animation: none !important;
         scroll-behavior: auto !important;
     }
 }
 
-/* ---------------- Reset ---------------- */
+/* =========================================================
+   Reset
+========================================================= */
 *,
 *::before,
 *::after {
     box-sizing: border-box;
 }
 
-body {
-    margin: 0;
-    min-height: 100vh;
-    background: var(--bg);
-    color: var(--fg);
-}
-
-#root {
-    min-height: 100vh;
-}
-
-/* Typography defaults */
-h1,
-h2,
-h3,
-h4 {
+h1,h2,h3,h4 {
     margin: 0;
     font-weight: 600;
     letter-spacing: -0.02em;
 }
 
-p {
-    margin: 0;
-}
+p { margin: 0; }
 
 a {
     color: inherit;
@@ -261,9 +182,9 @@ a:hover {
 
 ::selection {
     background: var(--selectionBg);
+    color: var(--fg);
 }
 
-/* form controls inherit */
 button,
 input,
 textarea,
@@ -272,20 +193,20 @@ select {
     color: inherit;
 }
 
-/* Calm, consistent focus */
+/* Calm focus */
 :focus-visible {
     outline: 2px solid var(--focusRing);
     outline-offset: 2px;
     border-radius: 10px;
 }
 
-/* Optional “premium focus” helper for components that want it:
-   Use: .focus-shadow:focus-visible { box-shadow: var(--focusShadow); } */
 .focus-shadow:focus-visible {
     box-shadow: var(--focusShadow);
 }
 
-/* ---------------- Layout utilities ---------------- */
+/* =========================================================
+   Layout Utilities
+========================================================= */
 .container {
     width: min(var(--container), calc(100% - 32px));
     margin-inline: auto;
@@ -296,14 +217,15 @@ select {
     margin-inline: auto;
 }
 
-/* calm “pill” controls */
 .surface {
     background: var(--panel);
     border: 1px solid var(--hairline);
     border-radius: var(--radius-sm);
 }
 
-/* ---------------- Reading ---------------- */
+/* =========================================================
+   Reading
+========================================================= */
 .prose {
     font-family: var(--font-serif);
     font-size: 18px;
@@ -323,55 +245,27 @@ select {
     font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
 }
 
-/* ---------------- Ambient helpers (optional) ----------------
-   If you ever want a reusable “soft particles” layer in CSS,
-   you can use these utilities instead of per-component <style> tags.
-
-   Example:
-     <div class="ambient">
-       <span class="ambient__glow a" />
-       <span class="ambient__glow b" />
-       <span class="ambient__p p1" />
-       ...
-     </div>
-*/
+/* =========================================================
+   Ambient Helpers (optional)
+========================================================= */
 @keyframes bp-ambient-pulse {
-    0% {
-        transform: translateZ(0) scale(1);
-        opacity: 0.42;
-    }
-    50% {
-        transform: translateZ(0) scale(1.06);
-        opacity: 0.62;
-    }
-    100% {
-        transform: translateZ(0) scale(1);
-        opacity: 0.42;
-    }
-}
-@keyframes bp-ambient-float {
-    0% {
-        transform: translate3d(0px, 0px, 0);
-    }
-    45% {
-        transform: translate3d(var(--drift, 16px), -10px, 0);
-    }
-    100% {
-        transform: translate3d(0px, 0px, 0);
-    }
+    0%,100% { transform: scale(1); opacity: 0.42; }
+    50% { transform: scale(1.06); opacity: 0.62; }
 }
 
-/* ambient wrapper */
+@keyframes bp-ambient-float {
+    0%,100% { transform: translate3d(0,0,0); }
+    50% { transform: translate3d(16px,-10px,0); }
+}
+
 .ambient {
     position: absolute;
     inset: -24px;
     pointer-events: none;
     overflow: hidden;
     border-radius: 26px;
-    z-index: 0;
 }
 
-/* glow blobs */
 .ambient__glow {
     position: absolute;
     border-radius: 999px;
@@ -380,23 +274,7 @@ select {
     opacity: 0.14;
     animation: bp-ambient-pulse 9000ms ease-in-out infinite;
 }
-.ambient__glow.a {
-    left: 8%;
-    top: 12%;
-    width: 260px;
-    height: 260px;
-}
-.ambient__glow.b {
-    right: 8%;
-    bottom: 10%;
-    width: 320px;
-    height: 320px;
-    background: var(--ambientInk2);
-    opacity: 0.11;
-    animation-duration: 11000ms;
-}
 
-/* particles */
 .ambient__p {
     position: absolute;
     width: 4px;
@@ -404,13 +282,13 @@ select {
     border-radius: 999px;
     background: var(--ambientParticle);
     opacity: 0.12;
-    mix-blend-mode: soft-light;
-    box-shadow: 0 0 0 1px color-mix(in oklab, var(--ambientParticle) 8%, transparent);
     animation: bp-ambient-float 8000ms ease-in-out infinite;
     will-change: transform;
 }
 
-/* ---------------- Mobile tweaks ---------------- */
+/* =========================================================
+   Mobile
+========================================================= */
 @media (max-width: 480px) {
     :root {
         --bpScriptureSize: 17px;

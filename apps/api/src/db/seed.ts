@@ -11,12 +11,8 @@
 //
 // Usage:
 //   bun run db:seed
-//
-// Recommended scripts (apps/api/package.json):
-//   "db:migrate": "bun src/db/migrate.ts"
-//   "db:seed": "bun src/db/seed.ts"
 
-import { sql } from "drizzle-orm";
+import {eq, sql} from "drizzle-orm";
 import { openDb } from "./client";
 import { bpBook, bpTranslation } from "./schema";
 
@@ -29,9 +25,13 @@ const TRANSLATION_LANG = (process.env.BP_TRANSLATION_LANG ?? "en").trim();
 
 // optional: mark KJV-derived translations or custom license text
 const TRANSLATION_LICENSE_KIND = (process.env.BP_TRANSLATION_LICENSE_KIND ?? "PUBLIC_DOMAIN").trim();
-const TRANSLATION_LICENSE_TEXT = (process.env.BP_TRANSLATION_LICENSE_TEXT ??
-    (TRANSLATION_ID.toUpperCase() === "KJV" ? "Public domain (US)" : "")).trim() || null;
+const TRANSLATION_LICENSE_TEXT =
+    (process.env.BP_TRANSLATION_LICENSE_TEXT ??
+        (TRANSLATION_ID.toUpperCase() === "KJV" ? "Public domain (US)" : "")).trim() || null;
 const TRANSLATION_SOURCE_URL = (process.env.BP_TRANSLATION_SOURCE_URL ?? "").trim() || null;
+
+// Only touch defaults if requested (prevents wiping defaults in multi-translation DBs)
+const FORCE_DEFAULT = (process.env.BP_SEED_FORCE_DEFAULT_TRANSLATION ?? "1").trim() !== "0";
 
 function log(...args: unknown[]) {
     // eslint-disable-next-line no-console
@@ -136,7 +136,7 @@ type Db = ReturnType<typeof openDb>["db"];
 type Sqlite = ReturnType<typeof openDb>["sqlite"];
 
 async function seedBooks(db: Db) {
-    log("upserting bp_book (66) …");
+    log("upserting bp_book (66)…");
 
     await db
         .insert(bpBook)
@@ -167,12 +167,11 @@ async function seedBooks(db: Db) {
 }
 
 async function seedTranslation(db: Db) {
-    log("upserting bp_translation …", TRANSLATION_ID);
+    log("upserting bp_translation…", TRANSLATION_ID);
 
-    // Only touch defaults if requested (prevents wiping defaults in multi-translation DBs)
-    const forceDefault = (process.env.BP_SEED_FORCE_DEFAULT_TRANSLATION ?? "1").trim() !== "0";
-    if (forceDefault) {
-        await db.update(bpTranslation).set({ isDefault: false }).run();
+    if (FORCE_DEFAULT) {
+        // clear any prior default(s) without destroying rows
+        await db.update(bpTranslation).set({ isDefault: false });
     }
 
     await db
@@ -182,10 +181,11 @@ async function seedTranslation(db: Db) {
             name: TRANSLATION_NAME,
             language: TRANSLATION_LANG,
             derivedFrom: null,
+            // keep this permissive unless you want to lock it down to an enum in schema
             licenseKind: TRANSLATION_LICENSE_KIND as any,
             licenseText: TRANSLATION_LICENSE_TEXT,
             sourceUrl: TRANSLATION_SOURCE_URL,
-            isDefault: true,
+            isDefault: FORCE_DEFAULT ? true : false,
             // createdAt default
         })
         .onConflictDoUpdate({
@@ -197,9 +197,23 @@ async function seedTranslation(db: Db) {
                 licenseKind: TRANSLATION_LICENSE_KIND as any,
                 licenseText: TRANSLATION_LICENSE_TEXT,
                 sourceUrl: TRANSLATION_SOURCE_URL,
-                isDefault: true,
+                // only flip default when FORCE_DEFAULT is enabled
+                ...(FORCE_DEFAULT ? ({ isDefault: true } as const) : {}),
             },
         });
+
+    // If not forcing default, we still want *a* default if none exists at all.
+    if (!FORCE_DEFAULT) {
+        const anyDefault = await db
+            .select({ id: bpTranslation.translationId })
+            .from(bpTranslation)
+            .where(eq(bpTranslation.isDefault, true))
+            .limit(1);
+
+        if (!anyDefault[0]) {
+            await db.update(bpTranslation).set({ isDefault: true }).where(eq(bpTranslation.translationId, TRANSLATION_ID));
+        }
+    }
 }
 
 function getVerseTextCount(sqlite: Sqlite): number {
@@ -232,7 +246,7 @@ async function main() {
         close();
     }
 
-    // Read-only post-check (use a fresh connection and close it)
+    // Read-only post-check (fresh connection)
     const check = openDb();
     try {
         const verseTextCount = getVerseTextCount(check.sqlite);

@@ -42,6 +42,38 @@ type Props = {
     err?: string | null;
 };
 
+function validateSpine(spine: SpineStats | null): { ok: true } | { ok: false; msg: string } {
+    if (!spine) return { ok: false, msg: "Missing spine." };
+
+    const { verseOrdMin, verseOrdMax, verseCount } = spine;
+
+    if (!Number.isFinite(verseOrdMin) || !Number.isFinite(verseOrdMax) || !Number.isFinite(verseCount)) {
+        return { ok: false, msg: "Spine has non-numeric fields." };
+    }
+    if (verseOrdMin <= 0 || verseOrdMax <= 0) {
+        return { ok: false, msg: "Spine ord bounds must be > 0." };
+    }
+    if (verseOrdMax < verseOrdMin) {
+        return { ok: false, msg: "Spine ord bounds invalid (max < min)." };
+    }
+
+    const derived = verseOrdMax - verseOrdMin + 1;
+
+    // If count is wildly wrong, don't mount virtualizer (it can freeze the tab via gigantic totalSize/layout).
+    // We allow small drift, but not absurd values.
+    if (verseCount <= 0) {
+        return { ok: false, msg: "Spine verseCount must be > 0." };
+    }
+    if (Math.abs(verseCount - derived) > 10_000) {
+        return {
+            ok: false,
+            msg: `Spine mismatch: verseCount=${verseCount} but bounds imply ${derived}. Refusing to mount reader.`,
+        };
+    }
+
+    return { ok: true };
+}
+
 const MeasureWrap = memo(function MeasureWrap(props: { children: React.ReactNode }) {
     const style = useMemo<React.CSSProperties>(
         () => ({
@@ -106,7 +138,21 @@ export function ReaderShell(props: Props) {
         err,
     } = props;
 
-    const hasData = !!spine;
+    const spineCheck = useMemo(() => validateSpine(spine), [spine]);
+    const hasData = spineCheck.ok;
+
+    // Force a hard remount if spine identity changes (prevents stale virtualizer/cache state)
+    const viewportKey = useMemo(() => {
+        if (!spine) return "no-spine";
+        return `${spine.verseOrdMin}:${spine.verseOrdMax}:${spine.verseCount}`;
+    }, [spine]);
+
+    const bannerMsg = useMemo(() => {
+        if (err) return err;
+        if (!spine && !err) return null;
+        if (!spineCheck.ok) return spineCheck.msg;
+        return null;
+    }, [err, spine, spineCheck]);
 
     return (
         <main style={sx.page} aria-busy={!hasData}>
@@ -121,10 +167,11 @@ export function ReaderShell(props: Props) {
                 onToggleTheme={onToggleTheme}
             />
 
-            {err ? <ErrBanner msg={err} /> : null}
+            {bannerMsg ? <ErrBanner msg={bannerMsg} /> : null}
 
-            {spine ? (
+            {hasData && spine ? (
                 <ReaderViewport
+                    key={viewportKey}
                     ref={viewportRef ?? null}
                     spine={spine}
                     bookById={bookById}

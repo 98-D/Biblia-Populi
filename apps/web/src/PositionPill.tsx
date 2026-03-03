@@ -1,4 +1,3 @@
-
 // apps/web/src/PositionPill.tsx
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
@@ -20,11 +19,6 @@ const COL_NARROW_W = S(92);
 const POPOVER_MAX_H = S(330);
 const POPOVER_MARGIN = 14;
 const LIST_PAD = S(10);
-
-// Paper-accent (subtle; should sit nicely on your paper light theme)
-const ACCENT = "#b10b2b";
-const ACCENT_SOFT = "rgba(177, 11, 43, 0.08)";
-const ACCENT_RING = "rgba(177, 11, 43, 0.22)";
 
 // Pill stability: fixed width (no jitter) + tighter
 const PILL_W_CLOSED = S(216);
@@ -75,16 +69,33 @@ function computePopoverPos(anchor: DOMRect, desiredWidth: number): PopPos {
   return { left, top, height: Math.min(cap, Math.max(S(200), aboveAvail)), width };
 }
 
+function subscribeMediaQuery(query: string, onChange: (matches: boolean) => void): () => void {
+  if (typeof window === "undefined" || !window.matchMedia) return () => {};
+  const mq = window.matchMedia(query);
+
+  const handler = () => onChange(mq.matches);
+  handler();
+
+  if (mq.addEventListener) {
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }
+
+  // legacy fallback without TS deprecated signatures
+  const anyMq = mq as any;
+  if (typeof anyMq.addListener === "function") {
+    anyMq.addListener(handler);
+    return () => {
+      if (typeof anyMq.removeListener === "function") anyMq.removeListener(handler);
+    };
+  }
+
+  return () => {};
+}
+
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(false);
-  useEffect(() => {
-    if (typeof window === "undefined" || !window.matchMedia) return;
-    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const onChange = () => setReduced(mq.matches);
-    onChange();
-    mq.addEventListener?.("change", onChange);
-    return () => mq.removeEventListener?.("change", onChange);
-  }, []);
+  useEffect(() => subscribeMediaQuery("(prefers-reduced-motion: reduce)", (m) => setReduced(!!m)), []);
   return reduced;
 }
 
@@ -102,33 +113,40 @@ function injectPopoverCssOnce(): void {
 
   const el = document.createElement("style");
   el.setAttribute(k, "1");
+
+  // ZERO red: only neutral vars / grayscale mixes.
   el.textContent = `
 #bp-pos-popover .bp-scroll { scrollbar-width: thin; scrollbar-color: var(--hairline) transparent; }
 #bp-pos-popover .bp-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
 #bp-pos-popover .bp-scroll::-webkit-scrollbar-track { background: transparent !important; }
 #bp-pos-popover .bp-scroll::-webkit-scrollbar-thumb {
-    background: var(--hairline); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box;
+  background: var(--hairline);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 #bp-pos-popover .bp-scroll::-webkit-scrollbar-thumb:hover { background: var(--focusRing); }
+
 #bp-pos-popover button.bp-row { transition: background 150ms ease, box-shadow 150ms ease, transform 110ms ease; }
 #bp-pos-popover button.bp-row:active { transform: scale(0.982); }
-#bp-pos-popover button.bp-row:hover { background: rgba(177, 11, 43, 0.032); }
-#bp-pos-popover button.bp-row:focus-visible { outline: none; box-shadow: inset 0 0 0 1px var(--bpAccentRing); }
-#bp-pos-popover button.bp-go { transition: transform 160ms cubic-bezier(0.23, 1.0, 0.32, 1.0), box-shadow 160ms ease; }
+#bp-pos-popover button.bp-row:hover { background: color-mix(in oklab, var(--panel) 22%, transparent); }
+#bp-pos-popover button.bp-row:focus-visible { outline: none; box-shadow: inset 0 0 0 1px var(--bpAccentRing), 0 0 0 3px color-mix(in oklab, var(--bpAccentRing) 55%, transparent); }
+
+#bp-pos-popover button.bp-go { transition: transform 160ms cubic-bezier(0.23, 1.0, 0.32, 1.0), box-shadow 160ms ease, opacity 160ms ease; }
 #bp-pos-popover button.bp-go:active { transform: scale(0.955) translateY(1px); }
 `;
   document.head.appendChild(el);
 }
 
 const ListItem = React.memo(function ListItem({
-  active,
-  onClick,
-  children,
-  tight = false,
-  mapRef,
-  itemKey,
-  ariaLabel,
-}: {
+                                                active,
+                                                onClick,
+                                                children,
+                                                tight = false,
+                                                mapRef,
+                                                itemKey,
+                                                ariaLabel,
+                                              }: {
   active: boolean;
   onClick: () => void;
   children: React.ReactNode;
@@ -149,24 +167,24 @@ const ListItem = React.memo(function ListItem({
   }, [mapRef, itemKey]);
 
   return (
-    <button
-      type="button"
-      className="bp-row"
-      ref={ref}
-      style={{ ...baseStyle, ...(active ? sx.itemActive : null) }}
-      onPointerDown={(e) => {
-        if (e.pointerType !== "mouse") e.preventDefault();
-      }}
-      onMouseDown={(e) => e.preventDefault()}
-      onClick={onClick}
-      aria-label={ariaLabel}
-      role="option"
-      aria-selected={active}
-    >
-      {active && <span style={sx.activeBar} aria-hidden />}
-      {children}
-      <span style={{ ...sx.selDot, ...(active ? sx.selDotOn : null) }} aria-hidden />
-    </button>
+      <button
+          type="button"
+          className="bp-row"
+          ref={ref}
+          style={{ ...baseStyle, ...(active ? sx.itemActive : null) }}
+          onPointerDown={(e) => {
+            if (e.pointerType !== "mouse") e.preventDefault();
+          }}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={onClick}
+          aria-label={ariaLabel}
+          role="option"
+          aria-selected={active}
+      >
+        {active && <span style={sx.activeBar} aria-hidden />}
+        {children}
+        <span style={{ ...sx.selDot, ...(active ? sx.selDotOn : null) }} aria-hidden />
+      </button>
   );
 });
 
@@ -241,12 +259,12 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
 
     let alive = true;
     apiGetChapters(bookId)
-      .then((p) => {
-        if (!alive) return;
-        chaptersCacheRef.current.set(bookId, p);
-        setChaptersMeta(p);
-      })
-      .catch(() => alive && setChaptersMeta(null));
+        .then((p) => {
+          if (!alive) return;
+          chaptersCacheRef.current.set(bookId, p);
+          setChaptersMeta(p);
+        })
+        .catch(() => alive && setChaptersMeta(null));
 
     return () => {
       alive = false;
@@ -430,7 +448,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     };
   }, [open, commit, closePopover, clearCloseTimer]);
 
-  // Focus management (avoid scrollIntoView on the whole page; we only call it after open)
+  // Focus management (after open)
   useEffect(() => {
     if (!open) return;
     const id = requestAnimationFrame(() => {
@@ -458,180 +476,189 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   };
 
   const popAnim: React.CSSProperties = reducedMotion
-    ? { opacity: 1, transform: "none" }
-    : phase === "opening"
-      ? { opacity: 0, transform: "scale(0.975) translateY(6px)" }
-      : phase === "closing"
-        ? { opacity: 0, transform: "scale(0.988) translateY(4px)" }
-        : { opacity: 1, transform: "scale(1) translateY(0)" };
+      ? { opacity: 1, transform: "none" }
+      : phase === "opening"
+          ? { opacity: 0, transform: "scale(0.975) translateY(6px)" }
+          : phase === "closing"
+              ? { opacity: 0, transform: "scale(0.988) translateY(4px)" }
+              : { opacity: 1, transform: "scale(1) translateY(0)" };
 
   const popTransition = reducedMotion
-    ? undefined
-    : "opacity 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0)";
+      ? undefined
+      : "opacity 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0)";
+
+  // Monochrome accent derived from theme tokens (no red):
+  // - Accent = var(--fg)
+  // - Soft = a faint panel wash
+  // - Ring = focus tone
+  const bpAccent = "var(--fg)";
+  const bpAccentSoft = "color-mix(in oklab, var(--panel) 26%, transparent)";
+  const bpAccentRing = "color-mix(in oklab, var(--focus) 72%, transparent)";
 
   const popover =
-    open && popPos
-      ? createPortal(
-          <div
-            id="bp-pos-popover"
-            ref={popoverElRef}
-            style={{
-              ...sx.popover,
-              left: popPos.left,
-              top: popPos.top,
-              width: popPos.width,
-              height: popPos.height,
-              ...popAnim,
-              transition: popTransition,
-              ["--bpAccent" as any]: ACCENT,
-              ["--bpAccentSoft" as any]: ACCENT_SOFT,
-              ["--bpAccentRing" as any]: ACCENT_RING,
-            }}
-            role="dialog"
-            aria-label="Jump"
-            aria-modal="false"
-          >
-            <div style={sx.topRow}>
+      open && popPos
+          ? createPortal(
               <div
-                style={sx.titleWrap}
-                aria-label="Selection summary"
-                title={`${titleBookPart}${titleNumPart}${titleTagPart}`}
+                  id="bp-pos-popover"
+                  ref={popoverElRef}
+                  style={{
+                    ...sx.popover,
+                    left: popPos.left,
+                    top: popPos.top,
+                    width: popPos.width,
+                    height: popPos.height,
+                    ...popAnim,
+                    transition: popTransition,
+                    ["--bpAccent" as any]: bpAccent,
+                    ["--bpAccentSoft" as any]: bpAccentSoft,
+                    ["--bpAccentRing" as any]: bpAccentRing,
+                  }}
+                  role="dialog"
+                  aria-label="Jump"
+                  aria-modal="false"
               >
-                <span style={sx.titleBook}>{titleBookPart}</span>
-                {titleNumPart && <span style={sx.titleNum}>{titleNumPart}</span>}
-                {titleTagPart && <span style={sx.titleTag}>{titleTagPart}</span>}
-              </div>
+                <div style={sx.topRow}>
+                  <div
+                      style={sx.titleWrap}
+                      aria-label="Selection summary"
+                      title={`${titleBookPart}${titleNumPart}${titleTagPart}`}
+                  >
+                    <span style={sx.titleBook}>{titleBookPart}</span>
+                    {titleNumPart && <span style={sx.titleNum}>{titleNumPart}</span>}
+                    {titleTagPart && <span style={sx.titleTag}>{titleTagPart}</span>}
+                  </div>
 
-              <button
-                type="button"
-                className="bp-go"
-                style={goStyle}
-                onClick={() => {
-                  if (canCommit) commit();
-                }}
-                disabled={!canCommit}
-                onPointerDown={() => setPressGo(true)}
-                onPointerUp={() => setPressGo(false)}
-                onPointerCancel={() => setPressGo(false)}
-                onPointerLeave={() => setPressGo(false)}
-                aria-label="Confirm jump"
-                title={canCommit ? "Confirm" : "Pick a chapter first"}
-              >
-                →
-              </button>
-            </div>
+                  <button
+                      type="button"
+                      className="bp-go"
+                      style={goStyle}
+                      onClick={() => {
+                        if (canCommit) commit();
+                      }}
+                      disabled={!canCommit}
+                      onPointerDown={() => setPressGo(true)}
+                      onPointerUp={() => setPressGo(false)}
+                      onPointerCancel={() => setPressGo(false)}
+                      onPointerLeave={() => setPressGo(false)}
+                      aria-label="Confirm jump"
+                      title={canCommit ? "Confirm" : "Pick a chapter first"}
+                  >
+                    →
+                  </button>
+                </div>
 
-            <div style={sx.bodyRow}>
-              {/* Books */}
-              <div style={sx.col}>
-                <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
-                  {list.map((b) => {
-                    const active = b.bookId === bookId;
-                    return (
-                      <ListItem
-                        key={b.bookId}
-                        active={active}
-                        onClick={() => onPickBook(b.bookId)}
-                        mapRef={bookBtnMapRef}
-                        itemKey={b.bookId}
-                        ariaLabel={`Select ${b.name}`}
-                      >
+                <div style={sx.bodyRow}>
+                  {/* Books */}
+                  <div style={sx.col}>
+                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
+                      {list.map((b) => {
+                        const active = b.bookId === bookId;
+                        return (
+                            <ListItem
+                                key={b.bookId}
+                                active={active}
+                                onClick={() => onPickBook(b.bookId)}
+                                mapRef={bookBtnMapRef}
+                                itemKey={b.bookId}
+                                ariaLabel={`Select ${b.name}`}
+                            >
                         <span style={sx.itemLine}>
                           <span style={{ ...sx.itemTextBook, ...(active ? sx.itemTextActive : null) }}>{b.name}</span>
                         </span>
-                      </ListItem>
-                    );
-                  })}
-                </div>
-              </div>
+                            </ListItem>
+                        );
+                      })}
+                    </div>
+                  </div>
 
-              {/* Chapters */}
-              <div style={sx.colNarrow}>
-                <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
-                  {chapterOptions.map((o) => {
-                    const n = o.value;
-                    const active = !pendingChapter && n === chapter;
-                    return (
-                      <ListItem
-                        key={o.key}
-                        active={active}
-                        onClick={() => onPickChapter(n)}
-                        tight
-                        mapRef={chapBtnMapRef}
-                        itemKey={`c:${n}`}
-                        ariaLabel={`Chapter ${n}`}
-                      >
+                  {/* Chapters */}
+                  <div style={sx.colNarrow}>
+                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
+                      {chapterOptions.map((o) => {
+                        const n = o.value;
+                        const active = !pendingChapter && n === chapter;
+                        return (
+                            <ListItem
+                                key={o.key}
+                                active={active}
+                                onClick={() => onPickChapter(n)}
+                                tight
+                                mapRef={chapBtnMapRef}
+                                itemKey={`c:${n}`}
+                                ariaLabel={`Chapter ${n}`}
+                            >
                         <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
                           <span style={sx.prefixLabel}>CH</span> {n}
                         </span>
-                      </ListItem>
-                    );
-                  })}
-                </div>
-              </div>
+                            </ListItem>
+                        );
+                      })}
+                    </div>
+                  </div>
 
-              {/* Verses */}
-              <div style={sx.colNarrow}>
-                <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Verses">
-                  {!chaptersMeta ? (
-                    <div style={sx.loadingBox}>Loading…</div>
-                  ) : (
-                    verseOptions.map((o) => {
-                      const n = o.value;
-                      const active = !pendingVerse && verse === n;
-                      return (
-                        <ListItem
-                          key={o.key}
-                          active={active}
-                          onClick={() => onPickVerse(n)}
-                          tight
-                          mapRef={verseBtnMapRef}
-                          itemKey={`v:${n}`}
-                          ariaLabel={`Verse ${n}`}
-                        >
+                  {/* Verses */}
+                  <div style={sx.colNarrow}>
+                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Verses">
+                      {!chaptersMeta ? (
+                          <div style={sx.loadingBox}>Loading…</div>
+                      ) : (
+                          verseOptions.map((o) => {
+                            const n = o.value;
+                            const active = !pendingVerse && verse === n;
+                            return (
+                                <ListItem
+                                    key={o.key}
+                                    active={active}
+                                    onClick={() => onPickVerse(n)}
+                                    tight
+                                    mapRef={verseBtnMapRef}
+                                    itemKey={`v:${n}`}
+                                    ariaLabel={`Verse ${n}`}
+                                >
                           <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
                             <span style={sx.prefixLabel}>V</span> {n}
                           </span>
-                        </ListItem>
-                      );
-                    })
-                  )}
+                                </ListItem>
+                            );
+                          })
+                      )}
+                    </div>
+                  </div>
                 </div>
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )
-      : null;
+              </div>,
+              document.body,
+          )
+          : null;
 
   return (
-    <div style={sx.root}>
-      <button
-        ref={anchorRef}
-        type="button"
-        className="bp-pill"
-        style={pillStyle}
-        aria-label="Current position"
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        onClick={toggleOpen}
-        onPointerDown={() => {
-          clearCloseTimer();
-          setPressPill(true);
-        }}
-        onPointerUp={() => setPressPill(false)}
-        onPointerCancel={() => setPressPill(false)}
-        onPointerLeave={() => setPressPill(false)}
-        title={pillLabel}
-      >
-        <span style={sx.pillTextStrong}>{currentBookName}</span>
-        <span style={sx.pillTextMuted}>{currentVerse == null ? `${currentChap}` : `${currentChap}:${currentVerse}`}</span>
-        <span style={sx.caret} aria-hidden>
+      <div style={sx.root}>
+        <button
+            ref={anchorRef}
+            type="button"
+            className="bp-pill"
+            style={pillStyle}
+            aria-label="Current position"
+            aria-haspopup="dialog"
+            aria-expanded={open}
+            onClick={toggleOpen}
+            onPointerDown={() => {
+              clearCloseTimer();
+              setPressPill(true);
+            }}
+            onPointerUp={() => setPressPill(false)}
+            onPointerCancel={() => setPressPill(false)}
+            onPointerLeave={() => setPressPill(false)}
+            title={pillLabel}
+        >
+          <span style={sx.pillTextStrong}>{currentBookName}</span>
+          <span style={sx.pillTextMuted}>{currentVerse == null ? `${currentChap}` : `${currentChap}:${currentVerse}`}</span>
+          <span style={sx.caret} aria-hidden>
           ▾
         </span>
-      </button>
-      {popover}
-    </div>
+        </button>
+
+        {popover}
+      </div>
   );
 }
 
@@ -654,7 +681,7 @@ const sx: Record<string, React.CSSProperties> = {
     lineHeight: 1,
     boxShadow: "0 6px 18px rgba(0,0,0,0.06)",
     transition:
-      "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
+        "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
     whiteSpace: "nowrap",
     textAlign: "left",
     WebkitTapHighlightColor: "transparent",
@@ -842,8 +869,10 @@ const sx: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     outline: "none",
   },
+
+  // active state uses portal vars (monochrome)
   itemActive: {
-    background: ACCENT_SOFT,
+    background: "var(--bpAccentSoft)",
     boxShadow: "inset 0 0 0 1px var(--bpAccentRing)",
   },
   activeBar: {
@@ -852,7 +881,7 @@ const sx: Record<string, React.CSSProperties> = {
     top: 0,
     bottom: 0,
     width: 3,
-    background: ACCENT,
+    background: "var(--bpAccent)",
     borderTopLeftRadius: S(12),
     borderBottomLeftRadius: S(12),
   },
@@ -900,7 +929,7 @@ const sx: Record<string, React.CSSProperties> = {
     justifySelf: "end",
   },
   selDotOn: {
-    background: ACCENT,
+    background: "var(--bpAccent)",
     border: "1px solid transparent",
     opacity: 0.82,
   },
@@ -917,4 +946,3 @@ const sx: Record<string, React.CSSProperties> = {
     flex: "1 1 auto",
   },
 };
-

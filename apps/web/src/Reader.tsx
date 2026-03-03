@@ -63,7 +63,9 @@ export function Reader(props: Props) {
     const [err, setErr] = useState<string | null>(null);
     const [pos, setPos] = useState<ReaderPosition>(() => ({ ord: 1, verse: null, book: null }));
 
+    // Keep both: ref for imperative use, and state to trigger effects reliably.
     const viewportHandleRef = useRef<ReaderViewportHandle | null>(null);
+    const [viewportHandle, setViewportHandle] = useState<ReaderViewportHandle | null>(null);
     const [viewportReady, setViewportReady] = useState(false);
 
     const pendingJumpRef = useRef<PendingJump | null>(null);
@@ -113,12 +115,13 @@ export function Reader(props: Props) {
         if (!pos.verse) return `#${pos.ord}`;
         const bookName = pos.book?.name ?? pos.verse.bookId;
         return `${bookName} ${pos.verse.chapter}:${pos.verse.verse}`;
-    }, [spine, pos]);
+    }, [spine, pos.ord, pos.verse, pos.book]);
 
-    const canJumpNow = !!(spine && viewportReady && viewportHandleRef.current);
+    const canJumpNow = !!(spine && viewportReady && viewportHandle);
 
     const setViewportRef = useCallback((h: ReaderViewportHandle | null) => {
         viewportHandleRef.current = h;
+        setViewportHandle(h);
     }, []);
 
     const jumpToOrd = useCallback(
@@ -126,14 +129,13 @@ export function Reader(props: Props) {
             if (!spine) return;
             const clamped = clampOrd(ord, spine);
 
-            const h = viewportHandleRef.current;
-            if (h && viewportReady) {
-                h.jumpToOrd(clamped, behavior);
+            if (viewportHandle && viewportReady) {
+                viewportHandle.jumpToOrd(clamped, behavior);
             } else {
                 pendingJumpRef.current = { ord: clamped, behavior };
             }
         },
-        [spine, viewportReady],
+        [spine, viewportHandle, viewportReady],
     );
 
     const resolveAndJump = useCallback(
@@ -204,8 +206,8 @@ export function Reader(props: Props) {
         if (!p) return;
 
         pendingJumpRef.current = null;
-        viewportHandleRef.current!.jumpToOrd(p.ord, p.behavior);
-    }, [canJumpNow]);
+        viewportHandle!.jumpToOrd(p.ord, p.behavior);
+    }, [canJumpNow, viewportHandle]);
 
     // Persist current position (debounced).
     useEffect(() => {
@@ -221,7 +223,6 @@ export function Reader(props: Props) {
     }, [pos.ord, spine]);
 
     const handleReady = useCallback(() => {
-        // idempotent
         setViewportReady(true);
     }, []);
 
@@ -229,8 +230,12 @@ export function Reader(props: Props) {
         setErr(m);
     }, []);
 
+    // Avoid re-render storms by ignoring identical position objects.
     const handlePosition = useCallback((p: ReaderPosition) => {
-        setPos(p);
+        setPos((prev) => {
+            if (prev.ord === p.ord && prev.verse === p.verse && prev.book === p.book) return prev;
+            return p;
+        });
     }, []);
 
     const handleJumpRef = useCallback(
