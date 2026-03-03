@@ -13,22 +13,84 @@ import {
     type TypographyFont,
 } from "./typography";
 
+type ActiveId = "font" | "sizePx" | "weight" | "leading" | "measurePx";
+
 type TabSpec = {
-    id: "font" | "sizePx" | "weight" | "leading" | "measurePx";
+    id: ActiveId;
     label: string;
-    icon: string;
+    icon: React.ReactNode;
 };
 
 type SliderSpec = {
-    id: "sizePx" | "weight" | "leading" | "measurePx";
+    id: Exclude<ActiveId, "font">;
     min: number;
     max: number;
     step: number;
     fmt: (t: ReaderTypography) => string;
+    get: (t: ReaderTypography) => number;
+    set: (v: number) => Partial<ReaderTypography>;
 };
 
 function clampNum(n: number, lo: number, hi: number): number {
     return Math.max(lo, Math.min(hi, n));
+}
+
+function usePrefersReducedMotion(): boolean {
+    const [reduced, setReduced] = useState(false);
+    useEffect(() => {
+        if (typeof window === "undefined" || !window.matchMedia) return;
+        const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+        const onChange = () => setReduced(mq.matches);
+        onChange();
+        mq.addEventListener?.("change", onChange);
+        return () => mq.removeEventListener?.("change", onChange);
+    }, []);
+    return reduced;
+}
+
+function IconAa() {
+    return <span style={{ fontWeight: 820, letterSpacing: "-0.06em" }}>Aa</span>;
+}
+function IconFont() {
+    return (
+        <span style={{ fontFamily: "ui-serif, Georgia, serif", fontStyle: "italic", fontWeight: 650 }}>
+      f
+    </span>
+    );
+}
+function IconWeight() {
+    return <span style={{ fontWeight: 920 }}>B</span>;
+}
+function IconLeading() {
+    return <span style={{ display: "inline-block", transform: "translateY(-0.5px)" }}>↕</span>;
+}
+function IconMeasure() {
+    return <span style={{ display: "inline-block", transform: "translateY(-0.5px)" }}>↔</span>;
+}
+function IconX() {
+    return <span style={{ fontSize: 14, lineHeight: 1 }}>✕</span>;
+}
+
+function nextOf<T>(arr: readonly T[], current: T, dir: 1 | -1): T {
+    const i = Math.max(0, arr.indexOf(current));
+    const n = (i + dir + arr.length) % arr.length;
+    return arr[n]!;
+}
+
+// IMPORTANT: fontOptions() only guarantees { id, label }.
+// We preview by setting font-family to the TypographyFont id, then fall back.
+function fontFamilyFor(id: TypographyFont): string {
+    return `"${id}", ui-serif, Georgia, Cambria, "Times New Roman", serif`;
+}
+
+function previewBlurb(): string {
+    return "In the beginning";
+}
+
+/** Single-card “carousel” font picker: center active, neighbors blurred and smaller. */
+function clampIndex(i: number, len: number): number {
+    if (len <= 0) return 0;
+    return ((i % len) + len) % len;
 }
 
 export function ReaderTypographyControl() {
@@ -36,29 +98,107 @@ export function ReaderTypographyControl() {
     const [enabled, setEnabled] = useState<boolean>(!!stored);
     const [t, setT] = useState<ReaderTypography>(stored ?? DEFAULT_TYPOGRAPHY);
     const [open, setOpen] = useState(false);
-    const [activeId, setActiveId] = useState<"font" | "sizePx" | "weight" | "leading" | "measurePx">("sizePx");
+    const [activeId, setActiveId] = useState<ActiveId>("sizePx");
+
+    const reducedMotion = usePrefersReducedMotion();
+
     const rootRef = useRef<HTMLDivElement | null>(null);
-    const wheelRef = useRef<HTMLDivElement>(null);
+    const triggerRef = useRef<HTMLButtonElement | null>(null);
+    const panelRef = useRef<HTMLDivElement | null>(null);
 
     const limits = useMemo(() => typographyLimits(), []);
     const fonts = useMemo(() => fontOptions(), []);
 
-    const tabs: TabSpec[] = useMemo(() => [
-        { id: "font", label: "Font", icon: "𝑓" },
-        { id: "sizePx", label: "Size", icon: "Aa" },
-        { id: "weight", label: "Weight", icon: "B" },
-        { id: "leading", label: "Leading", icon: "↕" },
-        { id: "measurePx", label: "Width", icon: "↔" },
-    ], []);
+    const tabs: TabSpec[] = useMemo(
+        () => [
+            { id: "font", label: "Font", icon: <IconFont /> },
+            { id: "sizePx", label: "Size", icon: <IconAa /> },
+            { id: "weight", label: "Weight", icon: <IconWeight /> },
+            { id: "leading", label: "Leading", icon: <IconLeading /> },
+            { id: "measurePx", label: "Width", icon: <IconMeasure /> },
+        ],
+        [],
+    );
 
-    const sliders: SliderSpec[] = useMemo(() => [
-        { id: "sizePx", min: 12, max: limits.sizePx.hi, step: limits.sizePx.step, fmt: (tt) => `${Math.round(tt.sizePx)}px` },
-        { id: "weight", min: 200, max: limits.weight.hi, step: limits.weight.step, fmt: (tt) => `${Math.round(tt.weight)}` },
-        { id: "leading", min: 0.95, max: limits.leading.hi, step: limits.leading.digits !== undefined ? Math.pow(10, -limits.leading.digits) : 0.01, fmt: (tt) => tt.leading.toFixed(2) },
-        { id: "measurePx", min: 240, max: limits.measurePx.hi, step: limits.measurePx.step, fmt: (tt) => `${Math.round(tt.measurePx)}px` },
-    ], [limits]);
+    const sliders: SliderSpec[] = useMemo(() => {
+        const leadingStep = limits.leading.digits !== undefined ? Math.pow(10, -limits.leading.digits) : 0.01;
+
+        return [
+            {
+                id: "sizePx",
+                min: 12,
+                max: limits.sizePx.hi,
+                step: limits.sizePx.step,
+                fmt: (tt) => `${Math.round(tt.sizePx)}px`,
+                get: (tt) => tt.sizePx,
+                set: (v) => ({ sizePx: Math.round(v) }),
+            },
+            {
+                id: "weight",
+                min: 200,
+                max: limits.weight.hi,
+                step: limits.weight.step,
+                fmt: (tt) => `${Math.round(tt.weight)}`,
+                get: (tt) => tt.weight,
+                set: (v) => ({ weight: Math.round(v) }),
+            },
+            {
+                id: "leading",
+                min: 0.95,
+                max: limits.leading.hi,
+                step: leadingStep,
+                fmt: (tt) => tt.leading.toFixed(2),
+                get: (tt) => tt.leading,
+                set: (v) => ({ leading: Number(v.toFixed(2)) }),
+            },
+            {
+                id: "measurePx",
+                min: 240,
+                max: limits.measurePx.hi,
+                step: limits.measurePx.step,
+                fmt: (tt) => `${Math.round(tt.measurePx)}px`,
+                get: (tt) => tt.measurePx,
+                set: (v) => ({ measurePx: Math.round(v) }),
+            },
+        ];
+    }, [limits]);
 
     const activeSlider = useMemo(() => sliders.find((s) => s.id === activeId), [sliders, activeId]);
+
+    const summary = useMemo(() => {
+        const size = `${Math.round(t.sizePx)}px`;
+        const weight = `${Math.round(t.weight)}`;
+        const leading = t.leading.toFixed(2);
+        const width = `${Math.round(t.measurePx)}px`;
+        return `${t.font} · ${size} · ${weight} · ${leading} · ${width}`;
+    }, [t]);
+
+    const isActuallyEnabled = enabled;
+
+    const ensureEnabled = useCallback(() => {
+        if (!enabled) setEnabled(true);
+    }, [enabled]);
+
+    const setPatch = useCallback(
+        (patch: Partial<ReaderTypography>) => {
+            ensureEnabled();
+            setT((prev) => updateTypography(prev, patch));
+        },
+        [ensureEnabled],
+    );
+
+    const closePanel = useCallback(() => {
+        setOpen(false);
+        queueMicrotask(() => triggerRef.current?.focus());
+    }, []);
+
+    const resetToDefaults = useCallback(() => {
+        setEnabled(false);
+        setT(DEFAULT_TYPOGRAPHY);
+        setActiveId("sizePx");
+        setOpen(false);
+        queueMicrotask(() => triggerRef.current?.focus());
+    }, []);
 
     // Live apply + save
     useEffect(() => {
@@ -71,157 +211,393 @@ export function ReaderTypographyControl() {
         saveReaderTypography(t);
     }, [enabled, t]);
 
-    // Click-outside + Escape
+    // Click-outside
     useEffect(() => {
         if (!open) return;
-        const handler = (e: MouseEvent) => {
-            if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+        const onPointerDown = (e: PointerEvent) => {
+            const root = rootRef.current;
+            if (!root) return;
+            if (!root.contains(e.target as Node)) closePanel();
         };
-        document.addEventListener("mousedown", handler, { capture: true });
-        return () => document.removeEventListener("mousedown", handler, { capture: true });
-    }, [open]);
+        document.addEventListener("pointerdown", onPointerDown, { capture: true });
+        return () => document.removeEventListener("pointerdown", onPointerDown, { capture: true } as any);
+    }, [open, closePanel]);
 
+    // Keyboard: Escape + arrows (font picker: left/right hop fonts)
     useEffect(() => {
         if (!open) return;
-        const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === "Escape") {
+                e.preventDefault();
+                closePanel();
+                return;
+            }
+            if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+            // Font tab: left/right hop fonts.
+            if (activeId === "font" && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+                if (!isActuallyEnabled || fonts.length === 0) return;
+                const ids = fonts.map((f) => f.id);
+                const dir: 1 | -1 = e.key === "ArrowRight" ? 1 : -1;
+                setPatch({ font: nextOf(ids, t.font, dir) });
+                e.preventDefault();
+                return;
+            }
+
+            // Left/right on panel: switch tabs.
+            if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+                const ids = tabs.map((x) => x.id);
+                const dir: 1 | -1 = e.key === "ArrowRight" ? 1 : -1;
+                setActiveId((prev) => nextOf(ids, prev, dir));
+                e.preventDefault();
+                return;
+            }
+
+            // Up/down: nudge slider.
+            if (activeSlider && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+                if (!isActuallyEnabled) return;
+                const dir = e.key === "ArrowUp" ? 1 : -1;
+                const cur = activeSlider.get(t);
+                const next = clampNum(cur + dir * activeSlider.step, activeSlider.min, activeSlider.max);
+                setPatch(activeSlider.set(next));
+                e.preventDefault();
+                return;
+            }
+        };
+
         window.addEventListener("keydown", onKey, { capture: true });
         return () => window.removeEventListener("keydown", onKey, { capture: true } as any);
+    }, [open, activeId, tabs, activeSlider, t, isActuallyEnabled, setPatch, closePanel, fonts]);
+
+    // When opening, focus panel.
+    useEffect(() => {
+        if (!open) return;
+        queueMicrotask(() => panelRef.current?.focus());
     }, [open]);
 
-    const ensureEnabled = useCallback(() => {
-        if (!enabled) setEnabled(true);
-    }, [enabled]);
+    const onToggle = useCallback(() => setOpen((v) => !v), []);
+    const onClose = useCallback(() => closePanel(), [closePanel]);
 
-    const setPatch = useCallback((patch: Partial<ReaderTypography>) => {
-        ensureEnabled();
-        setT((prev) => updateTypography(prev, patch));
-    }, [ensureEnabled]);
+    const toggleEnabled = useCallback(() => setEnabled((v) => !v), []);
+    const onReset = useCallback(() => resetToDefaults(), [resetToDefaults]);
 
-    const resetToDefaults = useCallback(() => {
-        setEnabled(false);
-        setT(DEFAULT_TYPOGRAPHY);
-        setOpen(false);
-        setActiveId("sizePx");
-    }, []);
+    const activeTab = useMemo(() => tabs.find((x) => x.id === activeId), [tabs, activeId]);
+    const activeLabel = activeTab?.label ?? "Typography";
 
-    const closePanel = useCallback(() => setOpen(false), []);
+    // --- Font carousel derived from current selection ---
+    const fontIndex = useMemo(() => {
+        if (fonts.length === 0) return 0;
+        const idx = fonts.findIndex((f) => f.id === t.font);
+        return idx >= 0 ? idx : 0;
+    }, [fonts, t.font]);
 
-    // Smoother arrow scrolling
-    const scrollWheel = useCallback((direction: "left" | "right") => {
-        if (!wheelRef.current) return;
-        const amount = 68;
-        wheelRef.current.scrollBy({
-            left: direction === "left" ? -amount : amount,
-            behavior: "smooth",
-        });
-    }, []);
+    const prevFont = useMemo(() => {
+        if (fonts.length === 0) return null;
+        return fonts[clampIndex(fontIndex - 1, fonts.length)]!;
+    }, [fonts, fontIndex]);
+
+    const curFont = useMemo(() => {
+        if (fonts.length === 0) return null;
+        return fonts[clampIndex(fontIndex, fonts.length)]!;
+    }, [fonts, fontIndex]);
+
+    const nextFont = useMemo(() => {
+        if (fonts.length === 0) return null;
+        return fonts[clampIndex(fontIndex + 1, fonts.length)]!;
+    }, [fonts, fontIndex]);
+
+    const hopFont = useCallback(
+        (dir: -1 | 1) => {
+            if (!isActuallyEnabled || fonts.length === 0) return;
+            const ids = fonts.map((f) => f.id);
+            setPatch({ font: nextOf(ids, t.font, dir) });
+        },
+        [fonts, isActuallyEnabled, setPatch, t.font],
+    );
+
+    const previewStyleFor = useCallback(
+        (fontId: TypographyFont, role: "prev" | "cur" | "next"): React.CSSProperties => {
+            const isCur = role === "cur";
+            return {
+                fontFamily: fontFamilyFor(fontId),
+                fontSize: isCur ? 14.4 : 13.2,
+                fontWeight: isCur ? 790 : 660,
+                letterSpacing: "-0.01em",
+                lineHeight: 1.06,
+                opacity: isCur ? 1 : 0.62,
+                filter: isCur ? "none" : "blur(0.75px)",
+                transform: isCur ? "translateY(-1px) scale(1.0)" : "translateY(0px) scale(0.92)",
+                transition: reducedMotion
+                    ? "none"
+                    : "transform 220ms cubic-bezier(0.23, 1, 0.32, 1), opacity 220ms ease, filter 220ms ease",
+            };
+        },
+        [reducedMotion],
+    );
+
+    const switchThumbTransform = isActuallyEnabled ? "translateX(12px)" : "translateX(0px)";
+    const switchTrackBg = isActuallyEnabled
+        ? "color-mix(in oklab, var(--focus) 86%, transparent)"
+        : "color-mix(in oklab, var(--panel) 92%, transparent)";
 
     return (
         <div ref={rootRef} style={sx.root}>
             <button
+                ref={triggerRef}
                 type="button"
-                style={{ ...sx.trigger, ...(open ? sx.triggerOpen : {}) }}
-                onClick={() => setOpen((v) => !v)}
+                style={{
+                    ...sx.trigger,
+                    ...(open ? sx.triggerOpen : {}),
+                    ...(isActuallyEnabled ? sx.triggerEnabled : sx.triggerDisabled),
+                }}
+                onClick={onToggle}
+                aria-haspopup="dialog"
+                aria-expanded={open}
                 aria-label="Typography settings"
-                title={`Typography (${t.font} • ${Math.round(t.sizePx)}px)`}
+                title={`Typography (${summary})`}
             >
-                <span style={sx.triggerAa}>Aa</span>
+        <span style={sx.triggerGlyph}>
+          <IconAa />
+        </span>
+                <span style={{ ...sx.dot, ...(isActuallyEnabled ? sx.dotOn : sx.dotOff) }} aria-hidden />
             </button>
 
             {open && (
-                <div style={sx.panel} role="dialog" aria-label="Typography settings">
+                <div
+                    ref={panelRef}
+                    style={{ ...sx.panel, ...(reducedMotion ? sx.panelNoMotion : {}) }}
+                    role="dialog"
+                    aria-label="Typography settings"
+                    tabIndex={-1}
+                >
                     <div style={sx.header}>
-                        <div style={sx.title}>Typography</div>
-                        <button type="button" onClick={closePanel} style={sx.closeBtn} aria-label="Close">✕</button>
-                    </div>
+                        <div style={sx.titleBlock}>
+                            <div style={sx.titleRow}>
+                                <div style={sx.title}>Typography</div>
+                                <span style={sx.badge}>{activeLabel}</span>
+                            </div>
+                            <div style={sx.subtitle}>{summary}</div>
+                        </div>
 
-                    <div style={sx.segmented}>
-                        {tabs.map((tab) => (
+                        <div style={sx.headerRight}>
                             <button
-                                key={tab.id}
-                                style={{ ...sx.tab, ...(activeId === tab.id ? sx.tabActive : {}) }}
-                                onClick={() => setActiveId(tab.id)}
-                                title={tab.label}
-                                aria-label={tab.label}
+                                type="button"
+                                onClick={toggleEnabled}
+                                style={{
+                                    ...sx.switch,
+                                    ...(isActuallyEnabled ? sx.switchOn : sx.switchOff),
+                                }}
+                                aria-label={isActuallyEnabled ? "Turn typography overrides off" : "Turn typography overrides on"}
+                                title={isActuallyEnabled ? "Overrides on" : "Overrides off"}
                             >
-                                {tab.icon}
+                                <span style={{ ...sx.switchTrack, background: switchTrackBg }} aria-hidden />
+                                <span style={{ ...sx.switchThumb, transform: switchThumbTransform }} aria-hidden />
                             </button>
-                        ))}
+
+                            <button type="button" onClick={onClose} style={sx.closeBtn} aria-label="Close">
+                                <IconX />
+                            </button>
+                        </div>
                     </div>
 
-                    {/* Shorter, tighter content area */}
+                    <div style={sx.segmented} role="tablist" aria-label="Typography sections">
+                        {tabs.map((tab) => {
+                            const active = activeId === tab.id;
+                            return (
+                                <button
+                                    key={tab.id}
+                                    type="button"
+                                    style={{ ...sx.tab, ...(active ? sx.tabActive : {}) }}
+                                    onClick={() => setActiveId(tab.id)}
+                                    title={tab.label}
+                                    aria-label={tab.label}
+                                    role="tab"
+                                    aria-selected={active}
+                                >
+                                    <span style={sx.tabIcon}>{tab.icon}</span>
+                                </button>
+                            );
+                        })}
+                    </div>
+
                     <div style={sx.activeBlock}>
+                        {!isActuallyEnabled && (
+                            <div style={sx.disabledHint}>
+                                <span style={sx.disabledPill}>Off</span>
+                                <span style={sx.disabledText}>Enable to customize reading typography.</span>
+                            </div>
+                        )}
+
                         {activeId === "font" ? (
-                            <div style={sx.fontWheelContainer}>
+                            <div style={sx.fontCarousel} aria-label="Font picker">
                                 <button
                                     type="button"
-                                    style={sx.wheelArrow}
-                                    onClick={() => scrollWheel("left")}
-                                    aria-label="Scroll fonts left"
+                                    style={sx.chevBtn}
+                                    onClick={() => hopFont(-1)}
+                                    aria-label="Previous font"
+                                    title="Previous font"
+                                    disabled={!isActuallyEnabled || fonts.length === 0}
                                 >
-                                    ‹
+                  <span style={sx.chevGlyph} aria-hidden>
+                    ‹
+                  </span>
                                 </button>
 
-                                <div ref={wheelRef} style={sx.fontWheel}>
-                                    {fonts.map((f) => (
+                                <div style={sx.fontStage} aria-label="Font previews">
+                                    {prevFont && (
+                                        <div style={{ ...sx.fontCard, ...sx.fontCardGhost }} aria-hidden>
+                                            <div style={sx.fontPillInner}>
+                                                <div style={sx.fontMetaRow}>
+                                                    <span style={sx.fontName}>{prevFont.label}</span>
+                                                </div>
+                                                <div style={{ ...sx.fontPreview, ...previewStyleFor(prevFont.id, "prev") }}>
+                                                    {previewBlurb()}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {curFont && (
                                         <button
-                                            key={f.id}
-                                            style={{ ...sx.fontPill, ...(t.font === f.id ? sx.fontPillActive : {}) }}
-                                            onClick={() => setPatch({ font: f.id })}
+                                            type="button"
+                                            style={{
+                                                ...sx.fontCard,
+                                                ...sx.fontCardActive,
+                                                ...(isActuallyEnabled ? null : sx.fontCardDisabled),
+                                            }}
+                                            onClick={() => {
+                                                if (!isActuallyEnabled) return;
+                                                setPatch({ font: curFont.id });
+                                            }}
+                                            aria-label={`Selected font: ${curFont.label}`}
+                                            aria-pressed
+                                            disabled={!isActuallyEnabled}
+                                            title={curFont.label}
                                         >
-                                            {f.label}
+                                            <div style={sx.fontPillInner}>
+                                                <div style={sx.fontMetaRowActive}>
+                                                    <span style={{ ...sx.fontName, ...sx.fontNameActive }}>{curFont.label}</span>
+                                                    <span style={sx.fontActiveDot} aria-hidden />
+                                                </div>
+                                                <div style={{ ...sx.fontPreview, ...previewStyleFor(curFont.id, "cur") }}>
+                                                    {previewBlurb()}
+                                                </div>
+                                            </div>
                                         </button>
-                                    ))}
+                                    )}
+
+                                    {nextFont && (
+                                        <div style={{ ...sx.fontCard, ...sx.fontCardGhost }} aria-hidden>
+                                            <div style={sx.fontPillInner}>
+                                                <div style={sx.fontMetaRow}>
+                                                    <span style={sx.fontName}>{nextFont.label}</span>
+                                                </div>
+                                                <div style={{ ...sx.fontPreview, ...previewStyleFor(nextFont.id, "next") }}>
+                                                    {previewBlurb()}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    <div style={sx.stageMaskLeft} aria-hidden />
+                                    <div style={sx.stageMaskRight} aria-hidden />
                                 </div>
 
                                 <button
                                     type="button"
-                                    style={sx.wheelArrow}
-                                    onClick={() => scrollWheel("right")}
-                                    aria-label="Scroll fonts right"
+                                    style={sx.chevBtn}
+                                    onClick={() => hopFont(1)}
+                                    aria-label="Next font"
+                                    title="Next font"
+                                    disabled={!isActuallyEnabled || fonts.length === 0}
                                 >
-                                    ›
+                  <span style={sx.chevGlyph} aria-hidden>
+                    ›
+                  </span>
                                 </button>
-
-                                {/* Fade gradients to show scrollability */}
-                                <div style={sx.fadeLeft} />
-                                <div style={sx.fadeRight} />
                             </div>
                         ) : activeSlider ? (
                             <>
                                 <div style={sx.sliderTop}>
                                     <div style={sx.sliderLabelGroup}>
-                                        <span style={sx.sliderIcon}>{tabs.find((t) => t.id === activeId)?.icon}</span>
-                                        <span style={sx.sliderLabel}>
-                                            {activeSlider.id === "sizePx" ? "Size" : activeSlider.id === "weight" ? "Weight" : activeSlider.id === "leading" ? "Leading" : "Width"}
-                                        </span>
+                    <span style={sx.sliderIcon} aria-hidden>
+                      {tabs.find((x) => x.id === activeId)?.icon}
+                    </span>
+                                        <span style={sx.sliderLabel}>{activeLabel}</span>
                                     </div>
+
                                     <span style={sx.sliderValue}>{activeSlider.fmt(t)}</span>
                                 </div>
+
                                 <input
                                     type="range"
                                     min={activeSlider.min}
                                     max={activeSlider.max}
                                     step={activeSlider.step}
-                                    value={activeSlider.id === "sizePx" ? t.sizePx : activeSlider.id === "weight" ? t.weight : activeSlider.id === "leading" ? t.leading : t.measurePx}
+                                    value={activeSlider.get(t)}
                                     onChange={(e) => {
                                         const raw = Number(e.target.value);
                                         const v = clampNum(raw, activeSlider.min, activeSlider.max);
-                                        if (activeSlider.id === "sizePx") setPatch({ sizePx: Math.round(v) });
-                                        else if (activeSlider.id === "weight") setPatch({ weight: Math.round(v) });
-                                        else if (activeSlider.id === "leading") setPatch({ leading: Number(v.toFixed(2)) });
-                                        else setPatch({ measurePx: Math.round(v) });
+                                        setPatch(activeSlider.set(v));
                                     }}
-                                    style={sx.range}
+                                    style={{ ...sx.range, ...(isActuallyEnabled ? null : sx.rangeDisabled) }}
+                                    disabled={!isActuallyEnabled}
                                 />
+
+                                <div style={sx.nudgeRow} aria-label="Fine controls">
+                                    <button
+                                        type="button"
+                                        style={{ ...sx.nudgeBtn, ...(isActuallyEnabled ? null : sx.nudgeBtnDisabled) }}
+                                        onClick={() => {
+                                            if (!isActuallyEnabled) return;
+                                            const cur = activeSlider.get(t);
+                                            const next = clampNum(cur - activeSlider.step, activeSlider.min, activeSlider.max);
+                                            setPatch(activeSlider.set(next));
+                                        }}
+                                        disabled={!isActuallyEnabled}
+                                        aria-label="Decrease"
+                                        title="Decrease"
+                                    >
+                                        −
+                                    </button>
+
+                                    <div style={sx.nudgeHint}>
+                                        <span style={sx.nudgeKbd}>↑</span>
+                                        <span style={sx.nudgeKbd}>↓</span>
+                                        <span style={sx.nudgeText}>to fine-tune</span>
+                                    </div>
+
+                                    <button
+                                        type="button"
+                                        style={{ ...sx.nudgeBtn, ...(isActuallyEnabled ? null : sx.nudgeBtnDisabled) }}
+                                        onClick={() => {
+                                            if (!isActuallyEnabled) return;
+                                            const cur = activeSlider.get(t);
+                                            const next = clampNum(cur + activeSlider.step, activeSlider.min, activeSlider.max);
+                                            setPatch(activeSlider.set(next));
+                                        }}
+                                        disabled={!isActuallyEnabled}
+                                        aria-label="Increase"
+                                        title="Increase"
+                                    >
+                                        +
+                                    </button>
+                                </div>
                             </>
                         ) : null}
                     </div>
 
                     <div style={sx.footer}>
-                        <button type="button" style={sx.footerBtnCancel} onClick={closePanel}>Cancel</button>
+                        <button type="button" style={sx.footerBtn} onClick={closePanel}>
+                            Done
+                        </button>
+
                         <div style={{ flex: 1 }} />
-                        <button type="button" style={sx.footerBtnReset} onClick={resetToDefaults}>Reset</button>
+
+                        <button type="button" style={sx.footerBtnGhost} onClick={onReset} title="Reset and turn off overrides">
+                            Reset
+                        </button>
                     </div>
                 </div>
             )}
@@ -233,226 +609,383 @@ const sx: Record<string, React.CSSProperties> = {
     root: { position: "relative", display: "inline-flex", alignItems: "center" },
 
     trigger: {
-        width: 34,
-        height: 34,
-        borderRadius: 11,
+        width: 36,
+        height: 36,
+        borderRadius: 12,
         border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 96%, transparent)",
+        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
         display: "inline-flex",
         alignItems: "center",
         justifyContent: "center",
         cursor: "pointer",
         userSelect: "none",
-        boxShadow: "0 6px 18px rgba(0,0,0,0.05)",
-        transition: "all 240ms cubic-bezier(0.23, 1, 0.32, 1)",
+        boxShadow: "0 10px 28px rgba(0,0,0,0.08)",
+        transition:
+            "transform 220ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 220ms cubic-bezier(0.23, 1, 0.32, 1), border-color 180ms ease, background 180ms ease",
+        position: "relative",
+        outline: "none",
     },
     triggerOpen: {
-        transform: "translateY(-2px) scale(1.04)",
-        borderColor: "var(--focus)",
-        boxShadow: "0 20px 64px rgba(0,0,0,0.18)",
+        transform: "translateY(-2px) scale(1.03)",
+        borderColor: "color-mix(in oklab, var(--focus) 70%, var(--hairline))",
+        boxShadow: "0 24px 72px rgba(0,0,0,0.20)",
+        background: "color-mix(in oklab, var(--panel) 86%, transparent)",
     },
-    triggerAa: { fontSize: 14.8, fontWeight: 760, letterSpacing: "-0.04em" },
+    triggerEnabled: {},
+    triggerDisabled: { opacity: 0.92 },
+    triggerGlyph: { fontSize: 14.5, fontWeight: 820, letterSpacing: "-0.05em" },
+
+    dot: {
+        position: "absolute",
+        right: 7,
+        bottom: 7,
+        width: 7,
+        height: 7,
+        borderRadius: 999,
+        border: "1px solid color-mix(in oklab, var(--hairline) 75%, transparent)",
+    },
+    dotOn: {
+        background: "var(--focus)",
+        boxShadow: "0 0 0 4px color-mix(in oklab, var(--focus) 16%, transparent)",
+    },
+    dotOff: { background: "color-mix(in oklab, var(--muted) 40%, transparent)" },
 
     panel: {
         position: "absolute",
         right: 0,
-        top: 44,
-        width: 242,
-        borderRadius: 15,
-        border: "1px solid var(--hairline)",
+        top: 46,
+        width: 292,
+        borderRadius: 16,
+        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
         background: "var(--bg)",
-        boxShadow: "0 26px 82px rgba(0,0,0,0.19)",
+        boxShadow: "0 26px 78px rgba(0,0,0,0.20)",
         overflow: "hidden",
         zIndex: 9999,
-        padding: 6,
+        padding: 8,
         display: "flex",
         flexDirection: "column",
-        gap: 5,
-        animation: "panelPop 180ms cubic-bezier(0.23, 1, 0.32, 1) both", // entrance animation
+        gap: 7,
+        transformOrigin: "top right",
+        animation: "bpTypographyPop 170ms cubic-bezier(0.23, 1, 0.32, 1) both",
     },
+    panelNoMotion: { animation: "none" },
 
-    header: { display: "flex", alignItems: "center", justifyContent: "space-between", paddingBottom: 2 },
-    title: { fontSize: 12.8, fontWeight: 710, letterSpacing: "-0.02em" },
-    closeBtn: {
-        width: 22,
-        height: 22,
+    header: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "2px 2px 0" },
+    titleBlock: { display: "flex", flexDirection: "column", gap: 2, minWidth: 0 },
+    titleRow: { display: "flex", alignItems: "center", gap: 8 },
+    title: { fontSize: 13.2, fontWeight: 840, letterSpacing: "-0.02em" },
+    badge: {
+        fontSize: 10.6,
+        fontWeight: 820,
+        letterSpacing: "0.06em",
+        textTransform: "uppercase",
+        padding: "4px 8px",
         borderRadius: 999,
-        border: "none",
+        border: "1px solid var(--hairline)",
+        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
+        color: "var(--muted)",
+        transform: "translateY(0.5px)",
+    },
+    subtitle: {
+        fontSize: 11.2,
+        color: "var(--muted)",
+        letterSpacing: "-0.01em",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        maxWidth: 198,
+    },
+    headerRight: { display: "flex", alignItems: "center", gap: 6 },
+
+    closeBtn: {
+        width: 28,
+        height: 28,
+        borderRadius: 999,
+        border: "1px solid transparent",
         background: "transparent",
         color: "var(--muted)",
-        fontSize: 14,
-        display: "flex",
+        display: "inline-flex",
         alignItems: "center",
         justifyContent: "center",
         cursor: "pointer",
-        transition: "color 180ms ease",
+        transition: "all 160ms ease",
+    },
+
+    // Cleaner switch: explicit track + thumb, no mystery bg.
+    switch: {
+        position: "relative",
+        width: 38,
+        height: 26,
+        borderRadius: 999,
+        border: "1px solid var(--hairline)",
+        background: "transparent",
+        cursor: "pointer",
+        padding: 0,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        overflow: "hidden",
+    },
+    switchOn: {
+        borderColor: "color-mix(in oklab, var(--focus) 55%, var(--hairline))",
+    },
+    switchOff: {},
+    switchTrack: {
+        position: "absolute",
+        inset: 0,
+        borderRadius: 999,
+        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
+        transition: "background 180ms ease",
+    },
+    switchThumb: {
+        position: "absolute",
+        top: 3,
+        left: 3,
+        width: 20,
+        height: 20,
+        borderRadius: 999,
+        background: "#fff",
+        boxShadow: "0 6px 14px rgba(0,0,0,0.16)",
+        transition: "transform 180ms cubic-bezier(0.23, 1, 0.32, 1)",
     },
 
     segmented: {
         display: "flex",
-        background: "var(--panel)",
+        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
         border: "1px solid var(--hairline)",
-        borderRadius: 10,
-        padding: 2,
-        gap: 2,
+        borderRadius: 12,
+        padding: 3,
+        gap: 3,
     },
     tab: {
         flex: 1,
-        height: 29,
-        borderRadius: 7,
-        border: "none",
+        height: 32,
+        borderRadius: 9,
+        border: "1px solid transparent",
         background: "transparent",
         color: "var(--muted)",
-        fontSize: 15.5,
-        fontWeight: 630,
-        display: "flex",
+        fontSize: 14.5,
+        fontWeight: 720,
+        display: "inline-flex",
         alignItems: "center",
         justifyContent: "center",
         cursor: "pointer",
-        transition: "all 220ms cubic-bezier(0.23, 1, 0.32, 1)",
+        transition: "all 200ms cubic-bezier(0.23, 1, 0.32, 1)",
         userSelect: "none",
+        outline: "none",
     },
+    tabIcon: { opacity: 0.92, transform: "translateY(-0.25px)" },
     tabActive: {
         background: "var(--focus)",
         color: "#fff",
-        boxShadow: "0 5px 14px color-mix(in oklab, var(--focus) 38%, transparent)",
-        transform: "scale(1.03)",
+        boxShadow: "0 8px 18px color-mix(in oklab, var(--focus) 30%, transparent)",
+        transform: "translateY(-0.5px)",
     },
 
-    /* Even shorter content block */
     activeBlock: {
-        background: "var(--panel)",
-        borderRadius: 11,
+        position: "relative",
+        background: "color-mix(in oklab, var(--bg) 86%, var(--panel))",
+        borderRadius: 12,
         border: "1px solid var(--hairline)",
-        padding: "6px 9px 5px",
-        minHeight: 68,
+        padding: "10px 10px 9px",
+        minHeight: 106,
         display: "flex",
         flexDirection: "column",
+        gap: 8,
     },
 
-    fontWheelContainer: {
-        position: "relative",
+    disabledHint: {
         display: "flex",
         alignItems: "center",
-        gap: 4,
+        gap: 8,
+        padding: "6px 8px",
+        borderRadius: 10,
+        border: "1px dashed color-mix(in oklab, var(--hairline) 92%, transparent)",
+        background: "color-mix(in oklab, var(--bg) 65%, transparent)",
     },
-    fontWheel: {
-        flex: 1,
-        display: "flex",
-        overflowX: "auto",
-        flexWrap: "nowrap",
-        gap: 7,
-        padding: "2px 0",
-        scrollSnapType: "x mandatory",
-        scrollbarWidth: "none",
-        WebkitOverflowScrolling: "touch",
-        msOverflowStyle: "none",
-    },
-    wheelArrow: {
-        width: 22,
-        height: 22,
-        borderRadius: 999,
-        border: "none",
-        background: "color-mix(in oklab, var(--panel) 80%, transparent)",
+    disabledPill: {
+        fontSize: 10.5,
+        fontWeight: 820,
+        letterSpacing: "0.06em",
+        textTransform: "uppercase",
         color: "var(--muted)",
-        fontSize: 18,
-        fontWeight: 600,
+        padding: "5px 8px",
+        borderRadius: 999,
+        border: "1px solid var(--hairline)",
+        background: "color-mix(in oklab, var(--panel) 90%, transparent)",
+    },
+    disabledText: { fontSize: 11.7, color: "var(--muted)" },
+
+    fontCarousel: {
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+    },
+    fontStage: {
+        position: "relative",
+        flex: 1,
+        height: 86,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        cursor: "pointer",
-        transition: "all 160ms cubic-bezier(0.23, 1, 0.32, 1)",
-        flexShrink: 0,
+        gap: 12,
+        overflow: "hidden",
+        borderRadius: 12,
     },
 
-    /* Fade gradients – the magic touch */
-    fadeLeft: {
+    // Cleaner chevrons: no heavy shadow.
+    chevBtn: {
+        width: 28,
+        height: 28,
+        borderRadius: 999,
+        border: "1px solid var(--hairline)",
+        background: "color-mix(in oklab, var(--bg) 70%, var(--panel))",
+        cursor: "pointer",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        transition: "transform 150ms cubic-bezier(0.23, 1, 0.32, 1), background 150ms ease, border-color 150ms ease, opacity 150ms ease",
+        userSelect: "none",
+    },
+    chevGlyph: {
+        fontSize: 18,
+        fontWeight: 760,
+        color: "var(--muted)",
+        transform: "translateY(-0.5px)",
+    },
+
+    fontCard: {
+        width: 156,
+        borderRadius: 12,
+        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        background: "color-mix(in oklab, var(--bg) 72%, var(--panel))",
+        boxShadow: "none",
+        padding: "9px 12px",
+    },
+    fontCardGhost: { opacity: 0.72 },
+    fontCardActive: {
+        borderColor: "color-mix(in oklab, var(--focus) 82%, var(--hairline))",
+        background: "var(--focus)",
+        boxShadow: "0 12px 28px color-mix(in oklab, var(--focus) 20%, transparent)",
+        cursor: "pointer",
+    },
+    fontCardDisabled: { opacity: 0.65, cursor: "not-allowed" },
+
+    fontPillInner: { display: "flex", flexDirection: "column", gap: 6, minWidth: 0 },
+    fontMetaRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 },
+    fontMetaRowActive: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 },
+    fontName: { fontSize: 11.1, fontWeight: 800, letterSpacing: "0.02em", color: "var(--muted)" },
+    fontNameActive: { color: "#fff" },
+    fontActiveDot: {
+        width: 7,
+        height: 7,
+        borderRadius: 999,
+        background: "#fff",
+        boxShadow: "0 0 0 4px rgba(255,255,255,0.14)",
+        flexShrink: 0,
+    },
+    fontPreview: {
+        fontSize: 13.6,
+        color: "color-mix(in oklab, var(--text) 90%, var(--muted))",
+        whiteSpace: "nowrap",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+    },
+
+    stageMaskLeft: {
         position: "absolute",
         left: 0,
         top: 0,
         bottom: 0,
         width: 18,
-        background: "linear-gradient(to right, var(--bg) 30%, transparent)",
         pointerEvents: "none",
-        zIndex: 1,
+        background: "linear-gradient(to right, color-mix(in oklab, var(--bg) 86%, var(--panel)) 28%, transparent)",
     },
-    fadeRight: {
+    stageMaskRight: {
         position: "absolute",
         right: 0,
         top: 0,
         bottom: 0,
         width: 18,
-        background: "linear-gradient(to left, var(--bg) 30%, transparent)",
         pointerEvents: "none",
-        zIndex: 1,
+        background: "linear-gradient(to left, color-mix(in oklab, var(--bg) 86%, var(--panel)) 28%, transparent)",
     },
 
-    fontPill: {
-        flex: "0 0 auto",
-        minWidth: 68,
-        padding: "8px 13px",
-        borderRadius: 9,
-        border: "1px solid var(--hairline)",
-        background: "var(--panel)",
-        fontSize: 12.6,
-        cursor: "pointer",
-        whiteSpace: "nowrap",
-        transition: "all 180ms cubic-bezier(0.23, 1, 0.32, 1)",
-        scrollSnapAlign: "center",
-        textAlign: "center",
-        boxShadow: "0 2px 5px rgba(0,0,0,0.03)",
-    },
-    fontPillActive: {
-        borderColor: "var(--focus)",
-        background: "var(--focus)",
-        color: "#fff",
-        fontWeight: 660,
-        transform: "scale(1.06)",
-        boxShadow: "0 6px 16px color-mix(in oklab, var(--focus) 35%, transparent)",
-    },
+    sliderTop: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 },
+    sliderLabelGroup: { display: "flex", alignItems: "center", gap: 7 },
+    sliderIcon: { fontSize: 16, width: 18, textAlign: "center", opacity: 0.95 },
+    sliderLabel: { fontSize: 12.4, fontWeight: 820, letterSpacing: "-0.01em" },
+    sliderValue: { fontSize: 12.8, color: "var(--focus)", fontVariantNumeric: "tabular-nums", fontWeight: 860 },
 
-    sliderTop: {
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        marginBottom: 3,
-    },
-    sliderLabelGroup: { display: "flex", alignItems: "center", gap: 5 },
-    sliderIcon: { fontSize: 17.5, width: 19, textAlign: "center", opacity: 0.92 },
-    sliderLabel: { fontSize: 12.3, fontWeight: 670, letterSpacing: "-0.01em" },
-    sliderValue: { fontSize: 12.8, color: "var(--focus)", fontVariantNumeric: "tabular-nums", fontWeight: 720 },
     range: {
         width: "100%",
         accentColor: "var(--focus)",
         cursor: "pointer",
-        height: 3.5,
+        height: 4,
         borderRadius: 999,
-        background: "color-mix(in oklab, var(--hairline) 45%, transparent)",
-        transition: "accent-color 140ms ease",
+        background: "color-mix(in oklab, var(--hairline) 44%, transparent)",
     },
+    rangeDisabled: { cursor: "not-allowed", opacity: 0.55 },
 
-    footer: { display: "flex", alignItems: "center", gap: 5, paddingTop: 1 },
-    footerBtnCancel: {
-        height: 31,
-        borderRadius: 9,
+    nudgeRow: { display: "flex", alignItems: "center", gap: 8, marginTop: 2 },
+    nudgeBtn: {
+        width: 34,
+        height: 30,
+        borderRadius: 10,
         border: "1px solid var(--hairline)",
-        background: "transparent",
-        color: "var(--muted)",
-        fontSize: 12.2,
-        fontWeight: 520,
-        padding: "0 13px",
+        background: "color-mix(in oklab, var(--bg) 72%, var(--panel))",
         cursor: "pointer",
-        transition: "all 160ms ease",
+        fontSize: 18,
+        fontWeight: 720,
+        color: "var(--muted)",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        transition: "all 160ms cubic-bezier(0.23, 1, 0.32, 1)",
     },
-    footerBtnReset: {
-        height: 31,
-        borderRadius: 9,
+    nudgeBtnDisabled: { cursor: "not-allowed", opacity: 0.55 },
+    nudgeHint: {
+        flex: 1,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 6,
+        color: "var(--muted)",
+        fontSize: 11.4,
+    },
+    nudgeKbd: {
+        fontSize: 11,
+        padding: "3px 6px",
+        borderRadius: 7,
+        border: "1px solid var(--hairline)",
+        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
+        fontVariantNumeric: "tabular-nums",
+    },
+    nudgeText: { opacity: 0.9 },
+
+    footer: { display: "flex", alignItems: "center", gap: 6, paddingTop: 2 },
+    footerBtn: {
+        height: 34,
+        borderRadius: 11,
+        border: "1px solid color-mix(in oklab, var(--focus) 70%, var(--hairline))",
+        background: "var(--focus)",
+        color: "#fff",
+        fontSize: 12.4,
+        fontWeight: 820,
+        padding: "0 14px",
+        cursor: "pointer",
+        boxShadow: "0 10px 22px color-mix(in oklab, var(--focus) 22%, transparent)",
+        transition: "all 160ms cubic-bezier(0.23, 1, 0.32, 1)",
+    },
+    footerBtnGhost: {
+        height: 34,
+        borderRadius: 11,
         border: "1px solid var(--hairline)",
         background: "transparent",
         color: "var(--muted)",
-        fontSize: 12.2,
-        fontWeight: 520,
-        padding: "0 13px",
+        fontSize: 12.4,
+        fontWeight: 680,
+        padding: "0 14px",
         cursor: "pointer",
         transition: "all 160ms ease",
     },

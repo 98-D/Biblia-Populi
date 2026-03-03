@@ -1,5 +1,5 @@
 // apps/web/src/reader/ReaderShell.tsx
-import React from "react";
+import React, { useMemo } from "react";
 import type { BookRow } from "../api";
 import type { ReaderLocation } from "../Search";
 import type { Mode } from "../theme";
@@ -39,6 +39,39 @@ type Props = {
     err?: string | null;
 };
 
+function ErrBanner(props: { msg: string }) {
+    return (
+        <div
+            role="status"
+            aria-live="polite"
+            style={{
+                borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+                background: "color-mix(in oklab, var(--bg) 94%, var(--panel))",
+            }}
+        >
+            <div
+                style={{
+                    maxWidth: "var(--bpReaderMeasure, 840px)",
+                    marginInline: "auto",
+                    padding: "9px 18px",
+                }}
+            >
+                <div style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "pre-wrap" }}>{props.msg}</div>
+            </div>
+        </div>
+    );
+}
+
+function LoadingBody() {
+    return (
+        <div style={sx.body}>
+            <div style={{ maxWidth: "var(--bpReaderMeasure, 840px)", marginInline: "auto", padding: "0 18px" }}>
+                <div style={sx.msg}>Loading…</div>
+            </div>
+        </div>
+    );
+}
+
 export function ReaderShell(props: Props) {
     const {
         styles,
@@ -58,6 +91,9 @@ export function ReaderShell(props: Props) {
         err,
     } = props;
 
+    // Ensure stable identity (helps reduce useless re-renders downstream)
+    const stableTopContent = useMemo(() => null as React.ReactNode, []);
+
     return (
         <main style={sx.page}>
             <ReaderHeader
@@ -71,19 +107,7 @@ export function ReaderShell(props: Props) {
                 onToggleTheme={onToggleTheme}
             />
 
-            {err ? (
-                <div style={{ borderBottom: "1px solid var(--hairline)", background: "var(--bg)" }}>
-                    <div
-                        style={{
-                            maxWidth: "var(--bpReaderMeasure, 840px)",
-                            marginInline: "auto",
-                            padding: "8px 18px",
-                        }}
-                    >
-                        <div style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "pre-wrap" }}>{err}</div>
-                    </div>
-                </div>
-            ) : null}
+            {err ? <ErrBanner msg={err} /> : null}
 
             {spine ? (
                 <ReaderViewport
@@ -93,14 +117,10 @@ export function ReaderShell(props: Props) {
                     onPosition={onPosition}
                     onError={onError}
                     onReady={onReady}
-                    topContent={null}
+                    topContent={stableTopContent}
                 />
             ) : (
-                <div style={sx.body}>
-                    <div style={{ maxWidth: "var(--bpReaderMeasure, 840px)", marginInline: "auto", padding: "0 18px" }}>
-                        <div style={sx.msg}>Loading…</div>
-                    </div>
-                </div>
+                <LoadingBody />
             )}
         </main>
     );

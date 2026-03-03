@@ -31,178 +31,146 @@ function insertSpaceBeforeDigits(s: string): string {
     return s.replace(/([a-zA-Z])(\d)/g, "$1 $2");
 }
 
-function safeJsonParse<T>(text: string | null): T | null {
+function safeJsonParseUnknown(text: string | null): unknown {
     if (!text) return null;
-    try { return JSON.parse(text) as T; } catch { return null; }
+    try {
+        return JSON.parse(text) as unknown;
+    } catch {
+        return null;
+    }
+}
+
+function parseAbbrs(abbrs: string | null): string[] {
+    if (!abbrs) return [];
+    const v = safeJsonParseUnknown(abbrs);
+
+    if (Array.isArray(v)) {
+        return v
+            .map((x) => (typeof x === "string" ? x : ""))
+            .map((s) => s.trim())
+            .filter(Boolean);
+    }
+
+    // fallback: comma / pipe separated string
+    return abbrs
+        .split(/[,|]/g)
+        .map((s) => s.trim())
+        .filter(Boolean);
 }
 
 function buildBookLookup(books: BookRow[]): Map<string, string> {
     const m = new Map<string, string>();
+
     for (const b of books) {
         const id = b.bookId;
+
         const add = (k: string | null | undefined) => {
             if (!k) return;
             const kk = toKey(k);
             if (!kk || m.has(kk)) return;
             m.set(kk, id);
         };
+
         add(id);
         add(b.name);
         add(b.nameShort);
-        add(b.osised ?? null);
-        add((b.nameShort ?? "").replace(/\./g, ""));
-        add(b.name.replace(/\./g, ""));
-    }
+        add(b.osised);
 
-    const addAlias = (alias: string, bookId: string) => {
-        const k = toKey(alias);
-        if (!m.has(k)) m.set(k, bookId);
-    };
-    addAlias("psalm", "PSA");
-    addAlias("psalms", "PSA");
-    addAlias("song of songs", "SNG");
-    addAlias("song", "SNG");
-    addAlias("canticles", "SNG");
-    addAlias("jn", "JHN");
-    addAlias("joh", "JHN");
-    addAlias("mt", "MAT");
-    addAlias("mk", "MRK");
-    addAlias("lk", "LUK");
-    addAlias("rom", "ROM");
-    addAlias("rev", "REV");
-    addAlias("1 sam", "1SA");
-    addAlias("2 sam", "2SA");
-    addAlias("1 kings", "1KI");
-    addAlias("2 kings", "2KI");
-    addAlias("1 cor", "1CO");
-    addAlias("2 cor", "2CO");
-    addAlias("1 thess", "1TH");
-    addAlias("2 thess", "2TH");
-    addAlias("1 tim", "1TI");
-    addAlias("2 tim", "2TI");
-    addAlias("1 pet", "1PE");
-    addAlias("2 pet", "2PE");
-    addAlias("1 john", "1JN");
-    addAlias("2 john", "2JN");
-    addAlias("3 john", "3JN");
+        for (const a of parseAbbrs(b.abbrs)) add(a);
+    }
 
     return m;
 }
 
-function parseReference(
-    raw: string,
-    lookup: Map<string, string> | null,
-    bookNameById: Map<string, string> | null
-): RefParse {
-    if (!lookup) return { ok: false };
-    let q = normalizeSpaces(raw);
+function parseRef(books: BookRow[] | null, raw: string): RefParse {
+    const q = normalizeSpaces(insertSpaceBeforeDigits(raw));
     if (!q) return { ok: false };
 
-    q = q.replace(/\s+(\d{1,3})\s+(\d{1,3})\s*$/g, " $1:$2");
-    q = insertSpaceBeforeDigits(q);
-    q = normalizeSpaces(q);
-
-    const parts = q.split(" ");
-    if (parts.length < 2) return { ok: false };
-
-    const last = parts[parts.length - 1] ?? "";
-    const m = last.match(/^(\d{1,3})(?::(\d{1,3}))?$/);
+    // patterns:
+    //  - "John 3"
+    //  - "John 3:16"
+    //  - "1 Cor 13:4"
+    const m = q.match(/^(.+?)\s+(\d+)(?::(\d+))?$/);
     if (!m) return { ok: false };
 
-    const chap = Number(m[1]);
-    const verse = m[2] ? Number(m[2]) : undefined;
-    if (!Number.isFinite(chap) || chap < 1) return { ok: false };
+    const book = toKey(m[1] ?? "");
+    const chapter = Number(m[2] ?? "NaN");
+    const verse = m[3] ? Number(m[3]) : undefined;
+
+    if (!Number.isFinite(chapter) || chapter < 1) return { ok: false };
     if (verse != null && (!Number.isFinite(verse) || verse < 1)) return { ok: false };
 
-    const bookPart = normalizeSpaces(parts.slice(0, -1).join(" "));
-    if (!bookPart) return { ok: false };
-
-    const tryKey = (k: string): string | null => lookup.get(toKey(k)) ?? null;
-    let bookId = tryKey(bookPart);
-    if (!bookId) bookId = tryKey(bookPart.replace(/\s+/g, ""));
-    if (!bookId) bookId = tryKey(bookPart.replace(/[^a-zA-Z0-9\s]/g, ""));
+    if (!books) return { ok: false };
+    const lookup = buildBookLookup(books);
+    const bookId = lookup.get(book);
     if (!bookId) return { ok: false };
 
-    const fullName = bookNameById?.get(bookId) ?? bookId;
-    const label = verse ? `${fullName} ${chap}:${verse}` : `${fullName} ${chap}`;
-    return { ok: true, loc: { bookId, chapter: chap, verse }, label };
+    const label = verse != null ? `${bookId} ${chapter}:${verse}` : `${bookId} ${chapter}`;
+    return { ok: true, label, loc: { bookId, chapter, verse } };
 }
 
-function splitSnippet(snippet: string): Array<{ text: string; hi: boolean }> {
-    if (!snippet.includes("‹")) return [{ text: snippet, hi: false }];
-    const out: Array<{ text: string; hi: boolean }> = [];
-    let hi = false;
-    let buf = "";
-    for (let i = 0; i < snippet.length; i++) {
-        const ch = snippet[i]!;
-        if (ch === "‹") {
-            if (buf) out.push({ text: buf, hi });
-            buf = "";
-            hi = true;
-            continue;
-        }
-        if (ch === "›") {
-            if (buf) out.push({ text: buf, hi });
-            buf = "";
-            hi = false;
-            continue;
-        }
-        buf += ch;
-    }
-    if (buf) out.push({ text: buf, hi });
-    return out;
-}
-
-function isEditableTarget(t: EventTarget | null): boolean {
-    if (!(t instanceof HTMLElement)) return false;
-    const tag = t.tagName.toLowerCase();
-    if (tag === "input" || tag === "textarea" || tag === "select") return true;
-    return t.isContentEditable;
-}
-
-type HistoryItem = Readonly<{ q: string; at: number }>;
-
+/* ---------------- Search history ---------------- */
+type HistoryItem = { q: string; at: number };
 const HISTORY_KEY = "bp_search_history_v1";
-const MAX_HISTORY = 8;
+const MAX_HISTORY = 14;
+
+function isHistoryItem(v: unknown): v is HistoryItem {
+    if (!v || typeof v !== "object") return false;
+    const o = v as Record<string, unknown>;
+    return typeof o.q === "string" && typeof o.at === "number";
+}
 
 function loadHistory(): HistoryItem[] {
-    const raw = typeof window !== "undefined" ? window.localStorage.getItem(HISTORY_KEY) : null;
-    const parsed = safeJsonParse<HistoryItem[]>(raw);
-    if (!parsed || !Array.isArray(parsed)) return [];
+    if (typeof window === "undefined") return [];
+    const raw = safeJsonParseUnknown(window.localStorage.getItem(HISTORY_KEY));
+    if (!Array.isArray(raw)) return [];
 
-    const out: HistoryItem[] = [];
-    for (const it of parsed) {
-        if (!it || typeof it !== "object") continue;
-        const q = typeof (it as any).q === "string" ? (it as any).q : "";
-        const at = typeof (it as any).at === "number" ? (it as any).at : 0;
-        const qq = normalizeSpaces(q);
-        if (!qq || !Number.isFinite(at) || at <= 0) continue;
-        out.push({ q: qq, at });
-    }
-
-    out.sort((a, b) => b.at - a.at);
-    const seen = new Set<string>();
-    const uniq: HistoryItem[] = [];
-    for (const it of out) {
-        const k = it.q.toLowerCase();
-        if (seen.has(k)) continue;
-        seen.add(k);
-        uniq.push(it);
-        if (uniq.length >= MAX_HISTORY) break;
-    }
-    return uniq;
+    return raw
+        .filter(isHistoryItem)
+        .map((x) => ({ q: normalizeSpaces(x.q), at: x.at }))
+        .filter((x) => x.q.length > 0 && Number.isFinite(x.at))
+        .sort((a, b) => b.at - a.at)
+        .slice(0, MAX_HISTORY);
 }
 
 function saveHistory(q: string): void {
     if (typeof window === "undefined") return;
+
     const qq = normalizeSpaces(q);
     if (!qq) return;
-    const prev = loadHistory();
-    const now: HistoryItem = { q: qq, at: Date.now() };
-    const merged = [now, ...prev.filter((it) => it.q.toLowerCase() !== qq.toLowerCase())].slice(0, MAX_HISTORY);
+
+    const now = Date.now();
+    const cur = loadHistory();
+    const merged = [{ q: qq, at: now }, ...cur.filter((it) => it.q.toLowerCase() !== qq.toLowerCase())].slice(
+        0,
+        MAX_HISTORY,
+    );
+
     try {
         window.localStorage.setItem(HISTORY_KEY, JSON.stringify(merged));
     } catch {}
+}
+
+/* ---------------- Snippet helper ---------------- */
+function splitSnippet(snippet: string): Array<{ text: string; hi: boolean }> {
+    const parts: Array<{ text: string; hi: boolean }> = [];
+    const re = /<em>(.*?)<\/em>/gi;
+
+    let last = 0;
+    let m: RegExpExecArray | null;
+
+    while ((m = re.exec(snippet))) {
+        const start = m.index;
+        const end = start + m[0].length;
+
+        if (start > last) parts.push({ text: snippet.slice(last, start), hi: false });
+        parts.push({ text: m[1] ?? "", hi: true });
+        last = end;
+    }
+
+    if (last < snippet.length) parts.push({ text: snippet.slice(last), hi: false });
+
+    return parts.map((p) => ({ ...p, text: p.text.replace(/<\/?[^>]+>/g, "") }));
 }
 
 export function Search(props: Props) {
@@ -210,6 +178,7 @@ export function Search(props: Props) {
 
     const inputRef = useRef<HTMLInputElement | null>(null);
     const panelRef = useRef<HTMLDivElement | null>(null);
+    const listRef = useRef<HTMLDivElement | null>(null);
 
     const [books, setBooks] = useState<BookRow[] | null>(null);
     const [q, setQ] = useState(props.initialQuery ?? "");
@@ -218,62 +187,78 @@ export function Search(props: Props) {
     const [payload, setPayload] = useState<SearchPayload | null>(null);
     const [err, setErr] = useState<string | null>(null);
     const [activeIdx, setActiveIdx] = useState(0);
+
     const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
     const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory());
 
-    // Load books
     useEffect(() => {
         let alive = true;
         apiGetBooks()
-            .then((r) => alive && setBooks(r.books))
-            .catch(() => alive && setBooks(null));
-        return () => { alive = false; };
+            .then((r) => {
+                if (!alive) return;
+                setBooks(r.books);
+            })
+            .catch(() => {
+                if (!alive) return;
+                setBooks(null);
+            });
+        return () => {
+            alive = false;
+        };
     }, []);
 
-    const bookLookup = useMemo(() => (books && books.length ? buildBookLookup(books) : null), [books]);
+    const ref = useMemo(() => parseRef(books, q), [books, q]);
+
     const bookNameById = useMemo(() => {
         const m = new Map<string, string>();
-        for (const b of books ?? []) m.set(b.bookId, b.name);
+        for (const b of books ?? []) m.set(b.bookId, b.name ?? b.bookId);
         return m;
     }, [books]);
 
-    // Autofocus
     useEffect(() => {
         if (!autoFocus) return;
-        const t = setTimeout(() => inputRef.current?.focus(), 50);
-        return () => clearTimeout(t);
+        inputRef.current?.focus();
+        setFocused(true);
     }, [autoFocus]);
 
-    const ref = useMemo(() => parseReference(q, bookLookup, bookNameById), [q, bookLookup, bookNameById]);
-
-    // Debounced search
+    // Query -> search (debounced)
     useEffect(() => {
         const qq = q.trim();
-        setErr(null);
-        setPayload(null);
-        setActiveIdx(0);
         if (!qq) {
+            setPayload(null);
+            setErr(null);
             setLoading(false);
+            setActiveIdx(0);
             return;
         }
 
+        let alive = true;
         const ctrl = new AbortController();
-        setLoading(true);
 
-        const timer = setTimeout(() => {
+        setLoading(true);
+        setErr(null);
+
+        const timer = window.setTimeout(() => {
+            // ✅ apiSearch signature: (q, limit?, opts?)
             apiSearch(qq, 30, { signal: ctrl.signal })
-                .then((p) => {
-                    setPayload(p);
+                .then((r) => {
+                    if (!alive) return;
+                    setPayload(r);
                     setLoading(false);
+                    setErr(null);
+                    setActiveIdx(0);
                 })
                 .catch((e) => {
-                    if (ctrl.signal.aborted) return;
-                    setErr(String(e?.message ?? e));
+                    if (!alive) return;
+                    if (String((e as any)?.name ?? "") === "AbortError") return;
+                    setPayload(null);
+                    setErr(String((e as any)?.message ?? e));
                     setLoading(false);
                 });
         }, 180);
 
         return () => {
+            alive = false;
             ctrl.abort();
             clearTimeout(timer);
         };
@@ -281,8 +266,8 @@ export function Search(props: Props) {
 
     const results = payload?.results ?? [];
 
-    const hasHistory = history.length > 0;
-    const showPanel = focused && (q.trim().length > 0 || loading || err != null || hasHistory);
+    // ✅ stability: do NOT open dropdown on focus when query is empty
+    const showPanel = focused && (q.trim().length > 0 || loading || err != null);
 
     const items = useMemo(() => {
         const list: Array<
@@ -294,7 +279,7 @@ export function Search(props: Props) {
         if (ref.ok) list.push({ kind: "ref", label: `Go to ${ref.label}`, loc: ref.loc });
 
         if (!q.trim()) {
-            for (const h of history) list.push({ kind: "history", label: h.q, q: h.q });
+            // history is *stored* but not shown until user types (keeps landing stable)
             return list;
         }
 
@@ -302,18 +287,29 @@ export function Search(props: Props) {
             const fullBook = bookNameById.get(r.bookId) ?? r.bookId;
             list.push({ kind: "result", label: `${fullBook} ${r.chapter}:${r.verse}`, result: r });
         }
-        return list;
-    }, [ref, results, bookNameById, history, q]);
 
-    // Scroll active item into view
+        return list;
+    }, [ref, results, bookNameById, q]);
+
+    // Keep active option visible WITHOUT scrollIntoView (avoids page jumps)
     useEffect(() => {
         const el = itemRefs.current[activeIdx];
-        if (el) el.scrollIntoView({ block: "nearest" });
+        const list = listRef.current;
+        if (!el || !list) return;
+
+        const top = el.offsetTop;
+        const bottom = top + el.offsetHeight;
+        const viewTop = list.scrollTop;
+        const viewBottom = viewTop + list.clientHeight;
+
+        if (top < viewTop) list.scrollTop = top;
+        else if (bottom > viewBottom) list.scrollTop = bottom - list.clientHeight;
     }, [activeIdx]);
 
-    // Click outside to close panel
+    // Click outside -> close
     useEffect(() => {
         if (!showPanel) return;
+
         const onDown = (e: MouseEvent) => {
             const panel = panelRef.current;
             const input = inputRef.current;
@@ -323,6 +319,7 @@ export function Search(props: Props) {
             if (input && input.contains(t)) return;
             setFocused(false);
         };
+
         window.addEventListener("mousedown", onDown, { capture: true });
         return () => window.removeEventListener("mousedown", onDown, { capture: true } as any);
     }, [showPanel]);
@@ -373,16 +370,19 @@ export function Search(props: Props) {
 
         if (e.key === "Enter") {
             e.preventDefault();
+
             if (!q.trim()) {
                 onStartReading?.();
                 setFocused(false);
                 inputRef.current?.blur();
                 return;
             }
+
             if (items.length > 0) {
                 commitSelection(activeIdx);
                 return;
             }
+
             if (ref.ok) {
                 saveHistory(q);
                 setHistory(loadHistory());
@@ -394,12 +394,14 @@ export function Search(props: Props) {
         }
 
         if (e.key === "ArrowDown") {
+            if (!showPanel) return;
             e.preventDefault();
             setActiveIdx((i) => Math.min(items.length - 1, Math.max(0, i + 1)));
             return;
         }
 
         if (e.key === "ArrowUp") {
+            if (!showPanel) return;
             e.preventDefault();
             setActiveIdx((i) => Math.max(0, i - 1));
             return;
@@ -411,10 +413,37 @@ export function Search(props: Props) {
         ...(focused ? (styles.searchRowFocused ?? {}) : null),
     };
 
+    const maxW = (styles.searchWrap?.maxWidth as any) ?? (styles.searchRow?.maxWidth as any) ?? 440;
+
+    const wrapStyle: React.CSSProperties = {
+        position: "relative",
+        width: "100%",
+        maxWidth: maxW,
+        ...(styles.searchWrap ?? null),
+    };
+
+    const panelStyle: React.CSSProperties = {
+        ...sx.panel,
+        ...(styles.searchPanel ?? null),
+    };
+
+    const hintText = props.hint ?? "";
+
     return (
-        <div style={{ position: "relative", maxWidth: "440px" }}>
-            <div style={searchRowStyle} aria-label="Search" onMouseDown={() => inputRef.current?.focus()}>
-                <span style={styles.searchIcon} aria-hidden>⌕</span>
+        <div style={wrapStyle}>
+            <div
+                style={searchRowStyle}
+                aria-label="Search"
+                onPointerDown={(e) => {
+                    // keeps focus stable without weird selection / blur side-effects
+                    e.preventDefault();
+                    inputRef.current?.focus();
+                }}
+            >
+        <span style={styles.searchIcon} aria-hidden>
+          ⌕
+        </span>
+
                 <input
                     ref={inputRef}
                     value={q}
@@ -429,11 +458,13 @@ export function Search(props: Props) {
                 />
             </div>
 
-            {!showPanel ? (
-                props.hint ? <div style={sx.hint}>{props.hint}</div> : null
-            ) : (
-                <div ref={panelRef} style={sx.panel} role="listbox" aria-label="Search results">
-                    {/* Status row */}
+            {/* ✅ stability: reserve hint height so center-layout never re-centers/jitters */}
+            <div style={{ ...sx.hintSlot, ...(showPanel ? sx.hintHidden : null) }} aria-hidden={showPanel}>
+                {hintText ? <div style={sx.hint}>{hintText}</div> : null}
+            </div>
+
+            {showPanel ? (
+                <div ref={panelRef} style={panelStyle} role="listbox" aria-label="Search results">
                     {err ? (
                         <div style={sx.panelMsg}>{err}</div>
                     ) : loading ? (
@@ -443,22 +474,20 @@ export function Search(props: Props) {
                             {items.length ? `${items.length}${items.length === 1 ? " result" : " results"}` : "No results."}
                             <span style={sx.panelMeta}> {payload?.mode ?? "search"}</span>
                         </div>
-                    ) : history.length ? (
-                        <div style={sx.panelMsg}>
-                            Recent <span style={sx.panelMeta}>(Enter to search)</span>
-                        </div>
                     ) : (
                         <div style={sx.panelMsg}>Type to search.</div>
                     )}
 
                     {items.length > 0 && (
-                        <div style={sx.list}>
+                        <div ref={listRef} style={sx.list}>
                             {items.map((it, idx) => {
                                 const active = idx === activeIdx;
                                 return (
                                     <button
                                         key={`${it.kind}:${idx}`}
-                                        ref={(el) => { itemRefs.current[idx] = el; }}
+                                        ref={(el) => {
+                                            itemRefs.current[idx] = el;
+                                        }}
                                         type="button"
                                         style={{ ...sx.item, ...(active ? sx.itemActive : null) }}
                                         onMouseEnter={() => setActiveIdx(idx)}
@@ -471,20 +500,15 @@ export function Search(props: Props) {
                                     >
                                         <div style={sx.itemTop}>
                                             <span style={sx.itemLabel}>{it.label}</span>
-                                            <span style={sx.itemMeta}>
-                                                {it.kind === "ref"
-                                                    ? "ref"
-                                                    : it.kind === "history"
-                                                        ? "recent"
-                                                        : payload?.mode ?? "search"}
-                                            </span>
+                                            <span style={sx.itemMeta}>{it.kind === "ref" ? "ref" : payload?.mode ?? "search"}</span>
                                         </div>
+
                                         {it.kind === "result" && it.result?.snippet && (
                                             <div style={sx.snippet}>
                                                 {splitSnippet(it.result.snippet).map((seg, i) => (
                                                     <span key={i} style={seg.hi ? sx.hi : undefined}>
-                                                        {seg.text}
-                                                    </span>
+                            {seg.text}
+                          </span>
                                                 ))}
                                             </div>
                                         )}
@@ -505,7 +529,7 @@ export function Search(props: Props) {
                         <span style={sx.footerSep}>clear</span>
                     </div>
                 </div>
-            )}
+            ) : null}
         </div>
     );
 }
@@ -516,11 +540,10 @@ const sx: Record<string, React.CSSProperties> = {
         left: 0,
         right: 0,
         marginTop: 8,
-        maxWidth: "440px",
         borderRadius: 16,
         border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--bg) 94%, transparent)",
-        boxShadow: "0 28px 92px rgba(0,0,0,0.22)",
+        background: "var(--overlay)",
+        boxShadow: "var(--shadowPop)",
         overflow: "hidden",
         zIndex: 20,
         backdropFilter: "blur(12px)",
@@ -535,6 +558,7 @@ const sx: Record<string, React.CSSProperties> = {
         justifyContent: "space-between",
         gap: 8,
         borderBottom: "1px solid var(--hairline)",
+        background: "var(--overlay2)",
     },
     panelMeta: {
         fontSize: 9.8,
@@ -557,12 +581,11 @@ const sx: Record<string, React.CSSProperties> = {
         cursor: "pointer",
         padding: "10px 14px",
         borderTop: "1px solid var(--hairline)",
-        transition: "background 160ms ease, transform 80ms ease",
+        transition: "background 140ms ease",
         fontSize: 13,
     },
     itemActive: {
-        background: "color-mix(in oklab, var(--focus) 8%, transparent)",
-        transform: "translateX(2px)",
+        background: "var(--activeBg)",
     },
     itemTop: {
         display: "flex",
@@ -594,18 +617,30 @@ const sx: Record<string, React.CSSProperties> = {
         flexWrap: "wrap",
         gap: 6,
         color: "var(--muted)",
-        background: "color-mix(in oklab, var(--bg) 96%, transparent)",
+        background: "var(--overlay2)",
         fontSize: 10.2,
     },
     footerText: { fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase" },
     footerSep: { fontSize: 10, opacity: 0.75 },
     footerDot: { opacity: 0.5, fontSize: 10, paddingInline: 4 },
-    hint: {
+
+    // reserves vertical space so Home stays perfectly still (centered layout won’t “re-center”)
+    hintSlot: {
+        height: 18,
         marginTop: 8,
+    },
+    hintHidden: {
+        opacity: 0,
+        pointerEvents: "none",
+    },
+    hint: {
         fontSize: 10.5,
         letterSpacing: "0.12em",
         color: "var(--muted)",
         opacity: 0.85,
         userSelect: "none",
+        whiteSpace: "nowrap",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
     },
 };

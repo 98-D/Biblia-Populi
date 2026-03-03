@@ -1,12 +1,16 @@
-/* apps/web/src/base.css — Biblia Populi (minimal, reading-first) */
 
-/*
-  Fonts:
-  - We self-host Inter / Quicksand / Literata via @fontsource-variable (see main.tsx).
-  - If those packages are missing, this stack gracefully falls back to system fonts.
-*/
+    /* apps/web/src/base.css — Biblia Populi (minimal, reading-first) */
+    /*
+      Goals:
+      - Paper-soft light mode (less harsh than pure white)
+      - Ink-like dark mode
+      - Stable layout (no scrollbar jump) + calm focus
+      - Premium transitions (theme swap without jitter)
+      - Search overlays supported (--overlay, --overlay2, --activeBg)
+    */
 
 :root {
+    /* ---------------- Fonts ---------------- */
     --font-sans: "Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans",
     "Apple Color Emoji", "Segoe UI Emoji";
     --font-serif: "Literata Variable", Literata, ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
@@ -14,7 +18,7 @@
     --font-rounded: "Quicksand Variable", Quicksand, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial,
     "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
 
-    /* Reader typography (scripture text only) */
+    /* ---------------- Reader typography ---------------- */
     --bpScriptureFont: var(--font-serif);
     --bpScriptureSize: 18px;
     --bpScriptureLeading: 1.75;
@@ -23,108 +27,116 @@
     /* Reader column width (scripture + chrome alignment) */
     --bpReaderMeasure: 840px;
 
+    /* ---------------- Layout widths ---------------- */
+    --container: 980px;
+    --reading: 720px;
+
+    /* ---------------- Radii ---------------- */
     --radius: 16px;
     --radius-sm: 12px;
 
+    /* ---------------- App text defaults ---------------- */
     --text: 16px;
     --leading: 1.6;
 
-    /* Layout widths */
-    --container: 980px; /* general */
-    --reading: 720px;   /* learn page / prose */
+    /* ---------------- Transition timings ---------------- */
+    --themeDur: 320ms;
+    --themeEase: cubic-bezier(0.2, 0.8, 0.2, 1);
 
-    /* ------------------------------------------------------------
-       Theme tokens (DEFAULT = softened Light)
-       NOTE: no color-mix / oklab to avoid tooling “typo” warnings.
-    ------------------------------------------------------------ */
+    /* ---------------- Light (paper) — default ----------------
+       Slight warm paper + ink. Avoid pure white and pure black. */
+    --bg: #f6f4f0;                 /* paper */
+    --fg: #101012;                 /* ink */
+    --muted: rgba(16, 16, 18, 0.58);
+    --hairline: rgba(16, 16, 18, 0.11);
+    --focus: rgba(16, 16, 18, 0.14);
+    --focusRing: rgba(16, 16, 18, 0.10);
 
-    /* softened light (less intense than pure white) */
-    --bg: #f6f4f0;
-    --fg: #0b0b0c;
-    --muted: rgba(11, 11, 12, 0.58);
-    --hairline: rgba(0, 0, 0, 0.11);
+    --panel: rgba(16, 16, 18, 0.025);
 
-    /* Surfaces */
-    --panel: rgba(0, 0, 0, 0.026);
+    /* overlay surfaces (search popovers etc) */
+    --overlay: rgba(246, 244, 240, 0.90);
+    --overlay2: rgba(246, 244, 240, 0.96);
+    --activeBg: rgba(16, 16, 18, 0.045);
 
-    /* Shadows (subtle, reusable) */
-    --shadow: 0 18px 60px rgba(0, 0, 0, 0.12);
-    --shadowSoft: 0 10px 34px rgba(0, 0, 0, 0.10);
-    --shadowPop: 0 24px 90px rgba(0, 0, 0, 0.20);
+    /* selections */
+    --selectionBg: rgba(16, 16, 18, 0.12);
 
-    /* Focus */
-    --focus: rgba(0, 0, 0, 0.14);
-    --focusRing: rgba(0, 0, 0, 0.08);
-
-    /* Selection */
-    --selection: rgba(0, 0, 0, 0.12);
+    /* Shadows (light) */
+    --shadowSoft: 0 10px 32px rgba(0, 0, 0, 0.10);
+    --shadowPop: 0 24px 90px rgba(0, 0, 0, 0.18);
 }
 
-/* System preference (only when user has NOT manually set a theme) */
+/* ---------------- Dark (ink) theme vars ---------------- */
 @media (prefers-color-scheme: dark) {
     html:not([data-theme]) {
         --bg: #0b0b0c;
         --fg: #f4f3f1;
-        --muted: rgba(244, 243, 241, 0.62);
+        --muted: rgba(244, 243, 241, 0.66);
         --hairline: rgba(255, 255, 255, 0.10);
+        --focus: rgba(255, 255, 255, 0.22);
+        --focusRing: rgba(255, 255, 255, 0.13);
 
         --panel: rgba(255, 255, 255, 0.045);
 
-        --shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
-        --shadowSoft: 0 10px 34px rgba(0, 0, 0, 0.34);
-        --shadowPop: 0 26px 110px rgba(0, 0, 0, 0.56);
+        --overlay: rgba(11, 11, 12, 0.76);
+        --overlay2: rgba(11, 11, 12, 0.88);
+        --activeBg: rgba(255, 255, 255, 0.065);
 
-        --focus: rgba(255, 255, 255, 0.22);
-        --focusRing: rgba(255, 255, 255, 0.12);
+        --selectionBg: rgba(244, 243, 241, 0.18);
 
-        --selection: rgba(255, 255, 255, 0.14);
+        --shadowSoft: 0 10px 36px rgba(0, 0, 0, 0.36);
+        --shadowPop: 0 26px 110px rgba(0, 0, 0, 0.58);
     }
 }
 
 /* Manual override (wins over system preference) */
 html[data-theme="light"] {
     --bg: #f6f4f0;
-    --fg: #0b0b0c;
-    --muted: rgba(11, 11, 12, 0.58);
-    --hairline: rgba(0, 0, 0, 0.11);
+    --fg: #101012;
+    --muted: rgba(16, 16, 18, 0.58);
+    --hairline: rgba(16, 16, 18, 0.11);
+    --focus: rgba(16, 16, 18, 0.14);
+    --focusRing: rgba(16, 16, 18, 0.10);
 
-    --panel: rgba(0, 0, 0, 0.026);
+    --panel: rgba(16, 16, 18, 0.025);
 
-    --shadow: 0 18px 60px rgba(0, 0, 0, 0.12);
-    --shadowSoft: 0 10px 34px rgba(0, 0, 0, 0.10);
-    --shadowPop: 0 24px 90px rgba(0, 0, 0, 0.20);
+    --overlay: rgba(246, 244, 240, 0.90);
+    --overlay2: rgba(246, 244, 240, 0.96);
+    --activeBg: rgba(16, 16, 18, 0.045);
 
-    --focus: rgba(0,  0,  0,  0.14);
-    --focusRing: rgba(0, 0, 0, 0.08);
+    --selectionBg: rgba(16, 16, 18, 0.12);
 
-    --selection: rgba(0, 0, 0, 0.12);
+    --shadowSoft: 0 10px 32px rgba(0, 0, 0, 0.10);
+    --shadowPop: 0 24px 90px rgba(0, 0, 0, 0.18);
 }
 
 html[data-theme="dark"] {
     --bg: #0b0b0c;
     --fg: #f4f3f1;
-    --muted: rgba(244, 243, 241, 0.62);
+    --muted: rgba(244, 243, 241, 0.66);
     --hairline: rgba(255, 255, 255, 0.10);
+    --focus: rgba(255, 255, 255, 0.22);
+    --focusRing: rgba(255, 255, 255, 0.13);
 
     --panel: rgba(255, 255, 255, 0.045);
 
-    --shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
-    --shadowSoft: 0 10px 34px rgba(0, 0, 0, 0.34);
-    --shadowPop: 0 26px 110px rgba(0, 0, 0, 0.56);
+    --overlay: rgba(11, 11, 12, 0.76);
+    --overlay2: rgba(11, 11, 12, 0.88);
+    --activeBg: rgba(255, 255, 255, 0.065);
 
-    --focus: rgba(255, 255, 255, 0.22);
-    --focusRing: rgba(255, 255, 255, 0.12);
+    --selectionBg: rgba(244, 243, 241, 0.18);
 
-    --selection: rgba(255, 255, 255, 0.14);
+    --shadowSoft: 0 10px 36px rgba(0, 0, 0, 0.36);
+    --shadowPop: 0 26px 110px rgba(0, 0, 0, 0.58);
 }
 
-*,
-*::before,
-*::after {
-    box-sizing: border-box;
-}
-
+/* ---------------- Theme transition (smooth, no layout jitter) ----------------
+   Apply transitions only to paint properties; avoid transform/layout. */
 html {
+    /* prevents horizontal “jump” when popovers alter scrollability */
+    scrollbar-gutter: stable;
+
     font-family: var(--font-sans);
     font-size: var(--text);
     line-height: var(--leading);
@@ -135,8 +147,49 @@ html {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
 
-    /* Helps scroll/overscroll feel clean; safe for a reader app */
     scroll-behavior: auto;
+}
+
+/* Paint-only transitions across the app */
+html,
+body,
+#root,
+button,
+input,
+textarea,
+select {
+    transition:
+            background-color var(--themeDur) var(--themeEase),
+            color var(--themeDur) var(--themeEase),
+            border-color var(--themeDur) var(--themeEase),
+            outline-color var(--themeDur) var(--themeEase),
+            box-shadow var(--themeDur) var(--themeEase),
+            fill var(--themeDur) var(--themeEase),
+            stroke var(--themeDur) var(--themeEase);
+}
+
+/* Reduce motion */
+@media (prefers-reduced-motion: reduce) {
+    html,
+    body,
+    #root,
+    button,
+    input,
+    textarea,
+    select,
+    * {
+        transition: none !important;
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+/* ---------------- Reset ---------------- */
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
 }
 
 body {
@@ -150,13 +203,19 @@ body {
     min-height: 100vh;
 }
 
-h1, h2, h3, h4 {
+/* Typography defaults */
+h1,
+h2,
+h3,
+h4 {
     margin: 0;
     font-weight: 600;
     letter-spacing: -0.02em;
 }
 
-p { margin: 0; }
+p {
+    margin: 0;
+}
 
 a {
     color: inherit;
@@ -168,7 +227,7 @@ a:hover {
 }
 
 ::selection {
-    background: var(--selection);
+    background: var(--selectionBg);
 }
 
 /* form controls inherit */
@@ -180,27 +239,14 @@ select {
     color: inherit;
 }
 
-/* focus (calm, consistent) */
+/* Calm, consistent focus */
 :focus-visible {
     outline: 2px solid var(--focusRing);
     outline-offset: 2px;
     border-radius: 10px;
 }
 
-/* Reduce motion for people who request it */
-@media (prefers-reduced-motion: reduce) {
-    *,
-    *::before,
-    *::after {
-        animation-duration: 0.001ms !important;
-        animation-iteration-count: 1 !important;
-        transition-duration: 0.001ms !important;
-        scroll-behavior: auto !important;
-    }
-}
-
 /* ---------------- Layout utilities ---------------- */
-
 .container {
     width: min(var(--container), calc(100% - 32px));
     margin-inline: auto;
@@ -219,7 +265,6 @@ select {
 }
 
 /* ---------------- Reading ---------------- */
-
 .prose {
     font-family: var(--font-serif);
     font-size: 18px;
@@ -234,13 +279,12 @@ select {
     font-weight: var(--bpScriptureWeight);
     color: var(--fg);
 
-    /* Small improvements for reading */
     text-rendering: optimizeLegibility;
     font-kerning: normal;
     font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
 }
 
-/* Mobile tweaks */
+/* ---------------- Mobile tweaks ---------------- */
 @media (max-width: 480px) {
     :root {
         --bpScriptureSize: 17px;
@@ -257,20 +301,3 @@ select {
     }
 }
 
-/* Optional: helps the landing grid collapse cleanly on small screens */
-@media (max-width: 860px) {
-    .container [data-landing-grid] {
-        grid-template-columns: 1fr !important;
-    }
-}
-
-@keyframes panelPop {
-    from {
-        opacity: 0;
-        transform: scale(0.92) translateY(6px);
-    }
-    to {
-        opacity: 1;
-        transform: scale(1) translateY(0);
-    }
-}

@@ -31,9 +31,7 @@ function safeGet(key: string): string | null {
 function safeSet(key: string, value: string): void {
     try {
         window.localStorage.setItem(key, value);
-    } catch {
-        // ignore
-    }
+    } catch {}
 }
 
 function getInitialMode(storageKey: string): Mode {
@@ -49,6 +47,13 @@ function setMetaThemeColor(hex: string): void {
     if (meta) meta.setAttribute("content", hex);
 }
 
+/**
+ * Theme vars are intentionally "paper-soft" in light mode:
+ * - Warm, low-contrast background (no harsh pure-white)
+ * - Ink is a deep warm black (less stark than #000/#0b0b0b)
+ * - Hairlines + panels are warm/neutral and extremely subtle
+ * - Focus ring is calm + slightly warm
+ */
 export function getThemeVars(mode: Mode): CssVarStyle {
     if (mode === "dark") {
         return {
@@ -61,20 +66,43 @@ export function getThemeVars(mode: Mode): CssVarStyle {
             ["--shadowSoft" as any]: "0 10px 34px rgba(0,0,0,0.34)",
             ["--focus" as any]: "rgba(255,255,255,0.22)",
             ["--focusRing" as any]: "rgba(255,255,255,0.12)",
+
+            // optional overlays for your Search panel (safe defaults)
+            ["--overlay" as any]: "rgba(20,20,22,0.78)",
+            ["--overlay2" as any]: "rgba(20,20,22,0.62)",
+            ["--activeBg" as any]: "rgba(255,255,255,0.06)",
         };
     }
 
-    // softened (less intense white)
+    // Light mode — paper-soft (warmer, lower contrast)
     return {
-        ["--bg" as any]: "#f6f4f0",
-        ["--panel" as any]: "rgba(0,0,0,0.026)",
-        ["--fg" as any]: "#0b0b0c",
-        ["--muted" as any]: "rgba(11,11,12,0.58)",
-        ["--hairline" as any]: "rgba(0,0,0,0.11)",
-        ["--shadow" as any]: "0 18px 60px rgba(0,0,0,0.12)",
-        ["--shadowSoft" as any]: "0 10px 34px rgba(0,0,0,0.10)",
-        ["--focus" as any]: "rgba(0,0,0,0.14)",
-        ["--focusRing" as any]: "rgba(0,0,0,0.08)",
+        // background: warm paper
+        ["--bg" as any]: "#f6f2ea",
+
+        // subtle surface: warm/neutral (avoid cold gray)
+        ["--panel" as any]: "rgba(20, 14, 10, 0.028)",
+
+        // text: warm ink (less harsh than pure black)
+        ["--fg" as any]: "#15110e",
+
+        // secondary text: gentle
+        ["--muted" as any]: "rgba(21, 17, 14, 0.56)",
+
+        // hairline: warm + very light
+        ["--hairline" as any]: "rgba(21, 17, 14, 0.09)",
+
+        // shadows: softer + warmer
+        ["--shadow" as any]: "0 18px 60px rgba(18, 12, 10, 0.10)",
+        ["--shadowSoft" as any]: "0 10px 34px rgba(18, 12, 10, 0.075)",
+
+        // focus: calm, warm
+        ["--focus" as any]: "rgba(21, 17, 14, 0.14)",
+        ["--focusRing" as any]: "rgba(21, 17, 14, 0.08)",
+
+        // overlays for Search panel (paper-glass, not blue/gray)
+        ["--overlay" as any]: "rgba(246, 242, 234, 0.86)",
+        ["--overlay2" as any]: "rgba(246, 242, 234, 0.72)",
+        ["--activeBg" as any]: "rgba(21, 17, 14, 0.045)",
     };
 }
 
@@ -86,16 +114,17 @@ export function ThemeProvider(props: {
 }) {
     const config: ThemeConfig = {
         storageKey: props.storageKey ?? "bp_theme",
-        metaThemeColorLight: props.metaThemeColorLight ?? "#f6f4f0",
+        // keep these in sync with getThemeVars() base colors
+        metaThemeColorLight: props.metaThemeColorLight ?? "#f6f2ea",
         metaThemeColorDark: props.metaThemeColorDark ?? "#0b0b0c",
     };
 
     const [mode, setMode] = useState<Mode>(() => getInitialMode(config.storageKey));
+
     const vars = useMemo(() => getThemeVars(mode), [mode]);
 
     useEffect(() => {
         if (typeof document === "undefined") return;
-
         document.documentElement.setAttribute("data-theme", mode);
         safeSet(config.storageKey, mode);
         setMetaThemeColor(mode === "dark" ? config.metaThemeColorDark : config.metaThemeColorLight);
@@ -116,18 +145,28 @@ export function useTheme(): ThemeCtx {
     return ctx;
 }
 
-/** Root wrapper that injects CSS vars into your layout */
+/** Root wrapper that injects CSS vars + smooth transition */
 export function ThemeShell(props: { children: React.ReactNode; style?: React.CSSProperties }) {
     const { vars } = useTheme();
-    return <div style={{ ...(props.style ?? null), ...vars }}>{props.children}</div>;
+
+    const shellStyle = useMemo(
+        () => ({
+            transition: `
+            background-color 320ms ease,
+            color 320ms ease,
+            border-color 320ms ease,
+            box-shadow 320ms ease
+        `,
+            // NOTE: inline styles can't express @media; reduced-motion should be handled in CSS
+            ...vars,
+            ...(props.style ?? {}),
+        }),
+        [vars, props.style],
+    );
+
+    return <div style={shellStyle}>{props.children}</div>;
 }
 
-/**
- * iOS-style slider switch (monochrome, calm).
- * - "On" == dark mode (knob to the right).
- * - Uses existing tokens: --panel / --focus / --hairline / --bg.
- * - If you pass styles.themePill/themeDot, they’re treated as base styles.
- */
 export function ThemeToggleSwitch(props: {
     styles?: Record<string, React.CSSProperties>;
     mode?: Mode;
@@ -137,8 +176,8 @@ export function ThemeToggleSwitch(props: {
     const ctx = useTheme();
     const mode = props.mode ?? ctx.mode;
     const onToggle = props.onToggle ?? ctx.toggle;
-
     const size = props.size ?? "md";
+
     const W = size === "sm" ? 40 : 44;
     const H = size === "sm" ? 24 : 26;
     const PAD = 2;
@@ -164,13 +203,16 @@ export function ThemeToggleSwitch(props: {
         opacity: press ? 0.96 : 1,
     };
 
+    // knob: slightly warmer in light mode (so it doesn't look "plastic-white")
     const knobStyle: React.CSSProperties = {
         ...baseKnob,
         width: KNOB,
         height: KNOB,
         borderRadius: 999,
-        background: "#ffffff",
-        boxShadow: "0 6px 16px rgba(0,0,0,0.18), 0 0 0 1px rgba(0,0,0,0.06)",
+        background: isOn ? "#ffffff" : "rgba(255,255,255,0.92)",
+        boxShadow: isOn
+            ? "0 6px 16px rgba(0,0,0,0.18), 0 0 0 1px rgba(0,0,0,0.06)"
+            : "0 6px 16px rgba(18, 12, 10, 0.12), 0 0 0 1px rgba(21, 17, 14, 0.06)",
         transform: `translateX(${isOn ? TRAVEL : 0}px)`,
     };
 
@@ -194,7 +236,6 @@ export function ThemeToggleSwitch(props: {
     );
 }
 
-/** Backwards-compatible name if you’re already using it everywhere. */
 export function ThemeTogglePill(props: { styles?: Record<string, React.CSSProperties>; mode?: Mode; onToggle?: () => void }) {
     return <ThemeToggleSwitch styles={props.styles} mode={props.mode} onToggle={props.onToggle} />;
 }

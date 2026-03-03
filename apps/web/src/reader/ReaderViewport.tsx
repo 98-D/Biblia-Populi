@@ -1,6 +1,7 @@
 // apps/web/src/reader/ReaderViewport.tsx
 import React, {
     forwardRef,
+    useCallback,
     useEffect,
     useImperativeHandle,
     useLayoutEffect,
@@ -56,11 +57,16 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     const [dataTick, setDataTick] = useState(0);
     const [posOrd, setPosOrd] = useState<number>(spine.verseOrdMin);
+    const posOrdRef = useRef(posOrd);
 
     const pendingJumpRef = useRef<{ ord: number; behavior: "auto" | "smooth" } | null>(null);
     const readyOnceRef = useRef(false);
 
-    // reset if spine changes (rare, but makes this component safe)
+    useEffect(() => {
+        posOrdRef.current = posOrd;
+    }, [posOrd]);
+
+    // reset if spine changes
     useEffect(() => {
         verseMapRef.current.clear();
         loadedChunksRef.current.clear();
@@ -68,58 +74,66 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         loadedChunkListRef.current = [];
         setDataTick((t) => t + 1);
         setPosOrd(spine.verseOrdMin);
+        posOrdRef.current = spine.verseOrdMin;
     }, [spine.verseOrdMin, spine.verseOrdMax, spine.verseCount]);
 
-    function evictFarChunks(keepOrd: number): void {
-        const keepChunk = chunkStart(clamp(keepOrd, spine.verseOrdMin, spine.verseOrdMax));
-        const list = loadedChunkListRef.current;
+    const evictFarChunks = useCallback(
+        (keepOrd: number): void => {
+            const keepChunk = chunkStart(clamp(keepOrd, spine.verseOrdMin, spine.verseOrdMax));
+            const list = loadedChunkListRef.current;
 
-        while (list.length > MAX_CHUNKS_IN_MEMORY) {
-            let farIdx = 0;
-            let farDist = -1;
+            while (list.length > MAX_CHUNKS_IN_MEMORY) {
+                let farIdx = 0;
+                let farDist = -1;
 
-            for (let i = 0; i < list.length; i++) {
-                const c = list[i]!;
-                const d = Math.abs(c - keepChunk);
-                if (d > farDist) {
-                    farDist = d;
-                    farIdx = i;
+                for (let i = 0; i < list.length; i++) {
+                    const c = list[i]!;
+                    const d = Math.abs(c - keepChunk);
+                    if (d > farDist) {
+                        farDist = d;
+                        farIdx = i;
+                    }
                 }
+
+                const victim = list.splice(farIdx, 1)[0]!;
+                loadedChunksRef.current.delete(victim);
+
+                const start = victim;
+                const end = Math.min(spine.verseOrdMax, victim + CHUNK - 1);
+                for (let ord = start; ord <= end; ord++) verseMapRef.current.delete(ord);
             }
+        },
+        [spine.verseOrdMin, spine.verseOrdMax],
+    );
 
-            const victim = list.splice(farIdx, 1)[0]!;
-            loadedChunksRef.current.delete(victim);
+    const ensureChunk = useCallback(
+        async (startOrd: number, keepOrd?: number): Promise<void> => {
+            const s = clamp(startOrd, spine.verseOrdMin, spine.verseOrdMax);
+            const chunk = chunkStart(s);
 
-            const start = victim;
-            const end = Math.min(spine.verseOrdMax, victim + CHUNK - 1);
-            for (let ord = start; ord <= end; ord++) verseMapRef.current.delete(ord);
-        }
-    }
+            if (loadedChunksRef.current.has(chunk)) return;
+            if (loadingChunksRef.current.has(chunk)) return;
 
-    async function ensureChunk(startOrd: number, keepOrd?: number): Promise<void> {
-        const s = clamp(startOrd, spine.verseOrdMin, spine.verseOrdMax);
-        const chunk = chunkStart(s);
+            loadingChunksRef.current.add(chunk);
+            try {
+                const res = await apiGetSlice(chunk, CHUNK);
+                for (const v of res.verses) verseMapRef.current.set(v.verseOrd, v);
 
-        if (loadedChunksRef.current.has(chunk)) return;
-        if (loadingChunksRef.current.has(chunk)) return;
+                loadedChunksRef.current.add(chunk);
+                loadedChunkListRef.current.push(chunk);
 
-        loadingChunksRef.current.add(chunk);
-        try {
-            const res = await apiGetSlice(chunk, CHUNK);
-            for (const v of res.verses) verseMapRef.current.set(v.verseOrd, v);
-
-            loadedChunksRef.current.add(chunk);
-            loadedChunkListRef.current.push(chunk);
-
-            evictFarChunks(keepOrd ?? posOrd);
-            setDataTick((t) => t + 1);
-        } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : String(e);
-            onError?.(msg);
-        } finally {
-            loadingChunksRef.current.delete(chunk);
-        }
-    }
+                // Use latest position (avoid async-stale eviction)
+                evictFarChunks(keepOrd ?? posOrdRef.current);
+                setDataTick((t) => t + 1);
+            } catch (e: unknown) {
+                const msg = e instanceof Error ? e.message : String(e);
+                onError?.(msg);
+            } finally {
+                loadingChunksRef.current.delete(chunk);
+            }
+        },
+        [evictFarChunks, onError, spine.verseOrdMin, spine.verseOrdMax],
+    );
 
     const count = spine.verseCount;
 
@@ -132,8 +146,8 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     const virtualItems = rowVirtualizer.getVirtualItems();
 
-    const jumpToOrd = useMemo(() => {
-        return (ord: number, behavior: "auto" | "smooth" = "auto") => {
+    const jumpToOrd = useCallback(
+        (ord: number, behavior: "auto" | "smooth" = "auto") => {
             const targetOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
             const idx = targetOrd - spine.verseOrdMin;
 
@@ -147,13 +161,13 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
             requestAnimationFrame(() => {
                 rowVirtualizer.scrollToIndex(idx, { align: "start", behavior });
             });
-        };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [scrollEl, spine.verseOrdMin, spine.verseOrdMax]);
+        },
+        [ensureChunk, rowVirtualizer, scrollEl, spine.verseOrdMin, spine.verseOrdMax],
+    );
 
     useImperativeHandle(ref, () => ({
         jumpToOrd,
-        getCurrentOrd: () => posOrd,
+        getCurrentOrd: () => posOrdRef.current,
     }));
 
     // Ready + pending jump
@@ -195,8 +209,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
             const behind = start - k * CHUNK;
             if (behind >= spine.verseOrdMin) void ensureChunk(behind, firstOrd);
         }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [virtualItems, dataTick, spine.verseOrdMin, spine.verseOrdMax]);
+    }, [virtualItems, dataTick, ensureChunk, spine.verseOrdMin, spine.verseOrdMax]);
 
     // Current position = topmost visible row
     useLayoutEffect(() => {
@@ -207,10 +220,13 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         const topItem = virtualItems.find((it) => it.start + it.size > st + 1) ?? virtualItems[0]!;
         const ord = spine.verseOrdMin + topItem.index;
 
-        setPosOrd((prev) => (prev === ord ? prev : ord));
+        if (posOrdRef.current !== ord) {
+            posOrdRef.current = ord;
+            setPosOrd(ord);
+        }
+
         void ensureChunk(chunkStart(ord), ord);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [scrollEl, virtualItems, dataTick, spine.verseOrdMin]);
+    }, [scrollEl, virtualItems, dataTick, ensureChunk, spine.verseOrdMin]);
 
     // Emit position (also re-emit once verse loads so header label becomes real)
     const lastSentRef = useRef<{ ord: number; hasVerse: boolean }>({ ord: -1, hasVerse: false });
@@ -227,12 +243,14 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         onPosition({ ord: posOrd, verse, book });
     }, [posOrd, dataTick, bookById, onPosition]);
 
+    const totalSize = rowVirtualizer.getTotalSize();
+
     return (
         <div style={sx.body}>
             <div ref={setScrollEl} style={sx.scroll}>
                 <div className="container" style={sx.container}>
                     {topContent}
-                    <div style={{ height: rowVirtualizer.getTotalSize(), position: "relative" }}>
+                    <div style={{ height: totalSize, position: "relative" }}>
                         {virtualItems.map((v) => {
                             const verseOrd = spine.verseOrdMin + v.index;
                             const row = verseMapRef.current.get(verseOrd) ?? null;
@@ -241,7 +259,9 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                                 <div
                                     key={verseOrd}
                                     ref={(el) => {
-                                        if (el && row) rowVirtualizer.measureElement(el);
+                                        if (!el) return;
+                                        // Measure skeleton + real rows so estimates converge quickly & stay stable.
+                                        rowVirtualizer.measureElement(el);
                                     }}
                                     data-index={v.index}
                                     style={{
@@ -250,7 +270,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                                         left: 0,
                                         width: "100%",
                                         transform: `translate3d(0, ${v.start}px, 0)`,
-                                        willChange: "transform",
                                     }}
                                 >
                                     {!row ? (

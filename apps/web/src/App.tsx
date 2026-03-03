@@ -158,10 +158,8 @@ function AppInner() {
   const [page, setPage] = useState<Page>(initialNav.page);
   const [readerLoc, setReaderLoc] = useState<ReaderLocation | null>(initialNav.loc);
 
-  // prevent feedback loop when we write hash
   const writingUrl = useRef(false);
 
-  // Persist nav (localStorage)
   useEffect(() => {
     safeSet(LS_LAST_PAGE, page);
   }, [page]);
@@ -172,7 +170,6 @@ function AppInner() {
     else safeDel(LS_LAST_LOC);
   }, [readerLoc]);
 
-  // Sync URL hash to current state (lightweight “router”)
   useEffect(() => {
     if (typeof window === "undefined") return;
     const nextHash = formatHash(page, page === "reader" ? readerLoc : null);
@@ -185,7 +182,6 @@ function AppInner() {
     }, 0);
   }, [page, readerLoc]);
 
-  // Respond to user-driven URL changes (back/forward, manual hash edit)
   useEffect(() => {
     if (typeof window === "undefined") return;
 
@@ -282,14 +278,7 @@ function Home(props: {
       <main style={styles.centerStage} aria-label="Landing">
         <div style={styles.centerBlock}>
           <div style={styles.crossWrap} aria-hidden>
-            <img
-                src="/cross.png"
-                alt=""
-                style={styles.crossImg}
-                draggable={false}
-                decoding="async"
-                loading="eager"
-            />
+            <img src="/cross.png" alt="" style={styles.crossImg} draggable={false} decoding="async" loading="eager" />
           </div>
 
           <h1 style={styles.h1}>Biblia Populi</h1>
@@ -303,7 +292,7 @@ function Home(props: {
                 onNavigate={onNavigate}
                 onStartReading={onStartReading}
                 hint="Type a word or a reference (John 3:16)"
-                // no autoFocus (prevents dropdown popping on load)
+                /* no autoFocus (prevents dropdown popping on load) */
             />
           </div>
 
@@ -368,7 +357,7 @@ export const styles: Record<string, React.CSSProperties> = {
   },
 
   centerBlock: {
-    maxWidth: 820,
+    maxWidth: 860,
     width: "100%",
     textAlign: "center",
     margin: "0 auto",
@@ -402,7 +391,7 @@ export const styles: Record<string, React.CSSProperties> = {
     fontSize: 13,
     lineHeight: 1.95,
     color: "var(--muted)",
-    maxWidth: 600,
+    maxWidth: 620,
     marginInline: "auto",
   },
 
@@ -413,26 +402,31 @@ export const styles: Record<string, React.CSSProperties> = {
     justifyContent: "center",
   },
 
-  /* Consumed by Search */
+  // Search reads these (and now also reads searchWrap/searchPanel for sizing)
+  searchWrap: {
+    width: "100%",
+    maxWidth: 660,
+  },
+
   searchRow: {
     display: "grid",
     gridTemplateColumns: "24px 1fr",
     alignItems: "center",
     gap: 8,
-    padding: "9px 18px",
+    padding: "10px 18px",
     borderRadius: 30,
     border: "1px solid var(--hairline)",
     background: "var(--panel)",
-    maxWidth: 620, // wider
+    maxWidth: 660, // wider
     width: "100%",
     boxShadow: "0 8px 24px rgba(0,0,0,0.07)",
-    transition: "all 180ms cubic-bezier(0.23, 1, 0.32, 1)",
+    transition: "box-shadow 180ms ease, border-color 180ms ease",
   },
 
+  // no translateY “lift” (removes micro-jitter feel)
   searchRowFocused: {
     borderColor: "var(--focus)",
     boxShadow: "0 12px 36px rgba(0,0,0,0.12), 0 0 0 3px var(--focusRing)",
-    transform: "translateY(-1px)",
   },
 
   searchIcon: {
@@ -452,6 +446,9 @@ export const styles: Record<string, React.CSSProperties> = {
     padding: "4px 0",
     width: "100%",
   },
+
+  // optional hook for Search panel (keeps things consistent)
+  searchPanel: {},
 
   ctaRow: {
     marginTop: 10,
@@ -499,4 +496,21 @@ export const styles: Record<string, React.CSSProperties> = {
   },
 
   linkPressed: { opacity: 0.7 },
+
+  // handy for LearnMorePage (optional)
+  backBtn: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid var(--hairline)",
+    background: "var(--panel)",
+    cursor: "pointer",
+  },
+
+  footerMuted: {
+    color: "var(--muted)",
+    fontSize: 12,
+  },
 };

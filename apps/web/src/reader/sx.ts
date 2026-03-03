@@ -1,5 +1,5 @@
 // apps/web/src/reader/sx.ts
-import type React from "react";
+import type { CSSProperties } from "react";
 
 /**
  * Reader UI tokens (inline styles)
@@ -8,8 +8,13 @@ import type React from "react";
  * - center area should never force child centering weirdness
  * - stable scroll + measure-driven column
  * - verse rows: calmer spacing, less “boxy”, better rhythm
+ *
+ * Notes:
+ * - Uses color-mix(in oklab, ...) consistently (your theme already relies on it).
+ * - Header shadow is intentionally *thin* (more “lift” than “bar”).
+ * - Verse rows are “air-first”: hover is a soft wash, not a tile.
  */
-export const sx: Record<string, React.CSSProperties> = {
+export const sx: Record<string, CSSProperties> = {
     page: {
         height: "100vh",
         display: "flex",
@@ -23,16 +28,25 @@ export const sx: Record<string, React.CSSProperties> = {
         position: "sticky",
         top: 0,
         zIndex: 10,
+
         display: "grid",
         gridTemplateColumns: "minmax(92px, 1fr) auto minmax(92px, 1fr)",
         alignItems: "center",
         gap: 12,
+
         padding: "10px 14px",
-        borderBottom: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--bg) 86%, transparent)",
+
+        // “Glass” but not milky
+        background: "color-mix(in oklab, var(--bg) 88%, transparent)",
         backdropFilter: "blur(12px)",
         WebkitBackdropFilter: "blur(12px)",
-        boxShadow: "0 8px 26px rgba(0, 0, 0, 0.05)",
+
+        // Hairline + micro shadow (avoid “heavy bar”)
+        borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        boxShadow: "0 10px 22px rgba(0, 0, 0, 0.035)",
+
+        // Prevent weird halos on some GPUs
+        transform: "translateZ(0)",
     },
 
     topLeft: {
@@ -51,7 +65,6 @@ export const sx: Record<string, React.CSSProperties> = {
 
         // IMPORTANT:
         // Center wrapper should NOT force text-align center on children.
-        // Some controls (PositionPill) use inline-grid and can inherit text-align.
         textAlign: "initial",
     },
 
@@ -87,15 +100,19 @@ export const sx: Record<string, React.CSSProperties> = {
         fontSize: 12,
         padding: "7px 11px",
         borderRadius: 12,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
+        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        background: "color-mix(in oklab, var(--panel) 90%, transparent)",
+        color: "inherit",
         cursor: "pointer",
         lineHeight: 1,
-        transition: "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease",
-        color: "inherit",
         userSelect: "none",
         whiteSpace: "nowrap",
-        boxShadow: "0 10px 26px rgba(0,0,0,0.08)",
+
+        // Lighter than before (avoid “button sticker” look)
+        boxShadow: "0 8px 18px rgba(0,0,0,0.06)",
+        transition:
+            "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease",
+        outline: "none",
     },
 
     /* ---------- Viewport ---------- */
@@ -110,10 +127,16 @@ export const sx: Record<string, React.CSSProperties> = {
         position: "absolute",
         inset: 0,
         overflow: "auto",
+
+        // Top padding should feel “breathing”, bottom allows footer UI / lazy loads
         padding: "18px 0 96px",
+
         overscrollBehaviorY: "contain",
         scrollbarGutter: "stable",
         WebkitOverflowScrolling: "touch",
+
+        // Prevent subpixel wobble on some platforms
+        transform: "translateZ(0)",
     },
 
     // Reader column width is driven by --bpReaderMeasure (controlled by typography UI).
@@ -135,7 +158,7 @@ export const sx: Record<string, React.CSSProperties> = {
     bookHeader: {
         padding: "16px 2px 12px",
         marginTop: 6,
-        borderBottom: "1px solid var(--hairline)",
+        borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
     },
 
     bookKicker: {
@@ -157,7 +180,7 @@ export const sx: Record<string, React.CSSProperties> = {
     chapterHeader: {
         padding: "12px 2px 10px",
         marginTop: 14,
-        borderBottom: "1px solid var(--hairline)",
+        borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
     },
 
     chapterKicker: {
@@ -181,9 +204,17 @@ export const sx: Record<string, React.CSSProperties> = {
         gridTemplateColumns: "36px 1fr",
         gap: 12,
         alignItems: "start",
+
         borderRadius: 14,
         padding: "9px 6px",
-        transition: "background 140ms ease, transform 140ms ease",
+
+        // Default: transparent. Hover should be applied by caller if desired,
+        // but we prep the transition to keep it premium.
+        background: "transparent",
+        transition: "background 140ms ease, transform 140ms ease, box-shadow 140ms ease",
+
+        // Avoid accidental selection highlight bleed in some browsers
+        WebkitTapHighlightColor: "transparent",
     },
 
     verseNum: {
@@ -200,7 +231,16 @@ export const sx: Record<string, React.CSSProperties> = {
     verseText: {
         // intentionally empty; .scripture handles typography
     },
+    verseRowHover: {
+        background: "color-mix(in oklab, var(--panel) 22%, transparent)",
+    },
 
+    verseRowFocus: {
+        background: "color-mix(in oklab, var(--panel) 26%, transparent)",
+        boxShadow: "0 0 0 3px color-mix(in oklab, var(--focus) 18%, transparent)",
+    },
+
+    /* ---------- Skeleton ---------- */
     skelRow: {
         display: "grid",
         gridTemplateColumns: "36px 1fr",
@@ -214,7 +254,7 @@ export const sx: Record<string, React.CSSProperties> = {
     skelText: {
         height: 14,
         borderRadius: 9,
-        background: "var(--hairline)",
+        background: "color-mix(in oklab, var(--hairline) 92%, transparent)",
         marginTop: 6,
     },
 };
