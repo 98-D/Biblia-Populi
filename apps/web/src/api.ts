@@ -10,7 +10,11 @@
 // - Safe JSON parsing + better diagnostics
 //
 // Server endpoints:
+// - GET /health
 // - GET /meta
+// - GET /spine
+// - GET /slice?fromOrd=...&limit=...
+// - GET /loc?bookId=...&chapter=...[&verse=...]
 // - GET /books
 // - GET /chapters/:bookId
 // - GET /chapter/:bookId/:chapter
@@ -71,9 +75,16 @@ export type TranslationMeta = {
     createdAt?: string;
 };
 
+export type SpineStats = {
+    verseOrdMin: number;
+    verseOrdMax: number;
+    verseCount: number;
+};
+
 export type MetaPayload = {
     translation: TranslationMeta;
     ftsEnabled: boolean;
+    spine?: SpineStats;
 };
 
 export type BookRow = {
@@ -284,6 +295,36 @@ export type EventPayload =
     }>;
 };
 
+export type SliceVerseRow = {
+    verseKey: string;
+    verseOrd: number;
+    bookId: string;
+    chapter: number;
+    verse: number;
+    text: string | null;
+    updatedAt: string | null;
+};
+
+export type SlicePayload = {
+    translationId: string;
+    fromOrd: number;
+    limit: number;
+    verses: SliceVerseRow[];
+    done: boolean;
+    nextFromOrd: number | null;
+    spine?: SpineStats;
+};
+
+export type LocPayload =
+    | null
+    | {
+    verseKey: string;
+    verseOrd: number;
+    bookId: string;
+    chapter: number;
+    verse: number;
+};
+
 /* --------------------------------- Base URL -------------------------------- */
 
 // If VITE_API_BASE is set, use it. Otherwise same-origin (works with Vite proxy).
@@ -315,7 +356,6 @@ function mergeSignals(a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined
     if (!a) return b;
     if (!b) return a;
 
-    // If already aborted, prefer that immediate state.
     if (a.aborted) return a;
     if (b.aborted) return b;
 
@@ -359,7 +399,6 @@ async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T
         const parsed = tryParseJson(bodyText);
 
         if (!res.ok) {
-            // Prefer server-provided ApiErr shape when present.
             if (parsed.ok && isObj(parsed.value) && (parsed.value as any).ok === false) {
                 const v = parsed.value as ApiErr;
                 throw new ApiError("API_ERROR", v.error?.message ?? res.statusText, { status: res.status, url, bodyText });
@@ -371,7 +410,6 @@ async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T
             throw new ApiError("NOT_JSON", "Expected JSON response but got non-JSON.", { status: res.status, url, bodyText });
         }
 
-        // Expect ApiRes<T> envelope.
         if (!isObj(parsed.value)) {
             throw new ApiError("BAD_RESPONSE", "Expected JSON object envelope.", { status: res.status, url, bodyText });
         }
@@ -388,7 +426,6 @@ async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T
 
         return (env as ApiOk<T>).data;
     } catch (e) {
-        // Distinguish timeout vs user abort.
         if (e && typeof e === "object" && (e as any).name === "AbortError") {
             if (timeoutOn) throw new ApiError("TIMEOUT", "Request took too long.", { url });
             throw new ApiError("ABORTED", "Request aborted.", { url });
@@ -433,4 +470,28 @@ export function apiGetPlace(id: string, opts?: ApiRequestOptions): Promise<Place
 
 export function apiGetEvent(id: string, opts?: ApiRequestOptions): Promise<EventPayload> {
     return getJson(`/events/${encodeURIComponent(id)}`, opts);
+}
+
+/* --------------------- Infinite-scroll (global spine) ---------------------- */
+
+export function apiGetSpine(opts?: ApiRequestOptions): Promise<SpineStats> {
+    return getJson(`/spine`, opts);
+}
+
+export function apiGetSlice(fromOrd: number, limit = 240, opts?: ApiRequestOptions): Promise<SlicePayload> {
+    const f = encodeURIComponent(String(fromOrd));
+    const l = encodeURIComponent(String(limit));
+    return getJson(`/slice?fromOrd=${f}&limit=${l}`, opts);
+}
+
+export function apiResolveLoc(
+    bookId: string,
+    chapter: number,
+    verse: number | null,
+    opts?: ApiRequestOptions,
+): Promise<LocPayload> {
+    const b = encodeURIComponent(bookId);
+    const c = encodeURIComponent(String(chapter));
+    const v = verse != null ? `&verse=${encodeURIComponent(String(verse))}` : "";
+    return getJson(`/loc?bookId=${b}&chapter=${c}${v}`, opts);
 }

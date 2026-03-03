@@ -1,29 +1,29 @@
-// apps/web/src/Search.tsx
+// apps/web/src/reader/ReaderHeaderSearch.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { apiGetBooks, apiSearch, type BookRow, type SearchPayload, type SearchResult } from "./api";
+import { apiGetBooks, apiSearch, type BookRow, type SearchPayload, type SearchResult } from "../api";
+import type { ReaderLocation } from "../Search";
 
-export type ReaderLocation = {
-    bookId: string;
-    chapter: number;
-    verse?: number;
-};
+/**
+ * ReaderHeaderSearch — compact, header-only search
+ * - Smaller height + tighter padding (fixes “too tall” in header)
+ * - Uses same reference parsing + results panel logic
+ * - Accepts `books` from parent to avoid redundant API call
+ */
 
 type Props = {
-    styles: Record<string, React.CSSProperties>;
-    /** Called when user chooses a ref/result */
     onNavigate: (loc: ReaderLocation) => void;
 
-    /** Optional: called if user presses Enter with empty query */
-    onStartReading?: () => void;
-
-    /** Optional initial query */
-    initialQuery?: string;
+    /** Optional: pass already-loaded books (recommended for Reader header) */
+    books?: BookRow[] | null;
 
     /** Enable Ctrl/Cmd+K focus */
     enableHotkey?: boolean;
 
-    /** Optional hint text under input */
-    hint?: string;
+    /** Placeholder override */
+    placeholder?: string;
+
+    /** Max results */
+    limit?: number;
 };
 
 type RefParse = { ok: true; loc: ReaderLocation; label: string } | { ok: false };
@@ -165,14 +165,14 @@ function isMacPlatform(): boolean {
     return p.includes("mac");
 }
 
-export function Search(props: Props) {
-    const { styles, onNavigate, onStartReading, enableHotkey = true } = props;
+export function ReaderHeaderSearch(props: Props) {
+    const { onNavigate, enableHotkey = true, placeholder, limit = 20 } = props;
 
     const inputRef = useRef<HTMLInputElement | null>(null);
 
-    const [books, setBooks] = useState<BookRow[] | null>(null);
+    const [books, setBooks] = useState<BookRow[] | null>(props.books ?? null);
 
-    const [q, setQ] = useState(props.initialQuery ?? "");
+    const [q, setQ] = useState("");
     const [focused, setFocused] = useState(false);
 
     const [loading, setLoading] = useState(false);
@@ -180,21 +180,24 @@ export function Search(props: Props) {
     const [err, setErr] = useState<string | null>(null);
 
     const [activeIdx, setActiveIdx] = useState(0);
-
     const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
-    // Load books for reference parsing + nice labels
+    // Prefer parent-provided books; else load.
     useEffect(() => {
+        if (props.books) {
+            setBooks(props.books);
+            return;
+        }
+
         let alive = true;
         apiGetBooks()
             .then((r) => alive && setBooks(r.books))
-            .catch(() => {
-                if (alive) setBooks(null);
-            });
+            .catch(() => alive && setBooks(null));
+
         return () => {
             alive = false;
         };
-    }, []);
+    }, [props.books]);
 
     const bookLookup = useMemo(() => (books && books.length ? buildBookLookup(books) : null), [books]);
 
@@ -245,7 +248,7 @@ export function Search(props: Props) {
 
         setLoading(true);
         const t = setTimeout(() => {
-            apiSearch(qq, 30)
+            apiSearch(qq, limit)
                 .then((p) => {
                     if (!alive) return;
                     setPayload(p);
@@ -256,16 +259,15 @@ export function Search(props: Props) {
                     setErr(String(e?.message ?? e));
                     setLoading(false);
                 });
-        }, 180);
+        }, 160);
 
         return () => {
             alive = false;
             clearTimeout(t);
         };
-    }, [q]);
+    }, [q, limit]);
 
     const results = payload?.results ?? [];
-
     const showPanel = focused && (q.trim().length > 0 || loading || err != null);
 
     const items = useMemo(() => {
@@ -306,21 +308,16 @@ export function Search(props: Props) {
             return;
         }
 
-        if (item.kind === "result") {
-            const r = item.result;
-            onNavigate({ bookId: r.bookId, chapter: r.chapter, verse: r.verse });
-            setFocused(false);
-            inputRef.current?.blur();
-        }
+        const r = item.result;
+        onNavigate({ bookId: r.bookId, chapter: r.chapter, verse: r.verse });
+        setFocused(false);
+        inputRef.current?.blur();
     }
 
     function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>): void {
         if (e.key === "Enter") {
             e.preventDefault();
-            if (!q.trim()) {
-                onStartReading?.();
-                return;
-            }
+            if (!q.trim()) return;
             if (items.length > 0) commitSelection(activeIdx);
             else if (ref.ok) onNavigate(ref.loc);
             return;
@@ -338,26 +335,25 @@ export function Search(props: Props) {
         }
     }
 
-    const searchRowStyle: React.CSSProperties = {
-        ...(styles.searchRow ?? {}),
-        ...(focused ? (styles.searchRowFocused ?? {}) : null),
-    };
-
     const hotkeyLabel = isMacPlatform() ? "⌘K" : "Ctrl+K";
 
     return (
         <div style={{ position: "relative" }}>
-            <div style={searchRowStyle} aria-label="Search" onMouseDown={() => inputRef.current?.focus()}>
-                <span style={styles.searchIcon} aria-hidden>
-                    ⌕
-                </span>
+            <div
+                style={{ ...hxs.row, ...(focused ? hxs.rowFocused : null) }}
+                aria-label="Search"
+                onMouseDown={() => inputRef.current?.focus()}
+            >
+        <span style={hxs.icon} aria-hidden>
+          ⌕
+        </span>
 
                 <input
                     ref={inputRef}
                     value={q}
                     onChange={(e) => setQ(e.target.value)}
-                    placeholder="Search… (or type John 3:16)"
-                    style={styles.searchInput}
+                    placeholder={placeholder ?? "Search… (John 3:16)"}
+                    style={hxs.input}
                     aria-label="Search scripture"
                     spellCheck={false}
                     inputMode="search"
@@ -368,21 +364,22 @@ export function Search(props: Props) {
                     }}
                     onKeyDown={onKeyDown}
                 />
+
+                <span style={hxs.hotkey} aria-hidden>
+          {hotkeyLabel}
+        </span>
             </div>
 
-            {!showPanel ? (
-                props.hint ? <div style={sx.hint}>{props.hint}</div> : null
-            ) : (
-                <div style={sx.panel} role="listbox" aria-label="Search results">
-                    {err ? <div style={sx.panelMsg}>{err}</div> : null}
-                    {!err && loading ? <div style={sx.panelMsg}>Searching…</div> : null}
-                    {!err && !loading && items.length === 0 ? <div style={sx.panelMsg}>No results.</div> : null}
+            {!showPanel ? null : (
+                <div style={hxs.panel} role="listbox" aria-label="Search results">
+                    {err ? <div style={hxs.panelMsg}>{err}</div> : null}
+                    {!err && loading ? <div style={hxs.panelMsg}>Searching…</div> : null}
+                    {!err && !loading && items.length === 0 ? <div style={hxs.panelMsg}>No results.</div> : null}
 
                     {!err && !loading && items.length > 0 ? (
-                        <div style={sx.list}>
+                        <div style={hxs.list}>
                             {items.map((it, idx) => {
                                 const active = idx === activeIdx;
-                                const mode = payload?.mode ?? "search";
                                 return (
                                     <button
                                         key={`${it.kind}:${it.label}:${idx}`}
@@ -390,7 +387,7 @@ export function Search(props: Props) {
                                             itemRefs.current[idx] = el;
                                         }}
                                         type="button"
-                                        style={{ ...sx.item, ...(active ? sx.itemActive : null) }}
+                                        style={{ ...hxs.item, ...(active ? hxs.itemActive : null) }}
                                         onMouseEnter={() => setActiveIdx(idx)}
                                         onMouseDown={(e) => {
                                             // prevent input blur before click
@@ -398,17 +395,17 @@ export function Search(props: Props) {
                                             commitSelection(idx);
                                         }}
                                     >
-                                        <div style={sx.itemTop}>
-                                            <span style={sx.itemLabel}>{it.label}</span>
-                                            <span style={sx.itemMeta}>{it.kind === "ref" ? "ref" : mode}</span>
+                                        <div style={hxs.itemTop}>
+                                            <span style={hxs.itemLabel}>{it.label}</span>
+                                            <span style={hxs.itemMeta}>{it.kind === "ref" ? "ref" : payload?.mode ?? "search"}</span>
                                         </div>
 
                                         {it.kind === "result" && it.result?.snippet ? (
-                                            <div style={sx.snippet}>
+                                            <div style={hxs.snippet}>
                                                 {splitSnippet(it.result.snippet).map((seg, i) => (
-                                                    <span key={i} style={seg.hi ? sx.hi : undefined}>
-                                                        {seg.text}
-                                                    </span>
+                                                    <span key={i} style={seg.hi ? hxs.hi : undefined}>
+                            {seg.text}
+                          </span>
                                                 ))}
                                             </div>
                                         ) : null}
@@ -417,41 +414,74 @@ export function Search(props: Props) {
                             })}
                         </div>
                     ) : null}
-
-                    <div style={sx.footer}>
-                        <span style={sx.footerText}>↑↓</span>
-                        <span style={sx.footerSep}>navigate</span>
-                        <span style={sx.footerDot}>•</span>
-                        <span style={sx.footerText}>Enter</span>
-                        <span style={sx.footerSep}>open</span>
-                        <span style={sx.footerDot}>•</span>
-                        <span style={sx.footerText}>Esc</span>
-                        <span style={sx.footerSep}>clear</span>
-                        <span style={sx.footerDot}>•</span>
-                        <span style={sx.footerText}>{hotkeyLabel}</span>
-                        <span style={sx.footerSep}>focus</span>
-                    </div>
                 </div>
             )}
         </div>
     );
 }
 
-const sx: Record<string, React.CSSProperties> = {
+const hxs: Record<string, React.CSSProperties> = {
+    row: {
+        height: 30,
+        display: "grid",
+        gridTemplateColumns: "18px 1fr auto",
+        alignItems: "center",
+        gap: 6,
+        padding: "0 10px",
+        borderRadius: 999,
+        border: "1px solid var(--hairline)",
+        background: "var(--panel)",
+        boxShadow: "none",
+        cursor: "text",
+        userSelect: "none",
+    },
+    rowFocused: {
+        borderColor: "var(--focus)",
+        outline: "1px solid var(--focusRing)",
+        boxShadow: "0 10px 30px rgba(0,0,0,0.08)",
+    },
+    icon: {
+        width: 18,
+        textAlign: "center",
+        color: "var(--muted)",
+        fontSize: 12,
+        transform: "translateY(-0.5px)",
+    },
+    input: {
+        width: "100%",
+        height: 30,
+        border: "none",
+        outline: "none",
+        background: "transparent",
+        color: "inherit",
+        fontSize: 12,
+        padding: 0,
+        lineHeight: "30px",
+    },
+    hotkey: {
+        fontSize: 10,
+        letterSpacing: "0.14em",
+        textTransform: "uppercase",
+        color: "var(--muted)",
+        opacity: 0.75,
+        userSelect: "none",
+        paddingLeft: 6,
+    },
+
     panel: {
         position: "absolute",
         left: 0,
         right: 0,
-        marginTop: 10,
-        borderRadius: 16,
+        marginTop: 8,
+        borderRadius: 14,
         border: "1px solid var(--hairline)",
-        background: "var(--bg)", // opaque, calmer than blur
+        background: "var(--bg)",
         boxShadow: "0 24px 90px rgba(0,0,0,0.20)",
         overflow: "hidden",
         zIndex: 20,
     },
     panelMsg: {
-        padding: "12px 12px",
+        padding: "10px 10px",
         fontSize: 12,
         color: "var(--muted)",
         whiteSpace: "pre-wrap",
@@ -459,7 +489,7 @@ const sx: Record<string, React.CSSProperties> = {
     list: {
         display: "flex",
         flexDirection: "column",
-        maxHeight: 320,
+        maxHeight: 280,
         overflowY: "auto",
     },
     item: {
@@ -468,7 +498,7 @@ const sx: Record<string, React.CSSProperties> = {
         background: "transparent",
         color: "inherit",
         cursor: "pointer",
-        padding: "10px 12px",
+        padding: "9px 10px",
         borderTop: "1px solid var(--hairline)",
     },
     itemActive: {
@@ -492,32 +522,12 @@ const sx: Record<string, React.CSSProperties> = {
         userSelect: "none",
     },
     snippet: {
-        marginTop: 6,
-        fontSize: 12,
+        marginTop: 5,
+        fontSize: 11.5,
         color: "var(--muted)",
-        lineHeight: 1.6,
+        lineHeight: 1.55,
     },
     hi: {
         color: "var(--fg)",
-    },
-    footer: {
-        borderTop: "1px solid var(--hairline)",
-        padding: "10px 12px",
-        display: "flex",
-        alignItems: "center",
-        flexWrap: "wrap",
-        gap: 6,
-        color: "var(--muted)",
-    },
-    footerText: { fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase" },
-    footerSep: { fontSize: 10, opacity: 0.8 },
-    footerDot: { opacity: 0.55, fontSize: 10, paddingInline: 4 },
-    hint: {
-        marginTop: 8,
-        fontSize: 10,
-        letterSpacing: "0.12em",
-        color: "var(--muted)",
-        opacity: 0.85,
-        userSelect: "none",
     },
 };

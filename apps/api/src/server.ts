@@ -1,37 +1,34 @@
 // apps/api/src/server.ts
 // Biblia Populi — Production API server (Bun + Hono + Drizzle + bun:sqlite)
 //
-// Upgraded to match the **current bp_* schema** (orientation-only):
-// - No canon_id
-// - No translation revisions
-// - Verse identity is bp_verse (verse_key + verse_ord)
-// - Text is bp_verse_text keyed by (translation_id, verse_key)
-// - Entities are bp_entity (+ bp_entity_name / bp_entity_relation)
-// - Events are bp_event (+ bp_event_participant)
-// - Optional search uses FTS5 table: bp_verse_text_fts (created by migrate.ts extras)
+// Upgraded for reading-first + infinite scroll primitives:
 //
-// Endpoints (stable, reading-first):
+// Endpoints:
 //   GET  /health
 //   GET  /meta
+//   GET  /spine                       -> global verse_ord bounds + count (for virtualization)
+//   GET  /slice?fromOrd=1&limit=240   -> contiguous verse_ord window (cross-book; perfect for infinite scroll)
+//   GET  /loc?bookId=GEN&chapter=1&verse=1 -> resolve a reference to verse_ord (chapter-only supported)
 //   GET  /books
 //   GET  /chapters/:bookId
-//   GET  /chapter/:bookId/:chapter
+//   GET  /chapter/:bookId/:chapter    -> legacy chapter payload (still supported)
 //   GET  /search?q=...
 //   GET  /people/:id
 //   GET  /places/:id
 //   GET  /events/:id
 //
 // Notes:
-// - /chapter returns { verses, ranges, links, crossrefs } and keeps legacy fields
-//   { marks, mentions, footnotes } as empty arrays for transition safety.
+// - verse_ord in bp_verse is the global canonical scroll axis.
+// - /slice is designed for @tanstack/react-virtual: index = verseOrd - 1.
+// - /chapter still returns { ranges, links, crossrefs } + legacy placeholders.
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { compress } from "hono/compress";
 import { etag } from "hono/etag";
 import { z } from "zod";
-import { and, asc, eq, like, sql as dsql, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, like, sql as dsql, inArray } from "drizzle-orm";
 
 import { db, sqlite } from "./db/client";
 import {
@@ -58,48 +55,48 @@ const PORT = Number(process.env.PORT ?? "3000");
 // Prefer explicit env, else fall back to DB default translation (bp_translation.is_default)
 const ENV_TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "").trim();
 
+// CORS (dev-friendly default). In practice, Vite proxy means CORS is rarely used in dev.
+const CORS_ORIGIN = (process.env.BP_CORS_ORIGIN ?? "*").trim();
+
 /* --------------------------------- Helpers -------------------------------- */
 
-type JsonOk<T> = Readonly<{ ok: true; data: T }>;
-type JsonErr = Readonly<{ ok: false; error: { code: string; message: string } }>;
+type ApiOk<T> = Readonly<{ ok: true; data: T }>;
+type ApiErr = Readonly<{ ok: false; error: { code: string; message: string } }>;
 
-function jsonOk<T>(c: any, data: T, extraHeaders?: Record<string, string>) {
-    if (extraHeaders) {
-        for (const [k, v] of Object.entries(extraHeaders)) c.header(k, v);
-    }
-    const body: JsonOk<T> = { ok: true, data };
-    return c.json(body);
+function jsonOk<T>(c: Context, data: T, extraHeaders?: Record<string, string>) {
+    if (extraHeaders) for (const [k, v] of Object.entries(extraHeaders)) c.header(k, v);
+    const body: ApiOk<T> = { ok: true, data };
+    // Cast keeps Hono happy without triggering TS deep-instantiation on huge payload types.
+    return c.json(body as any);
 }
 
-function jsonErr(c: any, status: number, code: string, message: string) {
-    const body: JsonErr = { ok: false, error: { code, message } };
-    return c.json(body, status);
+function jsonErr(c: Context, status: number, code: string, message: string) {
+    const body: ApiErr = { ok: false, error: { code, message } };
+    // @ts-ignore
+    return c.json(body as any, status);
 }
 
 function clamp(n: number, lo: number, hi: number) {
     return Math.max(lo, Math.min(hi, n));
 }
 
-function cacheNoStore(c: any) {
+function cacheNoStore(c: Context) {
     c.header("Cache-Control", "no-store");
 }
 
-function cachePublic(c: any, seconds: number) {
+function cachePublic(c: Context, seconds: number) {
     c.header("Cache-Control", `public, max-age=${seconds}`);
 }
 
-const RefBookIdSchema = z
-    .string()
-    .min(2)
-    .max(8)
-    .regex(/^[A-Z0-9_]+$/);
-
+const RefBookIdSchema = z.string().min(2).max(8).regex(/^[A-Z0-9_]+$/);
 const ChapterNumSchema = z.coerce.number().int().min(1).max(200);
+const VerseNumSchema = z.coerce.number().int().min(1).max(200);
 
 const SearchQuerySchema = z.string().trim().min(1).max(200);
+const SliceFromSchema = z.coerce.number().int().min(1).max(1_000_000);
+const SliceLimitSchema = z.coerce.number().int().min(1).max(2_000);
 
 let _resolvedTranslationId: string | null = null;
-
 async function resolveTranslationId(): Promise<string | null> {
     if (_resolvedTranslationId) return _resolvedTranslationId;
 
@@ -118,12 +115,47 @@ async function resolveTranslationId(): Promise<string | null> {
     return _resolvedTranslationId;
 }
 
+let _hasFts: boolean | null = null;
 function hasFts(): boolean {
+    if (_hasFts != null) return _hasFts;
+
     const row = sqlite
         .query(`SELECT 1 AS one FROM sqlite_master WHERE type='table' AND name='bp_verse_text_fts' LIMIT 1;`)
         .get() as { one?: number } | undefined;
 
-    return row != null;
+    _hasFts = row != null;
+    return _hasFts;
+}
+
+type SpineStats = Readonly<{ verseOrdMin: number; verseOrdMax: number; verseCount: number }>;
+let _spineStats: SpineStats | null = null;
+
+function getSpineStats(): SpineStats {
+    if (_spineStats) return _spineStats;
+
+    const row = sqlite
+        .query(
+            `
+                SELECT
+                    MIN(verse_ord) AS mn,
+                    MAX(verse_ord) AS mx,
+                    COUNT(*)       AS c
+                FROM bp_verse;
+            `,
+        )
+        .get() as { mn?: number; mx?: number; c?: number } | undefined;
+
+    const mn = Number(row?.mn ?? 0);
+    const mx = Number(row?.mx ?? 0);
+    const c = Number(row?.c ?? 0);
+
+    _spineStats = Object.freeze({
+        verseOrdMin: Number.isFinite(mn) && mn > 0 ? Math.trunc(mn) : 1,
+        verseOrdMax: Number.isFinite(mx) && mx > 0 ? Math.trunc(mx) : 0,
+        verseCount: Number.isFinite(c) && c >= 0 ? Math.trunc(c) : 0,
+    });
+
+    return _spineStats;
 }
 
 type ChapterBounds = Readonly<{
@@ -176,22 +208,62 @@ async function getChapterBounds(bookId: string, chapter: number): Promise<Chapte
     };
 }
 
+async function fetchEntityBase(kind: "PERSON" | "PLACE", id: string) {
+    const ent = await db
+        .select({
+            entityId: bpEntity.entityId,
+            kind: bpEntity.kind,
+            canonicalName: bpEntity.canonicalName,
+            slug: bpEntity.slug,
+            summaryNeutral: bpEntity.summaryNeutral,
+            confidence: bpEntity.confidence,
+            createdAt: bpEntity.createdAt,
+        })
+        .from(bpEntity)
+        .where(and(eq(bpEntity.entityId, id), eq(bpEntity.kind, kind)))
+        .limit(1);
+
+    if (!ent[0]) return null;
+
+    const names = await db
+        .select({
+            entityNameId: bpEntityName.entityNameId,
+            name: bpEntityName.name,
+            language: bpEntityName.language,
+            isPrimary: bpEntityName.isPrimary,
+            source: bpEntityName.source,
+            confidence: bpEntityName.confidence,
+        })
+        .from(bpEntityName)
+        .where(eq(bpEntityName.entityId, id))
+        .orderBy(asc(bpEntityName.name));
+
+    return { entity: ent[0], names };
+}
+
 /* ----------------------------------- App ---------------------------------- */
 
 const app = new Hono();
 
-// Middleware (production-friendly)
 app.use("*", logger());
 app.use("*", compress());
 app.use("*", etag());
 app.use(
     "*",
     cors({
-        origin: "*",
+        origin: CORS_ORIGIN,
         allowHeaders: ["Content-Type"],
-        allowMethods: ["GET", "POST", "OPTIONS"],
+        allowMethods: ["GET", "OPTIONS"],
     }),
 );
+
+app.onError((err, c) => {
+    // eslint-disable-next-line no-console
+    console.error("[api] error:", err);
+    return jsonErr(c, 500, "INTERNAL", "Internal server error.");
+});
+
+/* ---------------------------------- Routes -------------------------------- */
 
 // Health
 app.get("/health", (c) => {
@@ -199,7 +271,7 @@ app.get("/health", (c) => {
     return c.text("ok");
 });
 
-// Meta: translation + search capability
+// Meta: translation + fts + spine stats
 app.get("/meta", async (c) => {
     cacheNoStore(c);
 
@@ -232,7 +304,155 @@ app.get("/meta", async (c) => {
     return jsonOk(c, {
         translation: t[0] ?? { translationId },
         ftsEnabled: hasFts(),
+        spine: getSpineStats(),
     });
+});
+
+// Global spine stats (for virtualization / infinite scroll)
+app.get("/spine", (c) => {
+    cachePublic(c, 30);
+    return jsonOk(c, getSpineStats());
+});
+
+// Contiguous verse window (cross-book), keyed by global verse_ord.
+app.get("/slice", async (c) => {
+    cachePublic(c, 10);
+
+    const translationId = await resolveTranslationId();
+    if (!translationId) {
+        return jsonErr(
+            c,
+            404,
+            "NO_TRANSLATION",
+            "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
+        );
+    }
+
+    const fromP = SliceFromSchema.safeParse(c.req.query("fromOrd") ?? "1");
+    if (!fromP.success) return jsonErr(c, 400, "BAD_FROM", "Invalid fromOrd.");
+
+    const limitP = SliceLimitSchema.safeParse(c.req.query("limit") ?? "240");
+    if (!limitP.success) return jsonErr(c, 400, "BAD_LIMIT", "Invalid limit.");
+
+    const spine = getSpineStats();
+    if (spine.verseOrdMax <= 0) {
+        return jsonOk(c, {
+            translationId,
+            fromOrd: fromP.data,
+            limit: limitP.data,
+            verses: [],
+            done: true,
+            nextFromOrd: null,
+            spine,
+        });
+    }
+
+    const fromOrd = clamp(fromP.data, spine.verseOrdMin, spine.verseOrdMax);
+    const limit = clamp(limitP.data, 1, 2000);
+
+    // Use raw sqlite here: avoids Drizzle TS type-instantiation blowups on joins.
+    const verses = sqlite
+        .query(
+            `
+      SELECT
+        v.verse_key  AS verseKey,
+        v.verse_ord  AS verseOrd,
+        v.book_id    AS bookId,
+        v.chapter    AS chapter,
+        v.verse      AS verse,
+        t.text       AS text,
+        t.updated_at AS updatedAt
+      FROM bp_verse v
+      LEFT JOIN bp_verse_text t
+        ON t.verse_key = v.verse_key
+       AND t.translation_id = ?
+      WHERE v.verse_ord >= ?
+      ORDER BY v.verse_ord
+      LIMIT ?;
+    `,
+        )
+        .all(translationId, fromOrd, limit) as Array<{
+        verseKey: string;
+        verseOrd: number;
+        bookId: string;
+        chapter: number;
+        verse: number;
+        text: string | null;
+        updatedAt: string | null;
+    }>;
+
+    const lastOrd = verses.length ? Number(verses[verses.length - 1]!.verseOrd) : fromOrd - 1;
+    const done = lastOrd >= spine.verseOrdMax || verses.length === 0;
+    const nextFromOrd = done ? null : lastOrd + 1;
+
+    return jsonOk(c, { translationId, fromOrd, limit, verses, done, nextFromOrd, spine });
+});
+
+// Resolve a reference to verse_ord (supports chapter-only).
+app.get("/loc", async (c) => {
+    cachePublic(c, 60);
+
+    const bookIdP = RefBookIdSchema.safeParse((c.req.query("bookId") ?? "").trim());
+    if (!bookIdP.success) return jsonErr(c, 400, "BAD_BOOK", "Invalid bookId.");
+
+    const chapterP = ChapterNumSchema.safeParse(c.req.query("chapter") ?? "");
+    if (!chapterP.success) return jsonErr(c, 400, "BAD_CHAPTER", "Invalid chapter.");
+
+    const verseRaw = (c.req.query("verse") ?? "").trim();
+    const verseP = verseRaw ? VerseNumSchema.safeParse(verseRaw) : null;
+    if (verseP && !verseP.success) return jsonErr(c, 400, "BAD_VERSE", "Invalid verse.");
+
+    const bookId = bookIdP.data;
+    const chapter = chapterP.data;
+
+    if (verseP?.success) {
+        const verse = verseP.data;
+
+        const row = sqlite
+            .query(
+                `
+        SELECT
+          verse_key AS verseKey,
+          verse_ord AS verseOrd,
+          book_id   AS bookId,
+          chapter   AS chapter,
+          verse     AS verse
+        FROM bp_verse
+        WHERE book_id = ?
+          AND chapter = ?
+          AND verse = ?
+        LIMIT 1;
+      `,
+            )
+            .get(bookId, chapter, verse) as
+            | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
+            | undefined;
+
+        return jsonOk(c, row ?? null);
+    }
+
+    // Chapter-only -> first verse in chapter
+    const first = sqlite
+        .query(
+            `
+      SELECT
+        verse_key AS verseKey,
+        verse_ord AS verseOrd,
+        book_id   AS bookId,
+        chapter   AS chapter,
+        verse     AS verse
+      FROM bp_verse
+      WHERE book_id = ?
+        AND chapter = ?
+      ORDER BY verse
+      LIMIT 1;
+    `,
+        )
+        .get(bookId, chapter) as
+        | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
+        | undefined;
+
+    return jsonOk(c, first ?? null);
 });
 
 // Books (canonical order)
@@ -265,7 +485,6 @@ app.get("/chapters/:bookId", async (c) => {
 
     const bookId = bookIdP.data;
 
-    // Prefer bp_chapter rows if present for this book
     const rows = await db
         .select({
             chapter: bpChapter.chapter,
@@ -277,35 +496,10 @@ app.get("/chapters/:bookId", async (c) => {
         .where(eq(bpChapter.bookId, bookId))
         .orderBy(asc(bpChapter.chapter));
 
-    if (rows.length > 0) {
-        return jsonOk(c, { bookId, chapters: rows });
-    }
-
-    // Fallback: compute distinct chapters from bp_verse
-    const chapters = await db
-        .select({
-            chapter: bpVerse.chapter,
-            startVerseOrd: dsql<number>`min(${bpVerse.verseOrd})`.as("start_verse_ord"),
-            endVerseOrd: dsql<number>`max(${bpVerse.verseOrd})`.as("end_verse_ord"),
-            verseCount: dsql<number>`count(*)`.as("verse_count"),
-        })
-        .from(bpVerse)
-        .where(eq(bpVerse.bookId, bookId))
-        .groupBy(bpVerse.chapter)
-        .orderBy(asc(bpVerse.chapter));
-
-    return jsonOk(c, {
-        bookId,
-        chapters: chapters.map((r) => ({
-            chapter: Number(r.chapter),
-            startVerseOrd: Number(r.startVerseOrd),
-            endVerseOrd: Number(r.endVerseOrd),
-            verseCount: Number(r.verseCount),
-        })),
-    });
+    return jsonOk(c, { bookId, chapters: rows });
 });
 
-// Fetch a chapter: verse text + (optional) ranges/links/crossrefs
+// Legacy chapter payload (still useful for orientation graph later)
 app.get("/chapter/:bookId/:chapter", async (c) => {
     cachePublic(c, 30);
 
@@ -331,7 +525,6 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
     const bounds = await getChapterBounds(bookId, chapterNum);
     if (!bounds) return jsonErr(c, 404, "CHAPTER_NOT_FOUND", "Chapter not found in bp_verse.");
 
-    // Verses (join bp_verse -> bp_verse_text)
     const verses = await db
         .select({
             verseKey: bpVerse.verseKey,
@@ -342,14 +535,10 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
             updatedAt: bpVerseText.updatedAt,
         })
         .from(bpVerse)
-        .leftJoin(
-            bpVerseText,
-            and(eq(bpVerseText.verseKey, bpVerse.verseKey), eq(bpVerseText.translationId, translationId)),
-        )
+        .leftJoin(bpVerseText, and(eq(bpVerseText.verseKey, bpVerse.verseKey), eq(bpVerseText.translationId, translationId)))
         .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapterNum)))
         .orderBy(asc(bpVerse.verse));
 
-    // Optional: ranges intersecting this chapter (for orientation graph)
     const ranges = await db
         .select({
             rangeId: bpRange.rangeId,
@@ -360,7 +549,12 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
             label: bpRange.label,
         })
         .from(bpRange)
-        .where(and(dsql`${bpRange.startVerseOrd} <= ${bounds.endVerseOrd}`, dsql`${bpRange.endVerseOrd} >= ${bounds.startVerseOrd}`))
+        .where(
+            and(
+                dsql`${bpRange.startVerseOrd} <= ${bounds.endVerseOrd}`,
+                dsql`${bpRange.endVerseOrd} >= ${bounds.startVerseOrd}`,
+            ),
+        )
         .orderBy(asc(bpRange.startVerseOrd), asc(bpRange.endVerseOrd));
 
     const rangeIds = ranges.map((r) => r.rangeId);
@@ -405,54 +599,22 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
         chapter: chapterNum,
         chapterBounds: bounds,
         verses,
-
-        // Upgraded orientation surfaces:
         ranges,
         links,
         crossrefs,
-
-        // Legacy placeholders (old client expectations; safe-empty):
         marks: [] as unknown[],
         mentions: [] as unknown[],
         footnotes: [] as unknown[],
     });
 });
 
-// Entity endpoints (drawer)
-
-// PERSON
+// PERSON drawer
 app.get("/people/:id", async (c) => {
     cachePublic(c, 60);
     const id = c.req.param("id");
 
-    const ent = await db
-        .select({
-            entityId: bpEntity.entityId,
-            kind: bpEntity.kind,
-            canonicalName: bpEntity.canonicalName,
-            slug: bpEntity.slug,
-            summaryNeutral: bpEntity.summaryNeutral,
-            confidence: bpEntity.confidence,
-            createdAt: bpEntity.createdAt,
-        })
-        .from(bpEntity)
-        .where(and(eq(bpEntity.entityId, id), eq(bpEntity.kind, "PERSON")))
-        .limit(1);
-
-    if (!ent[0]) return jsonOk(c, null);
-
-    const names = await db
-        .select({
-            entityNameId: bpEntityName.entityNameId,
-            name: bpEntityName.name,
-            language: bpEntityName.language,
-            isPrimary: bpEntityName.isPrimary,
-            source: bpEntityName.source,
-            confidence: bpEntityName.confidence,
-        })
-        .from(bpEntityName)
-        .where(eq(bpEntityName.entityId, id))
-        .orderBy(asc(bpEntityName.name));
+    const base = await fetchEntityBase("PERSON", id);
+    if (!base) return jsonOk(c, null);
 
     const relFrom = await db
         .select({
@@ -482,46 +644,16 @@ app.get("/people/:id", async (c) => {
         .from(bpEntityRelation)
         .where(eq(bpEntityRelation.toEntityId, id));
 
-    return jsonOk(c, {
-        entity: ent[0],
-        names,
-        relations: { from: relFrom, to: relTo },
-    });
+    return jsonOk(c, { ...base, relations: { from: relFrom, to: relTo } });
 });
 
-// PLACE (+ geo)
+// PLACE drawer (+ geo)
 app.get("/places/:id", async (c) => {
     cachePublic(c, 60);
     const id = c.req.param("id");
 
-    const ent = await db
-        .select({
-            entityId: bpEntity.entityId,
-            kind: bpEntity.kind,
-            canonicalName: bpEntity.canonicalName,
-            slug: bpEntity.slug,
-            summaryNeutral: bpEntity.summaryNeutral,
-            confidence: bpEntity.confidence,
-            createdAt: bpEntity.createdAt,
-        })
-        .from(bpEntity)
-        .where(and(eq(bpEntity.entityId, id), eq(bpEntity.kind, "PLACE")))
-        .limit(1);
-
-    if (!ent[0]) return jsonOk(c, null);
-
-    const names = await db
-        .select({
-            entityNameId: bpEntityName.entityNameId,
-            name: bpEntityName.name,
-            language: bpEntityName.language,
-            isPrimary: bpEntityName.isPrimary,
-            source: bpEntityName.source,
-            confidence: bpEntityName.confidence,
-        })
-        .from(bpEntityName)
-        .where(eq(bpEntityName.entityId, id))
-        .orderBy(asc(bpEntityName.name));
+    const base = await fetchEntityBase("PLACE", id);
+    if (!base) return jsonOk(c, null);
 
     const geos = await db
         .select({
@@ -538,10 +670,10 @@ app.get("/places/:id", async (c) => {
         .from(bpPlaceGeo)
         .where(eq(bpPlaceGeo.entityId, id));
 
-    return jsonOk(c, { entity: ent[0], names, geos });
+    return jsonOk(c, { ...base, geos });
 });
 
-// EVENT (+ participants)
+// EVENT drawer (+ participants)
 app.get("/events/:id", async (c) => {
     cachePublic(c, 60);
     const id = c.req.param("id");
@@ -598,21 +730,19 @@ app.get("/search", async (c) => {
     }
 
     if (hasFts()) {
-        // Join FTS rowid -> bp_verse_text.rowid -> bp_verse by verse_key
-        // snippet column index: 2 (text)
         const rows = sqlite
             .query(
                 `
         SELECT
-          v.book_id  AS bookId,
-          v.chapter  AS chapter,
-          v.verse    AS verse,
-          v.verse_key AS verseKey,
-          v.verse_ord AS verseOrd,
+          v.book_id    AS bookId,
+          v.chapter    AS chapter,
+          v.verse      AS verse,
+          v.verse_key  AS verseKey,
+          v.verse_ord  AS verseOrd,
           snippet(bp_verse_text_fts, 2, '‹', '›', '…', 24) AS snippet
         FROM bp_verse_text_fts
         JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
-        JOIN bp_verse v ON v.verse_key = t.verse_key
+        JOIN bp_verse v      ON v.verse_key = t.verse_key
         WHERE bp_verse_text_fts MATCH ?
           AND t.translation_id = ?
         ORDER BY bm25(bp_verse_text_fts)
@@ -631,7 +761,6 @@ app.get("/search", async (c) => {
         return jsonOk(c, { q, mode: "fts" as const, results: rows });
     }
 
-    // LIKE fallback
     const likeQ = `%${q}%`;
     const rows = await db
         .select({
@@ -645,6 +774,7 @@ app.get("/search", async (c) => {
         .from(bpVerseText)
         .innerJoin(bpVerse, eq(bpVerse.verseKey, bpVerseText.verseKey))
         .where(and(eq(bpVerseText.translationId, translationId), like(bpVerseText.text, likeQ)))
+        .orderBy(desc(bpVerse.verseOrd))
         .limit(limit);
 
     const results = rows.map((r) => ({
@@ -653,22 +783,23 @@ app.get("/search", async (c) => {
         verse: r.verse,
         verseKey: r.verseKey,
         verseOrd: r.verseOrd,
-        snippet: r.text.length > 200 ? r.text.slice(0, 197) + "…" : r.text,
+        snippet: (r.text ?? "").length > 200 ? (r.text ?? "").slice(0, 197) + "…" : (r.text ?? ""),
     }));
 
     return jsonOk(c, { q, mode: "like" as const, results });
 });
 
-/* --------------------------------- 404 ---------------------------------- */
-
 app.notFound((c) => jsonErr(c, 404, "NOT_FOUND", "Route not found."));
-
-/* --------------------------------- Start ---------------------------------- */
 
 export default {
     port: PORT,
     fetch: app.fetch,
 };
 
+const spine = getSpineStats();
+// eslint-disable-next-line no-console
 console.log(`[api] listening on http://localhost:${PORT}`);
-console.log(`[api] translation=${ENV_TRANSLATION_ID || "(db default)"} fts=${hasFts() ? "on" : "off"}`);
+// eslint-disable-next-line no-console
+console.log(
+    `[api] translation=${ENV_TRANSLATION_ID || "(db default)"} fts=${hasFts() ? "on" : "off"} verses=${spine.verseCount} ordMax=${spine.verseOrdMax}`,
+);

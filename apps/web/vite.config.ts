@@ -27,6 +27,9 @@ export default defineConfig({
       "/chapters": { target: API_TARGET, changeOrigin: true },
       "/chapter": { target: API_TARGET, changeOrigin: true },
       "/search": { target: API_TARGET, changeOrigin: true },
+      "/spine": { target: API_TARGET, changeOrigin: true },
+      "/slice": { target: API_TARGET, changeOrigin: true },
+      "/loc": { target: API_TARGET, changeOrigin: true },
 
       // Entity drawers (future)
       "/people": { target: API_TARGET, changeOrigin: true },

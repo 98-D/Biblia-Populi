@@ -1,74 +1,72 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+// apps/web/src/App.tsx
+import React, { useCallback, useState } from "react";
 import { LearnMorePage } from "./LearnMorePage";
 import { Reader } from "./Reader";
 import { Search, type ReaderLocation } from "./Search";
-
-type Mode = "light" | "dark";
-
-function useTheme() {
-  const [mode, setMode] = useState<Mode>(() => {
-    const saved = localStorage.getItem("bp_theme");
-    if (saved === "light" || saved === "dark") return saved;
-    return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
-  });
-
-  useEffect(() => {
-    document.documentElement.setAttribute("data-theme", mode);
-    localStorage.setItem("bp_theme", mode);
-
-    const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute("content", mode === "dark" ? "#0b0b0c" : "#fbfbfc");
-  }, [mode]);
-
-  function toggle(): void {
-    setMode((m) => (m === "dark" ? "light" : "dark"));
-  }
-
-  return { mode, toggle };
-}
+import { ThemeProvider, ThemeShell, ThemeTogglePill, useTheme } from "./theme";
 
 type Page = "home" | "learn" | "reader";
 
 export default function App() {
+  return (
+      <ThemeProvider>
+        <AppInner />
+      </ThemeProvider>
+  );
+}
+
+function AppInner() {
   const { mode, toggle } = useTheme();
+
   const [page, setPage] = useState<Page>("home");
   const [readerLoc, setReaderLoc] = useState<ReaderLocation | null>(null);
 
-  const themeVars = useMemo(() => getThemeVars(mode), [mode]);
+  const goHome = useCallback(() => setPage("home"), []);
+  const goLearn = useCallback(() => setPage("learn"), []);
+  const goReader = useCallback(() => setPage("reader"), []);
+
+  const startReading = useCallback(() => {
+    setReaderLoc({ bookId: "GEN", chapter: 1 });
+    goReader();
+  }, [goReader]);
+
+  const navigateTo = useCallback(
+      (loc: ReaderLocation) => {
+        setReaderLoc(loc);
+        goReader();
+      },
+      [goReader],
+  );
 
   return (
-      <div style={{ ...styles.page, ...themeVars }}>
+      <ThemeShell style={styles.page}>
         {page === "home" ? (
             <Home
                 mode={mode}
                 onToggleTheme={toggle}
-                onLearnMore={() => setPage("learn")}
-                onStartReading={() => {
-                  setReaderLoc({ bookId: "GEN", chapter: 1 });
-                  setPage("reader");
-                }}
-                onNavigate={(loc) => {
-                  setReaderLoc(loc);
-                  setPage("reader");
-                }}
+                onLearnMore={goLearn}
+                onStartReading={startReading}
+                onNavigate={navigateTo}
             />
         ) : page === "learn" ? (
-            <LearnMorePage mode={mode} onToggleTheme={toggle} onBack={() => setPage("home")} styles={styles} />
+            <LearnMorePage mode={mode} onToggleTheme={toggle} onBack={goHome} styles={styles} />
         ) : (
             <Reader
                 styles={styles}
                 initialLocation={readerLoc ?? undefined}
-                onBackHome={() => setPage("home")}
+                onBackHome={goHome}
+                mode={mode}
+                onToggleTheme={toggle}
             />
         )}
-      </div>
+      </ThemeShell>
   );
 }
 
 /* ---------------- Home ---------------- */
 
 function Home(props: {
-  mode: Mode;
+  mode: "light" | "dark";
   onToggleTheme: () => void;
   onLearnMore: () => void;
   onStartReading: () => void;
@@ -94,7 +92,7 @@ function Home(props: {
   return (
       <main style={styles.centerStage} aria-label="Landing">
         <div style={styles.cornerControls} aria-label="Landing controls">
-          <ThemeToggle mode={mode} onToggle={onToggleTheme} />
+          <ThemeTogglePill styles={styles} mode={mode} onToggle={onToggleTheme} />
         </div>
 
         <div className="container" style={styles.centerInner}>
@@ -150,51 +148,6 @@ function Home(props: {
         </div>
       </main>
   );
-}
-
-function ThemeToggle(props: { mode: Mode; onToggle: () => void }) {
-  const { mode, onToggle } = props;
-
-  return (
-      <button
-          type="button"
-          onClick={onToggle}
-          style={styles.themePill}
-          aria-label={mode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-          title={mode === "dark" ? "Light" : "Dark"}
-      >
-        <span style={{ ...styles.themeDot, transform: mode === "dark" ? "translateX(16px)" : "translateX(0px)" }} />
-      </button>
-  );
-}
-
-/* ---------------- Theme Vars ---------------- */
-
-function getThemeVars(mode: Mode): React.CSSProperties {
-  if (mode === "dark") {
-    return {
-      ["--bg" as any]: "#0b0b0c",
-      ["--panel" as any]: "rgba(255,255,255,0.045)",
-      ["--fg" as any]: "#f4f3f1",
-      ["--muted" as any]: "rgba(244,243,241,0.62)",
-      ["--hairline" as any]: "rgba(255,255,255,0.10)",
-      ["--shadow" as any]: "0 18px 60px rgba(0,0,0,0.45)",
-      ["--shadowSoft" as any]: "0 10px 34px rgba(0,0,0,0.34)",
-      ["--focus" as any]: "rgba(255,255,255,0.22)",
-      ["--focusRing" as any]: "rgba(255,255,255,0.12)",
-    };
-  }
-  return {
-    ["--bg" as any]: "#fbfbfc",
-    ["--panel" as any]: "rgba(0,0,0,0.028)",
-    ["--fg" as any]: "#0b0b0c",
-    ["--muted" as any]: "rgba(11,11,12,0.56)",
-    ["--hairline" as any]: "rgba(0,0,0,0.10)",
-    ["--shadow" as any]: "0 18px 60px rgba(0,0,0,0.12)",
-    ["--shadowSoft" as any]: "0 10px 34px rgba(0,0,0,0.10)",
-    ["--focus" as any]: "rgba(0,0,0,0.16)",
-    ["--focusRing" as any]: "rgba(0,0,0,0.10)",
-  };
 }
 
 /* ---------------- Styles ---------------- */
