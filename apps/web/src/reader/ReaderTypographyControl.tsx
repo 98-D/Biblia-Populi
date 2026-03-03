@@ -54,8 +54,8 @@ function IconAa() {
 function IconFont() {
     return (
         <span style={{ fontFamily: "ui-serif, Georgia, serif", fontStyle: "italic", fontWeight: 650 }}>
-      f
-    </span>
+            f
+        </span>
     );
 }
 function IconWeight() {
@@ -77,20 +77,53 @@ function nextOf<T>(arr: readonly T[], current: T, dir: 1 | -1): T {
     return arr[n]!;
 }
 
-// IMPORTANT: fontOptions() only guarantees { id, label }.
-// We preview by setting font-family to the TypographyFont id, then fall back.
-function fontFamilyFor(id: TypographyFont): string {
-    return `"${id}", ui-serif, Georgia, Cambria, "Times New Roman", serif`;
+/**
+ * We support BOTH:
+ * - updated typography.ts: fontOptions() returns { id, label, cssFamily }
+ * - older typography.ts: fontOptions() returns { id, label } only
+ */
+type FontOpt = ReturnType<typeof fontOptions>[number] & {
+    cssFamily?: string; // preferred (maps to FONT_PRESETS[k].css)
+    family?: string; // tolerated legacy
+};
+
+function fontFamilyForOpt(f: FontOpt): string {
+    const fam = (f.cssFamily ?? f.family ?? String(f.id)).trim();
+    if (fam.includes(",") || fam.startsWith("var(") || fam.startsWith("ui-") || fam.includes("system-ui")) return fam;
+    return `"${fam}", ui-serif, Georgia, Cambria, "Times New Roman", serif`;
 }
 
 function previewBlurb(): string {
-    return "In the beginning";
+    // Slightly longer so you can judge rhythm; we clamp to 3 lines now.
+    return "In the beginning God created the heaven and the earth. And the earth was without form, and void; and darkness was upon the face of the deep.";
 }
 
-/** Single-card “carousel” font picker: center active, neighbors blurred and smaller. */
+/** Single-card “carousel” font picker */
 function clampIndex(i: number, len: number): number {
     if (len <= 0) return 0;
     return ((i % len) + len) % len;
+}
+
+function useInjectOnceStyle(cssText: string, attr: string): void {
+    useEffect(() => {
+        if (typeof document === "undefined") return;
+
+        const existing = document.querySelector(`style[${attr}]`);
+        if (existing) return;
+
+        const el = document.createElement("style");
+        el.setAttribute(attr, "1");
+        el.textContent = cssText;
+        document.head.appendChild(el);
+
+        return () => el.remove();
+    }, [cssText, attr]);
+}
+
+/** helps avoid floating drift when step is 0.01 etc */
+function dirStep(step: number): number {
+    if (Number.isInteger(step)) return step;
+    return Number(step.toFixed(2));
 }
 
 export function ReaderTypographyControl() {
@@ -107,7 +140,31 @@ export function ReaderTypographyControl() {
     const panelRef = useRef<HTMLDivElement | null>(null);
 
     const limits = useMemo(() => typographyLimits(), []);
-    const fonts = useMemo(() => fontOptions(), []);
+    const fonts = useMemo(() => fontOptions() as FontOpt[], []);
+
+    // Keyframes + small helpers for multi-line clamp (once)
+    useInjectOnceStyle(
+        `
+@keyframes bpTypographyPop {
+  from { opacity: 0; transform: translateY(6px) scale(0.985); }
+  to   { opacity: 1; transform: translateY(0px) scale(1); }
+}
+/* 2/3-line clamp utilities */
+[data-bp-lines="2"]{
+  display:-webkit-box;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:2;
+  overflow:hidden;
+}
+[data-bp-lines="3"]{
+  display:-webkit-box;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:3;
+  overflow:hidden;
+}
+`,
+        "data-bp-typography-keyframes",
+    );
 
     const tabs: TabSpec[] = useMemo(
         () => [
@@ -223,7 +280,7 @@ export function ReaderTypographyControl() {
         return () => document.removeEventListener("pointerdown", onPointerDown, { capture: true } as any);
     }, [open, closePanel]);
 
-    // Keyboard: Escape + arrows (font picker: left/right hop fonts)
+    // Keyboard: Escape + arrows
     useEffect(() => {
         if (!open) return;
 
@@ -238,14 +295,14 @@ export function ReaderTypographyControl() {
             // Font tab: left/right hop fonts.
             if (activeId === "font" && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
                 if (!isActuallyEnabled || fonts.length === 0) return;
-                const ids = fonts.map((f) => f.id);
+                const ids = fonts.map((f) => f.id) as TypographyFont[];
                 const dir: 1 | -1 = e.key === "ArrowRight" ? 1 : -1;
                 setPatch({ font: nextOf(ids, t.font, dir) });
                 e.preventDefault();
                 return;
             }
 
-            // Left/right on panel: switch tabs.
+            // Left/right: switch tabs.
             if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
                 const ids = tabs.map((x) => x.id);
                 const dir: 1 | -1 = e.key === "ArrowRight" ? 1 : -1;
@@ -277,8 +334,6 @@ export function ReaderTypographyControl() {
     }, [open]);
 
     const onToggle = useCallback(() => setOpen((v) => !v), []);
-    const onClose = useCallback(() => closePanel(), [closePanel]);
-
     const toggleEnabled = useCallback(() => setEnabled((v) => !v), []);
     const onReset = useCallback(() => resetToDefaults(), [resetToDefaults]);
 
@@ -292,42 +347,46 @@ export function ReaderTypographyControl() {
         return idx >= 0 ? idx : 0;
     }, [fonts, t.font]);
 
-    const prevFont = useMemo(() => {
-        if (fonts.length === 0) return null;
-        return fonts[clampIndex(fontIndex - 1, fonts.length)]!;
-    }, [fonts, fontIndex]);
-
-    const curFont = useMemo(() => {
-        if (fonts.length === 0) return null;
-        return fonts[clampIndex(fontIndex, fonts.length)]!;
-    }, [fonts, fontIndex]);
-
-    const nextFont = useMemo(() => {
-        if (fonts.length === 0) return null;
-        return fonts[clampIndex(fontIndex + 1, fonts.length)]!;
-    }, [fonts, fontIndex]);
+    const prevFont = useMemo(
+        () => (fonts.length ? fonts[clampIndex(fontIndex - 1, fonts.length)]! : null),
+        [fonts, fontIndex],
+    );
+    const curFont = useMemo(() => (fonts.length ? fonts[clampIndex(fontIndex, fonts.length)]! : null), [fonts, fontIndex]);
+    const nextFont = useMemo(
+        () => (fonts.length ? fonts[clampIndex(fontIndex + 1, fonts.length)]! : null),
+        [fonts, fontIndex],
+    );
 
     const hopFont = useCallback(
         (dir: -1 | 1) => {
             if (!isActuallyEnabled || fonts.length === 0) return;
-            const ids = fonts.map((f) => f.id);
+            const ids = fonts.map((f) => f.id) as TypographyFont[];
             setPatch({ font: nextOf(ids, t.font, dir) });
         },
         [fonts, isActuallyEnabled, setPatch, t.font],
     );
 
+    // Preview style (smaller text + more lines + less “waste”)
     const previewStyleFor = useCallback(
-        (fontId: TypographyFont, role: "prev" | "cur" | "next"): React.CSSProperties => {
+        (fontOpt: FontOpt, role: "prev" | "cur" | "next"): React.CSSProperties => {
             const isCur = role === "cur";
             return {
-                fontFamily: fontFamilyFor(fontId),
-                fontSize: isCur ? 14.4 : 13.2,
-                fontWeight: isCur ? 790 : 660,
+                fontFamily: fontFamilyForOpt(fontOpt),
+
+                // ↓ Key change: smaller preview text so you can see more
+                fontSize: isCur ? 12.2 : 11.4,
+                fontWeight: isCur ? 740 : 640,
+
                 letterSpacing: "-0.01em",
-                lineHeight: 1.06,
+                lineHeight: isCur ? 1.24 : 1.2,
+
+                textRendering: "optimizeLegibility",
+                WebkitFontSmoothing: "antialiased",
+                MozOsxFontSmoothing: "grayscale",
+
                 opacity: isCur ? 1 : 0.62,
-                filter: isCur ? "none" : "blur(0.75px)",
-                transform: isCur ? "translateY(-1px) scale(1.0)" : "translateY(0px) scale(0.92)",
+                filter: isCur ? "none" : "blur(0.5px)",
+                transform: isCur ? "translateY(0px) scale(1.0)" : "translateY(0px) scale(0.94)",
                 transition: reducedMotion
                     ? "none"
                     : "transform 220ms cubic-bezier(0.23, 1, 0.32, 1), opacity 220ms ease, filter 220ms ease",
@@ -336,10 +395,11 @@ export function ReaderTypographyControl() {
         [reducedMotion],
     );
 
-    const switchThumbTransform = isActuallyEnabled ? "translateX(12px)" : "translateX(0px)";
     const switchTrackBg = isActuallyEnabled
         ? "color-mix(in oklab, var(--focus) 86%, transparent)"
         : "color-mix(in oklab, var(--panel) 92%, transparent)";
+
+    const switchThumbTransform = isActuallyEnabled ? "translateX(12px)" : "translateX(0px)";
 
     return (
         <div ref={rootRef} style={sx.root}>
@@ -357,16 +417,19 @@ export function ReaderTypographyControl() {
                 aria-label="Typography settings"
                 title={`Typography (${summary})`}
             >
-        <span style={sx.triggerGlyph}>
-          <IconAa />
-        </span>
+                <span style={sx.triggerGlyph}>
+                    <IconAa />
+                </span>
                 <span style={{ ...sx.dot, ...(isActuallyEnabled ? sx.dotOn : sx.dotOff) }} aria-hidden />
             </button>
 
             {open && (
                 <div
                     ref={panelRef}
-                    style={{ ...sx.panel, ...(reducedMotion ? sx.panelNoMotion : {}) }}
+                    style={{
+                        ...sx.panel,
+                        ...(reducedMotion ? sx.panelNoMotion : {}),
+                    }}
                     role="dialog"
                     aria-label="Typography settings"
                     tabIndex={-1}
@@ -381,21 +444,19 @@ export function ReaderTypographyControl() {
                         </div>
 
                         <div style={sx.headerRight}>
-                            <button
-                                type="button"
-                                onClick={toggleEnabled}
-                                style={{
-                                    ...sx.switch,
-                                    ...(isActuallyEnabled ? sx.switchOn : sx.switchOff),
-                                }}
-                                aria-label={isActuallyEnabled ? "Turn typography overrides off" : "Turn typography overrides on"}
-                                title={isActuallyEnabled ? "Overrides on" : "Overrides off"}
-                            >
+                            <label style={sx.switchLabel} title={isActuallyEnabled ? "Overrides on" : "Overrides off"}>
+                                <input
+                                    type="checkbox"
+                                    checked={isActuallyEnabled}
+                                    onChange={toggleEnabled}
+                                    style={sx.switchInput}
+                                    aria-label={isActuallyEnabled ? "Turn typography overrides off" : "Turn typography overrides on"}
+                                />
                                 <span style={{ ...sx.switchTrack, background: switchTrackBg }} aria-hidden />
                                 <span style={{ ...sx.switchThumb, transform: switchThumbTransform }} aria-hidden />
-                            </button>
+                            </label>
 
-                            <button type="button" onClick={onClose} style={sx.closeBtn} aria-label="Close">
+                            <button type="button" onClick={closePanel} style={sx.closeBtn} aria-label="Close">
                                 <IconX />
                             </button>
                         </div>
@@ -439,9 +500,9 @@ export function ReaderTypographyControl() {
                                     title="Previous font"
                                     disabled={!isActuallyEnabled || fonts.length === 0}
                                 >
-                  <span style={sx.chevGlyph} aria-hidden>
-                    ‹
-                  </span>
+                                    <span style={sx.chevGlyph} aria-hidden>
+                                        ‹
+                                    </span>
                                 </button>
 
                                 <div style={sx.fontStage} aria-label="Font previews">
@@ -451,7 +512,7 @@ export function ReaderTypographyControl() {
                                                 <div style={sx.fontMetaRow}>
                                                     <span style={sx.fontName}>{prevFont.label}</span>
                                                 </div>
-                                                <div style={{ ...sx.fontPreview, ...previewStyleFor(prevFont.id, "prev") }}>
+                                                <div style={{ ...sx.fontPreview, ...previewStyleFor(prevFont, "prev") }} data-bp-lines="3">
                                                     {previewBlurb()}
                                                 </div>
                                             </div>
@@ -480,7 +541,10 @@ export function ReaderTypographyControl() {
                                                     <span style={{ ...sx.fontName, ...sx.fontNameActive }}>{curFont.label}</span>
                                                     <span style={sx.fontActiveDot} aria-hidden />
                                                 </div>
-                                                <div style={{ ...sx.fontPreview, ...previewStyleFor(curFont.id, "cur") }}>
+                                                <div
+                                                    style={{ ...sx.fontPreviewActive, ...previewStyleFor(curFont, "cur") }}
+                                                    data-bp-lines="3"
+                                                >
                                                     {previewBlurb()}
                                                 </div>
                                             </div>
@@ -493,7 +557,7 @@ export function ReaderTypographyControl() {
                                                 <div style={sx.fontMetaRow}>
                                                     <span style={sx.fontName}>{nextFont.label}</span>
                                                 </div>
-                                                <div style={{ ...sx.fontPreview, ...previewStyleFor(nextFont.id, "next") }}>
+                                                <div style={{ ...sx.fontPreview, ...previewStyleFor(nextFont, "next") }} data-bp-lines="3">
                                                     {previewBlurb()}
                                                 </div>
                                             </div>
@@ -512,18 +576,18 @@ export function ReaderTypographyControl() {
                                     title="Next font"
                                     disabled={!isActuallyEnabled || fonts.length === 0}
                                 >
-                  <span style={sx.chevGlyph} aria-hidden>
-                    ›
-                  </span>
+                                    <span style={sx.chevGlyph} aria-hidden>
+                                        ›
+                                    </span>
                                 </button>
                             </div>
                         ) : activeSlider ? (
                             <>
                                 <div style={sx.sliderTop}>
                                     <div style={sx.sliderLabelGroup}>
-                    <span style={sx.sliderIcon} aria-hidden>
-                      {tabs.find((x) => x.id === activeId)?.icon}
-                    </span>
+                                        <span style={sx.sliderIcon} aria-hidden>
+                                            {tabs.find((x) => x.id === activeId)?.icon}
+                                        </span>
                                         <span style={sx.sliderLabel}>{activeLabel}</span>
                                     </div>
 
@@ -552,7 +616,7 @@ export function ReaderTypographyControl() {
                                         onClick={() => {
                                             if (!isActuallyEnabled) return;
                                             const cur = activeSlider.get(t);
-                                            const next = clampNum(cur - activeSlider.step, activeSlider.min, activeSlider.max);
+                                            const next = clampNum(cur - dirStep(activeSlider.step), activeSlider.min, activeSlider.max);
                                             setPatch(activeSlider.set(next));
                                         }}
                                         disabled={!isActuallyEnabled}
@@ -574,7 +638,7 @@ export function ReaderTypographyControl() {
                                         onClick={() => {
                                             if (!isActuallyEnabled) return;
                                             const cur = activeSlider.get(t);
-                                            const next = clampNum(cur + activeSlider.step, activeSlider.min, activeSlider.max);
+                                            const next = clampNum(cur + dirStep(activeSlider.step), activeSlider.min, activeSlider.max);
                                             setPatch(activeSlider.set(next));
                                         }}
                                         disabled={!isActuallyEnabled}
@@ -605,6 +669,9 @@ export function ReaderTypographyControl() {
     );
 }
 
+// ---- sizing tweaks: wider panel + bigger cards (more horizontal space) ----
+const PANEL_W = 380; // was 300
+
 const sx: Record<string, React.CSSProperties> = {
     root: { position: "relative", display: "inline-flex", alignItems: "center" },
 
@@ -624,6 +691,7 @@ const sx: Record<string, React.CSSProperties> = {
             "transform 220ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 220ms cubic-bezier(0.23, 1, 0.32, 1), border-color 180ms ease, background 180ms ease",
         position: "relative",
         outline: "none",
+        WebkitTapHighlightColor: "transparent",
     },
     triggerOpen: {
         transform: "translateY(-2px) scale(1.03)",
@@ -654,7 +722,8 @@ const sx: Record<string, React.CSSProperties> = {
         position: "absolute",
         right: 0,
         top: 46,
-        width: 292,
+        width: PANEL_W,
+        maxWidth: "min(420px, calc(100vw - 24px))", // safe on small screens
         borderRadius: 16,
         border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
         background: "var(--bg)",
@@ -693,7 +762,7 @@ const sx: Record<string, React.CSSProperties> = {
         overflow: "hidden",
         textOverflow: "ellipsis",
         whiteSpace: "nowrap",
-        maxWidth: 198,
+        maxWidth: 270, // was 204 (wider panel)
     },
     headerRight: { display: "flex", alignItems: "center", gap: 6 },
 
@@ -709,12 +778,12 @@ const sx: Record<string, React.CSSProperties> = {
         justifyContent: "center",
         cursor: "pointer",
         transition: "all 160ms ease",
+        WebkitTapHighlightColor: "transparent",
     },
 
-    // Cleaner switch: explicit track + thumb, no mystery bg.
-    switch: {
+    switchLabel: {
         position: "relative",
-        width: 38,
+        width: 40,
         height: 26,
         borderRadius: 999,
         border: "1px solid var(--hairline)",
@@ -725,17 +794,21 @@ const sx: Record<string, React.CSSProperties> = {
         alignItems: "center",
         justifyContent: "center",
         overflow: "hidden",
+        userSelect: "none",
+        WebkitTapHighlightColor: "transparent",
     },
-    switchOn: {
-        borderColor: "color-mix(in oklab, var(--focus) 55%, var(--hairline))",
+    switchInput: {
+        position: "absolute",
+        inset: 0,
+        opacity: 0,
+        cursor: "pointer",
     },
-    switchOff: {},
     switchTrack: {
         position: "absolute",
         inset: 0,
         borderRadius: 999,
-        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
         transition: "background 180ms ease",
+        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
     },
     switchThumb: {
         position: "absolute",
@@ -744,7 +817,8 @@ const sx: Record<string, React.CSSProperties> = {
         width: 20,
         height: 20,
         borderRadius: 999,
-        background: "#fff",
+        background: "var(--bg)",
+        border: "1px solid color-mix(in oklab, var(--hairline) 70%, transparent)",
         boxShadow: "0 6px 14px rgba(0,0,0,0.16)",
         transition: "transform 180ms cubic-bezier(0.23, 1, 0.32, 1)",
     },
@@ -773,6 +847,7 @@ const sx: Record<string, React.CSSProperties> = {
         transition: "all 200ms cubic-bezier(0.23, 1, 0.32, 1)",
         userSelect: "none",
         outline: "none",
+        WebkitTapHighlightColor: "transparent",
     },
     tabIcon: { opacity: 0.92, transform: "translateY(-0.25px)" },
     tabActive: {
@@ -788,7 +863,7 @@ const sx: Record<string, React.CSSProperties> = {
         borderRadius: 12,
         border: "1px solid var(--hairline)",
         padding: "10px 10px 9px",
-        minHeight: 106,
+        minHeight: 118,
         display: "flex",
         flexDirection: "column",
         gap: 8,
@@ -816,24 +891,20 @@ const sx: Record<string, React.CSSProperties> = {
     },
     disabledText: { fontSize: 11.7, color: "var(--muted)" },
 
-    fontCarousel: {
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-    },
+    fontCarousel: { display: "flex", alignItems: "center", gap: 8 },
     fontStage: {
         position: "relative",
         flex: 1,
-        height: 86,
+        height: 100, // slightly taller so 3 lines doesn't feel cramped
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
         gap: 12,
         overflow: "hidden",
         borderRadius: 12,
+        paddingInline: 2,
     },
 
-    // Cleaner chevrons: no heavy shadow.
     chevBtn: {
         width: 28,
         height: 28,
@@ -846,6 +917,7 @@ const sx: Record<string, React.CSSProperties> = {
         justifyContent: "center",
         transition: "transform 150ms cubic-bezier(0.23, 1, 0.32, 1), background 150ms ease, border-color 150ms ease, opacity 150ms ease",
         userSelect: "none",
+        WebkitTapHighlightColor: "transparent",
     },
     chevGlyph: {
         fontSize: 18,
@@ -855,7 +927,7 @@ const sx: Record<string, React.CSSProperties> = {
     },
 
     fontCard: {
-        width: 156,
+        width: 200, // was 164 (more width = more preview text)
         borderRadius: 12,
         border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
         background: "color-mix(in oklab, var(--bg) 72%, var(--panel))",
@@ -874,22 +946,28 @@ const sx: Record<string, React.CSSProperties> = {
     fontPillInner: { display: "flex", flexDirection: "column", gap: 6, minWidth: 0 },
     fontMetaRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 },
     fontMetaRowActive: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 },
+
     fontName: { fontSize: 11.1, fontWeight: 800, letterSpacing: "0.02em", color: "var(--muted)" },
     fontNameActive: { color: "#fff" },
+
     fontActiveDot: {
         width: 7,
         height: 7,
         borderRadius: 999,
         background: "#fff",
-        boxShadow: "0 0 0 4px rgba(255,255,255,0.14)",
+        boxShadow: "0 0 0 4px rgba(255, 255, 255, 0.14)",
         flexShrink: 0,
     },
+
     fontPreview: {
-        fontSize: 13.6,
-        color: "color-mix(in oklab, var(--text) 90%, var(--muted))",
-        whiteSpace: "nowrap",
+        color: "var(--fg)",
         overflow: "hidden",
-        textOverflow: "ellipsis",
+        wordBreak: "break-word",
+    },
+    fontPreviewActive: {
+        color: "#fff",
+        overflow: "hidden",
+        wordBreak: "break-word",
     },
 
     stageMaskLeft: {
@@ -942,6 +1020,7 @@ const sx: Record<string, React.CSSProperties> = {
         alignItems: "center",
         justifyContent: "center",
         transition: "all 160ms cubic-bezier(0.23, 1, 0.32, 1)",
+        WebkitTapHighlightColor: "transparent",
     },
     nudgeBtnDisabled: { cursor: "not-allowed", opacity: 0.55 },
     nudgeHint: {
@@ -976,6 +1055,7 @@ const sx: Record<string, React.CSSProperties> = {
         cursor: "pointer",
         boxShadow: "0 10px 22px color-mix(in oklab, var(--focus) 22%, transparent)",
         transition: "all 160ms cubic-bezier(0.23, 1, 0.32, 1)",
+        WebkitTapHighlightColor: "transparent",
     },
     footerBtnGhost: {
         height: 34,
@@ -988,5 +1068,6 @@ const sx: Record<string, React.CSSProperties> = {
         padding: "0 14px",
         cursor: "pointer",
         transition: "all 160ms ease",
+        WebkitTapHighlightColor: "transparent",
     },
 };

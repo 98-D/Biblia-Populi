@@ -1,5 +1,5 @@
 // apps/web/src/reader/ReaderShell.tsx
-import React, { useMemo } from "react";
+import React, { memo, useMemo } from "react";
 import type { BookRow } from "../api";
 import type { ReaderLocation } from "../Search";
 import type { Mode } from "../theme";
@@ -19,6 +19,7 @@ type CurrentPos = {
 type Props = {
     styles: Record<string, React.CSSProperties>;
     books: BookRow[] | null;
+
     onBackHome: () => void;
 
     current: CurrentPos;
@@ -31,7 +32,9 @@ type Props = {
     spine: SpineStats | null;
     bookById: Map<string, BookRow>;
 
-    viewportRef: (h: ReaderViewportHandle | null) => void;
+    /** Pass-through ref target for ReaderViewport */
+    viewportRef?: React.Ref<ReaderViewportHandle> | null;
+
     onPosition: (pos: ReaderPosition) => void;
     onError?: (msg: string) => void;
     onReady?: () => void;
@@ -39,38 +42,44 @@ type Props = {
     err?: string | null;
 };
 
-function ErrBanner(props: { msg: string }) {
+const ErrBanner = memo(function ErrBanner(props: { msg: string }) {
+    const outer = useMemo<React.CSSProperties>(
+        () => ({
+            borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+            background: "color-mix(in oklab, var(--bg) 94%, var(--panel))",
+        }),
+        [],
+    );
+
+    const inner = useMemo<React.CSSProperties>(
+        () => ({
+            maxWidth: "var(--bpReaderMeasure, 840px)",
+            marginInline: "auto",
+            padding: "9px 18px",
+        }),
+        [],
+    );
+
     return (
-        <div
-            role="status"
-            aria-live="polite"
-            style={{
-                borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-                background: "color-mix(in oklab, var(--bg) 94%, var(--panel))",
-            }}
-        >
-            <div
-                style={{
-                    maxWidth: "var(--bpReaderMeasure, 840px)",
-                    marginInline: "auto",
-                    padding: "9px 18px",
-                }}
-            >
+        <div role="status" aria-live="polite" style={outer}>
+            <div style={inner}>
                 <div style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "pre-wrap" }}>{props.msg}</div>
             </div>
         </div>
     );
-}
+});
 
-function LoadingBody() {
+const LoadingBody = memo(function LoadingBody() {
     return (
         <div style={sx.body}>
             <div style={{ maxWidth: "var(--bpReaderMeasure, 840px)", marginInline: "auto", padding: "0 18px" }}>
-                <div style={sx.msg}>Loading…</div>
+                <div style={sx.msg} role="status" aria-live="polite">
+                    Loading…
+                </div>
             </div>
         </div>
     );
-}
+});
 
 export function ReaderShell(props: Props) {
     const {
@@ -91,9 +100,6 @@ export function ReaderShell(props: Props) {
         err,
     } = props;
 
-    // Ensure stable identity (helps reduce useless re-renders downstream)
-    const stableTopContent = useMemo(() => null as React.ReactNode, []);
-
     return (
         <main style={sx.page}>
             <ReaderHeader
@@ -111,13 +117,13 @@ export function ReaderShell(props: Props) {
 
             {spine ? (
                 <ReaderViewport
-                    ref={viewportRef}
+                    ref={viewportRef ?? null}
                     spine={spine}
                     bookById={bookById}
                     onPosition={onPosition}
                     onError={onError}
                     onReady={onReady}
-                    topContent={stableTopContent}
+                    topContent={null}
                 />
             ) : (
                 <LoadingBody />

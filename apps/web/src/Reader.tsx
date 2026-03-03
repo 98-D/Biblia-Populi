@@ -1,5 +1,5 @@
 // apps/web/src/Reader.tsx
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiGetBooks, apiGetSpine, apiResolveLoc, type BookRow } from "./api";
 import type { ReaderLocation } from "./Search";
 import type { Mode } from "./theme";
@@ -17,7 +17,8 @@ type Props = {
     onToggleTheme?: () => void;
 };
 
-const LS_LAST_ORD = "bp_last_pos_ord";
+const LS_LAST_ORD = "bp_last_pos_ord_v1";
+const LS_LAST_LOC = "bp_last_pos_loc_v1"; // optional (book/ch/verse), future-proof
 
 function safeGetLS(key: string): string | null {
     try {
@@ -34,6 +35,20 @@ function safeSetLS(key: string, value: string): void {
     }
 }
 
+function clampOrd(ord: number, spine: SpineStats): number {
+    const n = Math.floor(ord);
+    return Math.max(spine.verseOrdMin, Math.min(spine.verseOrdMax, n));
+}
+
+function parseFiniteInt(s: string | null): number | null {
+    if (!s) return null;
+    const n = Number(s);
+    if (!Number.isFinite(n)) return null;
+    return Math.floor(n);
+}
+
+type PendingJump = { ord: number; behavior: "auto" | "smooth" };
+
 export function Reader(props: Props) {
     const { styles, onBackHome, initialLocation, mode, onToggleTheme } = props;
 
@@ -46,8 +61,12 @@ export function Reader(props: Props) {
     const viewportRef = useRef<ReaderViewportHandle | null>(null);
     const [viewportReady, setViewportReady] = useState(false);
 
-    const pendingJumpRef = useRef<{ ord: number; behavior: "auto" | "smooth" } | null>(null);
+    const pendingJumpRef = useRef<PendingJump | null>(null);
+    const didApplyInitialJumpRef = useRef(false);
     const didRestoreRef = useRef(false);
+
+    // If multiple async resolves race (rapid navigation), ignore stale results.
+    const resolveSeqRef = useRef(0);
 
     // Apply typography ASAP on mount (prevents “flash”)
     useEffect(() => {
@@ -90,80 +109,103 @@ export function Reader(props: Props) {
         return `${bookName} ${pos.verse.chapter}:${pos.verse.verse}`;
     }, [spine, pos]);
 
-    async function jumpToRef(bookId: string, chapter: number, verse: number | null, behavior: "auto" | "smooth") {
-        try {
+    const canJumpNow = !!(spine && viewportReady && viewportRef.current);
+
+    const jumpToOrd = useCallback(
+        (ord: number, behavior: "auto" | "smooth") => {
+            if (!spine) return;
+            const clamped = clampOrd(ord, spine);
+
+            if (viewportRef.current && viewportReady) {
+                viewportRef.current.jumpToOrd(clamped, behavior);
+            } else {
+                pendingJumpRef.current = { ord: clamped, behavior };
+            }
+        },
+        [spine, viewportReady],
+    );
+
+    const resolveAndJump = useCallback(
+        async (bookId: string, chapter: number, verse: number | null, behavior: "auto" | "smooth") => {
+            if (!bookId) return;
+
+            // Clear errors on intentional navigation
             setErr(null);
-            const loc = await apiResolveLoc(bookId, chapter, verse);
-            if (!loc?.verseOrd) return;
 
-            if (viewportRef.current && viewportReady) viewportRef.current.jumpToOrd(loc.verseOrd, behavior);
-            else pendingJumpRef.current = { ord: loc.verseOrd, behavior };
-        } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : String(e);
-            setErr(msg);
-        }
-    }
+            const seq = ++resolveSeqRef.current;
+            try {
+                const loc = await apiResolveLoc(bookId, chapter, verse);
+                if (seq !== resolveSeqRef.current) return; // stale
 
-    // Deep-link / incoming location -> jump (auto)
+                if (!loc?.verseOrd) return;
+                jumpToOrd(loc.verseOrd, behavior);
+
+                // Optional: persist last semantic loc (useful for future “resume by ref” UX)
+                safeSetLS(
+                    LS_LAST_LOC,
+                    JSON.stringify({
+                        bookId,
+                        chapter,
+                        verse: verse ?? null,
+                    }),
+                );
+            } catch (e: unknown) {
+                if (seq !== resolveSeqRef.current) return;
+                const msg = e instanceof Error ? e.message : String(e);
+                setErr(msg);
+            }
+        },
+        [jumpToOrd],
+    );
+
+    // Deep-link / incoming location -> jump (auto). Do this ONCE per mount + change.
     useEffect(() => {
+        if (!spine) return;
+
         const loc = initialLocation;
         if (!loc) return;
 
-        let alive = true;
-        (async () => {
-            try {
-                const resolved = await apiResolveLoc(loc.bookId, loc.chapter, loc.verse ?? null);
-                if (!alive) return;
-                if (!resolved?.verseOrd) return;
+        // If initialLocation changes, allow new initial jump (but still once per distinct loc)
+        didApplyInitialJumpRef.current = false;
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [spine, initialLocation?.bookId, initialLocation?.chapter, initialLocation?.verse]);
 
-                if (viewportRef.current && viewportReady) viewportRef.current.jumpToOrd(resolved.verseOrd, "auto");
-                else pendingJumpRef.current = { ord: resolved.verseOrd, behavior: "auto" };
-            } catch {
-                // ignore
-            }
-        })();
+    useEffect(() => {
+        if (!spine) return;
 
-        return () => {
-            alive = false;
-        };
-    }, [initialLocation?.bookId, initialLocation?.chapter, initialLocation?.verse, viewportReady]);
+        const loc = initialLocation;
+        if (!loc) return;
+        if (didApplyInitialJumpRef.current) return;
 
-    // Restore last position if no initialLocation
+        didApplyInitialJumpRef.current = true;
+        void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "auto");
+    }, [spine, initialLocation, resolveAndJump]);
+
+    // Restore last position if no initialLocation (only once)
     useEffect(() => {
         if (!spine) return;
         if (initialLocation) return;
         if (didRestoreRef.current) return;
 
-        const raw = safeGetLS(LS_LAST_ORD);
-        if (!raw) {
+        const ordRaw = parseFiniteInt(safeGetLS(LS_LAST_ORD));
+        if (ordRaw == null) {
             didRestoreRef.current = true;
             return;
         }
 
-        const ord = Number(raw);
-        if (!Number.isFinite(ord)) {
-            didRestoreRef.current = true;
-            return;
-        }
-
-        const clamped = Math.max(spine.verseOrdMin, Math.min(spine.verseOrdMax, Math.floor(ord)));
         didRestoreRef.current = true;
-
-        if (viewportRef.current && viewportReady) viewportRef.current.jumpToOrd(clamped, "auto");
-        else pendingJumpRef.current = { ord: clamped, behavior: "auto" };
-    }, [spine, viewportReady, initialLocation]);
+        jumpToOrd(ordRaw, "auto");
+    }, [spine, initialLocation, jumpToOrd]);
 
     // If we had a pending jump and now we’re ready, perform it once.
     useEffect(() => {
-        if (!spine) return;
-        if (!viewportReady) return;
-        if (!viewportRef.current) return;
+        if (!canJumpNow) return;
 
         const p = pendingJumpRef.current;
         if (!p) return;
         pendingJumpRef.current = null;
-        viewportRef.current.jumpToOrd(p.ord, p.behavior);
-    }, [spine, viewportReady]);
+        viewportRef.current!.jumpToOrd(p.ord, p.behavior);
+    }, [canJumpNow]);
 
     // Persist current position (debounced)
     useEffect(() => {
@@ -171,7 +213,7 @@ export function Reader(props: Props) {
         if (!Number.isFinite(pos.ord)) return;
 
         const id = window.setTimeout(() => {
-            safeSetLS(LS_LAST_ORD, String(pos.ord));
+            safeSetLS(LS_LAST_ORD, String(clampOrd(pos.ord, spine)));
         }, 220);
 
         return () => window.clearTimeout(id);
@@ -189,8 +231,8 @@ export function Reader(props: Props) {
                 chapter: pos.verse?.chapter ?? null,
                 verse: pos.verse?.verse ?? null,
             }}
-            onJumpRef={(b, c, v) => void jumpToRef(b, c, v, "smooth")}
-            onNavigate={(loc) => void jumpToRef(loc.bookId, loc.chapter, loc.verse ?? null, "smooth")}
+            onJumpRef={(b, c, v) => void resolveAndJump(b, c, v, "smooth")}
+            onNavigate={(loc) => void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "smooth")}
             mode={mode}
             onToggleTheme={onToggleTheme}
             spine={spine}

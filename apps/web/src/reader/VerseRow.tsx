@@ -3,11 +3,11 @@ import React, { useCallback, useState } from "react";
 import type { BookRow } from "../api";
 import type { SliceVerse } from "./types";
 import { sx } from "./sx";
+import { BookTitlePage } from "./BookTitlePage";
 
 export const VerseRow = React.memo(function VerseRow(props: { row: SliceVerse; book: BookRow | null }) {
     const { row, book } = props;
 
-    const isChapterStart = row.verse === 1;
     const isBookStart = row.chapter === 1 && row.verse === 1;
 
     const [hovered, setHovered] = useState(false);
@@ -20,21 +20,7 @@ export const VerseRow = React.memo(function VerseRow(props: { row: SliceVerse; b
 
     return (
         <div id={`ord-${row.verseOrd}`} style={{ padding: 0 }}>
-            {isBookStart ? (
-                <div style={sx.bookHeader}>
-                    <div style={sx.bookKicker}>{book?.testament ?? ""}</div>
-                    <div style={sx.bookTitle}>{book?.name ?? row.bookId}</div>
-                </div>
-            ) : null}
-
-            {isChapterStart ? (
-                <div style={sx.chapterHeader}>
-                    <div style={sx.chapterKicker}>SCRIPTURE</div>
-                    <div style={sx.chapterTitle}>
-                        {book?.name ?? row.bookId} {row.chapter}
-                    </div>
-                </div>
-            ) : null}
+            {isBookStart ? <BookTitlePage book={book} bookId={row.bookId} /> : null}
 
             <div
                 style={{
@@ -47,7 +33,6 @@ export const VerseRow = React.memo(function VerseRow(props: { row: SliceVerse; b
             >
                 <div style={sx.verseNum}>{row.verse}</div>
 
-                {/* Focus target: gives keyboard users a real affordance without changing layout */}
                 <div
                     className="scripture"
                     style={sx.verseText}
