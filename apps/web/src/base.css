@@ -5,6 +5,12 @@
     "Apple Color Emoji", "Segoe UI Emoji";
     --font-serif: ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", Times, serif;
 
+    /* Reader typography (scripture text only) */
+    --bpScriptureFont: var(--font-serif);
+    --bpScriptureSize: 18px;
+    --bpScriptureLeading: 1.75;
+    --bpScriptureWeight: 400;
+
     /* Default (Light) */
     --bg: #ffffff;
     --fg: #0b0b0b;
@@ -107,6 +113,7 @@ a:hover {
     background: color-mix(in oklab, var(--fg) 14%, transparent);
 }
 
+/* form controls inherit */
 button,
 input,
 textarea,
@@ -129,51 +136,12 @@ select {
     margin-inline: auto;
 }
 
-/* narrower, centered reading column */
-.container-reading {
+.reading {
     width: min(var(--reading), calc(100% - 32px));
     margin-inline: auto;
 }
 
-.hairline {
-    height: 1px;
-    background: var(--hairline);
-}
-
-.kicker {
-    font-size: 11px;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    color: var(--muted);
-}
-
-/* ---------------- Controls (subtle) ---------------- */
-
-button {
-    -webkit-tap-highlight-color: transparent;
-}
-
-button,
-select,
-input {
-    transition: transform 140ms ease, opacity 140ms ease, border-color 140ms ease, background 140ms ease;
-}
-
-button:active {
-    transform: translateY(1px);
-}
-
-input,
-select,
-textarea {
-    background: transparent;
-}
-
-select {
-    appearance: none;
-}
-
-/* Optional: calm “pill” controls */
+/* calm “pill” controls */
 .surface {
     background: var(--panel);
     border: 1px solid var(--hairline);
@@ -182,17 +150,27 @@ select {
 
 /* ---------------- Reading ---------------- */
 
-.prose,
-.scripture {
+.prose {
     font-family: var(--font-serif);
     font-size: 18px;
     line-height: 1.75;
     color: var(--fg);
 }
 
+.scripture {
+    font-family: var(--bpScriptureFont);
+    font-size: var(--bpScriptureSize);
+    line-height: var(--bpScriptureLeading);
+    font-weight: var(--bpScriptureWeight);
+    color: var(--fg);
+}
+
 @media (max-width: 480px) {
-    .prose,
-    .scripture {
+    :root {
+        --bpScriptureSize: 17px;
+    }
+
+    .prose {
         font-size: 17px;
     }
 }
@@ -202,12 +180,4 @@ select {
     .container [data-landing-grid] {
         grid-template-columns: 1fr !important;
     }
-    .container [data-toc-grid] {
-        grid-template-columns: 1fr !important;
-    }
-}
-
-/* Motion */
-@media (prefers-reduced-motion: reduce) {
-    * { transition: none !important; animation: none !important; }
 }

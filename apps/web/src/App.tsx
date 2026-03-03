@@ -102,10 +102,10 @@ function Home(props: {
             </div>
 
             <h1 style={styles.h1}>Biblia Populi</h1>
-            <div style={styles.latin}>“The Bible of the People”</div>
+
 
             <p style={styles.lede}>
-              A public, open-access Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen.
+              A public, open-access KJV Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen.
             </p>
 
             <Search
