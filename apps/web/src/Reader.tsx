@@ -3,10 +3,9 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { apiGetBooks, apiGetSpine, apiResolveLoc, type BookRow } from "./api";
 import type { ReaderLocation } from "./Search";
 import type { Mode } from "./theme";
-import { ReaderHeader } from "./reader/ReaderHeader";
-import { ReaderViewport, type ReaderViewportHandle } from "./reader/ReaderViewport";
+import { ReaderShell } from "./reader/ReaderShell";
 import type { ReaderPosition, SpineStats } from "./reader/types";
-import { sx } from "./reader/sx";
+import type { ReaderViewportHandle } from "./reader/ReaderViewport";
 
 type Props = {
     styles: Record<string, React.CSSProperties>;
@@ -33,16 +32,17 @@ export function Reader(props: Props) {
     // Load books + spine once
     useEffect(() => {
         let alive = true;
+
         (async () => {
             try {
                 const [b, s] = await Promise.all([apiGetBooks(), apiGetSpine()]);
                 if (!alive) return;
+
                 setBooks(b.books);
                 setSpine(s);
-                setErr(null);
             } catch (e: unknown) {
-                if (!alive) return;
                 const msg = e instanceof Error ? e.message : String(e);
+                if (!alive) return;
                 setErr(msg);
             }
         })();
@@ -116,49 +116,30 @@ export function Reader(props: Props) {
     }, [spine, viewportReady]);
 
     return (
-        <main style={sx.page}>
-            <ReaderHeader
-                styles={styles}
-                books={books}
-                onBackHome={onBackHome}
-                current={{
-                    label: posLabel,
-                    ord: pos.ord,
-                    bookId: pos.verse?.bookId ?? null,
-                    chapter: pos.verse?.chapter ?? null,
-                    verse: pos.verse?.verse ?? null,
-                }}
-                onJumpRef={(b, c, v) => void jumpToRef(b, c, v)}
-                onNavigate={(loc) => void jumpToRef(loc.bookId, loc.chapter, loc.verse ?? null)}
-                mode={mode}
-                onToggleTheme={onToggleTheme}
-            />
-
-            {spine ? (
-                <ReaderViewport
-                    ref={(h) => {
-                        viewportRef.current = h;
-                    }}
-                    spine={spine}
-                    bookById={bookById}
-                    onPosition={setPos}
-                    onError={(m) => setErr(m)}
-                    onReady={() => setViewportReady(true)}
-                    topContent={
-                        <>
-                            {err ? <div style={sx.msg}>{err}</div> : null}
-                            {!spine ? <div style={sx.msg}>Loading…</div> : null}
-                        </>
-                    }
-                />
-            ) : (
-                <div style={sx.body}>
-                    <div style={sx.container}>
-                        {err ? <div style={sx.msg}>{err}</div> : null}
-                        <div style={sx.msg}>Loading…</div>
-                    </div>
-                </div>
-            )}
-        </main>
+        <ReaderShell
+            styles={styles}
+            books={books}
+            onBackHome={onBackHome}
+            current={{
+                label: posLabel,
+                ord: pos.ord,
+                bookId: pos.verse?.bookId ?? null,
+                chapter: pos.verse?.chapter ?? null,
+                verse: pos.verse?.verse ?? null,
+            }}
+            onJumpRef={(b, c, v) => void jumpToRef(b, c, v)}
+            onNavigate={(loc) => void jumpToRef(loc.bookId, loc.chapter, loc.verse ?? null)}
+            mode={mode}
+            onToggleTheme={onToggleTheme}
+            spine={spine}
+            bookById={bookById}
+            viewportRef={(h) => {
+                viewportRef.current = h;
+            }}
+            onPosition={setPos}
+            onError={(m) => setErr(m)}
+            onReady={() => setViewportReady(true)}
+            err={err}
+        />
     );
 }

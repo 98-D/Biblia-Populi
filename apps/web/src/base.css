@@ -1,15 +1,27 @@
 /* apps/web/src/base.css — Biblia Populi (minimal, reading-first) */
 
+/*
+  Fonts:
+  - We self-host Inter / Quicksand / Literata via @fontsource-variable (see main.tsx).
+  - If those packages are missing, this stack gracefully falls back to system fonts.
+*/
+
 :root {
-    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, Arial, "Noto Sans",
+    --font-sans: "Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans",
     "Apple Color Emoji", "Segoe UI Emoji";
-    --font-serif: ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", Times, serif;
+    --font-serif: "Literata Variable", Literata, ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
+    "Times New Roman", Times, serif;
+    --font-rounded: "Quicksand Variable", Quicksand, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans",
+    "Apple Color Emoji", "Segoe UI Emoji";
 
     /* Reader typography (scripture text only) */
     --bpScriptureFont: var(--font-serif);
     --bpScriptureSize: 18px;
     --bpScriptureLeading: 1.75;
     --bpScriptureWeight: 400;
+
+    /* Reader column width (scripture + chrome alignment) */
+    --bpReaderMeasure: 840px;
 
     /* Default (Light) */
     --bg: #ffffff;
@@ -29,7 +41,7 @@
 
     /* Layout widths */
     --container: 980px; /* general */
-    --reading: 720px;   /* scripture pages / learn page */
+    --reading: 720px;   /* learn page / prose */
 }
 
 /* System preference (only when user has NOT manually set a theme) */
@@ -168,6 +180,7 @@ select {
 @media (max-width: 480px) {
     :root {
         --bpScriptureSize: 17px;
+        --bpReaderMeasure: 100%;
     }
 
     .prose {

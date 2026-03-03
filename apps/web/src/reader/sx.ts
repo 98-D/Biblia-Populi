@@ -14,16 +14,17 @@ export const sx: Record<string, React.CSSProperties> = {
     topBar: {
         position: "sticky",
         top: 0,
-        zIndex: 5,
+        zIndex: 10,
         display: "grid",
         gridTemplateColumns: "1fr auto 1fr",
         alignItems: "center",
         gap: 12,
         padding: "12px 16px",
         borderBottom: "1px solid var(--hairline)",
-        background: "var(--bg)",
-        boxShadow: "0 2px 4px rgba(0, 0, 0, 0.04)",  // Added subtle shadow for depth and elegance
-        transition: "box-shadow 200ms ease",  // Smooth transition for potential interactions
+        background: "color-mix(in oklab, var(--bg) 88%, transparent)",
+        backdropFilter: "blur(10px)",
+        WebkitBackdropFilter: "blur(10px)",
+        boxShadow: "0 10px 30px rgba(0, 0, 0, 0.06)",
     },
 
     topLeft: {
@@ -56,7 +57,8 @@ export const sx: Record<string, React.CSSProperties> = {
     },
 
     searchWrap: {
-        width: "clamp(160px, 210px, 230px)",  // Refined to use clamp for smoother responsiveness
+        width: "clamp(170px, 22vw, 260px)",
+        minWidth: 0,
     },
 
     themeWrap: {
@@ -68,16 +70,17 @@ export const sx: Record<string, React.CSSProperties> = {
 
     backBtn: {
         fontSize: 12,
-        padding: "6px 10px",  // Slightly increased horizontal padding for better touch targets
-        borderRadius: 10,
+        padding: "7px 11px",
+        borderRadius: 12,
         border: "1px solid var(--hairline)",
-        background: "var(--panel)",
+        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
         cursor: "pointer",
         lineHeight: 1,
-        transition: "transform 140ms ease, opacity 140ms ease, background 140ms ease",  // Added background transition for subtle hover/press effects
+        transition: "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease",
         color: "inherit",
         userSelect: "none",
         whiteSpace: "nowrap",
+        boxShadow: "0 10px 26px rgba(0,0,0,0.08)",
     },
 
     /* ---------- Viewport ---------- */
@@ -85,21 +88,23 @@ export const sx: Record<string, React.CSSProperties> = {
         position: "relative",
         flex: 1,
         minHeight: 0,
+        overflow: "hidden",
     },
 
     scroll: {
         position: "absolute",
         inset: 0,
         overflow: "auto",
-        padding: "16px 0 80px",
+        padding: "18px 0 96px",
         overscrollBehaviorY: "contain",
         scrollbarGutter: "stable",
         WebkitOverflowScrolling: "touch",
     },
 
+    // Reader column width is driven by --bpReaderMeasure (controlled by typography UI).
     container: {
         paddingInline: 18,
-        maxWidth: 840,
+        maxWidth: "var(--bpReaderMeasure, 840px)",
         marginInline: "auto",
     },
 
@@ -112,35 +117,36 @@ export const sx: Record<string, React.CSSProperties> = {
 
     /* ---------- Verse rows ---------- */
     bookHeader: {
-        padding: "14px 2px 10px",
+        padding: "16px 2px 12px",
         marginTop: 6,
         borderBottom: "1px solid var(--hairline)",
     },
 
     bookKicker: {
         fontSize: 9,
-        letterSpacing: "0.33em",
+        letterSpacing: "0.34em",
         textTransform: "uppercase",
         color: "var(--muted)",
         opacity: 0.95,
     },
 
     bookTitle: {
-        marginTop: 8,
-        fontSize: 22,
+        marginTop: 9,
+        fontSize: 24,
         letterSpacing: "-0.03em",
-        fontWeight: 600,  // Added semi-bold weight for better typographic hierarchy
+        fontWeight: 650,
+        lineHeight: 1.15,
     },
 
     chapterHeader: {
-        padding: "10px 2px 8px",
-        marginTop: 12,
+        padding: "12px 2px 10px",
+        marginTop: 14,
         borderBottom: "1px solid var(--hairline)",
     },
 
     chapterKicker: {
         fontSize: 9,
-        letterSpacing: "0.33em",
+        letterSpacing: "0.34em",
         textTransform: "uppercase",
         color: "var(--muted)",
     },
@@ -149,26 +155,29 @@ export const sx: Record<string, React.CSSProperties> = {
         marginTop: 8,
         fontSize: 16,
         letterSpacing: "-0.02em",
-        fontWeight: 600,  // Added semi-bold weight for consistency
+        fontWeight: 650,
+        lineHeight: 1.2,
     },
 
     verseRow: {
         display: "grid",
-        gridTemplateColumns: "30px 1fr",
+        gridTemplateColumns: "34px 1fr",
         gap: 12,
         alignItems: "start",
-        borderRadius: 12,
-        padding: "10px 6px",
-        transition: "background 200ms ease",  // Added for potential hover effects in components
+        borderRadius: 14,
+        padding: "10px 8px",
+        transition: "background 140ms ease, transform 140ms ease",
     },
 
     verseNum: {
         fontSize: 10,
         color: "var(--muted)",
-        letterSpacing: "0.12em",
+        letterSpacing: "0.14em",
         textAlign: "right",
-        paddingTop: 4,
+        paddingTop: 5,
         userSelect: "none",
+        fontVariantNumeric: "tabular-nums",
+        opacity: 0.9,
     },
 
     verseText: {
@@ -177,17 +186,17 @@ export const sx: Record<string, React.CSSProperties> = {
 
     skelRow: {
         display: "grid",
-        gridTemplateColumns: "30px 1fr",
+        gridTemplateColumns: "34px 1fr",
         gap: 12,
         alignItems: "start",
-        borderRadius: 12,
-        padding: "10px 6px",
+        borderRadius: 14,
+        padding: "10px 8px",
         opacity: 0.55,
     },
 
     skelText: {
         height: 14,
-        borderRadius: 8,
+        borderRadius: 9,
         background: "var(--hairline)",
         marginTop: 6,
     },
