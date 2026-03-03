@@ -3,6 +3,7 @@ import type { CSSProperties } from "react";
 
 /**
  * Reader UI tokens (inline styles)
+ *
  * Goals:
  * - crisp sticky header without “heavy bar” feel
  * - center area should never force child centering weirdness
@@ -10,17 +11,35 @@ import type { CSSProperties } from "react";
  * - verse rows: calmer spacing, less “boxy”, better rhythm
  *
  * Notes:
- * - Uses color-mix(in oklab, ...) consistently (your theme already relies on it).
- * - Header shadow is intentionally *thin* (more “lift” than “bar”).
- * - Verse rows are “air-first”: hover is a soft wash, not a tile.
+ * - Uses color-mix(in oklab, ...) consistently (theme already relies on it).
+ * - Adds safe-area padding for iOS PWAs via env(safe-area-inset-*)
+ * - Avoids expensive layout traps (no contain:size on virtualized scrolling)
  */
+
+const RADIUS = 14;
+const HAIRLINE = "color-mix(in oklab, var(--hairline) 92%, transparent)";
+const PANEL_WASH = "color-mix(in oklab, var(--panel) 22%, transparent)";
+const PANEL_WASH_FOCUS = "color-mix(in oklab, var(--panel) 26%, transparent)";
+
+// iOS safe area helpers (strings so env() survives)
+const SAFE_TOP = "env(safe-area-inset-top, 0px)";
+const SAFE_BOT = "env(safe-area-inset-bottom, 0px)";
+const SAFE_L = "env(safe-area-inset-left, 0px)";
+const SAFE_R = "env(safe-area-inset-right, 0px)";
+
 export const sx: Record<string, CSSProperties> = {
+    /* ---------- Shell ---------- */
     page: {
         height: "100vh",
         display: "flex",
         flexDirection: "column",
+        minHeight: 0,
         color: "var(--fg)",
         background: "var(--bg)",
+
+        // keeps header shadows from blending with ancestors on some GPUs
+        isolation: "isolate",
+        overflow: "hidden",
     },
 
     /* ---------- Header ---------- */
@@ -34,19 +53,24 @@ export const sx: Record<string, CSSProperties> = {
         alignItems: "center",
         gap: 12,
 
-        padding: "10px 14px",
+        // safe-area aware padding (top especially for iOS)
+        paddingTop: `calc(10px + ${SAFE_TOP})`,
+        paddingBottom: 10,
+        paddingLeft: `calc(14px + ${SAFE_L})`,
+        paddingRight: `calc(14px + ${SAFE_R})`,
 
         // “Glass” but not milky
         background: "color-mix(in oklab, var(--bg) 88%, transparent)",
         backdropFilter: "blur(12px)",
         WebkitBackdropFilter: "blur(12px)",
 
-        // Hairline + micro shadow (avoid “heavy bar”)
-        borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-        boxShadow: "0 10px 22px rgba(0, 0, 0, 0.035)",
+        borderBottom: `1px solid ${HAIRLINE}`,
+        // thinner / cleaner lift
+        boxShadow: "0 10px 22px rgba(0, 0, 0, 0.032)",
 
         // Prevent weird halos on some GPUs
         transform: "translateZ(0)",
+        willChange: "transform",
     },
 
     topLeft: {
@@ -55,6 +79,7 @@ export const sx: Record<string, CSSProperties> = {
         justifyContent: "flex-start",
         minWidth: 92,
         minHeight: 40,
+        gap: 10,
     },
 
     topCenter: {
@@ -85,7 +110,7 @@ export const sx: Record<string, CSSProperties> = {
     },
 
     searchWrap: {
-        width: "clamp(160px, 21vw, 248px)",
+        width: "clamp(160px, 21vw, 252px)",
         minWidth: 0,
     },
 
@@ -94,25 +119,41 @@ export const sx: Record<string, CSSProperties> = {
         alignItems: "center",
         justifyContent: "center",
         paddingLeft: 2,
+        flex: "0 0 auto",
     },
 
     backBtn: {
         fontSize: 12,
         padding: "7px 11px",
         borderRadius: 12,
-        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        border: `1px solid ${HAIRLINE}`,
         background: "color-mix(in oklab, var(--panel) 90%, transparent)",
         color: "inherit",
         cursor: "pointer",
         lineHeight: 1,
         userSelect: "none",
         whiteSpace: "nowrap",
+        boxSizing: "border-box",
 
         // Lighter than before (avoid “button sticker” look)
-        boxShadow: "0 8px 18px rgba(0,0,0,0.06)",
+        boxShadow: "0 8px 18px rgba(0,0,0,0.055)",
         transition:
             "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease",
         outline: "none",
+        WebkitTapHighlightColor: "transparent",
+    },
+
+    backBtnHover: {
+        background: "color-mix(in oklab, var(--panel) 94%, transparent)",
+        borderColor: "color-mix(in oklab, var(--hairline) 98%, transparent)",
+        boxShadow: "0 10px 20px rgba(0,0,0,0.07)",
+        transform: "translateY(-0.5px)",
+    },
+
+    backBtnActive: {
+        transform: "translateY(0px)",
+        boxShadow: "0 6px 14px rgba(0,0,0,0.06)",
+        opacity: 0.96,
     },
 
     /* ---------- Viewport ---------- */
@@ -121,6 +162,9 @@ export const sx: Record<string, CSSProperties> = {
         flex: 1,
         minHeight: 0,
         overflow: "hidden",
+
+        // helps isolate scroll paint without breaking measurements
+        contain: "layout paint",
     },
 
     scroll: {
@@ -128,23 +172,34 @@ export const sx: Record<string, CSSProperties> = {
         inset: 0,
         overflow: "auto",
 
-        // Top padding should feel “breathing”, bottom allows footer UI / lazy loads
-        padding: "18px 0 96px",
+        // breathing room + safe area bottom (for iOS home indicator)
+        paddingTop: 18,
+        paddingBottom: `calc(96px + ${SAFE_BOT})`,
 
         overscrollBehaviorY: "contain",
         scrollbarGutter: "stable",
         WebkitOverflowScrolling: "touch",
+        touchAction: "pan-y",
+
+        // Firefox-only niceness
+        scrollbarWidth: "thin",
+        scrollbarColor: "color-mix(in oklab, var(--hairline) 86%, transparent) transparent",
 
         // Prevent subpixel wobble on some platforms
         transform: "translateZ(0)",
+        willChange: "transform",
     },
 
-    // Reader column width is driven by --bpReaderMeasure (controlled by typography UI).
-    // Keep padding here minimal so measure feels consistent.
+    // Reader column width is driven by --bpReaderMeasure (typography UI).
+    // Keep padding minimal so measure feels consistent.
     container: {
-        paddingInline: 16,
+        // safe area left/right so text never sits under rounded corners / notches
+        paddingLeft: `calc(16px + ${SAFE_L})`,
+        paddingRight: `calc(16px + ${SAFE_R})`,
+        width: "100%",
         maxWidth: "var(--bpReaderMeasure, 840px)",
         marginInline: "auto",
+        boxSizing: "border-box",
     },
 
     msg: {
@@ -154,11 +209,11 @@ export const sx: Record<string, CSSProperties> = {
         whiteSpace: "pre-wrap",
     },
 
-    /* ---------- Verse rows ---------- */
+    /* ---------- Book / chapter headers ---------- */
     bookHeader: {
         padding: "16px 2px 12px",
         marginTop: 6,
-        borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        borderBottom: `1px solid ${HAIRLINE}`,
     },
 
     bookKicker: {
@@ -180,7 +235,7 @@ export const sx: Record<string, CSSProperties> = {
     chapterHeader: {
         padding: "12px 2px 10px",
         marginTop: 14,
-        borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        borderBottom: `1px solid ${HAIRLINE}`,
     },
 
     chapterKicker: {
@@ -198,6 +253,7 @@ export const sx: Record<string, CSSProperties> = {
         lineHeight: 1.2,
     },
 
+    /* ---------- Verse rows ---------- */
     // Verse rows should feel like “air + alignment”, not a box.
     verseRow: {
         display: "grid",
@@ -205,16 +261,29 @@ export const sx: Record<string, CSSProperties> = {
         gap: 12,
         alignItems: "start",
 
-        borderRadius: 14,
+        borderRadius: RADIUS,
         padding: "9px 6px",
+        boxSizing: "border-box",
 
-        // Default: transparent. Hover should be applied by caller if desired,
-        // but we prep the transition to keep it premium.
         background: "transparent",
         transition: "background 140ms ease, transform 140ms ease, box-shadow 140ms ease",
 
         // Avoid accidental selection highlight bleed in some browsers
         WebkitTapHighlightColor: "transparent",
+    },
+
+    verseRowHover: {
+        background: PANEL_WASH,
+    },
+
+    verseRowFocus: {
+        background: PANEL_WASH_FOCUS,
+        boxShadow: "0 0 0 3px color-mix(in oklab, var(--focus) 18%, transparent)",
+    },
+
+    verseRowSelected: {
+        background: "color-mix(in oklab, var(--panel) 30%, transparent)",
+        boxShadow: "0 0 0 1px color-mix(in oklab, var(--hairline) 96%, transparent)",
     },
 
     verseNum: {
@@ -229,15 +298,10 @@ export const sx: Record<string, CSSProperties> = {
     },
 
     verseText: {
-        // intentionally empty; .scripture handles typography
-    },
-    verseRowHover: {
-        background: "color-mix(in oklab, var(--panel) 22%, transparent)",
-    },
-
-    verseRowFocus: {
-        background: "color-mix(in oklab, var(--panel) 26%, transparent)",
-        boxShadow: "0 0 0 3px color-mix(in oklab, var(--focus) 18%, transparent)",
+        // VerseRow.tsx applies `.scripture` class; keep this as a safety net for long tokens.
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
+        minWidth: 0,
     },
 
     /* ---------- Skeleton ---------- */
@@ -246,15 +310,16 @@ export const sx: Record<string, CSSProperties> = {
         gridTemplateColumns: "36px 1fr",
         gap: 12,
         alignItems: "start",
-        borderRadius: 14,
+        borderRadius: RADIUS,
         padding: "9px 6px",
         opacity: 0.55,
+        boxSizing: "border-box",
     },
 
     skelText: {
         height: 14,
         borderRadius: 9,
-        background: "color-mix(in oklab, var(--hairline) 92%, transparent)",
+        background: `color-mix(in oklab, var(--hairline) 92%, transparent)`,
         marginTop: 6,
     },
 };

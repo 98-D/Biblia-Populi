@@ -44,7 +44,7 @@ const LIMITS = Object.freeze({
     sizePx: { lo: 12, hi: 30, step: 1 },
     weight: { lo: 200, hi: 650, step: 1 },
     leading: { lo: 0.95, hi: 2.1, digits: 2 },
-    measurePx: { lo: 240, hi: 980, step: 1 },
+    measurePx: { lo: 535, hi: 980, step: 1 },
 });
 
 export const FONT_PRESETS: Readonly<Record<TypographyFont, { label: string; css: string }>> = Object.freeze({

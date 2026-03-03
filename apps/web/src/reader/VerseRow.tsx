@@ -12,6 +12,7 @@ type Props = {
 
 export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
     const isBookStart = row.chapter === 1 && row.verse === 1;
+    const isChapterStart = row.verse === 1;
 
     // Keep these local, but make them hard to “thrash”:
     // - only set true if not already true
@@ -19,33 +20,60 @@ export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
     const [hovered, setHovered] = useState(false);
     const [focused, setFocused] = useState(false);
 
-    const onEnter = useCallback(() => setHovered((v) => (v ? v : true)), []);
-    const onLeave = useCallback(() => setHovered((v) => (v ? false : v)), []);
+    // Hover is a mouse/pen affordance; avoid “sticky hover” on touch.
+    const onEnter = useCallback((e: React.PointerEvent) => {
+        if (e.pointerType === "touch") return;
+        setHovered((v) => (v ? v : true));
+    }, []);
+    const onLeave = useCallback((e: React.PointerEvent) => {
+        if (e.pointerType === "touch") return;
+        setHovered((v) => (v ? false : v));
+    }, []);
+
     const onFocus = useCallback(() => setFocused((v) => (v ? v : true)), []);
     const onBlur = useCallback(() => setFocused((v) => (v ? false : v)), []);
 
-    const ariaLabel = useMemo(() => {
-        const bookLabel = (book?.name ?? row.bookId).toString();
-        const txt = (row.text ?? "").toString().trim();
-        // Keep it useful but not absurdly long in screen readers.
-        const snippet = txt.length > 160 ? `${txt.slice(0, 160)}…` : txt;
-        return `${bookLabel} ${row.chapter}:${row.verse}. ${snippet}`;
-    }, [book?.name, row.bookId, row.chapter, row.verse, row.text]);
+    const bookLabel = (book?.name ?? row.bookId).toString();
+    const ariaLabel = useMemo(() => `${bookLabel} ${row.chapter}:${row.verse}`, [bookLabel, row.chapter, row.verse]);
+
+    const verseTextId = `ord-${row.verseOrd}-text`;
+
+    const rowStyle = useMemo<React.CSSProperties>(() => {
+        const base = sx.verseRow;
+        const h = hovered ? sx.verseRowHover : undefined;
+        const f = focused ? sx.verseRowFocus : undefined;
+        return { ...base, ...(h ?? {}), ...(f ?? {}) };
+    }, [hovered, focused]);
 
     return (
-        <div id={`ord-${row.verseOrd}`} data-ord={row.verseOrd} style={{ padding: 0 }}>
+        <div
+            id={`ord-${row.verseOrd}`}
+            data-ord={row.verseOrd}
+            data-verse-key={row.verseKey}
+            data-book={row.bookId}
+            data-chapter={row.chapter}
+            data-verse={row.verse}
+            style={{ padding: 0 }}
+        >
             {isBookStart ? <BookTitlePage book={book} bookId={row.bookId} /> : null}
+
+            {isChapterStart ? (
+                <div style={sx.chapterHeader}>
+                    <div style={sx.chapterKicker}>CHAPTER</div>
+                    <div style={sx.chapterTitle}>
+                        {bookLabel} {row.chapter}
+                    </div>
+                </div>
+            ) : null}
 
             {/* Make the *row* the focus target (not the inner text). */}
             <div
                 role="article"
+                aria-roledescription="verse"
                 aria-label={ariaLabel}
+                aria-describedby={verseTextId}
                 tabIndex={0}
-                style={{
-                    ...sx.verseRow,
-                    ...(hovered ? (sx as any).verseRowHover : null),
-                    ...(focused ? (sx as any).verseRowFocus : null),
-                }}
+                style={rowStyle}
                 onPointerEnter={onEnter}
                 onPointerLeave={onLeave}
                 onFocus={onFocus}
@@ -55,7 +83,7 @@ export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
                     {row.verse}
                 </div>
 
-                <div className="scripture" style={sx.verseText}>
+                <div id={verseTextId} className="scripture" style={sx.verseText}>
                     {row.text ?? ""}
                 </div>
             </div>

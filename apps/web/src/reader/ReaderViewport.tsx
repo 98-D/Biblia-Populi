@@ -1,18 +1,15 @@
 // apps/web/src/reader/ReaderViewport.tsx
 // Biblia Populi — Reader Viewport (TanStack Virtual + smart chunked prefetching)
 //
-// Fixes / upgrades (freeze killers):
-// • Prevent measure/render thrash: measure each element once per run (WeakSet) + reset on spine change
-// • Prefetch effect depends on first/last index (not virtualItems identity) to avoid rerun storms
-// • LayoutEffect top-tracker uses stable first/last + scrollTop; avoids find() over array every tick
-// • Safer count derivation (spine.verseCount can drift): compute from ord range (clamped)
-// • Guard against invalid scroll element early
+// Freeze killers (why it was locking up):
+// • The scroll container MUST remain sx.scroll (position:absolute; inset:0). Do NOT override to position:relative.
+//   Overriding causes massive layout (millions of px) + virtualizer instability.
 //
-// Behavior unchanged:
-// • Chunked loading + LRU eviction
-// • Gate UX on book boundary
-// • Jump API + pending jumps
-// • Zero red (theme vars only)
+// Upgrades / bulletproofing:
+// • Real request cancellation via AbortController (abort on spine-change + unmount).
+// • Stable prefetch deps (first/last index; not virtualItems identity).
+// • Measuring is allowed again when dataTick bumps (skeleton -> real text) but limited to once/element/tick.
+// • Book-gate will NOT trigger at verseOrdMin (no “gate at Genesis 1:1”).
 
 import React, {
     forwardRef,
@@ -41,7 +38,6 @@ const EST_ROW_PX = 56;
 function chunkStart(ord: number): number {
     return Math.floor((ord - 1) / CHUNK) * CHUNK + 1;
 }
-
 function clamp(n: number, lo: number, hi: number): number {
     return Math.max(lo, Math.min(hi, n));
 }
@@ -64,11 +60,7 @@ type Props = {
 
 /* --------------------------- Internal types ---------------------------- */
 type PendingJump = { ord: number; behavior: "auto" | "smooth" };
-
-type BookGateState = {
-    ord: number;
-    bookId: string;
-};
+type BookGateState = { ord: number; bookId: string };
 
 /* ----------------------------- Book Gate UI ---------------------------- */
 function BookGate(props: { book: BookRow | null; bookId: string; onContinue: () => void }) {
@@ -181,10 +173,12 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     // All heavy data lives in a ref (prevents massive re-renders)
     const chunkRef = useRef<ChunkState>(createChunkState());
-    const [dataTick, setDataTick] = useState(0); // only used to trigger virtualizer refresh
+    const [dataTick, setDataTick] = useState(0); // triggers virtualizer refresh (and re-measure pass)
 
-    // measure-thrash breaker: only measure each element once per run
-    const measuredElsRef = useRef<WeakSet<Element>>(new WeakSet());
+    // Measure thrash breaker:
+    // - we allow measuring again when dataTick changes (skeleton -> real text)
+    // - but never more than once per element per tick
+    const measuredAtRef = useRef<WeakMap<Element, number>>(new WeakMap());
 
     const bumpTick = useCallback(() => setDataTick((t) => t + 1), []);
 
@@ -198,16 +192,12 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     const count = useMemo(() => {
         const c = Number.isFinite(spine.verseCount) ? spine.verseCount : 0;
-        // prefer derived unless server count matches
         if (c <= 0) return derivedCount;
         if (derivedCount > 0 && c !== derivedCount) return derivedCount;
         return c;
     }, [spine.verseCount, derivedCount]);
 
-    const initialOrd = useMemo(
-        () => clamp(1, spine.verseOrdMin, spine.verseOrdMax),
-        [spine.verseOrdMin, spine.verseOrdMax],
-    );
+    const initialOrd = useMemo(() => clamp(1, spine.verseOrdMin, spine.verseOrdMax), [spine.verseOrdMin, spine.verseOrdMax]);
 
     const [posOrd, setPosOrd] = useState<number>(initialOrd);
     const posOrdRef = useRef<number>(initialOrd);
@@ -217,6 +207,13 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     // Invalidate in-flight requests when spine changes
     const runIdRef = useRef(0);
+
+    // Real cancellation (prevents late commits + reduces network spam)
+    const inFlightRef = useRef<Map<number, AbortController>>(new Map());
+    const abortAllInFlight = useCallback(() => {
+        for (const c of inFlightRef.current.values()) c.abort();
+        inFlightRef.current.clear();
+    }, []);
 
     // Book-boundary gate
     const [gate, setGate] = useState<BookGateState | null>(null);
@@ -256,9 +253,10 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                 const victim = list.splice(farIdx, 1)[0]!;
                 state.loadedChunks.delete(victim);
 
-                const start = victim;
-                const end = Math.min(spine.verseOrdMax, victim + CHUNK - 1);
-                for (let ord = start; ord <= end; ord++) state.verseMap.delete(ord);
+                // Remove all verses within victim chunk
+                const startOrd = victim;
+                const end = Math.min(victim + CHUNK - 1, spine.verseOrdMax);
+                for (let ord = startOrd; ord <= end; ord++) state.verseMap.delete(ord);
             }
         },
         [spine.verseOrdMin, spine.verseOrdMax],
@@ -274,11 +272,15 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
             if (state.loadedChunks.has(chunk) || state.loadingChunks.has(chunk)) return;
 
             const myRunId = runIdRef.current;
+
             state.loadingChunks.add(chunk);
+            const ctrl = new AbortController();
+            inFlightRef.current.set(chunk, ctrl);
 
             try {
-                const res = await apiGetSlice(chunk, CHUNK);
+                const res = await apiGetSlice(chunk, CHUNK, { signal: ctrl.signal });
                 if (runIdRef.current !== myRunId) return;
+                if (ctrl.signal.aborted) return;
 
                 for (const v of res.verses) state.verseMap.set(v.verseOrd, v);
 
@@ -289,9 +291,11 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                 bumpTick();
             } catch (e: unknown) {
                 if (runIdRef.current !== myRunId) return;
+                if (ctrl.signal.aborted) return;
                 onError?.(e instanceof Error ? e.message : String(e));
             } finally {
                 state.loadingChunks.delete(chunk);
+                inFlightRef.current.delete(chunk);
             }
         },
         [bumpTick, evictFarChunks, onError, spine.verseOrdMin, spine.verseOrdMax],
@@ -299,10 +303,12 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     /* ------------------------- Reset on spine change ------------------------- */
     useEffect(() => {
+        // New run: abort in-flight requests and invalidate late results
+        abortAllInFlight();
         runIdRef.current++;
 
         chunkRef.current = createChunkState();
-        measuredElsRef.current = new WeakSet(); // ✅ reset measured cache per run
+        measuredAtRef.current = new WeakMap(); // reset measured cache per run
 
         setPosOrd(initialOrd);
         posOrdRef.current = initialOrd;
@@ -318,7 +324,12 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         // Kick initial chunk
         void ensureChunk(chunkStart(initialOrd), initialOrd);
         bumpTick();
-    }, [initialOrd, ensureChunk, bumpTick]);
+    }, [initialOrd, ensureChunk, bumpTick, abortAllInFlight]);
+
+    // Abort any in-flight fetches on unmount
+    useEffect(() => {
+        return () => abortAllInFlight();
+    }, [abortAllInFlight]);
 
     /* ------------------------- Scroll element ready ------------------------- */
     useEffect(() => {
@@ -410,10 +421,8 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
             if (behind >= spine.verseOrdMin) void ensureChunk(behind, firstOrd);
         }
     }, [
-        // ✅ stable deps (not virtualItems identity)
         firstIndex,
         lastIndex,
-        dataTick,
         ensureChunk,
         spine.verseOrdMin,
         spine.verseOrdMax,
@@ -451,7 +460,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
         const st = scrollEl.scrollTop;
 
-        // Find topmost visible without scanning whole array via heavy predicates.
         // virtualItems are sorted by start.
         let topItem = virtualItems[0]!;
         for (let i = 0; i < virtualItems.length; i++) {
@@ -470,7 +478,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         }
 
         void ensureChunk(chunkStart(ord), ord);
-    }, [scrollEl, virtualItems.length, firstIndex, lastIndex, dataTick, ensureChunk, spine.verseOrdMin]);
+    }, [scrollEl, virtualItems.length, firstIndex, lastIndex, ensureChunk, spine.verseOrdMin]);
 
     /* ------------------------- Emit position ------------------------- */
     const lastSentRef = useRef<{ ord: number; hasVerse: boolean }>({ ord: -1, hasVerse: false });
@@ -501,11 +509,12 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         const cur = chunkRef.current.verseMap.get(ord) ?? null;
         if (!cur) return;
 
-        // Need previous verse to be sure we crossed a boundary
-        if (ord !== spine.verseOrdMin) {
-            const prev = chunkRef.current.verseMap.get(ord - 1) ?? null;
-            if (!prev || prev.bookId === cur.bookId) return;
-        }
+        // Gate only when we *enter* a new book from the previous verse.
+        // (Never gate at the very first verse of the canon.)
+        if (ord === spine.verseOrdMin) return;
+        const prev = chunkRef.current.verseMap.get(ord - 1) ?? null;
+        if (!prev) return;
+        if (prev.bookId === cur.bookId) return;
 
         const bookId = cur.bookId;
         if (lastGatedBookIdRef.current === bookId) return;
@@ -538,21 +547,23 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
     );
 
     // Stable measurement ref (critical for TanStack Virtual stability)
-    // ✅ Freeze fix: measure each element once per run.
+    // Measure at most once per element per dataTick (skeleton -> real text).
     const measureRowEl = useCallback(
         (el: HTMLDivElement | null) => {
             if (!el) return;
-            const ws = measuredElsRef.current;
-            if (ws.has(el)) return;
-            ws.add(el);
+            const wm = measuredAtRef.current;
+            const last = wm.get(el);
+            if (last === dataTick) return;
+            wm.set(el, dataTick);
             rowVirtualizer.measureElement(el);
         },
-        [rowVirtualizer],
+        [rowVirtualizer, dataTick],
     );
 
     return (
         <div style={sx.body}>
-            <div ref={setScrollEl} style={{ ...sx.scroll, position: "relative" }}>
+            {/* IMPORTANT: do NOT override sx.scroll positioning (it must stay absolute+inset:0). */}
+            <div ref={setScrollEl} style={sx.scroll}>
                 <div className="container" style={sx.container}>
                     {topContent}
 

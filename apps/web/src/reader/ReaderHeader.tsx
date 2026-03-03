@@ -1,9 +1,9 @@
 // apps/web/src/reader/ReaderHeader.tsx
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useState, useCallback } from "react";
 import type { BookRow } from "../api";
 import type { ReaderLocation } from "../Search";
 import { PositionPill } from "../PositionPill";
-import { ThemeTogglePill } from "../theme";
+import { ThemeToggleSwitch } from "../theme";
 import { sx } from "./sx";
 import { ReaderHeaderSearch } from "./ReaderHeaderSearch";
 import { ReaderTypographyControl } from "./ReaderTypographyControl";
@@ -27,7 +27,7 @@ type Props = {
 
     onNavigate: (loc: ReaderLocation) => void;
 
-    // legacy: keep props but header uses global ThemeTogglePill now
+    // legacy: keep props but header uses global theme now
     mode?: "light" | "dark";
     onToggleTheme?: () => void;
 };
@@ -36,19 +36,44 @@ export function ReaderHeader(props: Props) {
     const { styles, books, onBackHome, current, onJumpRef, onNavigate } = props;
 
     const [pressBack, setPressBack] = useState(false);
+    const [hoverBack, setHoverBack] = useState(false);
 
     const pressed =
         ((styles as any).btnPressed as React.CSSProperties | undefined) ??
         ((styles as any).buttonPressed as React.CSSProperties | undefined);
 
-    const backStyle = useMemo(() => ({ ...sx.backBtn, ...(pressBack ? pressed : null) }), [pressBack, pressed]);
+    const backStyle = useMemo(() => {
+        return {
+            ...sx.backBtn,
+            ...(hoverBack ? (sx as any).backBtnHover : null),
+            ...(pressBack ? (sx as any).backBtnActive : null),
+            ...(pressBack && pressed ? pressed : null),
+        };
+    }, [hoverBack, pressBack, pressed]);
 
-    const backHandlers = useMemo(
+    const onBackPointerEnter = useCallback((e: React.PointerEvent) => {
+        if (e.pointerType === "touch") return;
+        setHoverBack(true);
+    }, []);
+    const onBackPointerLeave = useCallback((e: React.PointerEvent) => {
+        if (e.pointerType === "touch") return;
+        setHoverBack(false);
+        setPressBack(false);
+    }, []);
+    const onBackPointerDown = useCallback(() => setPressBack(true), []);
+    const onBackPointerUp = useCallback(() => setPressBack(false), []);
+    const onBackPointerCancel = useCallback(() => setPressBack(false), []);
+
+    // Theme toggle can look “floaty” on the glass header; give it a subtle dock so it reads intentional.
+    const toggleDock = useMemo<React.CSSProperties>(
         () => ({
-            onPointerDown: () => setPressBack(true),
-            onPointerUp: () => setPressBack(false),
-            onPointerCancel: () => setPressBack(false),
-            onPointerLeave: () => setPressBack(false),
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 3,
+            borderRadius: 999,
+            background: "color-mix(in oklab, var(--bg) 86%, var(--panel))",
+            boxShadow: "0 8px 18px rgba(0,0,0,0.05)",
         }),
         [],
     );
@@ -62,7 +87,11 @@ export function ReaderHeader(props: Props) {
                     onClick={onBackHome}
                     aria-label="Back to home"
                     title="Back to home"
-                    {...backHandlers}
+                    onPointerEnter={onBackPointerEnter}
+                    onPointerLeave={onBackPointerLeave}
+                    onPointerDown={onBackPointerDown}
+                    onPointerUp={onBackPointerUp}
+                    onPointerCancel={onBackPointerCancel}
                 >
                     ← Home
                 </button>
@@ -86,9 +115,10 @@ export function ReaderHeader(props: Props) {
 
                     <ReaderTypographyControl />
 
-                    {/* use our theme toggle pill (no fixed overlay assumptions) */}
-                    <div style={{ marginLeft: 10, display: "flex", alignItems: "center" }}>
-                        <ThemeTogglePill />
+                    <div style={sx.themeWrap}>
+                        <div style={toggleDock}>
+                            <ThemeToggleSwitch size="sm" />
+                        </div>
                     </div>
                 </div>
             </div>

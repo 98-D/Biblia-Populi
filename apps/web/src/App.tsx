@@ -80,9 +80,12 @@ function encodeLoc(loc: ReaderLocation | null): string | null {
 /* ---------------- URL intent + syncing ---------------- */
 function readUrlIntent(): { page?: Page; loc?: ReaderLocation } {
     try {
-        const { hash, search } = window.location;
+        const { hash, search, pathname } = window.location;
 
+        /* ---------------- hash routes ---------------- */
         const h = hash.trim();
+
+        // Explicit reader loc: #/read/GEN/1/1 or #/read/GEN/1
         if (h.startsWith("#/read/")) {
             const parts = h
                 .slice("#/read/".length)
@@ -97,9 +100,13 @@ function readUrlIntent(): { page?: Page; loc?: ReaderLocation } {
             const loc = normalizeLoc({ bookId, chapter: chapter ?? undefined, verse });
             if (loc) return { page: "reader", loc };
         }
+
+        // Reader without explicit loc (use saved loc / last-ord restore)
+        if (h === "#/reader") return { page: "reader" };
         if (h === "#/learn") return { page: "learn" };
         if (h === "#/home") return { page: "home" };
 
+        /* ---------------- query routes ---------------- */
         const q = new URLSearchParams(search);
 
         const read = q.get("read");
@@ -118,6 +125,13 @@ function readUrlIntent(): { page?: Page; loc?: ReaderLocation } {
         const page = q.get("page");
         if (page === "learn") return { page: "learn" };
         if (page === "home") return { page: "home" };
+        if (page === "reader") return { page: "reader" };
+
+        /* ---------------- pathname routes ---------------- */
+        const p = (pathname ?? "").toLowerCase();
+        if (p.endsWith("/reader")) return { page: "reader" };
+        if (p.endsWith("/learn")) return { page: "learn" };
+        if (p.endsWith("/home")) return { page: "home" };
 
         return {};
     } catch {
@@ -126,9 +140,12 @@ function readUrlIntent(): { page?: Page; loc?: ReaderLocation } {
 }
 
 function formatHash(page: Page, loc: ReaderLocation | null): string {
-    if (page === "reader" && loc) {
-        const base = `#/read/${loc.bookId}/${loc.chapter}`;
-        return loc.verse ? `${base}/${loc.verse}` : base;
+    if (page === "reader") {
+        if (loc) {
+            const base = `#/read/${loc.bookId}/${loc.chapter}`;
+            return loc.verse ? `${base}/${loc.verse}` : base;
+        }
+        return "#/reader";
     }
     if (page === "learn") return "#/learn";
     return "#/home";
@@ -155,9 +172,7 @@ function AppInner() {
         const savedLoc = parseLoc(safeGet(LS_LAST_LOC));
 
         // Default to HOME unless URL explicitly asked for reader.
-        const page: Page =
-            (url.page as Page | undefined) ??
-            (savedPage && savedPage !== "reader" ? savedPage : "home");
+        const page: Page = (url.page as Page | undefined) ?? (savedPage && savedPage !== "reader" ? savedPage : "home");
 
         const loc: ReaderLocation | null = url.loc ?? savedLoc;
 
@@ -276,31 +291,19 @@ function AppInner() {
 
 /* ---------------- Home ---------------- */
 
-function Home(props: {
-    onLearnMore: () => void;
-    onStartReading: () => void;
-    onNavigate: (loc: ReaderLocation) => void;
-}) {
+function Home(props: { onLearnMore: () => void; onStartReading: () => void; onNavigate: (loc: ReaderLocation) => void }) {
     const { onLearnMore, onStartReading, onNavigate } = props;
 
     return (
         <main style={styles.centerStage} aria-label="Landing">
             <div style={styles.centerBlock}>
                 <div style={styles.crossWrap} aria-hidden>
-                    <img
-                        src="/cross.png"
-                        alt=""
-                        style={styles.crossImg}
-                        draggable={false}
-                        decoding="async"
-                        loading="eager"
-                    />
+                    <img src="/cross.png" alt="" style={styles.crossImg} draggable={false} decoding="async" loading="eager" />
                 </div>
 
                 <h1 style={styles.h1}>Biblia Populi</h1>
                 <p style={styles.lede}>
-                    A public, open-access KJV Scripture platform centered on <strong>Jesus Christ</strong>, crucified and
-                    risen.
+                    A public, open-access KJV Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen.
                 </p>
 
                 <div style={styles.searchContainer}>
@@ -495,10 +498,5 @@ export const styles: Record<string, React.CSSProperties> = {
         border: "1px solid var(--hairline)",
         background: "var(--panel)",
         cursor: "pointer",
-    },
-
-    footerMuted: {
-        color: "var(--muted)",
-        fontSize: 12,
     },
 };
