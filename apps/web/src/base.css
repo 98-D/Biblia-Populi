@@ -1,19 +1,16 @@
 /* apps/web/src/base.css — Biblia.to (minimal, reading-first, premium)
  *
  * Goals:
- * - Paper-soft light mode (less harsh than pure white)
- * - Ink-like dark mode (high contrast, calm)
- * - Stable layout (no scrollbar jump)
- * - Premium transitions (theme swap without jitter)
- * - Excellent focus/accessibility defaults
- * - Scrollbars: subtle, themed, not obnoxious
- * - Overlay primitives (search/panels/popovers)
- * - Reader typography tokens (fixed measure; user controls font/weight/size)
- * - Annotation-friendly primitives (selection, ink layer, highlight color tokens)
+ * - Paper-soft light mode
+ * - Ink-like dark mode
+ * - Stable layout and scrollbars
+ * - Controlled theme transitions
+ * - Strong accessibility defaults
+ * - Reader/annotation-ready primitives
  *
  * Notes:
- * - Avoid “global transitions always on”: only enable transitions during theme swap via html.bp-theme-swap
- * - Keep tokens orientation-first. Component CSS can build on these primitives.
+ * - Theme transitions are enabled only during explicit swaps via html.bp-theme-swap
+ * - Layout tokens remain global primitives; component CSS should build on them
  */
 
 /* =========================================================
@@ -21,19 +18,44 @@
 ========================================================= */
 :root {
     /* ---------------- Fonts ---------------- */
-    --font-sans: "Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans",
-    "Apple Color Emoji", "Segoe UI Emoji";
-    --font-serif: "Literata Variable", Literata, ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
-    "Times New Roman", Times, serif;
-    --font-rounded: "Quicksand Variable", Quicksand, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial;
+    --font-sans:
+            "Inter Variable",
+            Inter,
+            ui-sans-serif,
+            system-ui,
+            -apple-system,
+            "Segoe UI",
+            Roboto,
+            Arial,
+            "Noto Sans",
+            "Apple Color Emoji",
+            "Segoe UI Emoji";
+    --font-serif:
+            "Literata Variable",
+            Literata,
+            ui-serif,
+            "Iowan Old Style",
+            "Palatino Linotype",
+            Palatino,
+            Georgia,
+            "Times New Roman",
+            Times,
+            serif;
+    --font-rounded:
+            "Quicksand Variable",
+            Quicksand,
+            ui-sans-serif,
+            system-ui,
+            -apple-system,
+            "Segoe UI",
+            Roboto,
+            Arial;
 
     /* ---------------- Reader Typography ---------------- */
     --bpScriptureFont: var(--font-serif);
     --bpScriptureSize: 18px;
     --bpScriptureLeading: 1.75;
     --bpScriptureWeight: 400;
-
-    /* Fixed width measure; user can change only font/weight/size in UI */
     --bpReaderMeasure: 840px;
 
     /* ---------------- Layout ---------------- */
@@ -81,8 +103,8 @@
     --overlay2: rgba(246, 244, 240, 0.96);
     --activeBg: rgba(16, 16, 18, 0.045);
 
-    /* Brand / accents (keep subtle; UI can opt-in) */
-    --accent: rgba(170, 34, 34, 0.92); /* your red cross */
+    /* Brand / accents */
+    --accent: rgba(170, 34, 34, 0.92);
     --accent2: rgba(170, 34, 34, 0.22);
     --link: rgba(16, 16, 18, 0.86);
 
@@ -103,7 +125,7 @@
     --scrollThumb: rgba(16, 16, 18, 0.18);
     --scrollThumbHover: rgba(16, 16, 18, 0.28);
 
-    /* Ambient (optional) */
+    /* Ambient */
     --ambientInk: rgba(16, 16, 18, 0.06);
     --ambientInk2: rgba(16, 16, 18, 0.04);
     --ambientParticle: rgba(16, 16, 18, 0.3);
@@ -114,9 +136,12 @@
     --hl-blue: rgba(120, 180, 255, 0.24);
     --ink: rgba(16, 16, 18, 0.72);
     --ink-soft: rgba(16, 16, 18, 0.42);
+
+    /* Scrollbar geometry */
+    --scrollSize: 10px;
+    --scrollRadius: 999px;
 }
 
-/* Prefer color-mix when supported (better theme coherence) */
 @supports (color: color-mix(in oklab, white, black)) {
     :root {
         --muted: color-mix(in oklab, var(--fg) 58%, transparent);
@@ -239,11 +264,16 @@ html {
     -webkit-text-size-adjust: 100%;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    color-scheme: light dark;
 
-    /* Better underline default */
+    /* Explicitly own form/control styling by theme */
+    color-scheme: light;
+
     text-underline-offset: 3px;
     text-decoration-thickness: 1.25px;
+}
+
+html[data-theme="dark"] {
+    color-scheme: dark;
 }
 
 body {
@@ -281,10 +311,15 @@ html.bp-theme-swap [data-overlay] {
 
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
-    * {
-        transition: none !important;
+    html {
+        scroll-behavior: auto;
+    }
+
+    *,
+    *::before,
+    *::after {
         animation: none !important;
-        scroll-behavior: auto !important;
+        transition: none !important;
     }
 }
 
@@ -372,7 +407,6 @@ textarea::placeholder {
     color: var(--muted);
 }
 
-/* Calm focus */
 :focus-visible {
     outline: 2px solid var(--focusRing);
     outline-offset: 2px;
@@ -383,28 +417,19 @@ textarea::placeholder {
     box-shadow: var(--focusShadow);
 }
 
-/* Disable iOS tap highlight where it causes glare */
 a,
 button {
     -webkit-tap-highlight-color: transparent;
 }
 
 /* =========================================================
-   Scrollbars (nice but subtle)
-   - Styles are best-effort: macOS overlay scrollbars may ignore
+   Scrollbars
 ========================================================= */
-:root {
-    --scrollSize: 10px;
-    --scrollRadius: 999px;
-}
-
-/* Firefox */
 * {
     scrollbar-width: thin;
     scrollbar-color: var(--scrollThumb) var(--scrollTrack);
 }
 
-/* Chromium/Safari */
 *::-webkit-scrollbar {
     width: var(--scrollSize);
     height: var(--scrollSize);
@@ -424,7 +449,6 @@ button {
     background-clip: padding-box;
 }
 
-/* Optional utility: hide scrollbars but keep scroll */
 .scrollbars-none {
     scrollbar-width: none;
 }
@@ -455,21 +479,25 @@ button {
 .hairline {
     border: var(--hairlineW) solid var(--hairline);
 }
+
 .muted {
     color: var(--muted);
 }
+
 .muted2 {
     color: var(--muted2);
 }
+
 .shadow-soft {
     box-shadow: var(--shadowSoft);
 }
+
 .shadow-pop {
     box-shadow: var(--shadowPop);
 }
 
 /* =========================================================
-   Buttons (basic primitives)
+   Buttons
 ========================================================= */
 .btn {
     display: inline-flex;
@@ -484,14 +512,15 @@ button {
     user-select: none;
     box-shadow: 0 8px 22px rgba(0, 0, 0, 0.06);
 }
+
 .btn:hover {
     border-color: var(--hairline2);
 }
+
 .btn:active {
     transform: translateY(0.5px);
 }
 
-/* Subtle “pill” */
 .pill {
     display: inline-flex;
     align-items: center;
@@ -525,13 +554,11 @@ button {
     font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
 }
 
-/* Fixed measure wrapper (use in ReaderViewport) */
 .measure {
     width: min(var(--bpReaderMeasure), calc(100% - 32px));
     margin-inline: auto;
 }
 
-/* Numbers / refs in scripture */
 .scripture .vnum,
 .scripture .cnum {
     font-family: var(--font-sans);
@@ -542,7 +569,7 @@ button {
 }
 
 /* =========================================================
-   Overlay primitives (search panels, popovers)
+   Overlay primitives
 ========================================================= */
 .bp-overlay {
     background: var(--overlay);
@@ -562,36 +589,34 @@ button {
 }
 
 /* =========================================================
-   Annotation helpers (optional UI classes)
+   Annotation helpers
 ========================================================= */
-
-/* highlight markup (you can render spans with this class) */
 .bp-hl {
     background: var(--hl-yellow);
     border-radius: 6px;
     padding: 0 2px;
 }
+
 .bp-hl--green {
     background: var(--hl-green);
 }
+
 .bp-hl--blue {
     background: var(--hl-blue);
 }
 
-/* Ink layer: place over text; make sure it doesn't steal scroll */
 .bp-ink-layer {
     position: absolute;
     inset: 0;
-    pointer-events: none; /* enable only while drawing */
+    pointer-events: none;
 }
 
-/* When actively drawing, enable pointer events */
 .bp-ink-layer.is-drawing {
     pointer-events: auto;
 }
 
 /* =========================================================
-   Ambient Helpers (optional)
+   Ambient Helpers
 ========================================================= */
 @keyframes bp-ambient-pulse {
     0%,
