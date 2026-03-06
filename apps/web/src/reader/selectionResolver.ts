@@ -79,7 +79,7 @@ function getTokenCharEnd(tokenEl: HTMLElement | null): number | null {
     return parseIntStrict(tokenEl.getAttribute(ATTR_TOKEN_CHAR_END));
 }
 
-function normalizeTranslationId(value: string | null): string | null {
+function normalizeString(value: string | null): string | null {
     if (typeof value !== "string") return null;
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : null;
@@ -126,7 +126,7 @@ export class ReaderDomSelectionResolver implements DomSelectionResolver {
         const verseEl = findVerseElement(node);
         if (!verseEl) return null;
 
-        const verseKey = normalizeTranslationId(verseEl.getAttribute(ATTR_VERSE_KEY));
+        const verseKey = normalizeString(verseEl.getAttribute(ATTR_VERSE_KEY));
         const verseOrd = parseIntStrict(verseEl.getAttribute(ATTR_VERSE_ORD));
         if (!verseKey || verseOrd == null || verseOrd < 1) {
             return null;
@@ -146,6 +146,6 @@ export class ReaderDomSelectionResolver implements DomSelectionResolver {
 
     resolveTranslationId(root: Node): string | null {
         const el = findClosestAttrElement(root, ATTR_TRANSLATION_ID);
-        return normalizeTranslationId(el?.getAttribute(ATTR_TRANSLATION_ID) ?? null);
+        return normalizeString(el?.getAttribute(ATTR_TRANSLATION_ID) ?? null);
     }
 }

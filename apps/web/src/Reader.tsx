@@ -1,24 +1,24 @@
-// apps/web/src/Reader.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiGetBooks, apiGetSpine, apiResolveLoc, type BookRow } from "./api";
 import type { ReaderLocation } from "./Search";
 import type { Mode } from "./theme";
 import { ReaderShell } from "./reader/ReaderShell";
+import { ReaderSelectionToolbar } from "./reader/ReaderSelectionToolbar";
 import type { ReaderPosition, SpineStats } from "./reader/types";
 import type { ReaderViewportHandle } from "./reader/ReaderViewport";
 import { applyReaderTypographyFromStorage } from "./reader/typography";
+import { useReaderAnnotations } from "./reader/useReaderAnnotations";
 
 type Props = {
     styles: Record<string, React.CSSProperties>;
     onBackHome: () => void;
     initialLocation?: ReaderLocation;
-
     mode?: Mode;
     onToggleTheme?: () => void;
 };
 
 const LS_LAST_ORD = "bp_last_pos_ord_v1";
-const LS_LAST_LOC = "bp_last_pos_loc_v1"; // optional (book/ch/verse), future-proof
+const LS_LAST_LOC = "bp_last_pos_loc_v1";
 
 function safeGetLS(key: string): string | null {
     try {
@@ -27,6 +27,7 @@ function safeGetLS(key: string): string | null {
         return null;
     }
 }
+
 function safeSetLS(key: string, value: string): void {
     try {
         localStorage.setItem(key, value);
@@ -59,37 +60,36 @@ export function Reader(props: Props) {
 
     const [books, setBooks] = useState<BookRow[] | null>(null);
     const [spine, setSpine] = useState<SpineStats | null>(null);
-
     const [err, setErr] = useState<string | null>(null);
     const [pos, setPos] = useState<ReaderPosition>(() => ({ ord: 1, verse: null, book: null }));
 
-    // Keep both: ref for imperative use, and state to trigger effects reliably.
     const viewportHandleRef = useRef<ReaderViewportHandle | null>(null);
     const [viewportHandle, setViewportHandle] = useState<ReaderViewportHandle | null>(null);
     const [viewportReady, setViewportReady] = useState(false);
 
     const pendingJumpRef = useRef<PendingJump | null>(null);
-
-    // Guards
     const didRestoreRef = useRef(false);
     const appliedInitialKeyRef = useRef<string>("");
-
-    // If multiple async resolves race (rapid navigation), ignore stale results.
     const resolveSeqRef = useRef(0);
 
-    // Apply typography ASAP on mount (prevents “flash”)
+    const selectionRootRef = useRef<HTMLDivElement | null>(null);
+
+    const annotations = useReaderAnnotations(selectionRootRef);
+
     useEffect(() => {
         applyReaderTypographyFromStorage();
     }, []);
 
-    // Load books + spine once
+    useEffect(() => {
+        setViewportReady(false);
+    }, [spine?.verseOrdMin, spine?.verseOrdMax, spine?.verseCount]);
+
     useEffect(() => {
         const ac = new AbortController();
         let alive = true;
 
         (async () => {
             try {
-                // If your api helpers don't accept AbortSignal, this still safely no-ops.
                 const [b, s] = await Promise.all([apiGetBooks(), apiGetSpine()]);
                 if (!alive || ac.signal.aborted) return;
                 setBooks(b.books);
@@ -145,14 +145,14 @@ export function Reader(props: Props) {
         async (bookId: string, chapter: number, verse: number | null, behavior: "auto" | "smooth") => {
             if (!bookId) return;
 
-            // Clear errors on intentional navigation
+            annotations.clearSelection();
             setErr(null);
 
             const seq = ++resolveSeqRef.current;
 
             try {
                 const loc = await apiResolveLoc(bookId, chapter, verse);
-                if (seq !== resolveSeqRef.current) return; // stale
+                if (seq !== resolveSeqRef.current) return;
                 if (!loc?.verseOrd) return;
 
                 jumpToOrd(loc.verseOrd, behavior);
@@ -171,24 +171,24 @@ export function Reader(props: Props) {
                 setErr(msg);
             }
         },
-        [jumpToOrd],
+        [annotations, jumpToOrd],
     );
 
-    // Apply deep-link / incoming location once per distinct loc key.
     useEffect(() => {
         if (!spine) return;
 
         const key = makeLocKey(initialLocation);
         if (!key) return;
-
         if (appliedInitialKeyRef.current === key) return;
+
         appliedInitialKeyRef.current = key;
 
-        const loc = initialLocation!;
+        const loc = initialLocation;
+        if (!loc) return;
+
         void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "auto");
     }, [spine, initialLocation, resolveAndJump]);
 
-    // Restore last position if no initialLocation (only once).
     useEffect(() => {
         if (!spine) return;
         if (initialLocation) return;
@@ -202,18 +202,16 @@ export function Reader(props: Props) {
         jumpToOrd(ordRaw, "auto");
     }, [spine, initialLocation, jumpToOrd]);
 
-    // If we had a pending jump and now we’re ready, perform it once.
     useEffect(() => {
         if (!canJumpNow) return;
 
-        const p = pendingJumpRef.current;
-        if (!p) return;
+        const pending = pendingJumpRef.current;
+        if (!pending) return;
 
         pendingJumpRef.current = null;
-        viewportHandle!.jumpToOrd(p.ord, p.behavior);
+        viewportHandle?.jumpToOrd(pending.ord, pending.behavior);
     }, [canJumpNow, viewportHandle]);
 
-    // Persist current position (debounced).
     useEffect(() => {
         if (!spine) return;
         if (!Number.isFinite(pos.ord)) return;
@@ -234,8 +232,6 @@ export function Reader(props: Props) {
         setErr(m);
     }, []);
 
-    // Avoid re-render storms by ignoring identical position objects.
-    // NOTE: object identity for verse/book may change; compare stable fields.
     const handlePosition = useCallback((p: ReaderPosition) => {
         setPos((prev) => {
             const prevV = prev.verse;
@@ -261,8 +257,8 @@ export function Reader(props: Props) {
     }, []);
 
     const handleJumpRef = useCallback(
-        (b: string, c: number, v: number | null) => {
-            void resolveAndJump(b, c, v, "smooth");
+        (bookId: string, chapter: number, verse: number | null) => {
+            void resolveAndJump(bookId, chapter, verse, "smooth");
         },
         [resolveAndJump],
     );
@@ -274,11 +270,35 @@ export function Reader(props: Props) {
         [resolveAndJump],
     );
 
+    const handleBackHome = useCallback(() => {
+        annotations.clearSelection();
+        onBackHome();
+    }, [annotations, onBackHome]);
+
+    const topContent = useMemo(
+        () => (
+            <ReaderSelectionToolbar
+                selection={annotations.selection}
+                onHighlight={() => {
+                    annotations.createHighlight();
+                }}
+                onBookmark={() => {
+                    annotations.createBookmark();
+                }}
+                onNote={() => {
+                    annotations.createNote(null, "New note");
+                }}
+                onClear={annotations.clearSelection}
+            />
+        ),
+        [annotations],
+    );
+
     return (
         <ReaderShell
             styles={styles}
             books={books}
-            onBackHome={onBackHome}
+            onBackHome={handleBackHome}
             current={{
                 label: posLabel,
                 ord: pos.ord,
@@ -293,11 +313,13 @@ export function Reader(props: Props) {
             spine={spine}
             bookById={bookById}
             viewportRef={setViewportRef}
+            selectionRootRef={selectionRootRef}
+            annotationSnapshot={annotations.snapshot}
+            topContent={topContent}
             onPosition={handlePosition}
             onError={handleError}
             onReady={handleReady}
             err={err}
         />
-
     );
 }

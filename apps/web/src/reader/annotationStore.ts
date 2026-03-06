@@ -3,6 +3,7 @@ import {
     createAnnotation,
     createAnnotationCreatedEvent,
     createAnnotationId,
+    createAnnotationSpan,
     createDeviceId,
     createEventId,
     createUserId,
@@ -15,7 +16,6 @@ import {
     type DeviceId,
     type SelectionAnchorInput,
     type UserId,
-    createAnnotationSpan,
 } from "@biblia/annotation";
 
 const LS_KEY = "bp.reader.annotation.events.v1";
@@ -44,8 +44,28 @@ export type CreateTextAnnotationInput = {
     archived?: boolean;
 };
 
+type PersistedAnnotationEventEnvelope = {
+    type: string;
+    eventId: string;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null;
+}
+
+function hasNonEmptyStringProp(
+    value: Record<string, unknown>,
+    key: string,
+): boolean {
+    const v = value[key];
+    return typeof v === "string" && v.trim().length > 0;
+}
+
+function isPersistedAnnotationEventEnvelope(
+    value: unknown,
+): value is PersistedAnnotationEventEnvelope {
+    if (!isRecord(value)) return false;
+    return hasNonEmptyStringProp(value, "type") && hasNonEmptyStringProp(value, "eventId");
 }
 
 function safeJsonParse<T>(raw: string | null): T | null {
@@ -78,14 +98,18 @@ function safeStorageSet(key: string, value: string): void {
     if (!canUseWindowStorage()) return;
     try {
         window.localStorage.setItem(key, value);
-    } catch {}
+    } catch {
+        // ignore
+    }
 }
 
 function safeStorageRemove(key: string): void {
     if (!canUseWindowStorage()) return;
     try {
         window.localStorage.removeItem(key);
-    } catch {}
+    } catch {
+        // ignore
+    }
 }
 
 function randomHex(bytes = 10): string {
@@ -121,10 +145,8 @@ function materializeEvents(input: unknown): AnnotationEvent[] {
 
     const out: AnnotationEvent[] = [];
     for (const item of input) {
-        if (!isRecord(item)) continue;
-        if (typeof item.type !== "string") continue;
-        if (typeof item.eventId !== "string") continue;
-        out.push(item as AnnotationEvent);
+        if (!isPersistedAnnotationEventEnvelope(item)) continue;
+        out.push(item as unknown as AnnotationEvent);
     }
 
     return out;

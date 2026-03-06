@@ -1,9 +1,9 @@
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-06T23:09:01.871Z
+Generated: 2026-03-06T23:20:16.277Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
-Total files: 70
-Total raw bytes (all included files): 1782874
+Total files: 71
+Total raw bytes (all included files): 1805857
 Truncated/skipped files: 1
 Export time: 17ms
 
@@ -16487,27 +16487,27 @@ const sx: Record<string, React.CSSProperties> = {
 ### apps/web/src/Reader.tsx
 
 ```tsx
-// apps/web/src/Reader.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiGetBooks, apiGetSpine, apiResolveLoc, type BookRow } from "./api";
 import type { ReaderLocation } from "./Search";
 import type { Mode } from "./theme";
 import { ReaderShell } from "./reader/ReaderShell";
+import { ReaderSelectionToolbar } from "./reader/ReaderSelectionToolbar";
 import type { ReaderPosition, SpineStats } from "./reader/types";
 import type { ReaderViewportHandle } from "./reader/ReaderViewport";
 import { applyReaderTypographyFromStorage } from "./reader/typography";
+import { useReaderAnnotations } from "./reader/useReaderAnnotations";
 
 type Props = {
     styles: Record<string, React.CSSProperties>;
     onBackHome: () => void;
     initialLocation?: ReaderLocation;
-
     mode?: Mode;
     onToggleTheme?: () => void;
 };
 
 const LS_LAST_ORD = "bp_last_pos_ord_v1";
-const LS_LAST_LOC = "bp_last_pos_loc_v1"; // optional (book/ch/verse), future-proof
+const LS_LAST_LOC = "bp_last_pos_loc_v1";
 
 function safeGetLS(key: string): string | null {
     try {
@@ -16516,6 +16516,7 @@ function safeGetLS(key: string): string | null {
         return null;
     }
 }
+
 function safeSetLS(key: string, value: string): void {
     try {
         localStorage.setItem(key, value);
@@ -16548,37 +16549,36 @@ export function Reader(props: Props) {
 
     const [books, setBooks] = useState<BookRow[] | null>(null);
     const [spine, setSpine] = useState<SpineStats | null>(null);
-
     const [err, setErr] = useState<string | null>(null);
     const [pos, setPos] = useState<ReaderPosition>(() => ({ ord: 1, verse: null, book: null }));
 
-    // Keep both: ref for imperative use, and state to trigger effects reliably.
     const viewportHandleRef = useRef<ReaderViewportHandle | null>(null);
     const [viewportHandle, setViewportHandle] = useState<ReaderViewportHandle | null>(null);
     const [viewportReady, setViewportReady] = useState(false);
 
     const pendingJumpRef = useRef<PendingJump | null>(null);
-
-    // Guards
     const didRestoreRef = useRef(false);
     const appliedInitialKeyRef = useRef<string>("");
-
-    // If multiple async resolves race (rapid navigation), ignore stale results.
     const resolveSeqRef = useRef(0);
 
-    // Apply typography ASAP on mount (prevents “flash”)
+    const selectionRootRef = useRef<HTMLDivElement | null>(null);
+
+    const annotations = useReaderAnnotations(selectionRootRef);
+
     useEffect(() => {
         applyReaderTypographyFromStorage();
     }, []);
 
-    // Load books + spine once
+    useEffect(() => {
+        setViewportReady(false);
+    }, [spine?.verseOrdMin, spine?.verseOrdMax, spine?.verseCount]);
+
     useEffect(() => {
         const ac = new AbortController();
         let alive = true;
 
         (async () => {
             try {
-                // If your api helpers don't accept AbortSignal, this still safely no-ops.
                 const [b, s] = await Promise.all([apiGetBooks(), apiGetSpine()]);
                 if (!alive || ac.signal.aborted) return;
                 setBooks(b.books);
@@ -16634,14 +16634,14 @@ export function Reader(props: Props) {
         async (bookId: string, chapter: number, verse: number | null, behavior: "auto" | "smooth") => {
             if (!bookId) return;
 
-            // Clear errors on intentional navigation
+            annotations.clearSelection();
             setErr(null);
 
             const seq = ++resolveSeqRef.current;
 
             try {
                 const loc = await apiResolveLoc(bookId, chapter, verse);
-                if (seq !== resolveSeqRef.current) return; // stale
+                if (seq !== resolveSeqRef.current) return;
                 if (!loc?.verseOrd) return;
 
                 jumpToOrd(loc.verseOrd, behavior);
@@ -16660,24 +16660,24 @@ export function Reader(props: Props) {
                 setErr(msg);
             }
         },
-        [jumpToOrd],
+        [annotations, jumpToOrd],
     );
 
-    // Apply deep-link / incoming location once per distinct loc key.
     useEffect(() => {
         if (!spine) return;
 
         const key = makeLocKey(initialLocation);
         if (!key) return;
-
         if (appliedInitialKeyRef.current === key) return;
+
         appliedInitialKeyRef.current = key;
 
-        const loc = initialLocation!;
+        const loc = initialLocation;
+        if (!loc) return;
+
         void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "auto");
     }, [spine, initialLocation, resolveAndJump]);
 
-    // Restore last position if no initialLocation (only once).
     useEffect(() => {
         if (!spine) return;
         if (initialLocation) return;
@@ -16691,18 +16691,16 @@ export function Reader(props: Props) {
         jumpToOrd(ordRaw, "auto");
     }, [spine, initialLocation, jumpToOrd]);
 
-    // If we had a pending jump and now we’re ready, perform it once.
     useEffect(() => {
         if (!canJumpNow) return;
 
-        const p = pendingJumpRef.current;
-        if (!p) return;
+        const pending = pendingJumpRef.current;
+        if (!pending) return;
 
         pendingJumpRef.current = null;
-        viewportHandle!.jumpToOrd(p.ord, p.behavior);
+        viewportHandle?.jumpToOrd(pending.ord, pending.behavior);
     }, [canJumpNow, viewportHandle]);
 
-    // Persist current position (debounced).
     useEffect(() => {
         if (!spine) return;
         if (!Number.isFinite(pos.ord)) return;
@@ -16723,8 +16721,6 @@ export function Reader(props: Props) {
         setErr(m);
     }, []);
 
-    // Avoid re-render storms by ignoring identical position objects.
-    // NOTE: object identity for verse/book may change; compare stable fields.
     const handlePosition = useCallback((p: ReaderPosition) => {
         setPos((prev) => {
             const prevV = prev.verse;
@@ -16750,8 +16746,8 @@ export function Reader(props: Props) {
     }, []);
 
     const handleJumpRef = useCallback(
-        (b: string, c: number, v: number | null) => {
-            void resolveAndJump(b, c, v, "smooth");
+        (bookId: string, chapter: number, verse: number | null) => {
+            void resolveAndJump(bookId, chapter, verse, "smooth");
         },
         [resolveAndJump],
     );
@@ -16763,11 +16759,35 @@ export function Reader(props: Props) {
         [resolveAndJump],
     );
 
+    const handleBackHome = useCallback(() => {
+        annotations.clearSelection();
+        onBackHome();
+    }, [annotations, onBackHome]);
+
+    const topContent = useMemo(
+        () => (
+            <ReaderSelectionToolbar
+                selection={annotations.selection}
+                onHighlight={() => {
+                    annotations.createHighlight();
+                }}
+                onBookmark={() => {
+                    annotations.createBookmark();
+                }}
+                onNote={() => {
+                    annotations.createNote(null, "New note");
+                }}
+                onClear={annotations.clearSelection}
+            />
+        ),
+        [annotations],
+    );
+
     return (
         <ReaderShell
             styles={styles}
             books={books}
-            onBackHome={onBackHome}
+            onBackHome={handleBackHome}
             current={{
                 label: posLabel,
                 ord: pos.ord,
@@ -16782,12 +16802,14 @@ export function Reader(props: Props) {
             spine={spine}
             bookById={bookById}
             viewportRef={setViewportRef}
+            selectionRootRef={selectionRootRef}
+            annotationSnapshot={annotations.snapshot}
+            topContent={topContent}
             onPosition={handlePosition}
             onError={handleError}
             onReady={handleReady}
             err={err}
         />
-
     );
 }
 ```
@@ -16800,6 +16822,7 @@ import {
     createAnnotation,
     createAnnotationCreatedEvent,
     createAnnotationId,
+    createAnnotationSpan,
     createDeviceId,
     createEventId,
     createUserId,
@@ -16812,7 +16835,6 @@ import {
     type DeviceId,
     type SelectionAnchorInput,
     type UserId,
-    createAnnotationSpan,
 } from "@biblia/annotation";
 
 const LS_KEY = "bp.reader.annotation.events.v1";
@@ -16841,8 +16863,28 @@ export type CreateTextAnnotationInput = {
     archived?: boolean;
 };
 
+type PersistedAnnotationEventEnvelope = {
+    type: string;
+    eventId: string;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null;
+}
+
+function hasNonEmptyStringProp(
+    value: Record<string, unknown>,
+    key: string,
+): boolean {
+    const v = value[key];
+    return typeof v === "string" && v.trim().length > 0;
+}
+
+function isPersistedAnnotationEventEnvelope(
+    value: unknown,
+): value is PersistedAnnotationEventEnvelope {
+    if (!isRecord(value)) return false;
+    return hasNonEmptyStringProp(value, "type") && hasNonEmptyStringProp(value, "eventId");
 }
 
 function safeJsonParse<T>(raw: string | null): T | null {
@@ -16875,14 +16917,18 @@ function safeStorageSet(key: string, value: string): void {
     if (!canUseWindowStorage()) return;
     try {
         window.localStorage.setItem(key, value);
-    } catch {}
+    } catch {
+        // ignore
+    }
 }
 
 function safeStorageRemove(key: string): void {
     if (!canUseWindowStorage()) return;
     try {
         window.localStorage.removeItem(key);
-    } catch {}
+    } catch {
+        // ignore
+    }
 }
 
 function randomHex(bytes = 10): string {
@@ -16918,10 +16964,8 @@ function materializeEvents(input: unknown): AnnotationEvent[] {
 
     const out: AnnotationEvent[] = [];
     for (const item of input) {
-        if (!isRecord(item)) continue;
-        if (typeof item.type !== "string") continue;
-        if (typeof item.eventId !== "string") continue;
-        out.push(item as AnnotationEvent);
+        if (!isPersistedAnnotationEventEnvelope(item)) continue;
+        out.push(item as unknown as AnnotationEvent);
     }
 
     return out;
@@ -17542,6 +17586,157 @@ export function useReaderPrefs(): ReaderPrefsState {
     if (!ctx) throw new Error("useReaderPrefs must be used within <ReaderPrefsProvider />");
     return ctx;
 }
+```
+
+### apps/web/src/reader/ReaderAnnotationOverlay.tsx
+
+```tsx
+import React, { memo, useMemo } from "react";
+import type { Annotation } from "@biblia/annotation";
+
+type Props = {
+    annotations: readonly Annotation[];
+};
+
+function toneForKind(kind: Annotation["kind"]): {
+    tint: string;
+    rail: string;
+    dot: string;
+} {
+    switch (kind) {
+        case "BOOKMARK":
+            return {
+                tint: "color-mix(in oklab, #7ba9ff 10%, transparent)",
+                rail: "color-mix(in oklab, #5f92ff 70%, transparent)",
+                dot: "color-mix(in oklab, #5f92ff 82%, transparent)",
+            };
+        case "NOTE":
+            return {
+                tint: "color-mix(in oklab, #b191ff 10%, transparent)",
+                rail: "color-mix(in oklab, #9c75ff 70%, transparent)",
+                dot: "color-mix(in oklab, #9c75ff 82%, transparent)",
+            };
+        case "DRAWING":
+            return {
+                tint: "color-mix(in oklab, #7de0d0 10%, transparent)",
+                rail: "color-mix(in oklab, #42cdb7 70%, transparent)",
+                dot: "color-mix(in oklab, #42cdb7 82%, transparent)",
+            };
+        default:
+            return {
+                tint: "color-mix(in oklab, #efcf73 12%, transparent)",
+                rail: "color-mix(in oklab, #ddb54c 68%, transparent)",
+                dot: "color-mix(in oklab, #ddb54c 82%, transparent)",
+            };
+    }
+}
+
+export const ReaderAnnotationOverlay = memo(function ReaderAnnotationOverlay(props: Props) {
+    const { annotations } = props;
+
+    const live = useMemo(
+        () => annotations.filter((annotation) => annotation.deletedAt === null),
+        [annotations],
+    );
+
+    const primary = live[0] ?? null;
+    const hasHighlight = live.some((annotation) => annotation.kind === "HIGHLIGHT");
+    const hasBookmark = live.some((annotation) => annotation.kind === "BOOKMARK");
+    const hasNote = live.some((annotation) => annotation.kind === "NOTE");
+    const markerKinds = live.slice(0, 3).map((annotation) => annotation.kind);
+
+    if (!primary) return null;
+
+    const tone = toneForKind(primary.kind);
+
+    return (
+        <div
+            aria-hidden="true"
+            style={{
+                position: "absolute",
+                inset: 0,
+                pointerEvents: "none",
+                borderRadius: 16,
+                overflow: "hidden",
+                zIndex: 0,
+            }}
+        >
+            {hasHighlight ? (
+                <div
+                    style={{
+                        position: "absolute",
+                        inset: 0,
+                        background: tone.tint,
+                        borderRadius: 16,
+                    }}
+                />
+            ) : null}
+
+            {(hasBookmark || hasNote || primary.kind === "DRAWING") ? (
+                <div
+                    style={{
+                        position: "absolute",
+                        left: 0,
+                        top: 8,
+                        bottom: 8,
+                        width: 3,
+                        borderRadius: 999,
+                        background: tone.rail,
+                    }}
+                />
+            ) : null}
+
+            <div
+                style={{
+                    position: "absolute",
+                    top: 8,
+                    right: 10,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 5,
+                }}
+            >
+                {markerKinds.map((kind, index) => {
+                    const markerTone = toneForKind(kind);
+                    return (
+                        <span
+                            key={`${kind}-${index}`}
+                            style={{
+                                width: 7,
+                                height: 7,
+                                borderRadius: 999,
+                                background: markerTone.dot,
+                                boxShadow: "0 0 0 1px color-mix(in oklab, white 58%, transparent)",
+                            }}
+                        />
+                    );
+                })}
+
+                {live.length > 3 ? (
+                    <span
+                        style={{
+                            minWidth: 18,
+                            height: 18,
+                            paddingInline: 5,
+                            borderRadius: 999,
+                            display: "inline-flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            background: "color-mix(in oklab, var(--card, white) 92%, transparent)",
+                            color: "color-mix(in oklab, var(--text, #111) 70%, transparent)",
+                            fontSize: 10,
+                            fontWeight: 700,
+                            lineHeight: 1,
+                            border: "1px solid color-mix(in oklab, var(--border, rgba(127,127,127,0.2)) 84%, transparent)",
+                        }}
+                    >
+                        +{live.length - 3}
+                    </span>
+                ) : null}
+            </div>
+        </div>
+    );
+});
 ```
 
 ### apps/web/src/reader/ReaderHeader.tsx
@@ -18674,8 +18869,8 @@ export const ReaderSelectionToolbar = memo(function ReaderSelectionToolbar(props
 ### apps/web/src/reader/ReaderShell.tsx
 
 ```tsx
-// apps/web/src/reader/ReaderShell.tsx
 import React, { memo, useMemo } from "react";
+import type { AnnotationSnapshot } from "@biblia/annotation";
 import type { BookRow } from "../api";
 import type { ReaderLocation } from "../Search";
 import type { Mode } from "../theme";
@@ -18708,8 +18903,10 @@ type Props = {
     spine: SpineStats | null;
     bookById: Map<string, BookRow>;
 
-    /** Pass-through ref target for ReaderViewport */
     viewportRef?: React.Ref<ReaderViewportHandle> | null;
+    selectionRootRef?: React.MutableRefObject<HTMLDivElement | null> | null;
+    annotationSnapshot?: AnnotationSnapshot | null;
+    topContent?: React.ReactNode;
 
     onPosition: (pos: ReaderPosition) => void;
     onError?: (msg: string) => void;
@@ -18734,9 +18931,6 @@ function validateSpine(spine: SpineStats | null): { ok: true } | { ok: false; ms
     }
 
     const derived = verseOrdMax - verseOrdMin + 1;
-
-    // If count is wildly wrong, don't mount virtualizer (it can freeze the tab via gigantic totalSize/layout).
-    // We allow small drift, but not absurd values.
     if (verseCount <= 0) {
         return { ok: false, msg: "Spine verseCount must be > 0." };
     }
@@ -18808,6 +19002,9 @@ export function ReaderShell(props: Props) {
         spine,
         bookById,
         viewportRef,
+        selectionRootRef,
+        annotationSnapshot,
+        topContent,
         onPosition,
         onError,
         onReady,
@@ -18817,7 +19014,6 @@ export function ReaderShell(props: Props) {
     const spineCheck = useMemo(() => validateSpine(spine), [spine]);
     const hasData = spineCheck.ok;
 
-    // Force a hard remount if spine identity changes (prevents stale virtualizer/cache state)
     const viewportKey = useMemo(() => {
         if (!spine) return "no-spine";
         return `${spine.verseOrdMin}:${spine.verseOrdMax}:${spine.verseCount}`;
@@ -18851,10 +19047,12 @@ export function ReaderShell(props: Props) {
                     ref={viewportRef ?? null}
                     spine={spine}
                     bookById={bookById}
+                    selectionRootRef={selectionRootRef ?? null}
+                    annotationSnapshot={annotationSnapshot ?? null}
                     onPosition={onPosition}
                     onError={onError}
                     onReady={onReady}
-                    topContent={null}
+                    topContent={topContent ?? null}
                 />
             ) : (
                 <LoadingBody />
@@ -19628,28 +19826,6 @@ const sx: Record<string, React.CSSProperties> = {
 ### apps/web/src/reader/ReaderViewport.tsx
 
 ```tsx
-// apps/web/src/reader/ReaderViewport.tsx
-// Biblia.to — Reader Viewport (TanStack Virtual + smart chunked prefetching)
-//
-// Freeze killers (why it was locking up):
-// • The scroll container MUST remain sx.scroll (position:absolute; inset:0). Do NOT override to position:relative.
-//   Overriding causes massive layout (millions of px) + virtualizer instability.
-//
-// Full upgrades in this pass:
-// • Real request cancellation via AbortController (abort on spine-change + unmount).
-// • De-duped chunk requests (same chunk never fetched twice concurrently).
-// • Stable prefetch deps (first/last index; not virtualItems identity).
-// • Measuring allowed again when dataTick bumps (skeleton -> real text) but limited to once/element/tick.
-// • Scroll/position tracking uses rAF throttle + passive listeners to reduce layout pressure.
-// • Book-gate will NOT trigger at verseOrdMin (no “gate at Genesis 1:1”).
-// • Memory pressure guard: hard cap on chunks + evict farthest-first from current chunk.
-// • Safer “ready” semantics: onReady fires once per spine-run when initial chunk queued.
-// • jumpToOrd queues if scrollEl not ready.
-//
-// Fix for TS2322:
-// TanStack Virtual expects behavior?: "auto" | "smooth" (its own type) — not DOM ScrollBehavior.
-// We define a local ScrollMode union and use it everywhere.
-
 import React, {
     forwardRef,
     useCallback,
@@ -19660,6 +19836,7 @@ import React, {
     useRef,
     useState,
 } from "react";
+import type { Annotation, AnnotationSnapshot } from "@biblia/annotation";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { apiGetSlice, type BookRow } from "../api";
 import type { ReaderPosition, SliceVerse, SpineStats } from "./types";
@@ -19670,11 +19847,9 @@ import { BookTitlePage } from "./BookTitlePage";
 const CHUNK = 240;
 const PREFETCH_CHUNKS_AHEAD = 2;
 const PREFETCH_CHUNKS_BEHIND = 1;
-
 const MAX_CHUNKS_IN_MEMORY = 10;
-
-// Keep estimate modest; measured sizes will correct after load.
 const EST_ROW_PX = 56;
+const EMPTY_ANNOTATIONS: readonly Annotation[] = [];
 
 type ScrollMode = "auto" | "smooth";
 
@@ -19686,27 +19861,40 @@ function clamp(n: number, lo: number, hi: number): number {
     return Math.max(lo, Math.min(hi, n));
 }
 
-/* ------------------------------ Public API ------------------------------ */
+function readMaybeString(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function getRowTranslationId(row: SliceVerse): string | null {
+    const record = row as unknown as Record<string, unknown>;
+    return (
+        readMaybeString(record.translationId) ??
+        readMaybeString(record.translation_id) ??
+        null
+    );
+}
+
 export type ReaderViewportHandle = {
     jumpToOrd: (ord: number, behavior?: ScrollMode) => void;
     getCurrentOrd: () => number;
 };
 
-/* ------------------------------- Props -------------------------------- */
 type Props = {
     spine: SpineStats;
     bookById: Map<string, BookRow>;
     topContent?: React.ReactNode;
+    selectionRootRef?: React.MutableRefObject<HTMLDivElement | null> | null;
+    annotationSnapshot?: AnnotationSnapshot | null;
     onPosition: (pos: ReaderPosition) => void;
     onError?: (msg: string) => void;
     onReady?: () => void;
 };
 
-/* --------------------------- Internal types ---------------------------- */
 type PendingJump = { ord: number; behavior: ScrollMode };
 type BookGateState = { ord: number; bookId: string };
 
-/* ----------------------------- Book Gate UI ---------------------------- */
 function BookGate(props: { book: BookRow | null; bookId: string; onContinue: () => void }) {
     const { book, bookId, onContinue } = props;
     const btnRef = useRef<HTMLButtonElement | null>(null);
@@ -19793,7 +19981,6 @@ function BookGate(props: { book: BookRow | null; bookId: string; onContinue: () 
     );
 }
 
-/* -------------------------- Chunk cache state -------------------------- */
 type ChunkState = {
     verseMap: Map<number, SliceVerse>;
     loadedChunks: Set<number>;
@@ -19810,22 +19997,66 @@ function createChunkState(): ChunkState {
     };
 }
 
-/* ----------------------------- Main Component --------------------------- */
+function buildAnnotationVerseIndex(
+    snapshot: AnnotationSnapshot | null | undefined,
+    minOrd: number,
+    maxOrd: number,
+): Map<number, readonly Annotation[]> {
+    const buckets = new Map<number, Map<string, Annotation>>();
+
+    if (!snapshot) return new Map();
+
+    for (const annotation of snapshot.annotations.values()) {
+        if (annotation.deletedAt !== null) continue;
+
+        for (const span of annotation.spans) {
+            if (span.deletedAt !== null) continue;
+
+            const startOrd = clamp(span.start.verseOrd, minOrd, maxOrd);
+            const endOrd = clamp(span.end.verseOrd, minOrd, maxOrd);
+
+            for (let ord = startOrd; ord <= endOrd; ord += 1) {
+                const bucket = buckets.get(ord) ?? new Map<string, Annotation>();
+                bucket.set(annotation.annotationId, annotation);
+                buckets.set(ord, bucket);
+            }
+        }
+    }
+
+    const out = new Map<number, readonly Annotation[]>();
+    for (const [ord, bucket] of buckets) {
+        out.set(
+            ord,
+            [...bucket.values()].sort((a, b) => {
+                if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
+                return a.annotationId.localeCompare(b.annotationId);
+            }),
+        );
+    }
+
+    return out;
+}
+
 export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function ReaderViewport(props, ref) {
-    const { spine, bookById, topContent, onPosition, onError, onReady } = props;
+    const {
+        spine,
+        bookById,
+        topContent,
+        selectionRootRef,
+        annotationSnapshot,
+        onPosition,
+        onError,
+        onReady,
+    } = props;
 
     const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
 
-    // All heavy data lives in a ref (prevents massive re-renders)
     const chunkRef = useRef<ChunkState>(createChunkState());
     const [dataTick, setDataTick] = useState(0);
 
-    // Measure thrash breaker: measure at most once per element per tick
     const measuredAtRef = useRef<WeakMap<Element, number>>(new WeakMap());
-
     const bumpTick = useCallback(() => setDataTick((t) => t + 1), []);
 
-    // spine sanity: derive count from ord bounds
     const derivedCount = useMemo(() => {
         const min = spine.verseOrdMin;
         const max = spine.verseOrdMax;
@@ -19849,24 +20080,41 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     const pendingJumpRef = useRef<PendingJump | null>(null);
     const readyOnceRef = useRef(false);
-
-    // Invalidate in-flight requests when spine changes
     const runIdRef = useRef(0);
 
-    // Real cancellation
     const inFlightRef = useRef<Map<number, AbortController>>(new Map());
     const abortAllInFlight = useCallback(() => {
-        for (const c of inFlightRef.current.values()) c.abort();
+        for (const controller of inFlightRef.current.values()) controller.abort();
         inFlightRef.current.clear();
     }, []);
 
-    // Book-boundary gate
     const [gate, setGate] = useState<BookGateState | null>(null);
     const gateRef = useRef<BookGateState | null>(null);
     const lastGatedBookIdRef = useRef<string | null>(null);
     const gateCooldownRef = useRef<number>(0);
 
-    /* -------------------------- Sync refs -------------------------- */
+    const annotationIndex = useMemo(
+        () => buildAnnotationVerseIndex(annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax),
+        [annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax],
+    );
+
+    const loadedTranslationId = useMemo(() => {
+        for (const row of chunkRef.current.verseMap.values()) {
+            const translationId = getRowTranslationId(row);
+            if (translationId) return translationId;
+        }
+        return null;
+    }, [dataTick]);
+
+    const setSelectionRootEl = useCallback(
+        (el: HTMLDivElement | null) => {
+            if (selectionRootRef) {
+                selectionRootRef.current = el;
+            }
+        },
+        [selectionRootRef],
+    );
+
     useEffect(() => {
         posOrdRef.current = posOrd;
     }, [posOrd]);
@@ -19875,7 +20123,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         gateRef.current = gate;
     }, [gate]);
 
-    /* ------------------------- Eviction ------------------------- */
     const evictFarChunks = useCallback(
         (keepOrd: number): void => {
             const state = chunkRef.current;
@@ -19886,7 +20133,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                 let farIdx = 0;
                 let farDist = -1;
 
-                for (let i = 0; i < list.length; i++) {
+                for (let i = 0; i < list.length; i += 1) {
                     const c = list[i]!;
                     const d = Math.abs(c - keepChunk);
                     if (d > farDist) {
@@ -19900,13 +20147,14 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
                 const startOrd = victim;
                 const endOrd = Math.min(victim + CHUNK - 1, spine.verseOrdMax);
-                for (let ord = startOrd; ord <= endOrd; ord++) state.verseMap.delete(ord);
+                for (let ord = startOrd; ord <= endOrd; ord += 1) {
+                    state.verseMap.delete(ord);
+                }
             }
         },
         [spine.verseOrdMin, spine.verseOrdMax],
     );
 
-    /* ------------------------- Load chunk (dedup + cancel) ------------------------- */
     const ensureChunk = useCallback(
         async (startOrd: number, keepOrd?: number): Promise<void> => {
             const s = clamp(startOrd, spine.verseOrdMin, spine.verseOrdMax);
@@ -19920,15 +20168,17 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
             state.loadingChunks.add(chunk);
 
-            const ctrl = new AbortController();
-            inFlightRef.current.set(chunk, ctrl);
+            const controller = new AbortController();
+            inFlightRef.current.set(chunk, controller);
 
             try {
-                const res = await apiGetSlice(chunk, CHUNK, { signal: ctrl.signal });
+                const res = await apiGetSlice(chunk, CHUNK, { signal: controller.signal });
                 if (runIdRef.current !== myRunId) return;
-                if (ctrl.signal.aborted) return;
+                if (controller.signal.aborted) return;
 
-                for (const v of res.verses) state.verseMap.set(v.verseOrd, v);
+                for (const verse of res.verses) {
+                    state.verseMap.set(verse.verseOrd, verse);
+                }
 
                 state.loadedChunks.add(chunk);
                 state.loadedOrder.push(chunk);
@@ -19937,7 +20187,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                 bumpTick();
             } catch (e: unknown) {
                 if (runIdRef.current !== myRunId) return;
-                if (ctrl.signal.aborted) return;
+                if (controller.signal.aborted) return;
                 onError?.(e instanceof Error ? e.message : String(e));
             } finally {
                 state.loadingChunks.delete(chunk);
@@ -19947,10 +20197,9 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         [bumpTick, evictFarChunks, onError, spine.verseOrdMin, spine.verseOrdMax],
     );
 
-    /* ------------------------- Reset on spine change ------------------------- */
     useEffect(() => {
         abortAllInFlight();
-        runIdRef.current++;
+        runIdRef.current += 1;
 
         chunkRef.current = createChunkState();
         measuredAtRef.current = new WeakMap();
@@ -19974,13 +20223,11 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         return () => abortAllInFlight();
     }, [abortAllInFlight]);
 
-    /* ------------------------- Scroll element ready ------------------------- */
     useEffect(() => {
         if (!scrollEl) return;
         void ensureChunk(chunkStart(initialOrd), initialOrd);
     }, [scrollEl, ensureChunk, initialOrd]);
 
-    /* ------------------------- Virtualizer ------------------------- */
     const rowVirtualizer = useVirtualizer({
         count,
         getScrollElement: () => scrollEl,
@@ -19993,7 +20240,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
     const firstIndex = virtualItems[0]?.index ?? 0;
     const lastIndex = virtualItems.length ? virtualItems[virtualItems.length - 1]!.index : 0;
 
-    /* ------------------------- Public jump API ------------------------- */
     const jumpToOrd = useCallback(
         (ord: number, behavior: ScrollMode = "auto") => {
             const targetOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
@@ -20022,7 +20268,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         [jumpToOrd],
     );
 
-    /* ------------------------- Ready + pending jump ------------------------- */
     useEffect(() => {
         if (!scrollEl) return;
 
@@ -20032,14 +20277,13 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
             onReady?.();
         }
 
-        const p = pendingJumpRef.current;
-        if (p) {
+        const pending = pendingJumpRef.current;
+        if (pending) {
             pendingJumpRef.current = null;
-            jumpToOrd(p.ord, p.behavior);
+            jumpToOrd(pending.ord, pending.behavior);
         }
     }, [scrollEl, jumpToOrd, onReady, ensureChunk, initialOrd]);
 
-    /* ------------------------- Prefetch logic ------------------------- */
     useEffect(() => {
         if (!virtualItems.length) return;
 
@@ -20051,56 +20295,54 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
         for (let c = start; c <= end; c += CHUNK) void ensureChunk(c, firstOrd);
 
-        for (let k = 1; k <= PREFETCH_CHUNKS_AHEAD; k++) {
+        for (let k = 1; k <= PREFETCH_CHUNKS_AHEAD; k += 1) {
             const ahead = end + k * CHUNK;
             if (ahead <= spine.verseOrdMax) void ensureChunk(ahead, lastOrd);
         }
 
-        for (let k = 1; k <= PREFETCH_CHUNKS_BEHIND; k++) {
+        for (let k = 1; k <= PREFETCH_CHUNKS_BEHIND; k += 1) {
             const behind = start - k * CHUNK;
             if (behind >= spine.verseOrdMin) void ensureChunk(behind, firstOrd);
         }
     }, [firstIndex, lastIndex, ensureChunk, spine.verseOrdMin, spine.verseOrdMax, virtualItems.length]);
 
-    /* ------------------------- Gate scroll lock ------------------------- */
     useEffect(() => {
         if (!scrollEl) return;
 
         const prevOverflowY = scrollEl.style.overflowY;
-        const prevOverscroll = (scrollEl.style as any).overscrollBehavior;
+        const prevOverscroll = (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior;
         const prevScrollBehavior = scrollEl.style.scrollBehavior;
 
         if (gate) {
             scrollEl.style.overflowY = "hidden";
-            (scrollEl.style as any).overscrollBehavior = "contain";
+            (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior = "contain";
             scrollEl.style.scrollBehavior = "auto";
         } else {
             scrollEl.style.overflowY = prevOverflowY;
-            (scrollEl.style as any).overscrollBehavior = prevOverscroll;
+            (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior = prevOverscroll;
             scrollEl.style.scrollBehavior = prevScrollBehavior;
         }
 
         return () => {
             scrollEl.style.overflowY = prevOverflowY;
-            (scrollEl.style as any).overscrollBehavior = prevOverscroll;
+            (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior = prevOverscroll;
             scrollEl.style.scrollBehavior = prevScrollBehavior;
         };
     }, [scrollEl, gate]);
 
-    /* ------------------------- Track top verse (throttled) ------------------------- */
     const rafScrollRef = useRef<number>(0);
 
     const computeAndSetTopOrd = useCallback(() => {
         rafScrollRef.current = 0;
         if (!scrollEl || !virtualItems.length || gateRef.current) return;
 
-        const st = scrollEl.scrollTop;
+        const scrollTop = scrollEl.scrollTop;
 
         let topItem = virtualItems[0]!;
-        for (let i = 0; i < virtualItems.length; i++) {
-            const it = virtualItems[i]!;
-            if (it.start + it.size > st + 1) {
-                topItem = it;
+        for (let i = 0; i < virtualItems.length; i += 1) {
+            const item = virtualItems[i]!;
+            if (item.start + item.size > scrollTop + 1) {
+                topItem = item;
                 break;
             }
         }
@@ -20117,8 +20359,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
     useLayoutEffect(() => {
         if (!scrollEl || !virtualItems.length || gateRef.current) return;
         computeAndSetTopOrd();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [scrollEl, virtualItems.length, firstIndex, lastIndex]);
+    }, [scrollEl, virtualItems.length, firstIndex, lastIndex, computeAndSetTopOrd]);
 
     useEffect(() => {
         if (!scrollEl) return;
@@ -20138,7 +20379,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         };
     }, [scrollEl, computeAndSetTopOrd]);
 
-    /* ------------------------- Emit position ------------------------- */
     const lastSentRef = useRef<{ ord: number; hasVerse: boolean }>({ ord: -1, hasVerse: false });
 
     useEffect(() => {
@@ -20154,12 +20394,11 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         onPosition({ ord: effectiveOrd, verse, book });
     }, [posOrd, dataTick, bookById, onPosition, initialOrd]);
 
-    /* ------------------------- Book-boundary gate detection ------------------------- */
     useEffect(() => {
         if (!scrollEl || gateRef.current) return;
 
         if (gateCooldownRef.current > 0) {
-            gateCooldownRef.current--;
+            gateCooldownRef.current -= 1;
             return;
         }
 
@@ -20168,6 +20407,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         if (!cur) return;
 
         if (ord === spine.verseOrdMin) return;
+
         const prev = chunkRef.current.verseMap.get(ord - 1) ?? null;
         if (!prev) return;
         if (prev.bookId === cur.bookId) return;
@@ -20183,12 +20423,12 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         });
     }, [scrollEl, posOrd, dataTick, rowVirtualizer, spine.verseOrdMin]);
 
-    /* ------------------------- Rendering ------------------------- */
     const totalSize = rowVirtualizer.getTotalSize();
 
     const renderRow = useCallback(
         (verseOrd: number) => {
             const row = chunkRef.current.verseMap.get(verseOrd) ?? null;
+
             if (!row) {
                 return (
                     <div style={sx.skelRow}>
@@ -20197,9 +20437,18 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                     </div>
                 );
             }
-            return <VerseRow row={row} book={bookById.get(row.bookId) ?? null} />;
+
+            const annotations = annotationIndex.get(verseOrd) ?? EMPTY_ANNOTATIONS;
+
+            return (
+                <VerseRow
+                    row={row}
+                    book={bookById.get(row.bookId) ?? null}
+                    annotations={annotations}
+                />
+            );
         },
-        [bookById],
+        [annotationIndex, bookById],
     );
 
     const measureRowEl = useCallback(
@@ -20216,9 +20465,13 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     return (
         <div style={sx.body}>
-            {/* IMPORTANT: do NOT override sx.scroll positioning (it must stay absolute+inset:0). */}
             <div ref={setScrollEl} style={sx.scroll}>
-                <div className="container" style={sx.container}>
+                <div
+                    ref={setSelectionRootEl}
+                    className="container"
+                    style={sx.container}
+                    data-translation-id={loadedTranslationId ?? undefined}
+                >
                     {topContent}
 
                     <div
@@ -20251,7 +20504,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                     </div>
                 </div>
 
-                {gate && (
+                {gate ? (
                     <BookGate
                         book={bookById.get(gate.bookId) ?? null}
                         bookId={gate.bookId}
@@ -20267,7 +20520,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                             });
                         }}
                     />
-                )}
+                ) : null}
             </div>
         </div>
     );
@@ -20358,7 +20611,7 @@ function getTokenCharEnd(tokenEl: HTMLElement | null): number | null {
     return parseIntStrict(tokenEl.getAttribute(ATTR_TOKEN_CHAR_END));
 }
 
-function normalizeTranslationId(value: string | null): string | null {
+function normalizeString(value: string | null): string | null {
     if (typeof value !== "string") return null;
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : null;
@@ -20405,7 +20658,7 @@ export class ReaderDomSelectionResolver implements DomSelectionResolver {
         const verseEl = findVerseElement(node);
         if (!verseEl) return null;
 
-        const verseKey = normalizeTranslationId(verseEl.getAttribute(ATTR_VERSE_KEY));
+        const verseKey = normalizeString(verseEl.getAttribute(ATTR_VERSE_KEY));
         const verseOrd = parseIntStrict(verseEl.getAttribute(ATTR_VERSE_ORD));
         if (!verseKey || verseOrd == null || verseOrd < 1) {
             return null;
@@ -20425,7 +20678,7 @@ export class ReaderDomSelectionResolver implements DomSelectionResolver {
 
     resolveTranslationId(root: Node): string | null {
         const el = findClosestAttrElement(root, ATTR_TRANSLATION_ID);
-        return normalizeTranslationId(el?.getAttribute(ATTR_TRANSLATION_ID) ?? null);
+        return normalizeString(el?.getAttribute(ATTR_TRANSLATION_ID) ?? null);
     }
 }
 ```
@@ -21727,9 +21980,10 @@ function getActiveSelection(): Selection | null {
 function clearDomSelection(): void {
     if (!canUseDom()) return;
     try {
-        const selection = document.getSelection();
-        selection?.removeAllRanges();
-    } catch {}
+        document.getSelection()?.removeAllRanges();
+    } catch {
+        // ignore
+    }
 }
 
 function selectionEquals(
@@ -21845,15 +22099,15 @@ export function useReaderAnnotations(
             readSelection();
         };
 
-        const onKeyUp = (): void => {
-            readSelection();
-        };
-
         const onMouseUp = (): void => {
             readSelection();
         };
 
         const onTouchEnd = (): void => {
+            readSelection();
+        };
+
+        const onKeyUp = (): void => {
             readSelection();
         };
 
@@ -21907,18 +22161,13 @@ export function useReaderAnnotations(
         selection,
         clearSelection,
         refreshSelection: readSelection,
-        createHighlight: () => {
-            return createAnnotationFromSelection("HIGHLIGHT");
-        },
-        createBookmark: () => {
-            return createAnnotationFromSelection("BOOKMARK");
-        },
-        createNote: (body, title) => {
-            return createAnnotationFromSelection("NOTE", {
+        createHighlight: () => createAnnotationFromSelection("HIGHLIGHT"),
+        createBookmark: () => createAnnotationFromSelection("BOOKMARK"),
+        createNote: (body, title) =>
+            createAnnotationFromSelection("NOTE", {
                 body: body ?? null,
                 title: title ?? null,
-            });
-        },
+            }),
     };
 }
 ```
@@ -21926,9 +22175,10 @@ export function useReaderAnnotations(
 ### apps/web/src/reader/VerseRow.tsx
 
 ```tsx
-// apps/web/src/reader/VerseRow.tsx
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
+import type { Annotation } from "@biblia/annotation";
 import type { BookRow } from "../api";
+import { ReaderAnnotationOverlay } from "./ReaderAnnotationOverlay";
 import type { SliceVerse } from "./types";
 import { sx } from "./sx";
 import { BookTitlePage } from "./BookTitlePage";
@@ -21936,78 +22186,71 @@ import { BookTitlePage } from "./BookTitlePage";
 type Props = {
     row: SliceVerse;
     book: BookRow | null;
+    annotations?: readonly Annotation[];
 };
 
-/**
- * Biblia.to — VerseRow (token-ready + selection/annotation-friendly)
- *
- * Upgrades:
- * - Stable IDs + data-* for verse + (optional) token anchors
- * - Pointer hover/focus are “non-thrashy” and ignore touch hover
- * - Keyboard: Enter/Space can toggle an "active" state hook via data attribute (non-breaking)
- * - Safer aria: verse is a region-like article with described-by text node
- * - Optional token rendering (if row.tokens exists) with char offsets when available
- *
- * NOTE:
- * - This component does NOT implement selection/highlight yet; it only emits stable DOM anchors
- *   that your future selection engine can target deterministically.
- */
-export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
+function readMaybeString(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function getRowTranslationId(row: SliceVerse): string | null {
+    const record = row as unknown as Record<string, unknown>;
+    return (
+        readMaybeString(record.translationId) ??
+        readMaybeString(record.translation_id) ??
+        null
+    );
+}
+
+export const VerseRow = React.memo(function VerseRow(props: Props) {
+    const { row, book, annotations = [] } = props;
+
     const isBookStart = row.chapter === 1 && row.verse === 1;
     const isChapterStart = row.verse === 1;
 
     const [hovered, setHovered] = useState(false);
     const [focused, setFocused] = useState(false);
 
-    // Optional “active” state (future: click to open annotation menu, etc.)
-    const [active, setActive] = useState(false);
+    const isInteractive = annotations.length > 0;
+    const translationId = getRowTranslationId(row);
+    const verseTextId = `ord-${row.verseOrd}-text`;
 
-    const rootRef = useRef<HTMLDivElement | null>(null);
-
-    // Hover is a mouse/pen affordance; avoid “sticky hover” on touch.
     const onEnter = useCallback((e: React.PointerEvent) => {
         if (e.pointerType === "touch") return;
-        setHovered((v) => (v ? v : true));
+        setHovered(true);
     }, []);
+
     const onLeave = useCallback((e: React.PointerEvent) => {
         if (e.pointerType === "touch") return;
-        setHovered((v) => (v ? false : v));
+        setHovered(false);
     }, []);
 
-    const onFocus = useCallback(() => setFocused((v) => (v ? v : true)), []);
+    const onFocus = useCallback(() => {
+        setFocused(true);
+    }, []);
+
     const onBlur = useCallback(() => {
-        setFocused((v) => (v ? false : v));
-        setActive(false);
-    }, []);
-
-    const onKeyDown = useCallback((e: React.KeyboardEvent) => {
-        // Keep this conservative; do not swallow arrows/page keys that scrolling might depend on.
-        if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            setActive((v) => !v);
-        }
-        if (e.key === "Escape") {
-            setActive(false);
-        }
+        setFocused(false);
     }, []);
 
     const bookLabel = (book?.name ?? row.bookId).toString();
     const ariaLabel = useMemo(() => `${bookLabel} ${row.chapter}:${row.verse}`, [bookLabel, row.chapter, row.verse]);
 
-    const verseTextId = `ord-${row.verseOrd}-text`;
-
     const rowStyle = useMemo<React.CSSProperties>(() => {
         const base = sx.verseRow;
-        const h = hovered ? sx.verseRowHover : undefined;
-        const f = focused ? sx.verseRowFocus : undefined;
-        // Active is optional; if you have a style token, it’ll apply; otherwise no-op.
-        const a = active ? (sx as any).verseRowActive : undefined;
-        return { ...base, ...(h ?? {}), ...(f ?? {}), ...(a ?? {}) };
-    }, [hovered, focused, active]);
+        const hover = hovered ? sx.verseRowHover : undefined;
+        const focus = focused ? sx.verseRowFocus : undefined;
+        return {
+            ...base,
+            ...(hover ?? {}),
+            ...(focus ?? {}),
+            position: "relative",
+            isolation: "isolate",
+        };
+    }, [hovered, focused]);
 
-    // Token-ready render:
-    // - If tokens are present, each token becomes a stable span with data-token-index.
-    // - If tokens are absent, render the plain text exactly as before.
     const tokens = row.tokens ?? null;
 
     const verseBody = useMemo(() => {
@@ -22015,20 +22258,19 @@ export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
             return row.text ?? "";
         }
 
-        // Render tokens as spans so selection/highlight can snap to token boundaries.
         return (
             <>
-                {tokens.map((t) => {
-                    const key = `${row.verseOrd}:${t.tokenIndex}`;
+                {tokens.map((token) => {
+                    const key = `${row.verseOrd}:${token.tokenIndex}`;
                     return (
                         <span
                             key={key}
-                            data-token-index={t.tokenIndex}
-                            data-token-kind={t.tokenKind ?? undefined}
-                            data-char-start={t.charStart ?? undefined}
-                            data-char-end={t.charEnd ?? undefined}
+                            data-token-index={token.tokenIndex}
+                            data-token-kind={token.tokenKind ?? undefined}
+                            data-token-char-start={token.charStart ?? undefined}
+                            data-token-char-end={token.charEnd ?? undefined}
                         >
-                            {t.token}
+                            {token.token}
                         </span>
                     );
                 })}
@@ -22039,14 +22281,14 @@ export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
     return (
         <div
             id={`ord-${row.verseOrd}`}
-            ref={rootRef}
             data-ord={row.verseOrd}
+            data-verse-ord={row.verseOrd}
             data-verse-key={row.verseKey}
             data-book={row.bookId}
             data-chapter={row.chapter}
             data-verse={row.verse}
+            data-translation-id={translationId ?? undefined}
             data-has-tokens={tokens && tokens.length > 0 ? "1" : "0"}
-            data-active={active ? "1" : "0"}
             style={{ padding: 0 }}
         >
             {isBookStart ? <BookTitlePage book={book} bookId={row.bookId} /> : null}
@@ -22060,7 +22302,6 @@ export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
                 </div>
             ) : null}
 
-            {/* Make the *row* the focus target (not the inner text). */}
             <div
                 role="article"
                 aria-roledescription="verse"
@@ -22072,17 +22313,10 @@ export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
                 onPointerLeave={onLeave}
                 onFocus={onFocus}
                 onBlur={onBlur}
-                onKeyDown={onKeyDown}
-                onPointerDown={(e) => {
-                    // Prevent touch from triggering odd focus/selection behavior.
-                    // Mouse should keep default text selection.
-                    if (e.pointerType !== "mouse") e.preventDefault();
-                }}
-                onClick={() => {
-                    // Mouse click can mark active without breaking selection; keep it light.
-                    setActive(true);
-                }}
+                data-has-annotations={isInteractive ? "1" : "0"}
             >
+                <ReaderAnnotationOverlay annotations={annotations} />
+
                 <div style={sx.verseNum} aria-hidden="true">
                     {row.verse}
                 </div>
@@ -22093,6 +22327,7 @@ export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
                     style={sx.verseText}
                     data-verse-ord={row.verseOrd}
                     data-verse-key={row.verseKey}
+                    data-translation-id={translationId ?? undefined}
                 >
                     {verseBody}
                 </div>
@@ -23410,17 +23645,17 @@ export default defineConfig({
 
 ### biblia.to-code-export.md
 
-> TRUNCATED: file was 908825 bytes; showing first 48000 chars
+> TRUNCATED: file was 926523 bytes; showing first 48000 chars
 
 ```md
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-06T23:02:23.158Z
+Generated: 2026-03-06T23:09:01.871Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
-Total files: 69
-Total raw bytes (all included files): 1747683
+Total files: 70
+Total raw bytes (all included files): 1782874
 Truncated/skipped files: 1
-Export time: 25ms
+Export time: 17ms
 
 ## Notes
 

@@ -1,25 +1,3 @@
-// apps/web/src/reader/ReaderViewport.tsx
-// Biblia.to — Reader Viewport (TanStack Virtual + smart chunked prefetching)
-//
-// Freeze killers (why it was locking up):
-// • The scroll container MUST remain sx.scroll (position:absolute; inset:0). Do NOT override to position:relative.
-//   Overriding causes massive layout (millions of px) + virtualizer instability.
-//
-// Full upgrades in this pass:
-// • Real request cancellation via AbortController (abort on spine-change + unmount).
-// • De-duped chunk requests (same chunk never fetched twice concurrently).
-// • Stable prefetch deps (first/last index; not virtualItems identity).
-// • Measuring allowed again when dataTick bumps (skeleton -> real text) but limited to once/element/tick.
-// • Scroll/position tracking uses rAF throttle + passive listeners to reduce layout pressure.
-// • Book-gate will NOT trigger at verseOrdMin (no “gate at Genesis 1:1”).
-// • Memory pressure guard: hard cap on chunks + evict farthest-first from current chunk.
-// • Safer “ready” semantics: onReady fires once per spine-run when initial chunk queued.
-// • jumpToOrd queues if scrollEl not ready.
-//
-// Fix for TS2322:
-// TanStack Virtual expects behavior?: "auto" | "smooth" (its own type) — not DOM ScrollBehavior.
-// We define a local ScrollMode union and use it everywhere.
-
 import React, {
     forwardRef,
     useCallback,
@@ -30,6 +8,7 @@ import React, {
     useRef,
     useState,
 } from "react";
+import type { Annotation, AnnotationSnapshot } from "@biblia/annotation";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { apiGetSlice, type BookRow } from "../api";
 import type { ReaderPosition, SliceVerse, SpineStats } from "./types";
@@ -40,11 +19,9 @@ import { BookTitlePage } from "./BookTitlePage";
 const CHUNK = 240;
 const PREFETCH_CHUNKS_AHEAD = 2;
 const PREFETCH_CHUNKS_BEHIND = 1;
-
 const MAX_CHUNKS_IN_MEMORY = 10;
-
-// Keep estimate modest; measured sizes will correct after load.
 const EST_ROW_PX = 56;
+const EMPTY_ANNOTATIONS: readonly Annotation[] = [];
 
 type ScrollMode = "auto" | "smooth";
 
@@ -56,27 +33,40 @@ function clamp(n: number, lo: number, hi: number): number {
     return Math.max(lo, Math.min(hi, n));
 }
 
-/* ------------------------------ Public API ------------------------------ */
+function readMaybeString(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function getRowTranslationId(row: SliceVerse): string | null {
+    const record = row as unknown as Record<string, unknown>;
+    return (
+        readMaybeString(record.translationId) ??
+        readMaybeString(record.translation_id) ??
+        null
+    );
+}
+
 export type ReaderViewportHandle = {
     jumpToOrd: (ord: number, behavior?: ScrollMode) => void;
     getCurrentOrd: () => number;
 };
 
-/* ------------------------------- Props -------------------------------- */
 type Props = {
     spine: SpineStats;
     bookById: Map<string, BookRow>;
     topContent?: React.ReactNode;
+    selectionRootRef?: React.MutableRefObject<HTMLDivElement | null> | null;
+    annotationSnapshot?: AnnotationSnapshot | null;
     onPosition: (pos: ReaderPosition) => void;
     onError?: (msg: string) => void;
     onReady?: () => void;
 };
 
-/* --------------------------- Internal types ---------------------------- */
 type PendingJump = { ord: number; behavior: ScrollMode };
 type BookGateState = { ord: number; bookId: string };
 
-/* ----------------------------- Book Gate UI ---------------------------- */
 function BookGate(props: { book: BookRow | null; bookId: string; onContinue: () => void }) {
     const { book, bookId, onContinue } = props;
     const btnRef = useRef<HTMLButtonElement | null>(null);
@@ -163,7 +153,6 @@ function BookGate(props: { book: BookRow | null; bookId: string; onContinue: () 
     );
 }
 
-/* -------------------------- Chunk cache state -------------------------- */
 type ChunkState = {
     verseMap: Map<number, SliceVerse>;
     loadedChunks: Set<number>;
@@ -180,22 +169,66 @@ function createChunkState(): ChunkState {
     };
 }
 
-/* ----------------------------- Main Component --------------------------- */
+function buildAnnotationVerseIndex(
+    snapshot: AnnotationSnapshot | null | undefined,
+    minOrd: number,
+    maxOrd: number,
+): Map<number, readonly Annotation[]> {
+    const buckets = new Map<number, Map<string, Annotation>>();
+
+    if (!snapshot) return new Map();
+
+    for (const annotation of snapshot.annotations.values()) {
+        if (annotation.deletedAt !== null) continue;
+
+        for (const span of annotation.spans) {
+            if (span.deletedAt !== null) continue;
+
+            const startOrd = clamp(span.start.verseOrd, minOrd, maxOrd);
+            const endOrd = clamp(span.end.verseOrd, minOrd, maxOrd);
+
+            for (let ord = startOrd; ord <= endOrd; ord += 1) {
+                const bucket = buckets.get(ord) ?? new Map<string, Annotation>();
+                bucket.set(annotation.annotationId, annotation);
+                buckets.set(ord, bucket);
+            }
+        }
+    }
+
+    const out = new Map<number, readonly Annotation[]>();
+    for (const [ord, bucket] of buckets) {
+        out.set(
+            ord,
+            [...bucket.values()].sort((a, b) => {
+                if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
+                return a.annotationId.localeCompare(b.annotationId);
+            }),
+        );
+    }
+
+    return out;
+}
+
 export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function ReaderViewport(props, ref) {
-    const { spine, bookById, topContent, onPosition, onError, onReady } = props;
+    const {
+        spine,
+        bookById,
+        topContent,
+        selectionRootRef,
+        annotationSnapshot,
+        onPosition,
+        onError,
+        onReady,
+    } = props;
 
     const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
 
-    // All heavy data lives in a ref (prevents massive re-renders)
     const chunkRef = useRef<ChunkState>(createChunkState());
     const [dataTick, setDataTick] = useState(0);
 
-    // Measure thrash breaker: measure at most once per element per tick
     const measuredAtRef = useRef<WeakMap<Element, number>>(new WeakMap());
-
     const bumpTick = useCallback(() => setDataTick((t) => t + 1), []);
 
-    // spine sanity: derive count from ord bounds
     const derivedCount = useMemo(() => {
         const min = spine.verseOrdMin;
         const max = spine.verseOrdMax;
@@ -219,24 +252,41 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     const pendingJumpRef = useRef<PendingJump | null>(null);
     const readyOnceRef = useRef(false);
-
-    // Invalidate in-flight requests when spine changes
     const runIdRef = useRef(0);
 
-    // Real cancellation
     const inFlightRef = useRef<Map<number, AbortController>>(new Map());
     const abortAllInFlight = useCallback(() => {
-        for (const c of inFlightRef.current.values()) c.abort();
+        for (const controller of inFlightRef.current.values()) controller.abort();
         inFlightRef.current.clear();
     }, []);
 
-    // Book-boundary gate
     const [gate, setGate] = useState<BookGateState | null>(null);
     const gateRef = useRef<BookGateState | null>(null);
     const lastGatedBookIdRef = useRef<string | null>(null);
     const gateCooldownRef = useRef<number>(0);
 
-    /* -------------------------- Sync refs -------------------------- */
+    const annotationIndex = useMemo(
+        () => buildAnnotationVerseIndex(annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax),
+        [annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax],
+    );
+
+    const loadedTranslationId = useMemo(() => {
+        for (const row of chunkRef.current.verseMap.values()) {
+            const translationId = getRowTranslationId(row);
+            if (translationId) return translationId;
+        }
+        return null;
+    }, [dataTick]);
+
+    const setSelectionRootEl = useCallback(
+        (el: HTMLDivElement | null) => {
+            if (selectionRootRef) {
+                selectionRootRef.current = el;
+            }
+        },
+        [selectionRootRef],
+    );
+
     useEffect(() => {
         posOrdRef.current = posOrd;
     }, [posOrd]);
@@ -245,7 +295,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         gateRef.current = gate;
     }, [gate]);
 
-    /* ------------------------- Eviction ------------------------- */
     const evictFarChunks = useCallback(
         (keepOrd: number): void => {
             const state = chunkRef.current;
@@ -256,7 +305,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                 let farIdx = 0;
                 let farDist = -1;
 
-                for (let i = 0; i < list.length; i++) {
+                for (let i = 0; i < list.length; i += 1) {
                     const c = list[i]!;
                     const d = Math.abs(c - keepChunk);
                     if (d > farDist) {
@@ -270,13 +319,14 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
                 const startOrd = victim;
                 const endOrd = Math.min(victim + CHUNK - 1, spine.verseOrdMax);
-                for (let ord = startOrd; ord <= endOrd; ord++) state.verseMap.delete(ord);
+                for (let ord = startOrd; ord <= endOrd; ord += 1) {
+                    state.verseMap.delete(ord);
+                }
             }
         },
         [spine.verseOrdMin, spine.verseOrdMax],
     );
 
-    /* ------------------------- Load chunk (dedup + cancel) ------------------------- */
     const ensureChunk = useCallback(
         async (startOrd: number, keepOrd?: number): Promise<void> => {
             const s = clamp(startOrd, spine.verseOrdMin, spine.verseOrdMax);
@@ -290,15 +340,17 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
             state.loadingChunks.add(chunk);
 
-            const ctrl = new AbortController();
-            inFlightRef.current.set(chunk, ctrl);
+            const controller = new AbortController();
+            inFlightRef.current.set(chunk, controller);
 
             try {
-                const res = await apiGetSlice(chunk, CHUNK, { signal: ctrl.signal });
+                const res = await apiGetSlice(chunk, CHUNK, { signal: controller.signal });
                 if (runIdRef.current !== myRunId) return;
-                if (ctrl.signal.aborted) return;
+                if (controller.signal.aborted) return;
 
-                for (const v of res.verses) state.verseMap.set(v.verseOrd, v);
+                for (const verse of res.verses) {
+                    state.verseMap.set(verse.verseOrd, verse);
+                }
 
                 state.loadedChunks.add(chunk);
                 state.loadedOrder.push(chunk);
@@ -307,7 +359,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                 bumpTick();
             } catch (e: unknown) {
                 if (runIdRef.current !== myRunId) return;
-                if (ctrl.signal.aborted) return;
+                if (controller.signal.aborted) return;
                 onError?.(e instanceof Error ? e.message : String(e));
             } finally {
                 state.loadingChunks.delete(chunk);
@@ -317,10 +369,9 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         [bumpTick, evictFarChunks, onError, spine.verseOrdMin, spine.verseOrdMax],
     );
 
-    /* ------------------------- Reset on spine change ------------------------- */
     useEffect(() => {
         abortAllInFlight();
-        runIdRef.current++;
+        runIdRef.current += 1;
 
         chunkRef.current = createChunkState();
         measuredAtRef.current = new WeakMap();
@@ -344,13 +395,11 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         return () => abortAllInFlight();
     }, [abortAllInFlight]);
 
-    /* ------------------------- Scroll element ready ------------------------- */
     useEffect(() => {
         if (!scrollEl) return;
         void ensureChunk(chunkStart(initialOrd), initialOrd);
     }, [scrollEl, ensureChunk, initialOrd]);
 
-    /* ------------------------- Virtualizer ------------------------- */
     const rowVirtualizer = useVirtualizer({
         count,
         getScrollElement: () => scrollEl,
@@ -363,7 +412,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
     const firstIndex = virtualItems[0]?.index ?? 0;
     const lastIndex = virtualItems.length ? virtualItems[virtualItems.length - 1]!.index : 0;
 
-    /* ------------------------- Public jump API ------------------------- */
     const jumpToOrd = useCallback(
         (ord: number, behavior: ScrollMode = "auto") => {
             const targetOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
@@ -392,7 +440,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         [jumpToOrd],
     );
 
-    /* ------------------------- Ready + pending jump ------------------------- */
     useEffect(() => {
         if (!scrollEl) return;
 
@@ -402,14 +449,13 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
             onReady?.();
         }
 
-        const p = pendingJumpRef.current;
-        if (p) {
+        const pending = pendingJumpRef.current;
+        if (pending) {
             pendingJumpRef.current = null;
-            jumpToOrd(p.ord, p.behavior);
+            jumpToOrd(pending.ord, pending.behavior);
         }
     }, [scrollEl, jumpToOrd, onReady, ensureChunk, initialOrd]);
 
-    /* ------------------------- Prefetch logic ------------------------- */
     useEffect(() => {
         if (!virtualItems.length) return;
 
@@ -421,56 +467,54 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
         for (let c = start; c <= end; c += CHUNK) void ensureChunk(c, firstOrd);
 
-        for (let k = 1; k <= PREFETCH_CHUNKS_AHEAD; k++) {
+        for (let k = 1; k <= PREFETCH_CHUNKS_AHEAD; k += 1) {
             const ahead = end + k * CHUNK;
             if (ahead <= spine.verseOrdMax) void ensureChunk(ahead, lastOrd);
         }
 
-        for (let k = 1; k <= PREFETCH_CHUNKS_BEHIND; k++) {
+        for (let k = 1; k <= PREFETCH_CHUNKS_BEHIND; k += 1) {
             const behind = start - k * CHUNK;
             if (behind >= spine.verseOrdMin) void ensureChunk(behind, firstOrd);
         }
     }, [firstIndex, lastIndex, ensureChunk, spine.verseOrdMin, spine.verseOrdMax, virtualItems.length]);
 
-    /* ------------------------- Gate scroll lock ------------------------- */
     useEffect(() => {
         if (!scrollEl) return;
 
         const prevOverflowY = scrollEl.style.overflowY;
-        const prevOverscroll = (scrollEl.style as any).overscrollBehavior;
+        const prevOverscroll = (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior;
         const prevScrollBehavior = scrollEl.style.scrollBehavior;
 
         if (gate) {
             scrollEl.style.overflowY = "hidden";
-            (scrollEl.style as any).overscrollBehavior = "contain";
+            (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior = "contain";
             scrollEl.style.scrollBehavior = "auto";
         } else {
             scrollEl.style.overflowY = prevOverflowY;
-            (scrollEl.style as any).overscrollBehavior = prevOverscroll;
+            (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior = prevOverscroll;
             scrollEl.style.scrollBehavior = prevScrollBehavior;
         }
 
         return () => {
             scrollEl.style.overflowY = prevOverflowY;
-            (scrollEl.style as any).overscrollBehavior = prevOverscroll;
+            (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior = prevOverscroll;
             scrollEl.style.scrollBehavior = prevScrollBehavior;
         };
     }, [scrollEl, gate]);
 
-    /* ------------------------- Track top verse (throttled) ------------------------- */
     const rafScrollRef = useRef<number>(0);
 
     const computeAndSetTopOrd = useCallback(() => {
         rafScrollRef.current = 0;
         if (!scrollEl || !virtualItems.length || gateRef.current) return;
 
-        const st = scrollEl.scrollTop;
+        const scrollTop = scrollEl.scrollTop;
 
         let topItem = virtualItems[0]!;
-        for (let i = 0; i < virtualItems.length; i++) {
-            const it = virtualItems[i]!;
-            if (it.start + it.size > st + 1) {
-                topItem = it;
+        for (let i = 0; i < virtualItems.length; i += 1) {
+            const item = virtualItems[i]!;
+            if (item.start + item.size > scrollTop + 1) {
+                topItem = item;
                 break;
             }
         }
@@ -487,8 +531,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
     useLayoutEffect(() => {
         if (!scrollEl || !virtualItems.length || gateRef.current) return;
         computeAndSetTopOrd();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [scrollEl, virtualItems.length, firstIndex, lastIndex]);
+    }, [scrollEl, virtualItems.length, firstIndex, lastIndex, computeAndSetTopOrd]);
 
     useEffect(() => {
         if (!scrollEl) return;
@@ -508,7 +551,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         };
     }, [scrollEl, computeAndSetTopOrd]);
 
-    /* ------------------------- Emit position ------------------------- */
     const lastSentRef = useRef<{ ord: number; hasVerse: boolean }>({ ord: -1, hasVerse: false });
 
     useEffect(() => {
@@ -524,12 +566,11 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         onPosition({ ord: effectiveOrd, verse, book });
     }, [posOrd, dataTick, bookById, onPosition, initialOrd]);
 
-    /* ------------------------- Book-boundary gate detection ------------------------- */
     useEffect(() => {
         if (!scrollEl || gateRef.current) return;
 
         if (gateCooldownRef.current > 0) {
-            gateCooldownRef.current--;
+            gateCooldownRef.current -= 1;
             return;
         }
 
@@ -538,6 +579,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         if (!cur) return;
 
         if (ord === spine.verseOrdMin) return;
+
         const prev = chunkRef.current.verseMap.get(ord - 1) ?? null;
         if (!prev) return;
         if (prev.bookId === cur.bookId) return;
@@ -553,12 +595,12 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         });
     }, [scrollEl, posOrd, dataTick, rowVirtualizer, spine.verseOrdMin]);
 
-    /* ------------------------- Rendering ------------------------- */
     const totalSize = rowVirtualizer.getTotalSize();
 
     const renderRow = useCallback(
         (verseOrd: number) => {
             const row = chunkRef.current.verseMap.get(verseOrd) ?? null;
+
             if (!row) {
                 return (
                     <div style={sx.skelRow}>
@@ -567,9 +609,18 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                     </div>
                 );
             }
-            return <VerseRow row={row} book={bookById.get(row.bookId) ?? null} />;
+
+            const annotations = annotationIndex.get(verseOrd) ?? EMPTY_ANNOTATIONS;
+
+            return (
+                <VerseRow
+                    row={row}
+                    book={bookById.get(row.bookId) ?? null}
+                    annotations={annotations}
+                />
+            );
         },
-        [bookById],
+        [annotationIndex, bookById],
     );
 
     const measureRowEl = useCallback(
@@ -586,9 +637,13 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     return (
         <div style={sx.body}>
-            {/* IMPORTANT: do NOT override sx.scroll positioning (it must stay absolute+inset:0). */}
             <div ref={setScrollEl} style={sx.scroll}>
-                <div className="container" style={sx.container}>
+                <div
+                    ref={setSelectionRootEl}
+                    className="container"
+                    style={sx.container}
+                    data-translation-id={loadedTranslationId ?? undefined}
+                >
                     {topContent}
 
                     <div
@@ -621,7 +676,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                     </div>
                 </div>
 
-                {gate && (
+                {gate ? (
                     <BookGate
                         book={bookById.get(gate.bookId) ?? null}
                         bookId={gate.bookId}
@@ -637,7 +692,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                             });
                         }}
                     />
-                )}
+                ) : null}
             </div>
         </div>
     );

@@ -1,5 +1,5 @@
-// apps/web/src/reader/ReaderShell.tsx
 import React, { memo, useMemo } from "react";
+import type { AnnotationSnapshot } from "@biblia/annotation";
 import type { BookRow } from "../api";
 import type { ReaderLocation } from "../Search";
 import type { Mode } from "../theme";
@@ -32,8 +32,10 @@ type Props = {
     spine: SpineStats | null;
     bookById: Map<string, BookRow>;
 
-    /** Pass-through ref target for ReaderViewport */
     viewportRef?: React.Ref<ReaderViewportHandle> | null;
+    selectionRootRef?: React.MutableRefObject<HTMLDivElement | null> | null;
+    annotationSnapshot?: AnnotationSnapshot | null;
+    topContent?: React.ReactNode;
 
     onPosition: (pos: ReaderPosition) => void;
     onError?: (msg: string) => void;
@@ -58,9 +60,6 @@ function validateSpine(spine: SpineStats | null): { ok: true } | { ok: false; ms
     }
 
     const derived = verseOrdMax - verseOrdMin + 1;
-
-    // If count is wildly wrong, don't mount virtualizer (it can freeze the tab via gigantic totalSize/layout).
-    // We allow small drift, but not absurd values.
     if (verseCount <= 0) {
         return { ok: false, msg: "Spine verseCount must be > 0." };
     }
@@ -132,6 +131,9 @@ export function ReaderShell(props: Props) {
         spine,
         bookById,
         viewportRef,
+        selectionRootRef,
+        annotationSnapshot,
+        topContent,
         onPosition,
         onError,
         onReady,
@@ -141,7 +143,6 @@ export function ReaderShell(props: Props) {
     const spineCheck = useMemo(() => validateSpine(spine), [spine]);
     const hasData = spineCheck.ok;
 
-    // Force a hard remount if spine identity changes (prevents stale virtualizer/cache state)
     const viewportKey = useMemo(() => {
         if (!spine) return "no-spine";
         return `${spine.verseOrdMin}:${spine.verseOrdMax}:${spine.verseCount}`;
@@ -175,10 +176,12 @@ export function ReaderShell(props: Props) {
                     ref={viewportRef ?? null}
                     spine={spine}
                     bookById={bookById}
+                    selectionRootRef={selectionRootRef ?? null}
+                    annotationSnapshot={annotationSnapshot ?? null}
                     onPosition={onPosition}
                     onError={onError}
                     onReady={onReady}
-                    topContent={null}
+                    topContent={topContent ?? null}
                 />
             ) : (
                 <LoadingBody />

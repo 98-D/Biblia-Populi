@@ -42,9 +42,10 @@ function getActiveSelection(): Selection | null {
 function clearDomSelection(): void {
     if (!canUseDom()) return;
     try {
-        const selection = document.getSelection();
-        selection?.removeAllRanges();
-    } catch {}
+        document.getSelection()?.removeAllRanges();
+    } catch {
+        // ignore
+    }
 }
 
 function selectionEquals(
@@ -160,15 +161,15 @@ export function useReaderAnnotations(
             readSelection();
         };
 
-        const onKeyUp = (): void => {
-            readSelection();
-        };
-
         const onMouseUp = (): void => {
             readSelection();
         };
 
         const onTouchEnd = (): void => {
+            readSelection();
+        };
+
+        const onKeyUp = (): void => {
             readSelection();
         };
 
@@ -222,17 +223,12 @@ export function useReaderAnnotations(
         selection,
         clearSelection,
         refreshSelection: readSelection,
-        createHighlight: () => {
-            return createAnnotationFromSelection("HIGHLIGHT");
-        },
-        createBookmark: () => {
-            return createAnnotationFromSelection("BOOKMARK");
-        },
-        createNote: (body, title) => {
-            return createAnnotationFromSelection("NOTE", {
+        createHighlight: () => createAnnotationFromSelection("HIGHLIGHT"),
+        createBookmark: () => createAnnotationFromSelection("BOOKMARK"),
+        createNote: (body, title) =>
+            createAnnotationFromSelection("NOTE", {
                 body: body ?? null,
                 title: title ?? null,
-            });
-        },
+            }),
     };
 }
