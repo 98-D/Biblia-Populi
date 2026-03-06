@@ -1,11 +1,11 @@
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-06T21:58:44.247Z
+Generated: 2026-03-06T23:09:01.871Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
-Total files: 60
-Total raw bytes (all included files): 1621988
+Total files: 70
+Total raw bytes (all included files): 1782874
 Truncated/skipped files: 1
-Export time: 22ms
+Export time: 17ms
 
 ## Notes
 
@@ -16792,6 +16792,358 @@ export function Reader(props: Props) {
 }
 ```
 
+### apps/web/src/reader/annotationStore.ts
+
+```ts
+import {
+    ANNOTATION_KIND,
+    createAnnotation,
+    createAnnotationCreatedEvent,
+    createAnnotationId,
+    createDeviceId,
+    createEventId,
+    createUserId,
+    reduceAnnotationEvents,
+    type Annotation,
+    type AnnotationEvent,
+    type AnnotationId,
+    type AnnotationSnapshot,
+    type CreateEventMeta,
+    type DeviceId,
+    type SelectionAnchorInput,
+    type UserId,
+    createAnnotationSpan,
+} from "@biblia/annotation";
+
+const LS_KEY = "bp.reader.annotation.events.v1";
+const LS_DEVICE_KEY = "bp.reader.device-id.v1";
+const LS_USER_KEY = "bp.reader.user-id.v1";
+
+export type ReaderAnnotationStoreListener = (snapshot: AnnotationSnapshot) => void;
+
+export type ReaderAnnotationStoreOptions = {
+    storageKey?: string;
+    deviceStorageKey?: string;
+    userStorageKey?: string;
+    persist?: boolean;
+    now?: () => number;
+};
+
+export type CreateTextAnnotationInput = {
+    selection: SelectionAnchorInput;
+    kind?: "HIGHLIGHT" | "NOTE" | "BOOKMARK";
+    title?: string | null;
+    body?: string | null;
+    color?: string | null;
+    labels?: readonly string[];
+    collectionIds?: readonly string[];
+    pinned?: boolean;
+    archived?: boolean;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
+}
+
+function safeJsonParse<T>(raw: string | null): T | null {
+    if (!raw) return null;
+    try {
+        return JSON.parse(raw) as T;
+    } catch {
+        return null;
+    }
+}
+
+function safeJsonStringify(value: unknown): string {
+    return JSON.stringify(value);
+}
+
+function canUseWindowStorage(): boolean {
+    return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
+}
+
+function safeStorageGet(key: string): string | null {
+    if (!canUseWindowStorage()) return null;
+    try {
+        return window.localStorage.getItem(key);
+    } catch {
+        return null;
+    }
+}
+
+function safeStorageSet(key: string, value: string): void {
+    if (!canUseWindowStorage()) return;
+    try {
+        window.localStorage.setItem(key, value);
+    } catch {}
+}
+
+function safeStorageRemove(key: string): void {
+    if (!canUseWindowStorage()) return;
+    try {
+        window.localStorage.removeItem(key);
+    } catch {}
+}
+
+function randomHex(bytes = 10): string {
+    const out = new Uint8Array(bytes);
+
+    if (typeof globalThis.crypto !== "undefined" && typeof globalThis.crypto.getRandomValues === "function") {
+        globalThis.crypto.getRandomValues(out);
+    } else {
+        for (let i = 0; i < out.length; i += 1) {
+            out[i] = Math.floor(Math.random() * 256);
+        }
+    }
+
+    return Array.from(out, (n) => n.toString(16).padStart(2, "0")).join("");
+}
+
+function loadOrCreateBrandedId<T extends string>(
+    key: string,
+    create: (seed?: string) => T,
+): T {
+    const raw = safeStorageGet(key);
+    if (typeof raw === "string" && raw.trim().length > 0) {
+        return raw as T;
+    }
+
+    const next = create(randomHex(6));
+    safeStorageSet(key, next);
+    return next;
+}
+
+function materializeEvents(input: unknown): AnnotationEvent[] {
+    if (!Array.isArray(input)) return [];
+
+    const out: AnnotationEvent[] = [];
+    for (const item of input) {
+        if (!isRecord(item)) continue;
+        if (typeof item.type !== "string") continue;
+        if (typeof item.eventId !== "string") continue;
+        out.push(item as AnnotationEvent);
+    }
+
+    return out;
+}
+
+function sortAnnotationsNewestFirst(a: Annotation, b: Annotation): number {
+    if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
+    return a.annotationId.localeCompare(b.annotationId);
+}
+
+export class ReaderAnnotationStore {
+    readonly storageKey: string;
+    readonly deviceStorageKey: string;
+    readonly userStorageKey: string;
+    readonly persist: boolean;
+    readonly now: () => number;
+
+    private events: AnnotationEvent[];
+    private snapshot: AnnotationSnapshot;
+    private readonly listeners = new Set<ReaderAnnotationStoreListener>();
+    private readonly deviceId: DeviceId;
+    private readonly userId: UserId;
+
+    constructor(options: ReaderAnnotationStoreOptions = {}) {
+        this.storageKey = options.storageKey ?? LS_KEY;
+        this.deviceStorageKey = options.deviceStorageKey ?? LS_DEVICE_KEY;
+        this.userStorageKey = options.userStorageKey ?? LS_USER_KEY;
+        this.persist = options.persist ?? true;
+        this.now = options.now ?? (() => Date.now());
+
+        this.deviceId = loadOrCreateBrandedId(this.deviceStorageKey, createDeviceId);
+        this.userId = loadOrCreateBrandedId(this.userStorageKey, createUserId);
+
+        const raw = safeStorageGet(this.storageKey);
+        this.events = materializeEvents(safeJsonParse<unknown>(raw));
+
+        try {
+            this.snapshot = reduceAnnotationEvents(this.events);
+        } catch {
+            this.events = [];
+            this.snapshot = reduceAnnotationEvents([]);
+            if (this.persist) {
+                safeStorageRemove(this.storageKey);
+            }
+        }
+    }
+
+    getDeviceId(): DeviceId {
+        return this.deviceId;
+    }
+
+    getUserId(): UserId {
+        return this.userId;
+    }
+
+    getEvents(): readonly AnnotationEvent[] {
+        return this.events;
+    }
+
+    getSnapshot(): AnnotationSnapshot {
+        return this.snapshot;
+    }
+
+    getAnnotation(annotationId: AnnotationId): Annotation | null {
+        return this.snapshot.annotations.get(annotationId) ?? null;
+    }
+
+    hasAnnotation(annotationId: AnnotationId): boolean {
+        return this.snapshot.annotations.has(annotationId);
+    }
+
+    listAnnotations(): readonly Annotation[] {
+        return [...this.snapshot.annotations.values()]
+            .filter((annotation) => annotation.deletedAt === null)
+            .sort(sortAnnotationsNewestFirst);
+    }
+
+    listAnnotationsForVerseOrd(verseOrd: number): readonly Annotation[] {
+        const out: Annotation[] = [];
+
+        for (const annotation of this.snapshot.annotations.values()) {
+            if (annotation.deletedAt !== null) continue;
+
+            const hit = annotation.spans.some((span: Annotation["spans"][number]) => {
+                return (
+                    span.deletedAt === null &&
+                    span.start.verseOrd <= verseOrd &&
+                    span.end.verseOrd >= verseOrd
+                );
+            });
+
+            if (hit) out.push(annotation);
+        }
+
+        out.sort(sortAnnotationsNewestFirst);
+        return out;
+    }
+
+    subscribe(listener: ReaderAnnotationStoreListener): () => void {
+        this.listeners.add(listener);
+        return () => {
+            this.listeners.delete(listener);
+        };
+    }
+
+    append(event: AnnotationEvent): void {
+        this.events = [...this.events, event];
+        this.rebuildSnapshot();
+        this.persistNow();
+        this.emit();
+    }
+
+    appendMany(events: readonly AnnotationEvent[]): void {
+        if (events.length === 0) return;
+
+        this.events = [...this.events, ...events];
+        this.rebuildSnapshot();
+        this.persistNow();
+        this.emit();
+    }
+
+    createTextAnnotation(input: CreateTextAnnotationInput): AnnotationId {
+        const now = this.now();
+        const annotationId = createAnnotationId(input.selection.start.verseKey);
+
+        const span = createAnnotationSpan({
+            start: input.selection.start,
+            end: input.selection.end,
+            text: input.selection.text,
+            translationId: input.selection.translationId,
+            ordinal: 1,
+            createdAt: now,
+            updatedAt: now,
+            deletedAt: null,
+        });
+
+        const annotation = createAnnotation({
+            annotationId,
+            ownerUserId: this.userId,
+            createdByUserId: this.userId,
+            updatedByUserId: this.userId,
+            deviceId: this.deviceId,
+            kind:
+                input.kind === "NOTE"
+                    ? ANNOTATION_KIND.NOTE
+                    : input.kind === "BOOKMARK"
+                        ? ANNOTATION_KIND.BOOKMARK
+                        : ANNOTATION_KIND.HIGHLIGHT,
+            title: input.title ?? null,
+            body: input.body ?? null,
+            color: input.color ?? null,
+            labels: input.labels ?? [],
+            collectionIds: input.collectionIds ?? [],
+            spans: [span],
+            strokes: [],
+            pinned: input.pinned ?? false,
+            archived: input.archived ?? false,
+            createdAt: now,
+            updatedAt: now,
+            deletedAt: null,
+            revision: 1,
+        });
+
+        const meta = this.makeEventMeta(now);
+        const event = createAnnotationCreatedEvent(annotation, meta);
+
+        this.append(event);
+        return annotationId;
+    }
+
+    replaceAllEvents(events: readonly AnnotationEvent[]): void {
+        this.events = [...events];
+        this.rebuildSnapshot();
+        this.persistNow();
+        this.emit();
+    }
+
+    clearAll(): void {
+        this.events = [];
+        this.snapshot = reduceAnnotationEvents([]);
+        this.persistNow();
+        this.emit();
+    }
+
+    private rebuildSnapshot(): void {
+        this.snapshot = reduceAnnotationEvents(this.events);
+    }
+
+    private makeEventMeta(createdAt: number): CreateEventMeta {
+        return {
+            eventId: createEventId("reader"),
+            userId: this.userId,
+            deviceId: this.deviceId,
+            createdAt,
+        };
+    }
+
+    private persistNow(): void {
+        if (!this.persist) return;
+        safeStorageSet(this.storageKey, safeJsonStringify(this.events));
+    }
+
+    private emit(): void {
+        for (const listener of this.listeners) {
+            listener(this.snapshot);
+        }
+    }
+}
+
+let singleton: ReaderAnnotationStore | null = null;
+
+export function getReaderAnnotationStore(): ReaderAnnotationStore {
+    if (singleton) return singleton;
+    singleton = new ReaderAnnotationStore();
+    return singleton;
+}
+
+export function resetReaderAnnotationStoreSingleton(): void {
+    singleton = null;
+}
+```
+
 ### apps/web/src/reader/BookTitlePage.tsx
 
 ```tsx
@@ -17936,6 +18288,387 @@ const hxs: Record<string, React.CSSProperties> = {
         color: "var(--fg)",
     },
 };
+```
+
+### apps/web/src/reader/ReaderSelectionToolbar.tsx
+
+```tsx
+import React, { memo, useMemo, useState } from "react";
+import type { SelectionAnchorInput } from "@biblia/annotation";
+import {
+    Bookmark,
+    Highlighter,
+    NotebookPen,
+    Sparkles,
+    X,
+} from "lucide-react";
+
+type Props = {
+    selection: SelectionAnchorInput | null;
+    onHighlight: () => void;
+    onBookmark: () => void;
+    onNote: () => void;
+    onClear?: () => void;
+    className?: string;
+};
+
+type ActionTone = "gold" | "blue" | "violet";
+
+type ActionButtonProps = {
+    label: string;
+    title: string;
+    onClick: () => void;
+    icon: React.ReactNode;
+    tone: ActionTone;
+};
+
+function cleanText(value: string): string {
+    return value.replace(/\s+/g, " ").trim();
+}
+
+function clampText(value: string, max = 132): string {
+    const text = cleanText(value);
+    if (text.length <= max) return text;
+    return `${text.slice(0, max - 1).trimEnd()}…`;
+}
+
+function getSelectionLabel(selection: SelectionAnchorInput | null): string | null {
+    if (!selection) return null;
+
+    const start = cleanText(selection.start.verseKey);
+    const end = cleanText(selection.end.verseKey);
+
+    if (!start) return null;
+    if (start === end) return start;
+    return `${start} — ${end}`;
+}
+
+function getSelectionDetail(selection: SelectionAnchorInput | null): string | null {
+    if (!selection) return null;
+
+    const text = selection.text ? cleanText(selection.text) : "";
+    if (text.length > 0) return clampText(text);
+
+    const translationId = selection.translationId ? cleanText(selection.translationId) : "";
+    if (translationId.length > 0) return `Selection in ${translationId}`;
+
+    return "Text selection";
+}
+
+function getPanelBorder(): string {
+    return "1px solid color-mix(in oklab, var(--reader-border, var(--border, rgba(127,127,127,0.24))) 86%, transparent)";
+}
+
+function getPanelBackground(): string {
+    return `
+        linear-gradient(
+            180deg,
+            color-mix(in oklab, var(--reader-card, var(--card, rgba(255,255,255,0.96))) 96%, white) 0%,
+            color-mix(in oklab, var(--reader-card, var(--card, rgba(255,255,255,0.96))) 100%, transparent) 100%
+        )
+    `;
+}
+
+function getPanelShadow(): string {
+    return "0 14px 34px rgba(0,0,0,0.10), 0 2px 10px rgba(0,0,0,0.05)";
+}
+
+function getToneStyles(tone: ActionTone): {
+    color: string;
+    background: string;
+    border: string;
+    shadow: string;
+    hoverBackground: string;
+} {
+    switch (tone) {
+        case "gold":
+            return {
+                color: "color-mix(in oklab, var(--text, #111) 76%, #8a6400)",
+                background: "color-mix(in oklab, #efcf73 16%, var(--card, white))",
+                border: "1px solid color-mix(in oklab, #ddb54c 40%, transparent)",
+                shadow: "0 6px 16px color-mix(in oklab, #ddb54c 12%, transparent)",
+                hoverBackground: "color-mix(in oklab, #efcf73 22%, var(--card, white))",
+            };
+        case "blue":
+            return {
+                color: "color-mix(in oklab, var(--text, #111) 76%, #295ed8)",
+                background: "color-mix(in oklab, #7ba9ff 14%, var(--card, white))",
+                border: "1px solid color-mix(in oklab, #6d9fff 38%, transparent)",
+                shadow: "0 6px 16px color-mix(in oklab, #6d9fff 11%, transparent)",
+                hoverBackground: "color-mix(in oklab, #7ba9ff 20%, var(--card, white))",
+            };
+        case "violet":
+            return {
+                color: "color-mix(in oklab, var(--text, #111) 76%, #6b47d8)",
+                background: "color-mix(in oklab, #b191ff 14%, var(--card, white))",
+                border: "1px solid color-mix(in oklab, #a884ff 38%, transparent)",
+                shadow: "0 6px 16px color-mix(in oklab, #a884ff 11%, transparent)",
+                hoverBackground: "color-mix(in oklab, #b191ff 20%, var(--card, white))",
+            };
+    }
+}
+
+const ActionButton = memo(function ActionButton(props: ActionButtonProps) {
+    const { label, title, onClick, icon, tone } = props;
+    const toneStyles = getToneStyles(tone);
+    const [hovered, setHovered] = useState(false);
+
+    return (
+        <button
+            type="button"
+            title={title}
+            aria-label={title}
+            onClick={onClick}
+            onMouseDown={(event) => {
+                event.preventDefault();
+            }}
+            onMouseEnter={() => {
+                setHovered(true);
+            }}
+            onMouseLeave={() => {
+                setHovered(false);
+            }}
+            style={{
+                appearance: "none",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 8,
+                height: 38,
+                padding: "0 14px",
+                borderRadius: 999,
+                border: toneStyles.border,
+                background: hovered ? toneStyles.hoverBackground : toneStyles.background,
+                color: toneStyles.color,
+                boxShadow: toneStyles.shadow,
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+                fontSize: 13,
+                fontWeight: 700,
+                lineHeight: 1,
+                letterSpacing: "-0.01em",
+                transform: hovered ? "translateY(-1px)" : "translateY(0)",
+                transition:
+                    "transform 120ms ease, background 120ms ease, border-color 120ms ease, box-shadow 120ms ease, color 120ms ease",
+                WebkitTapHighlightColor: "transparent",
+            }}
+        >
+            <span
+                aria-hidden="true"
+                style={{
+                    width: 16,
+                    height: 16,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flex: "0 0 auto",
+                }}
+            >
+                {icon}
+            </span>
+            <span>{label}</span>
+        </button>
+    );
+});
+
+const ClearButton = memo(function ClearButton(props: { onClick: () => void }) {
+    const [hovered, setHovered] = useState(false);
+
+    return (
+        <button
+            type="button"
+            title="Clear selection"
+            aria-label="Clear selection"
+            onClick={props.onClick}
+            onMouseDown={(event) => {
+                event.preventDefault();
+            }}
+            onMouseEnter={() => {
+                setHovered(true);
+            }}
+            onMouseLeave={() => {
+                setHovered(false);
+            }}
+            style={{
+                appearance: "none",
+                width: 38,
+                height: 38,
+                borderRadius: 999,
+                border: "1px solid color-mix(in oklab, var(--border, rgba(127,127,127,0.24)) 86%, transparent)",
+                background: hovered
+                    ? "color-mix(in oklab, var(--text, #111) 5%, transparent)"
+                    : "transparent",
+                color: "color-mix(in oklab, var(--text, #111) 70%, transparent)",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                cursor: "pointer",
+                flex: "0 0 auto",
+                transform: hovered ? "translateY(-1px)" : "translateY(0)",
+                transition: "background 120ms ease, transform 120ms ease, border-color 120ms ease",
+                WebkitTapHighlightColor: "transparent",
+            }}
+        >
+            <X size={17} strokeWidth={2.1} />
+        </button>
+    );
+});
+
+export const ReaderSelectionToolbar = memo(function ReaderSelectionToolbar(props: Props) {
+    const { selection, onHighlight, onBookmark, onNote, onClear, className } = props;
+
+    const label = useMemo(() => getSelectionLabel(selection), [selection]);
+    const detail = useMemo(() => getSelectionDetail(selection), [selection]);
+
+    if (!selection) return null;
+
+    return (
+        <div
+            className={className}
+            role="toolbar"
+            aria-label="Selection actions"
+            style={{
+                position: "sticky",
+                top: 8,
+                zIndex: 60,
+                width: "100%",
+                display: "flex",
+                justifyContent: "center",
+                padding: "8px 12px 14px",
+                pointerEvents: "none",
+            }}
+        >
+            <div
+                style={{
+                    pointerEvents: "auto",
+                    width: "min(940px, 100%)",
+                    borderRadius: 22,
+                    border: getPanelBorder(),
+                    background: getPanelBackground(),
+                    boxShadow: getPanelShadow(),
+                    overflow: "hidden",
+                }}
+            >
+                <div
+                    style={{
+                        display: "grid",
+                        gridTemplateColumns: "minmax(0, 1fr) auto",
+                        gap: 12,
+                        alignItems: "center",
+                        padding: "12px 14px",
+                    }}
+                >
+                    <div
+                        style={{
+                            minWidth: 0,
+                            display: "flex",
+                            flexDirection: "column",
+                            gap: 4,
+                        }}
+                    >
+                        <div
+                            style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 8,
+                                minWidth: 0,
+                                flexWrap: "wrap",
+                            }}
+                        >
+                            <div
+                                aria-hidden="true"
+                                style={{
+                                    width: 24,
+                                    height: 24,
+                                    borderRadius: 999,
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    justifyContent: "center",
+                                    background: "color-mix(in oklab, var(--text, #111) 6%, transparent)",
+                                    color: "color-mix(in oklab, var(--text, #111) 76%, transparent)",
+                                    flex: "0 0 auto",
+                                }}
+                            >
+                                <Sparkles size={13} strokeWidth={2.2} />
+                            </div>
+
+                            {label ? (
+                                <div
+                                    style={{
+                                        minWidth: 0,
+                                        fontSize: 14,
+                                        fontWeight: 800,
+                                        letterSpacing: "-0.02em",
+                                        color: "var(--text, inherit)",
+                                        overflow: "hidden",
+                                        textOverflow: "ellipsis",
+                                        whiteSpace: "nowrap",
+                                    }}
+                                    title={label}
+                                >
+                                    {label}
+                                </div>
+                            ) : null}
+                        </div>
+
+                        {detail ? (
+                            <div
+                                style={{
+                                    minWidth: 0,
+                                    fontSize: 13,
+                                    lineHeight: 1.35,
+                                    color: "color-mix(in oklab, var(--text, #111) 66%, transparent)",
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    whiteSpace: "nowrap",
+                                }}
+                                title={detail}
+                            >
+                                {detail}
+                            </div>
+                        ) : null}
+                    </div>
+
+                    <div
+                        style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "flex-end",
+                            gap: 8,
+                            flexWrap: "wrap",
+                        }}
+                    >
+                        <ActionButton
+                            label="Highlight"
+                            title="Create highlight"
+                            onClick={onHighlight}
+                            icon={<Highlighter size={16} strokeWidth={2.1} />}
+                            tone="gold"
+                        />
+
+                        <ActionButton
+                            label="Bookmark"
+                            title="Create bookmark"
+                            onClick={onBookmark}
+                            icon={<Bookmark size={16} strokeWidth={2.1} />}
+                            tone="blue"
+                        />
+
+                        <ActionButton
+                            label="Note"
+                            title="Create note"
+                            onClick={onNote}
+                            icon={<NotebookPen size={16} strokeWidth={2.1} />}
+                            tone="violet"
+                        />
+
+                        {onClear ? <ClearButton onClick={onClear} /> : null}
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+});
 ```
 
 ### apps/web/src/reader/ReaderShell.tsx
@@ -19541,6 +20274,162 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 });
 ```
 
+### apps/web/src/reader/selectionResolver.ts
+
+```ts
+import type { DomSelectionResolver, DomSelectionTokenLocator } from "@biblia/annotation";
+
+const ATTR_VERSE_KEY = "data-verse-key";
+const ATTR_VERSE_ORD = "data-verse-ord";
+const ATTR_TOKEN_INDEX = "data-token-index";
+const ATTR_TOKEN_CHAR_START = "data-token-char-start";
+const ATTR_TOKEN_CHAR_END = "data-token-char-end";
+const ATTR_TRANSLATION_ID = "data-translation-id";
+
+function isElement(value: unknown): value is Element {
+    return typeof Element !== "undefined" && value instanceof Element;
+}
+
+function isTextNode(value: unknown): value is Text {
+    return typeof Text !== "undefined" && value instanceof Text;
+}
+
+function parseIntStrict(value: string | null): number | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return null;
+    const n = Number(trimmed);
+    return Number.isInteger(n) ? n : null;
+}
+
+function clampInt(value: number, min: number, max: number): number {
+    if (!Number.isFinite(value)) return min;
+    const asInt = Math.trunc(value);
+    if (asInt < min) return min;
+    if (asInt > max) return max;
+    return asInt;
+}
+
+function findClosestElement(node: Node | null): Element | null {
+    if (!node) return null;
+    if (isElement(node)) return node;
+    return node.parentElement;
+}
+
+function findClosestAttrElement(node: Node | null, attr: string): HTMLElement | null {
+    let current = findClosestElement(node);
+    while (current) {
+        if (current instanceof HTMLElement && current.hasAttribute(attr)) {
+            return current;
+        }
+        current = current.parentElement;
+    }
+    return null;
+}
+
+function findVerseElement(node: Node | null): HTMLElement | null {
+    let current = findClosestElement(node);
+    while (current) {
+        if (
+            current instanceof HTMLElement &&
+            current.hasAttribute(ATTR_VERSE_KEY) &&
+            current.hasAttribute(ATTR_VERSE_ORD)
+        ) {
+            return current;
+        }
+        current = current.parentElement;
+    }
+    return null;
+}
+
+function getNodeTextLength(node: Node | null): number {
+    if (!node) return 0;
+    const text = node.textContent;
+    return typeof text === "string" ? text.length : 0;
+}
+
+function getTokenCharStart(tokenEl: HTMLElement | null): number | null {
+    if (!tokenEl) return null;
+    return parseIntStrict(tokenEl.getAttribute(ATTR_TOKEN_CHAR_START));
+}
+
+function getTokenCharEnd(tokenEl: HTMLElement | null): number | null {
+    if (!tokenEl) return null;
+    return parseIntStrict(tokenEl.getAttribute(ATTR_TOKEN_CHAR_END));
+}
+
+function normalizeTranslationId(value: string | null): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function resolveTokenRelativeOffset(node: Node, offset: number, tokenEl: HTMLElement): number {
+    const tokenTextLen = getNodeTextLength(tokenEl);
+    if (isTextNode(node)) {
+        return clampInt(offset, 0, getNodeTextLength(node));
+    }
+    return clampInt(offset, 0, tokenTextLen);
+}
+
+function resolveCharOffset(node: Node, offset: number, tokenEl: HTMLElement | null): number | null {
+    if (!tokenEl) {
+        if (isTextNode(node)) {
+            return clampInt(offset, 0, getNodeTextLength(node));
+        }
+        return null;
+    }
+
+    const tokenStart = getTokenCharStart(tokenEl);
+    const tokenEnd = getTokenCharEnd(tokenEl);
+
+    if (tokenStart == null && tokenEnd == null) {
+        return isTextNode(node) ? clampInt(offset, 0, getNodeTextLength(node)) : null;
+    }
+
+    if (tokenStart != null && tokenEnd != null) {
+        const width = Math.max(0, tokenEnd - tokenStart);
+        const local = resolveTokenRelativeOffset(node, offset, tokenEl);
+        return tokenStart + clampInt(local, 0, width);
+    }
+
+    if (tokenStart != null) {
+        return tokenStart + resolveTokenRelativeOffset(node, offset, tokenEl);
+    }
+
+    return tokenEnd;
+}
+
+export class ReaderDomSelectionResolver implements DomSelectionResolver {
+    resolveBoundary(node: Node, offset: number): DomSelectionTokenLocator | null {
+        const verseEl = findVerseElement(node);
+        if (!verseEl) return null;
+
+        const verseKey = normalizeTranslationId(verseEl.getAttribute(ATTR_VERSE_KEY));
+        const verseOrd = parseIntStrict(verseEl.getAttribute(ATTR_VERSE_ORD));
+        if (!verseKey || verseOrd == null || verseOrd < 1) {
+            return null;
+        }
+
+        const tokenEl = findClosestAttrElement(node, ATTR_TOKEN_INDEX);
+        const tokenIndex = tokenEl ? parseIntStrict(tokenEl.getAttribute(ATTR_TOKEN_INDEX)) : null;
+        const charOffset = resolveCharOffset(node, offset, tokenEl);
+
+        return {
+            verseOrd,
+            verseKey,
+            tokenIndex,
+            charOffset,
+        };
+    }
+
+    resolveTranslationId(root: Node): string | null {
+        const el = findClosestAttrElement(root, ATTR_TRANSLATION_ID);
+        return normalizeTranslationId(el?.getAttribute(ATTR_TRANSLATION_ID) ?? null);
+    }
+}
+```
+
 ### apps/web/src/reader/sx.ts
 
 ```ts
@@ -20788,6 +21677,249 @@ export async function waitForFontsIfSupported(timeoutMs = 600): Promise<void> {
             void id;
         }),
     ]);
+}
+```
+
+### apps/web/src/reader/useReaderAnnotations.ts
+
+```ts
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+    domSelectionToAnchorInput,
+    type AnnotationSnapshot,
+    type SelectionAnchorInput,
+} from "@biblia/annotation";
+import {
+    getReaderAnnotationStore,
+    type ReaderAnnotationStore,
+} from "./annotationStore";
+import { ReaderDomSelectionResolver } from "./selectionResolver";
+
+export type ReaderAnnotationsApi = {
+    store: ReaderAnnotationStore;
+    snapshot: AnnotationSnapshot;
+    selection: SelectionAnchorInput | null;
+    clearSelection: () => void;
+    refreshSelection: () => void;
+    createHighlight: () => string | null;
+    createBookmark: () => string | null;
+    createNote: (body?: string | null, title?: string | null) => string | null;
+};
+
+function canUseDom(): boolean {
+    return typeof document !== "undefined" && typeof window !== "undefined";
+}
+
+function isNodeWithinRoot(root: HTMLElement, node: Node | null): boolean {
+    if (!node) return false;
+    return node === root || root.contains(node);
+}
+
+function getActiveSelection(): Selection | null {
+    if (!canUseDom()) return null;
+    try {
+        return document.getSelection();
+    } catch {
+        return null;
+    }
+}
+
+function clearDomSelection(): void {
+    if (!canUseDom()) return;
+    try {
+        const selection = document.getSelection();
+        selection?.removeAllRanges();
+    } catch {}
+}
+
+function selectionEquals(
+    a: SelectionAnchorInput | null,
+    b: SelectionAnchorInput | null,
+): boolean {
+    if (a === b) return true;
+    if (!a || !b) return false;
+
+    return (
+        a.start.verseOrd === b.start.verseOrd &&
+        a.start.verseKey === b.start.verseKey &&
+        a.start.tokenIndex === b.start.tokenIndex &&
+        a.start.charOffset === b.start.charOffset &&
+        a.end.verseOrd === b.end.verseOrd &&
+        a.end.verseKey === b.end.verseKey &&
+        a.end.tokenIndex === b.end.tokenIndex &&
+        a.end.charOffset === b.end.charOffset &&
+        a.text === b.text &&
+        a.translationId === b.translationId
+    );
+}
+
+export function useReaderAnnotations(
+    rootRef: React.RefObject<HTMLElement | null>,
+): ReaderAnnotationsApi {
+    const store = useMemo(() => getReaderAnnotationStore(), []);
+    const resolver = useMemo(() => new ReaderDomSelectionResolver(), []);
+
+    const [snapshot, setSnapshot] = useState<AnnotationSnapshot>(() => store.getSnapshot());
+    const [selection, setSelection] = useState<SelectionAnchorInput | null>(null);
+
+    const selectionRef = useRef<SelectionAnchorInput | null>(selection);
+    selectionRef.current = selection;
+
+    const setSelectionSafe = useCallback((next: SelectionAnchorInput | null): void => {
+        if (selectionEquals(selectionRef.current, next)) return;
+        selectionRef.current = next;
+        setSelection(next);
+    }, []);
+
+    const clearSelection = useCallback((): void => {
+        clearDomSelection();
+        setSelectionSafe(null);
+    }, [setSelectionSafe]);
+
+    const readSelection = useCallback((): void => {
+        const root = rootRef.current;
+        if (!root) {
+            setSelectionSafe(null);
+            return;
+        }
+
+        const sel = getActiveSelection();
+        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+            setSelectionSafe(null);
+            return;
+        }
+
+        let range: Range;
+        try {
+            range = sel.getRangeAt(0);
+        } catch {
+            setSelectionSafe(null);
+            return;
+        }
+
+        const { commonAncestorContainer } = range;
+        if (!isNodeWithinRoot(root, commonAncestorContainer)) {
+            setSelectionSafe(null);
+            return;
+        }
+
+        const next = domSelectionToAnchorInput(sel, resolver);
+        setSelectionSafe(next);
+    }, [resolver, rootRef, setSelectionSafe]);
+
+    const createAnnotationFromSelection = useCallback(
+        (
+            kind: "HIGHLIGHT" | "NOTE" | "BOOKMARK",
+            extras?: { body?: string | null; title?: string | null },
+        ): string | null => {
+            const current = selectionRef.current;
+            if (!current) return null;
+
+            const annotationId = store.createTextAnnotation({
+                selection: current,
+                kind,
+                body: extras?.body ?? null,
+                title: extras?.title ?? null,
+            });
+
+            clearSelection();
+            return annotationId;
+        },
+        [clearSelection, store],
+    );
+
+    useEffect(() => {
+        return store.subscribe((nextSnapshot) => {
+            setSnapshot(nextSnapshot);
+        });
+    }, [store]);
+
+    useEffect(() => {
+        if (!canUseDom()) return;
+
+        const onSelectionChange = (): void => {
+            readSelection();
+        };
+
+        const onPointerUp = (): void => {
+            readSelection();
+        };
+
+        const onKeyUp = (): void => {
+            readSelection();
+        };
+
+        const onMouseUp = (): void => {
+            readSelection();
+        };
+
+        const onTouchEnd = (): void => {
+            readSelection();
+        };
+
+        const onFocusIn = (): void => {
+            readSelection();
+        };
+
+        const onFocusOut = (event: FocusEvent): void => {
+            const root = rootRef.current;
+            if (!root) {
+                setSelectionSafe(null);
+                return;
+            }
+
+            const nextTarget = event.relatedTarget;
+            if (nextTarget instanceof Node && root.contains(nextTarget)) {
+                return;
+            }
+
+            readSelection();
+        };
+
+        const root = rootRef.current;
+
+        document.addEventListener("selectionchange", onSelectionChange);
+        document.addEventListener("pointerup", onPointerUp);
+        document.addEventListener("mouseup", onMouseUp);
+        document.addEventListener("touchend", onTouchEnd);
+        document.addEventListener("keyup", onKeyUp);
+
+        root?.addEventListener("focusin", onFocusIn);
+        root?.addEventListener("focusout", onFocusOut);
+
+        readSelection();
+
+        return () => {
+            document.removeEventListener("selectionchange", onSelectionChange);
+            document.removeEventListener("pointerup", onPointerUp);
+            document.removeEventListener("mouseup", onMouseUp);
+            document.removeEventListener("touchend", onTouchEnd);
+            document.removeEventListener("keyup", onKeyUp);
+
+            root?.removeEventListener("focusin", onFocusIn);
+            root?.removeEventListener("focusout", onFocusOut);
+        };
+    }, [readSelection, rootRef, setSelectionSafe]);
+
+    return {
+        store,
+        snapshot,
+        selection,
+        clearSelection,
+        refreshSelection: readSelection,
+        createHighlight: () => {
+            return createAnnotationFromSelection("HIGHLIGHT");
+        },
+        createBookmark: () => {
+            return createAnnotationFromSelection("BOOKMARK");
+        },
+        createNote: (body, title) => {
+            return createAnnotationFromSelection("NOTE", {
+                body: body ?? null,
+                title: title ?? null,
+            });
+        },
+    };
 }
 ```
 
@@ -22278,17 +23410,17 @@ export default defineConfig({
 
 ### biblia.to-code-export.md
 
-> TRUNCATED: file was 826107 bytes; showing first 48000 chars
+> TRUNCATED: file was 908825 bytes; showing first 48000 chars
 
 ```md
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-06T21:43:51.300Z
+Generated: 2026-03-06T23:02:23.158Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
-Total files: 58
-Total raw bytes (all included files): 1741841
+Total files: 69
+Total raw bytes (all included files): 1747683
 Truncated/skipped files: 1
-Export time: 20ms
+Export time: 25ms
 
 ## Notes
 
@@ -22314,6 +23446,8 @@ Export time: 20ms
 │   │   │   │   ├── prefs/
 ├── packages/
 │   ├── annotation/
+│   │   ├── src/
+│   │   │   ├── model/
 ├── scripts/
 ```
 
@@ -24086,8 +25220,7 @@ export default {
         "created_at": {
           "name": "created_at",
           "type": "text",
-          "primaryKey": false,
-          "notNull": true,
+          "primaryKey":
 ```
 
 ### export-repo.ts
@@ -24491,783 +25624,1801 @@ main();
 ```json
 {
   "name": "@biblia/annotation",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "sideEffects": false,
-  "main": "./dist/index.js",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./src/index.ts",
+  "module": "./src/index.ts",
+  "types": "./src/index.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "default": "./dist/index.js"
-    },
-    "./commands/types": {
-      "types": "./dist/commands/types.d.ts",
-      "import": "./dist/commands/types.js",
-      "default": "./dist/commands/types.js"
-    },
-    "./events/types": {
-      "types": "./dist/events/types.d.ts",
-      "import": "./dist/events/types.js",
-      "default": "./dist/events/types.js"
-    },
-    "./model/types": {
-      "types": "./dist/model/types.d.ts",
-      "import": "./dist/model/types.js",
-      "default": "./dist/model/types.js"
-    },
-    "./model/guards": {
-      "types": "./dist/model/guards.d.ts",
-      "import": "./dist/model/guards.js",
-      "default": "./dist/model/guards.js"
-    },
-    "./model/ids": {
-      "types": "./dist/model/ids.d.ts",
-      "import": "./dist/model/ids.js",
-      "default": "./dist/model/ids.js"
-    },
-    "./anchor/normalize": {
-      "types": "./dist/anchor/normalize.d.ts",
-      "import": "./dist/anchor/normalize.js",
-      "default": "./dist/anchor/normalize.js"
-    },
-    "./engine/createAnnotationEngine": {
-      "types": "./dist/engine/createAnnotationEngine.d.ts",
-      "import": "./dist/engine/createAnnotationEngine.js",
-      "default": "./dist/engine/createAnnotationEngine.js"
-    },
-    "./ink/ink": {
-      "types": "./dist/ink/ink.d.ts",
-      "import": "./dist/ink/ink.js",
-      "default": "./dist/ink/ink.js"
-    },
-    "./layout/geometry": {
-      "types": "./dist/layout/geometry.d.ts",
-      "import": "./dist/layout/geometry.js",
-      "default": "./dist/layout/geometry.js"
-    },
-    "./ops/reducer": {
-      "types": "./dist/ops/reducer.d.ts",
-      "import": "./dist/ops/reducer.js",
-      "default": "./dist/ops/reducer.js"
-    },
-    "./reanchor/reanchor": {
-      "types": "./dist/reanchor/reanchor.d.ts",
-      "import": "./dist/reanchor/reanchor.js",
-      "default": "./dist/reanchor/reanchor.js"
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
     }
   },
-  "files": [
-    "dist"
-  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "check": "bun run typecheck",
-    "clean": "bun x rimraf dist"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "rimraf": "^6.0.1"
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   }
 }
 ```
 
-### packages/annotation/src/model/anchor.ts
+### packages/annotation/src/domSelection.ts
 
 ```ts
-// packages/annotation/src/model/anchor.ts
+import type { AnnotationBoundary, SelectionAnchorInput } from "./model/span";
+import { compareAnnotationBoundaries, normalizeSelectionAnchorInput } from "./model/span";
 
-export type Brand<T, B extends string> = T & { readonly __brand: B };
-
-export type VerseKey = Brand<string, "VerseKey">;
-export type TranslationId = Brand<string, "TranslationId">;
-
-export type AnnotationAnchor = Readonly<{
-    /**
-     * Stable canon identity.
-     * Must always exist.
-     */
+export interface DomSelectionTokenLocator {
     verseOrd: number;
-    verseKey: VerseKey;
-
-    /**
-     * Optional semantic context.
-     * Useful for deterministic replay across translation/tokenizer changes.
-     */
-    translationId?: TranslationId | null;
-    tokenizerId?: string | null;
-
-    /**
-     * Preferred partial-anchor method.
-     * Half-open [start, end) semantics.
-     */
-    tokenStart?: number | null;
-    tokenEnd?: number | null;
-
-    /**
-     * Fallback partial-anchor method when tokens are unavailable.
-     * Half-open [start, end) semantics.
-     */
-    charStart?: number | null;
-    charEnd?: number | null;
-}>;
-
-export type AnnotationRange = Readonly<{
-    start: AnnotationAnchor;
-    end: AnnotationAnchor;
-}>;
-
-export type AnnotationScope = "RANGE" | "WHOLE_VERSE";
-
-export function hasTokenOffsets(anchor: AnnotationAnchor): boolean {
-    return Number.isInteger(anchor.tokenStart) && Number.isInteger(anchor.tokenEnd);
+    verseKey: string;
+    tokenIndex: number | null;
+    charOffset: number | null;
 }
 
-export function hasCharOffsets(anchor: AnnotationAnchor): boolean {
-    return Number.isInteger(anchor.charStart) && Number.isInteger(anchor.charEnd);
+export interface DomSelectionResolved {
+    start: DomSelectionTokenLocator;
+    end: DomSelectionTokenLocator;
+    text: string | null;
+    translationId: string | null;
 }
 
-export function compareAnchors(a: AnnotationAnchor, b: AnnotationAnchor): number {
-    if (a.verseOrd !== b.verseOrd) return a.verseOrd - b.verseOrd;
-
-    const aPos = firstDefinedNumber(a.tokenStart, a.charStart, 0);
-    const bPos = firstDefinedNumber(b.tokenStart, b.charStart, 0);
-
-    return aPos - bPos;
+export interface DomSelectionResolver {
+    resolveBoundary(node: Node, offset: number): DomSelectionTokenLocator | null;
+    resolveTranslationId(root: Node): string | null;
 }
 
-export function normalizeRange(range: AnnotationRange): AnnotationRange {
-    return compareAnchors(range.start, range.end) <= 0
-        ? range
-        : { start: range.end, end: range.start };
+function normalizeText(value: string): string | null {
+    const collapsed = value.replace(/\s+/g, " ").trim();
+    return collapsed.length > 0 ? collapsed : null;
 }
 
-export function validateAnchor(anchor: AnnotationAnchor): void {
-    if (!Number.isInteger(anchor.verseOrd) || anchor.verseOrd <= 0) {
-        throw new Error("anchor.verseOrd must be a positive integer");
+function toBoundary(locator: DomSelectionTokenLocator): AnnotationBoundary {
+    return {
+        verseOrd: locator.verseOrd,
+        verseKey: locator.verseKey,
+        tokenIndex: locator.tokenIndex,
+        charOffset: locator.charOffset,
+    };
+}
+
+export function resolveDomSelection(
+    selection: Selection | null,
+    resolver: DomSelectionResolver,
+): DomSelectionResolved | null {
+    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+        return null;
     }
 
-    if (!anchor.verseKey || typeof anchor.verseKey !== "string") {
-        throw new Error("anchor.verseKey must be present");
+    const range = selection.getRangeAt(0);
+    const start = resolver.resolveBoundary(range.startContainer, range.startOffset);
+    const end = resolver.resolveBoundary(range.endContainer, range.endOffset);
+    if (!start || !end) {
+        return null;
     }
 
-    const hasTokens = hasTokenOffsets(anchor);
-    const hasChars = hasCharOffsets(anchor);
+    const ordered = compareAnnotationBoundaries(toBoundary(start), toBoundary(end)) <= 0
+        ? { start, end }
+        : { start: end, end: start };
 
-    if (hasTokens) {
-        if ((anchor.tokenStart as number) < 0 || (anchor.tokenEnd as number) < (anchor.tokenStart as number)) {
-            throw new Error("anchor token range is invalid");
+    return {
+        start: ordered.start,
+        end: ordered.end,
+        text: normalizeText(selection.toString()),
+        translationId: resolver.resolveTranslationId(range.commonAncestorContainer),
+    };
+}
+
+export function domSelectionToAnchorInput(
+    selection: Selection | null,
+    resolver: DomSelectionResolver,
+): SelectionAnchorInput | null {
+    const resolved = resolveDomSelection(selection, resolver);
+    if (!resolved) return null;
+    return normalizeSelectionAnchorInput({
+        start: toBoundary(resolved.start),
+        end: toBoundary(resolved.end),
+        text: resolved.text,
+        translationId: resolved.translationId,
+    });
+}
+```
+
+### packages/annotation/src/events.ts
+
+```ts
+import type { Annotation, NoteAnnotationPatch } from "./model/annotation";
+import { assertAnnotation } from "./model/annotation";
+import type { AnnotationId, DeviceId, EventId, SpanId, StrokeId, UserId } from "./model/ids";
+import { createEventId, toAnnotationId, toEventId, toSpanId, toStrokeId, toUserId, toDeviceId } from "./model/ids";
+import type { AnnotationSpan } from "./model/span";
+import { assertAnnotationSpan } from "./model/span";
+import type { InkStroke, InkStrokePatch } from "./model/stroke";
+import { assertInkStroke } from "./model/stroke";
+
+export const ANNOTATION_EVENT_TYPE = {
+    ANNOTATION_CREATED: "ANNOTATION_CREATED",
+    ANNOTATION_PATCHED: "ANNOTATION_PATCHED",
+    ANNOTATION_SOFT_DELETED: "ANNOTATION_SOFT_DELETED",
+    ANNOTATION_RESTORED: "ANNOTATION_RESTORED",
+    SPANS_REPLACED: "SPANS_REPLACED",
+    SPAN_UPSERTED: "SPAN_UPSERTED",
+    SPAN_REMOVED: "SPAN_REMOVED",
+    STROKE_CREATED: "STROKE_CREATED",
+    STROKE_PATCHED: "STROKE_PATCHED",
+    STROKE_REMOVED: "STROKE_REMOVED",
+} as const;
+
+export type AnnotationEventType = (typeof ANNOTATION_EVENT_TYPE)[keyof typeof ANNOTATION_EVENT_TYPE];
+
+interface AnnotationEventBase<TType extends AnnotationEventType, TPayload> {
+    eventId: EventId;
+    type: TType;
+    annotationId: AnnotationId;
+    userId: UserId;
+    deviceId: DeviceId;
+    createdAt: number;
+    payload: TPayload;
+}
+
+export type AnnotationCreatedEvent = AnnotationEventBase<
+    typeof ANNOTATION_EVENT_TYPE.ANNOTATION_CREATED,
+    { annotation: Annotation }
+>;
+
+export type AnnotationPatchedEvent = AnnotationEventBase<
+    typeof ANNOTATION_EVENT_TYPE.ANNOTATION_PATCHED,
+    { patch: NoteAnnotationPatch }
+>;
+
+export type AnnotationSoftDeletedEvent = AnnotationEventBase<
+    typeof ANNOTATION_EVENT_TYPE.ANNOTATION_SOFT_DELETED,
+    { deletedAt?: number }
+>;
+
+export type AnnotationRestoredEvent = AnnotationEventBase<
+    typeof ANNOTATION_EVENT_TYPE.ANNOTATION_RESTORED,
+    { restoredAt?: number }
+>;
+
+export type SpansReplacedEvent = AnnotationEventBase<
+    typeof ANNOTATION_EVENT_TYPE.SPANS_REPLACED,
+    { spans: readonly AnnotationSpan[] }
+>;
+
+export type SpanUpsertedEvent = AnnotationEventBase<
+    typeof ANNOTATION_EVENT_TYPE.SPAN_UPSERTED,
+    { span: AnnotationSpan }
+>;
+
+export type SpanRemovedEvent = AnnotationEventBase<
+    typeof ANNOTATION_EVENT_TYPE.SPAN_REMOVED,
+    { spanId: SpanId }
+>;
+
+export type StrokeCreatedEvent = AnnotationEventBase<
+    typeof ANNOTATION_EVENT_TYPE.STROKE_CREATED,
+    { stroke: InkStroke }
+>;
+
+export type StrokePatchedEvent = AnnotationEventBase<
+    typeof ANNOTATION_EVENT_TYPE.STROKE_PATCHED,
+    { strokeId: StrokeId; patch: InkStrokePatch }
+>;
+
+export type StrokeRemovedEvent = AnnotationEventBase<
+    typeof ANNOTATION_EVENT_TYPE.STROKE_REMOVED,
+    { strokeId: StrokeId }
+>;
+
+export type AnnotationEvent =
+    | AnnotationCreatedEvent
+    | AnnotationPatchedEvent
+    | AnnotationSoftDeletedEvent
+    | AnnotationRestoredEvent
+    | SpansReplacedEvent
+    | SpanUpsertedEvent
+    | SpanRemovedEvent
+    | StrokeCreatedEvent
+    | StrokePatchedEvent
+    | StrokeRemovedEvent;
+
+export interface CreateEventMeta {
+    eventId?: EventId;
+    userId: UserId;
+    deviceId: DeviceId;
+    createdAt?: number;
+}
+
+function assertInteger(value: unknown, label: string): asserts value is number {
+    if (typeof value !== "number" || !Number.isInteger(value)) {
+        throw new Error(`[events] ${label} must be an integer`);
+    }
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
+}
+
+function createBaseEvent<TType extends AnnotationEventType, TPayload>(
+    type: TType,
+    annotationId: AnnotationId,
+    payload: TPayload,
+    meta: CreateEventMeta,
+): AnnotationEventBase<TType, TPayload> {
+    return {
+        eventId: meta.eventId ?? createEventId(type),
+        type,
+        annotationId,
+        userId: meta.userId,
+        deviceId: meta.deviceId,
+        createdAt: meta.createdAt ?? Date.now(),
+        payload,
+    };
+}
+
+export function createAnnotationCreatedEvent(annotation: Annotation, meta: CreateEventMeta): AnnotationCreatedEvent {
+    assertAnnotation(annotation);
+    return createBaseEvent(ANNOTATION_EVENT_TYPE.ANNOTATION_CREATED, annotation.annotationId, { annotation }, meta);
+}
+
+export function createAnnotationPatchedEvent(
+    annotationId: AnnotationId,
+    patch: NoteAnnotationPatch,
+    meta: CreateEventMeta,
+): AnnotationPatchedEvent {
+    return createBaseEvent(ANNOTATION_EVENT_TYPE.ANNOTATION_PATCHED, annotationId, { patch }, meta);
+}
+
+export function createAnnotationSoftDeletedEvent(
+    annotationId: AnnotationId,
+    meta: CreateEventMeta & { deletedAt?: number },
+): AnnotationSoftDeletedEvent {
+    return createBaseEvent(
+        ANNOTATION_EVENT_TYPE.ANNOTATION_SOFT_DELETED,
+        annotationId,
+        meta.deletedAt === undefined ? {} : { deletedAt: meta.deletedAt },
+        meta,
+    );
+}
+
+export function createAnnotationRestoredEvent(
+    annotationId: AnnotationId,
+    meta: CreateEventMeta & { restoredAt?: number },
+): AnnotationRestoredEvent {
+    return createBaseEvent(
+        ANNOTATION_EVENT_TYPE.ANNOTATION_RESTORED,
+        annotationId,
+        meta.restoredAt === undefined ? {} : { restoredAt: meta.restoredAt },
+        meta,
+    );
+}
+
+export function createSpansReplacedEvent(
+    annotationId: AnnotationId,
+    spans: readonly AnnotationSpan[],
+    meta: CreateEventMeta,
+): SpansReplacedEvent {
+    for (const span of spans) assertAnnotationSpan(span);
+    return createBaseEvent(ANNOTATION_EVENT_TYPE.SPANS_REPLACED, annotationId, { spans }, meta);
+}
+
+export function createSpanUpsertedEvent(
+    annotationId: AnnotationId,
+    span: AnnotationSpan,
+    meta: CreateEventMeta,
+): SpanUpsertedEvent {
+    assertAnnotationSpan(span);
+    return createBaseEvent(ANNOTATION_EVENT_TYPE.SPAN_UPSERTED, annotationId, { span }, meta);
+}
+
+export function createSpanRemovedEvent(
+    annotationId: AnnotationId,
+    spanId: SpanId,
+    meta: CreateEventMeta,
+): SpanRemovedEvent {
+    return createBaseEvent(ANNOTATION_EVENT_TYPE.SPAN_REMOVED, annotationId, { spanId }, meta);
+}
+
+export function createStrokeCreatedEvent(
+    annotationId: AnnotationId,
+    stroke: InkStroke,
+    meta: CreateEventMeta,
+): StrokeCreatedEvent {
+    assertInkStroke(stroke);
+    if (stroke.annotationId !== annotationId) {
+        throw new Error("[events] stroke.annotationId must match annotationId");
+    }
+    return createBaseEvent(ANNOTATION_EVENT_TYPE.STROKE_CREATED, annotationId, { stroke }, meta);
+}
+
+export function createStrokePatchedEvent(
+    annotationId: AnnotationId,
+    strokeId: StrokeId,
+    patch: InkStrokePatch,
+    meta: CreateEventMeta,
+): StrokePatchedEvent {
+    return createBaseEvent(ANNOTATION_EVENT_TYPE.STROKE_PATCHED, annotationId, { strokeId, patch }, meta);
+}
+
+export function createStrokeRemovedEvent(
+    annotationId: AnnotationId,
+    strokeId: StrokeId,
+    meta: CreateEventMeta,
+): StrokeRemovedEvent {
+    return createBaseEvent(ANNOTATION_EVENT_TYPE.STROKE_REMOVED, annotationId, { strokeId }, meta);
+}
+
+export function assertAnnotationEvent(value: unknown): asserts value is AnnotationEvent {
+    if (!isObjectRecord(value)) {
+        throw new Error("[events] event must be an object");
+    }
+
+    toEventId(value.eventId);
+    toAnnotationId(value.annotationId);
+    toUserId(value.userId);
+    toDeviceId(value.deviceId);
+    assertInteger(value.createdAt, "createdAt");
+    if (typeof value.type !== "string") {
+        throw new Error("[events] type must be a string");
+    }
+    if (!isObjectRecord(value.payload)) {
+        throw new Error("[events] payload must be an object");
+    }
+
+    switch (value.type) {
+        case ANNOTATION_EVENT_TYPE.ANNOTATION_CREATED: {
+            assertAnnotation(value.payload.annotation);
+            if (value.payload.annotation.annotationId !== value.annotationId) {
+                throw new Error("[events] created annotationId mismatch");
+            }
+            return;
         }
-    }
-
-    if (hasChars) {
-        if ((anchor.charStart as number) < 0 || (anchor.charEnd as number) < (anchor.charStart as number)) {
-            throw new Error("anchor char range is invalid");
+        case ANNOTATION_EVENT_TYPE.ANNOTATION_PATCHED: {
+            if (!isObjectRecord(value.payload.patch)) {
+                throw new Error("[events] patch payload must be an object");
+            }
+            return;
         }
+        case ANNOTATION_EVENT_TYPE.ANNOTATION_SOFT_DELETED: {
+            if (value.payload.deletedAt !== undefined) {
+                assertInteger(value.payload.deletedAt, "payload.deletedAt");
+            }
+            return;
+        }
+        case ANNOTATION_EVENT_TYPE.ANNOTATION_RESTORED: {
+            if (value.payload.restoredAt !== undefined) {
+                assertInteger(value.payload.restoredAt, "payload.restoredAt");
+            }
+            return;
+        }
+        case ANNOTATION_EVENT_TYPE.SPANS_REPLACED: {
+            if (!Array.isArray(value.payload.spans)) {
+                throw new Error("[events] payload.spans must be an array");
+            }
+            for (const span of value.payload.spans) assertAnnotationSpan(span);
+            return;
+        }
+        case ANNOTATION_EVENT_TYPE.SPAN_UPSERTED: {
+            assertAnnotationSpan(value.payload.span);
+            return;
+        }
+        case ANNOTATION_EVENT_TYPE.SPAN_REMOVED: {
+            toSpanId(value.payload.spanId);
+            return;
+        }
+        case ANNOTATION_EVENT_TYPE.STROKE_CREATED: {
+            assertInkStroke(value.payload.stroke);
+            return;
+        }
+        case ANNOTATION_EVENT_TYPE.STROKE_PATCHED: {
+            toStrokeId(value.payload.strokeId);
+            if (!isObjectRecord(value.payload.patch)) {
+                throw new Error("[events] payload.patch must be an object");
+            }
+            return;
+        }
+        case ANNOTATION_EVENT_TYPE.STROKE_REMOVED: {
+            toStrokeId(value.payload.strokeId);
+            return;
+        }
+        default:
+            throw new Error(`[events] unknown event type: ${String(value.type)}`);
     }
+}
+```
 
+### packages/annotation/src/index.ts
+
+```ts
+export * from "./model/ids";
+export * from "./model/span";
+export * from "./model/stroke";
+export * from "./model/annotation";
+export * from "./events";
+export * from "./reducer";
+export * from "./domSelection";
+```
+
+### packages/annotation/src/model/annotation.ts
+
+```ts
+import type { AnnotationId, DeviceId, PaletteId, SpanId, StrokeId, UserId } from "./ids";
+import {
+    createAnnotationId,
+    toAnnotationId,
+    toDeviceId,
+    toPaletteId,
+    toSpanId,
+    toStrokeId,
+    toUserId,
+} from "./ids";
+import type { AnnotationSpan } from "./span";
+import { assertAnnotationSpan, normalizeSpanOrdinals } from "./span";
+import type { InkStroke } from "./stroke";
+import { assertInkStroke, normalizeStrokeOrdinals } from "./stroke";
+
+export const ANNOTATION_KIND = {
+    HIGHLIGHT: "HIGHLIGHT",
+    NOTE: "NOTE",
+    BOOKMARK: "BOOKMARK",
+    DRAWING: "DRAWING",
+} as const;
+
+export type AnnotationKind = (typeof ANNOTATION_KIND)[keyof typeof ANNOTATION_KIND];
+
+export interface Annotation {
+    annotationId: AnnotationId;
+    ownerUserId: UserId;
+    createdByUserId: UserId;
+    updatedByUserId: UserId;
+    deviceId: DeviceId;
+    kind: AnnotationKind;
+    title: string | null;
+    body: string | null;
+    color: string | null;
+    paletteId: PaletteId | null;
+    labels: readonly string[];
+    collectionIds: readonly string[];
+    spans: readonly AnnotationSpan[];
+    strokes: readonly InkStroke[];
+    pinned: boolean;
+    archived: boolean;
+    createdAt: number;
+    updatedAt: number;
+    deletedAt: number | null;
+    revision: number;
+}
+
+export interface CreateAnnotationInput {
+    annotationId?: AnnotationId;
+    ownerUserId: UserId;
+    createdByUserId: UserId;
+    updatedByUserId?: UserId;
+    deviceId: DeviceId;
+    kind?: AnnotationKind;
+    title?: string | null;
+    body?: string | null;
+    color?: string | null;
+    paletteId?: PaletteId | null;
+    labels?: readonly string[];
+    collectionIds?: readonly string[];
+    spans?: readonly AnnotationSpan[];
+    strokes?: readonly InkStroke[];
+    pinned?: boolean;
+    archived?: boolean;
+    createdAt?: number;
+    updatedAt?: number;
+    deletedAt?: number | null;
+    revision?: number;
+}
+
+export interface NoteAnnotationPatch {
+    title?: string | null;
+    body?: string | null;
+    color?: string | null;
+    paletteId?: PaletteId | null;
+    labels?: readonly string[];
+    collectionIds?: readonly string[];
+    pinned?: boolean;
+    archived?: boolean;
+}
+
+export interface AnnotationMutationMeta {
+    updatedAt: number;
+    updatedByUserId: UserId;
+    deviceId?: DeviceId;
+}
+
+function assertInteger(value: unknown, label: string): asserts value is number {
+    if (typeof value !== "number" || !Number.isInteger(value)) {
+        throw new Error(`[annotation] ${label} must be an integer`);
+    }
+}
+
+function assertPositiveInteger(value: unknown, label: string): asserts value is number {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+        throw new Error(`[annotation] ${label} must be a positive integer`);
+    }
+}
+
+function assertKind(value: unknown): asserts value is AnnotationKind {
     if (
-        anchor.tokenStart != null ||
-        anchor.tokenEnd != null ||
-        anchor.charStart != null ||
-        anchor.charEnd != null
+        value !== ANNOTATION_KIND.HIGHLIGHT &&
+        value !== ANNOTATION_KIND.NOTE &&
+        value !== ANNOTATION_KIND.BOOKMARK &&
+        value !== ANNOTATION_KIND.DRAWING
     ) {
-        const completeTokenPair = anchor.tokenStart != null && anchor.tokenEnd != null;
-        const completeCharPair = anchor.charStart != null && anchor.charEnd != null;
+        throw new Error("[annotation] kind must be HIGHLIGHT, NOTE, BOOKMARK, or DRAWING");
+    }
+}
 
-        if (!completeTokenPair && !completeCharPair) {
-            throw new Error("partial anchor must provide tokenStart/tokenEnd or charStart/charEnd");
+function normalizeNullableString(value: string | null | undefined): string | null {
+    if (value == null) return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeStringList(values: readonly string[] | undefined): readonly string[] {
+    if (!values) return [];
+    return [...new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))].sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeSpans(spans: readonly AnnotationSpan[] | undefined): readonly AnnotationSpan[] {
+    if (!spans) return [];
+    for (const span of spans) assertAnnotationSpan(span);
+    return normalizeSpanOrdinals(spans);
+}
+
+function normalizeStrokes(strokes: readonly InkStroke[] | undefined): readonly InkStroke[] {
+    if (!strokes) return [];
+    for (const stroke of strokes) assertInkStroke(stroke);
+    return normalizeStrokeOrdinals(strokes);
+}
+
+function requireUniqueIds<T extends string>(ids: readonly T[], label: string): void {
+    const seen = new Set<T>();
+    for (const id of ids) {
+        if (seen.has(id)) {
+            throw new Error(`[annotation] duplicate ${label}: ${id}`);
+        }
+        seen.add(id);
+    }
+}
+
+export function createAnnotation(input: CreateAnnotationInput, now = Date.now()): Annotation {
+    const createdAt = input.createdAt ?? now;
+    const updatedAt = input.updatedAt ?? createdAt;
+    const deletedAt = input.deletedAt ?? null;
+    const spans = normalizeSpans(input.spans);
+    const strokes = normalizeStrokes(input.strokes);
+
+    requireUniqueIds(spans.map((span) => span.spanId), "spanId");
+    requireUniqueIds(strokes.map((stroke) => stroke.strokeId), "strokeId");
+
+    const annotation: Annotation = {
+        annotationId: input.annotationId ?? createAnnotationId(input.ownerUserId),
+        ownerUserId: input.ownerUserId,
+        createdByUserId: input.createdByUserId,
+        updatedByUserId: input.updatedByUserId ?? input.createdByUserId,
+        deviceId: input.deviceId,
+        kind: input.kind ?? ANNOTATION_KIND.HIGHLIGHT,
+        title: normalizeNullableString(input.title),
+        body: normalizeNullableString(input.body),
+        color: normalizeNullableString(input.color),
+        paletteId: input.paletteId ?? null,
+        labels: normalizeStringList(input.labels),
+        collectionIds: normalizeStringList(input.collectionIds),
+        spans,
+        strokes,
+        pinned: input.pinned ?? false,
+        archived: input.archived ?? false,
+        createdAt,
+        updatedAt,
+        deletedAt,
+        revision: input.revision ?? 1,
+    };
+    assertAnnotation(annotation);
+    return annotation;
+}
+
+export function assertAnnotation(value: unknown): asserts value is Annotation {
+    if (typeof value !== "object" || value === null) {
+        throw new Error("[annotation] annotation must be an object");
+    }
+    const annotation = value as Record<string, unknown>;
+    toAnnotationId(annotation.annotationId);
+    toUserId(annotation.ownerUserId);
+    toUserId(annotation.createdByUserId);
+    toUserId(annotation.updatedByUserId);
+    toDeviceId(annotation.deviceId);
+    assertKind(annotation.kind);
+    if (annotation.title != null && typeof annotation.title !== "string") {
+        throw new Error("[annotation] title must be null or a string");
+    }
+    if (annotation.body != null && typeof annotation.body !== "string") {
+        throw new Error("[annotation] body must be null or a string");
+    }
+    if (annotation.color != null && typeof annotation.color !== "string") {
+        throw new Error("[annotation] color must be null or a string");
+    }
+    if (annotation.paletteId != null) {
+        toPaletteId(annotation.paletteId);
+    }
+    if (!Array.isArray(annotation.labels) || annotation.labels.some((value) => typeof value !== "string" || value.trim().length === 0)) {
+        throw new Error("[annotation] labels must be a string array");
+    }
+    if (!Array.isArray(annotation.collectionIds) || annotation.collectionIds.some((value) => typeof value !== "string" || value.trim().length === 0)) {
+        throw new Error("[annotation] collectionIds must be a string array");
+    }
+    if (!Array.isArray(annotation.spans)) {
+        throw new Error("[annotation] spans must be an array");
+    }
+    if (!Array.isArray(annotation.strokes)) {
+        throw new Error("[annotation] strokes must be an array");
+    }
+    for (const span of annotation.spans) assertAnnotationSpan(span);
+    for (const stroke of annotation.strokes) {
+        assertInkStroke(stroke);
+        if (stroke.annotationId !== annotation.annotationId) {
+            throw new Error("[annotation] stroke.annotationId must match annotation.annotationId");
         }
     }
+    assertInteger(annotation.createdAt, "createdAt");
+    assertInteger(annotation.updatedAt, "updatedAt");
+    if (annotation.deletedAt !== null && annotation.deletedAt !== undefined) {
+        assertInteger(annotation.deletedAt, "deletedAt");
+        if ((annotation.deletedAt as number) < (annotation.createdAt as number)) {
+            throw new Error("[annotation] deletedAt must be >= createdAt");
+        }
+    }
+    if ((annotation.updatedAt as number) < (annotation.createdAt as number)) {
+        throw new Error("[annotation] updatedAt must be >= createdAt");
+    }
+    if (typeof annotation.pinned !== "boolean") {
+        throw new Error("[annotation] pinned must be boolean");
+    }
+    if (typeof annotation.archived !== "boolean") {
+        throw new Error("[annotation] archived must be boolean");
+    }
+    assertPositiveInteger(annotation.revision, "revision");
+    requireUniqueIds((annotation.spans as AnnotationSpan[]).map((span) => span.spanId), "spanId");
+    requireUniqueIds((annotation.strokes as InkStroke[]).map((stroke) => stroke.strokeId), "strokeId");
 }
 
-export function validateRange(range: AnnotationRange): void {
-    validateAnchor(range.start);
-    validateAnchor(range.end);
-
-    if (compareAnchors(range.start, range.end) > 0) {
-        throw new Error("range start must be <= range end");
-    }
+export function patchNoteAnnotation(annotation: Annotation, patch: NoteAnnotationPatch, meta: AnnotationMutationMeta): Annotation {
+    assertAnnotation(annotation);
+    return createAnnotation({
+        ...annotation,
+        title: patch.title !== undefined ? patch.title : annotation.title,
+        body: patch.body !== undefined ? patch.body : annotation.body,
+        color: patch.color !== undefined ? patch.color : annotation.color,
+        paletteId: patch.paletteId !== undefined ? patch.paletteId : annotation.paletteId,
+        labels: patch.labels !== undefined ? patch.labels : annotation.labels,
+        collectionIds: patch.collectionIds !== undefined ? patch.collectionIds : annotation.collectionIds,
+        pinned: patch.pinned !== undefined ? patch.pinned : annotation.pinned,
+        archived: patch.archived !== undefined ? patch.archived : annotation.archived,
+        updatedAt: meta.updatedAt,
+        updatedByUserId: meta.updatedByUserId,
+        deviceId: meta.deviceId ?? annotation.deviceId,
+        revision: annotation.revision + 1,
+    });
 }
 
-function firstDefinedNumber(...values: Array<number | null | undefined>): number {
-    for (const value of values) {
-        if (typeof value === "number" && Number.isFinite(value)) return value;
+export function replaceAnnotationSpans(annotation: Annotation, spans: readonly AnnotationSpan[], meta: AnnotationMutationMeta): Annotation {
+    assertAnnotation(annotation);
+    return createAnnotation({
+        ...annotation,
+        spans,
+        updatedAt: meta.updatedAt,
+        updatedByUserId: meta.updatedByUserId,
+        deviceId: meta.deviceId ?? annotation.deviceId,
+        revision: annotation.revision + 1,
+    });
+}
+
+export function upsertAnnotationSpan(annotation: Annotation, span: AnnotationSpan, meta: AnnotationMutationMeta): Annotation {
+    assertAnnotation(annotation);
+    assertAnnotationSpan(span);
+    const existingIndex = annotation.spans.findIndex((candidate) => candidate.spanId === span.spanId);
+    const spans = existingIndex === -1
+        ? [...annotation.spans, span]
+        : annotation.spans.map((candidate) => (candidate.spanId === span.spanId ? span : candidate));
+    return replaceAnnotationSpans(annotation, spans, meta);
+}
+
+export function removeAnnotationSpan(annotation: Annotation, spanId: SpanId, meta: AnnotationMutationMeta): Annotation {
+    assertAnnotation(annotation);
+    toSpanId(spanId);
+    const spans = annotation.spans.filter((span) => span.spanId !== spanId);
+    if (spans.length === annotation.spans.length) {
+        throw new Error(`[annotation] span not found: ${spanId}`);
     }
-    return 0;
+    return replaceAnnotationSpans(annotation, spans, meta);
+}
+
+export function replaceAnnotationStrokes(annotation: Annotation, strokes: readonly InkStroke[], meta: AnnotationMutationMeta): Annotation {
+    assertAnnotation(annotation);
+    return createAnnotation({
+        ...annotation,
+        strokes,
+        updatedAt: meta.updatedAt,
+        updatedByUserId: meta.updatedByUserId,
+        deviceId: meta.deviceId ?? annotation.deviceId,
+        revision: annotation.revision + 1,
+    });
+}
+
+export function upsertAnnotationStroke(annotation: Annotation, stroke: InkStroke, meta: AnnotationMutationMeta): Annotation {
+    assertAnnotation(annotation);
+    assertInkStroke(stroke);
+    if (stroke.annotationId !== annotation.annotationId) {
+        throw new Error("[annotation] upsert stroke annotationId mismatch");
+    }
+    const existingIndex = annotation.strokes.findIndex((candidate) => candidate.strokeId === stroke.strokeId);
+    const strokes = existingIndex === -1
+        ? [...annotation.strokes, stroke]
+        : annotation.strokes.map((candidate) => (candidate.strokeId === stroke.strokeId ? stroke : candidate));
+    return replaceAnnotationStrokes(annotation, strokes, meta);
+}
+
+export function removeAnnotationStroke(annotation: Annotation, strokeId: StrokeId, meta: AnnotationMutationMeta): Annotation {
+    assertAnnotation(annotation);
+    toStrokeId(strokeId);
+    const strokes = annotation.strokes.filter((stroke) => stroke.strokeId !== strokeId);
+    if (strokes.length === annotation.strokes.length) {
+        throw new Error(`[annotation] stroke not found: ${strokeId}`);
+    }
+    return replaceAnnotationStrokes(annotation, strokes, meta);
+}
+
+export function softDeleteAnnotation(annotation: Annotation, meta: AnnotationMutationMeta, deletedAt = meta.updatedAt): Annotation {
+    assertAnnotation(annotation);
+    return createAnnotation({
+        ...annotation,
+        updatedAt: meta.updatedAt,
+        updatedByUserId: meta.updatedByUserId,
+        deviceId: meta.deviceId ?? annotation.deviceId,
+        deletedAt,
+        revision: annotation.revision + 1,
+    });
+}
+
+export function restoreAnnotation(annotation: Annotation, meta: AnnotationMutationMeta): Annotation {
+    assertAnnotation(annotation);
+    return createAnnotation({
+        ...annotation,
+        updatedAt: meta.updatedAt,
+        updatedByUserId: meta.updatedByUserId,
+        deviceId: meta.deviceId ?? annotation.deviceId,
+        deletedAt: null,
+        revision: annotation.revision + 1,
+    });
 }
 ```
 
 ### packages/annotation/src/model/ids.ts
 
 ```ts
-// packages/annotation/src/model/ids.ts
-// Biblia.to — annotation ids + hashing
-//
-// Goals:
-// - strict branded string ids for annotation-domain objects
-// - lexicographically sortable, time-prefixed ids
-// - monotonic generation within the same millisecond
-// - runtime-safe validation helpers
-// - deterministic text normalization + hashing
-// - zero external dependencies
-//
-// Compatibility:
-// - preserves defaultMakeId(prefix?: string): string
-// - preserves defaultHashText(input: string): string
-// - preserves defaultHashNullableText(input): string | null
-// - preserves normalizeName(s: string): string
-//
-// Notes:
-// - IDs are not secrets and are not auth tokens.
-// - Hashes here are for stable fingerprints / change detection, not security.
-// - This file is safe for Bun / Node / browser runtimes and does not rely on DOM lib typings.
-
-export type Brand<T, B extends string> = T & { readonly __brand: B };
-
-/* ============================================================================
-   Branded ID types
-============================================================================ */
-
-export type AnnotationId = Brand<string, "AnnotationId">;
-export type CollectionId = Brand<string, "CollectionId">;
-export type LabelId = Brand<string, "LabelId">;
-export type PaletteId = Brand<string, "PaletteId">;
-export type ShareId = Brand<string, "ShareId">;
-export type EventId = Brand<string, "EventId">;
-export type StrokeId = Brand<string, "StrokeId">;
-export type AttachmentId = Brand<string, "AttachmentId">;
-
-export type UserId = Brand<string, "UserId">;
-export type DeviceId = Brand<string, "DeviceId">;
-
-export type VerseKey = Brand<string, "VerseKey">;
-export type TranslationId = Brand<string, "TranslationId">;
-export type BlockId = Brand<string, "BlockId">;
-export type ContainerKey = Brand<string, "ContainerKey">;
-
-export type SelectionHash = Brand<string, "SelectionHash">;
-
-/* ============================================================================
-   Prefix registry
-============================================================================ */
-
 export const ID_PREFIX = {
-    annotation: "ann",
-    collection: "col",
-    label: "lab",
-    palette: "pal",
-    share: "shr",
-    event: "evt",
-    stroke: "stk",
-    attachment: "att",
+    ANNOTATION: "ann",
+    DEVICE: "dev",
+    EVENT: "evt",
+    PALETTE: "pal",
+    SPAN: "spn",
+    STROKE: "stk",
+    USER: "usr",
 } as const;
 
-export type KnownIdPrefix = (typeof ID_PREFIX)[keyof typeof ID_PREFIX];
+declare const annotationIdBrand: unique symbol;
+declare const deviceIdBrand: unique symbol;
+declare const eventIdBrand: unique symbol;
+declare const paletteIdBrand: unique symbol;
+declare const spanIdBrand: unique symbol;
+declare const strokeIdBrand: unique symbol;
+declare const userIdBrand: unique symbol;
 
-/* ============================================================================
-   Public name normalization
-============================================================================ */
+export type AnnotationId = string & { readonly [annotationIdBrand]: true };
+export type DeviceId = string & { readonly [deviceIdBrand]: true };
+export type EventId = string & { readonly [eventIdBrand]: true };
+export type PaletteId = string & { readonly [paletteIdBrand]: true };
+export type SpanId = string & { readonly [spanIdBrand]: true };
+export type StrokeId = string & { readonly [strokeIdBrand]: true };
+export type UserId = string & { readonly [userIdBrand]: true };
 
-/**
- * Normalize a user-visible name for comparison / indexing.
- *
- * Behavior:
- * - unicode normalizes with NFKC
- * - trims ends
- * - collapses internal whitespace
- * - lowercases
- */
-export function normalizeName(s: string): string {
-    if (typeof s !== "string") {
-        throw new Error("[ids] normalizeName requires a string");
+type Brand<T> = T extends AnnotationId
+    ? AnnotationId
+    : T extends DeviceId
+        ? DeviceId
+        : T extends EventId
+            ? EventId
+            : T extends PaletteId
+                ? PaletteId
+                : T extends SpanId
+                    ? SpanId
+                    : T extends StrokeId
+                        ? StrokeId
+                        : T extends UserId
+                            ? UserId
+                            : never;
+
+function assertNonEmptyString(value: unknown, label: string): asserts value is string {
+    if (typeof value !== "string" || value.trim().length === 0) {
+        throw new Error(`[ids] ${label} must be a non-empty string`);
     }
-
-    return s
-        .normalize("NFKC")
-        .trim()
-        .replace(/\s+/g, " ")
-        .toLowerCase();
 }
 
-/* ============================================================================
-   Public ID creation API
-============================================================================ */
-
-/**
- * Backward-compatible generic id maker.
- *
- * Format:
- *   <prefix>_<26-char-monotonic-body>
- *
- * Example:
- *   ann_01JNCFSY8PG0A0FQ5FD7X7X9FH
- */
-export function defaultMakeId(prefix = "ann"): string {
-    return makeId(prefix);
+function randomHex(bytes = 8): string {
+    const out = new Uint8Array(bytes);
+    const cryptoObject = globalThis.crypto;
+    if (cryptoObject?.getRandomValues) {
+        cryptoObject.getRandomValues(out);
+    } else {
+        for (let i = 0; i < out.length; i += 1) {
+            out[i] = Math.floor(Math.random() * 256);
+        }
+    }
+    return Array.from(out, (n) => n.toString(16).padStart(2, "0")).join("");
 }
 
-export function makeId(prefix = "ann", nowMs = Date.now()): string {
-    const safePrefix = normalizePrefix(prefix);
-    const body = makeMonotonicBody(nowMs);
-    return `${safePrefix}_${body}`;
+function nowHex(): string {
+    return Date.now().toString(16).padStart(12, "0");
 }
 
-export function createAnnotationId(nowMs?: number): AnnotationId {
-    return makeKnownId(ID_PREFIX.annotation, nowMs) as AnnotationId;
+function normalizeIdFragment(value: string): string {
+    return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
-export function createCollectionId(nowMs?: number): CollectionId {
-    return makeKnownId(ID_PREFIX.collection, nowMs) as CollectionId;
+function createPrefixedId<T extends string>(prefix: string, seed?: string): Brand<T> {
+    const seedPart = seed ? normalizeIdFragment(seed) : "";
+    const core = seedPart.length > 0 ? `${nowHex()}-${seedPart}-${randomHex(4)}` : `${nowHex()}-${randomHex(6)}`;
+    return `${prefix}_${core}` as Brand<T>;
 }
 
-export function createLabelId(nowMs?: number): LabelId {
-    return makeKnownId(ID_PREFIX.label, nowMs) as LabelId;
+function toPrefixedId<T extends string>(value: unknown, prefix: string, label: string): Brand<T> {
+    assertNonEmptyString(value, label);
+    const trimmed = value.trim();
+    if (!trimmed.startsWith(`${prefix}_`)) {
+        throw new Error(`[ids] ${label} must start with ${prefix}_`);
+    }
+    return trimmed as Brand<T>;
 }
 
-export function createPaletteId(nowMs?: number): PaletteId {
-    return makeKnownId(ID_PREFIX.palette, nowMs) as PaletteId;
+export function defaultHashText(text: string): string {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < text.length; i += 1) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193);
+    }
+    return `h${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
 
-export function createShareId(nowMs?: number): ShareId {
-    return makeKnownId(ID_PREFIX.share, nowMs) as ShareId;
+export function createAnnotationId(seed?: string): AnnotationId {
+    return createPrefixedId<AnnotationId>(ID_PREFIX.ANNOTATION, seed);
 }
 
-export function createEventId(nowMs?: number): EventId {
-    return makeKnownId(ID_PREFIX.event, nowMs) as EventId;
+export function createDeviceId(seed?: string): DeviceId {
+    return createPrefixedId<DeviceId>(ID_PREFIX.DEVICE, seed);
 }
 
-export function createStrokeId(nowMs?: number): StrokeId {
-    return makeKnownId(ID_PREFIX.stroke, nowMs) as StrokeId;
+export function createEventId(seed?: string): EventId {
+    return createPrefixedId<EventId>(ID_PREFIX.EVENT, seed);
 }
 
-export function createAttachmentId(nowMs?: number): AttachmentId {
-    return makeKnownId(ID_PREFIX.attachment, nowMs) as AttachmentId;
+export function createPaletteId(seed?: string): PaletteId {
+    return createPrefixedId<PaletteId>(ID_PREFIX.PALETTE, seed);
 }
 
-/* ============================================================================
-   Public ID validation / coercion
-============================================================================ */
+export function createSpanId(seed?: string): SpanId {
+    return createPrefixedId<SpanId>(ID_PREFIX.SPAN, seed);
+}
+
+export function createStrokeId(seed?: string): StrokeId {
+    return createPrefixedId<StrokeId>(ID_PREFIX.STROKE, seed);
+}
+
+export function createUserId(seed?: string): UserId {
+    return createPrefixedId<UserId>(ID_PREFIX.USER, seed);
+}
+
+export function toAnnotationId(value: unknown): AnnotationId {
+    return toPrefixedId<AnnotationId>(value, ID_PREFIX.ANNOTATION, "annotationId");
+}
+
+export function toDeviceId(value: unknown): DeviceId {
+    return toPrefixedId<DeviceId>(value, ID_PREFIX.DEVICE, "deviceId");
+}
+
+export function toEventId(value: unknown): EventId {
+    return toPrefixedId<EventId>(value, ID_PREFIX.EVENT, "eventId");
+}
+
+export function toPaletteId(value: unknown): PaletteId {
+    return toPrefixedId<PaletteId>(value, ID_PREFIX.PALETTE, "paletteId");
+}
+
+export function toSpanId(value: unknown): SpanId {
+    return toPrefixedId<SpanId>(value, ID_PREFIX.SPAN, "spanId");
+}
+
+export function toStrokeId(value: unknown): StrokeId {
+    return toPrefixedId<StrokeId>(value, ID_PREFIX.STROKE, "strokeId");
+}
+
+export function toUserId(value: unknown): UserId {
+    return toPrefixedId<UserId>(value, ID_PREFIX.USER, "userId");
+}
 
 export function isAnnotationId(value: unknown): value is AnnotationId {
-    return isPrefixedId(value, ID_PREFIX.annotation);
+    return typeof value === "string" && value.startsWith(`${ID_PREFIX.ANNOTATION}_`);
 }
 
-export function isCollectionId(value: unknown): value is CollectionId {
-    return isPrefixedId(value, ID_PREFIX.collection);
-}
-
-export function isLabelId(value: unknown): value is LabelId {
-    return isPrefixedId(value, ID_PREFIX.label);
-}
-
-export function isPaletteId(value: unknown): value is PaletteId {
-    return isPrefixedId(value, ID_PREFIX.palette);
-}
-
-export function isShareId(value: unknown): value is ShareId {
-    return isPrefixedId(value, ID_PREFIX.share);
-}
-
-export function isEventId(value: unknown): value is EventId {
-    return isPrefixedId(value, ID_PREFIX.event);
+export function isSpanId(value: unknown): value is SpanId {
+    return typeof value === "string" && value.startsWith(`${ID_PREFIX.SPAN}_`);
 }
 
 export function isStrokeId(value: unknown): value is StrokeId {
-    return isPrefixedId(value, ID_PREFIX.stroke);
+    return typeof value === "string" && value.startsWith(`${ID_PREFIX.STROKE}_`);
+}
+```
+
+### packages/annotation/src/model/span.ts
+
+```ts
+import type { SpanId } from "./ids";
+import { createSpanId, toSpanId } from "./ids";
+
+export interface AnnotationBoundary {
+    verseOrd: number;
+    verseKey: string;
+    tokenIndex: number | null;
+    charOffset: number | null;
 }
 
-export function isAttachmentId(value: unknown): value is AttachmentId {
-    return isPrefixedId(value, ID_PREFIX.attachment);
+export interface SelectionAnchorInput {
+    start: AnnotationBoundary;
+    end: AnnotationBoundary;
+    text: string | null;
+    translationId: string | null;
 }
 
-export function toAnnotationId(value: string): AnnotationId {
-    assertPrefixedId(value, ID_PREFIX.annotation, "AnnotationId");
-    return value as AnnotationId;
+export interface AnnotationSpan {
+    spanId: SpanId;
+    ordinal: number;
+    start: AnnotationBoundary;
+    end: AnnotationBoundary;
+    text: string | null;
+    translationId: string | null;
+    createdAt: number;
+    updatedAt: number;
+    deletedAt: number | null;
 }
 
-export function toCollectionId(value: string): CollectionId {
-    assertPrefixedId(value, ID_PREFIX.collection, "CollectionId");
-    return value as CollectionId;
+export interface AnnotationSpanInput {
+    spanId?: SpanId;
+    ordinal?: number;
+    start: AnnotationBoundary;
+    end: AnnotationBoundary;
+    text?: string | null;
+    translationId?: string | null;
+    createdAt?: number;
+    updatedAt?: number;
+    deletedAt?: number | null;
 }
 
-export function toLabelId(value: string): LabelId {
-    assertPrefixedId(value, ID_PREFIX.label, "LabelId");
-    return value as LabelId;
+export interface AnnotationSpanRow {
+    span_id: string;
+    ordinal: number;
+    start_verse_ord: number;
+    start_verse_key: string;
+    start_token_index: number | null;
+    start_char_offset: number | null;
+    end_verse_ord: number;
+    end_verse_key: string;
+    end_token_index: number | null;
+    end_char_offset: number | null;
+    quote_text: string | null;
+    translation_id: string | null;
+    created_at: number;
+    updated_at: number;
+    deleted_at: number | null;
 }
 
-export function toPaletteId(value: string): PaletteId {
-    assertPrefixedId(value, ID_PREFIX.palette, "PaletteId");
-    return value as PaletteId;
-}
-
-export function toShareId(value: string): ShareId {
-    assertPrefixedId(value, ID_PREFIX.share, "ShareId");
-    return value as ShareId;
-}
-
-export function toEventId(value: string): EventId {
-    assertPrefixedId(value, ID_PREFIX.event, "EventId");
-    return value as EventId;
-}
-
-export function toStrokeId(value: string): StrokeId {
-    assertPrefixedId(value, ID_PREFIX.stroke, "StrokeId");
-    return value as StrokeId;
-}
-
-export function toAttachmentId(value: string): AttachmentId {
-    assertPrefixedId(value, ID_PREFIX.attachment, "AttachmentId");
-    return value as AttachmentId;
-}
-
-export function assertAnnotationId(value: unknown): asserts value is AnnotationId {
-    assertPrefixedId(value, ID_PREFIX.annotation, "AnnotationId");
-}
-
-export function assertCollectionId(value: unknown): asserts value is CollectionId {
-    assertPrefixedId(value, ID_PREFIX.collection, "CollectionId");
-}
-
-export function assertLabelId(value: unknown): asserts value is LabelId {
-    assertPrefixedId(value, ID_PREFIX.label, "LabelId");
-}
-
-export function assertPaletteId(value: unknown): asserts value is PaletteId {
-    assertPrefixedId(value, ID_PREFIX.palette, "PaletteId");
-}
-
-export function assertShareId(value: unknown): asserts value is ShareId {
-    assertPrefixedId(value, ID_PREFIX.share, "ShareId");
-}
-
-export function assertEventId(value: unknown): asserts value is EventId {
-    assertPrefixedId(value, ID_PREFIX.event, "EventId");
-}
-
-export function assertStrokeId(value: unknown): asserts value is StrokeId {
-    assertPrefixedId(value, ID_PREFIX.stroke, "StrokeId");
-}
-
-export function assertAttachmentId(value: unknown): asserts value is AttachmentId {
-    assertPrefixedId(value, ID_PREFIX.attachment, "AttachmentId");
-}
-
-export function isPrefixedId(value: unknown, prefix: string): value is string {
-    if (typeof value !== "string") return false;
-    if (!SAFE_PREFIX_RE.test(prefix)) return false;
-    if (!value.startsWith(`${prefix}_`)) return false;
-
-    const body = value.slice(prefix.length + 1);
-    return ID_BODY_RE.test(body);
-}
-
-export function assertPrefixedId(
-    value: unknown,
-    prefix: string,
-    label = "id",
-): asserts value is string {
-    if (!isPrefixedId(value, prefix)) {
-        throw new Error(`[ids] invalid ${label}: expected "${prefix}_<26-char-body>"`);
+function assertFiniteInteger(value: unknown, label: string): asserts value is number {
+    if (typeof value !== "number" || !Number.isInteger(value)) {
+        throw new Error(`[span] ${label} must be an integer`);
     }
 }
 
-export function extractIdPrefix(value: string): string | null {
-    const idx = value.indexOf("_");
-    if (idx <= 0) return null;
-
-    const prefix = value.slice(0, idx);
-    return SAFE_PREFIX_RE.test(prefix) ? prefix : null;
-}
-
-export function splitId(value: string): Readonly<{ prefix: string; body: string }> | null {
-    const idx = value.indexOf("_");
-    if (idx <= 0) return null;
-
-    const prefix = value.slice(0, idx);
-    const body = value.slice(idx + 1);
-
-    if (!SAFE_PREFIX_RE.test(prefix)) return null;
-    if (!ID_BODY_RE.test(body)) return null;
-
-    return { prefix, body };
-}
-
-/* ============================================================================
-   Public hashing API
-============================================================================ */
-
-/**
- * Deterministic 64-bit FNV-1a over UTF-8 bytes.
- *
- * Output format:
- *   fnv1a64_<16 hex chars>
- *
- * Good for:
- * - selection fingerprints
- * - re-anchor comparison
- * - change detection
- * - cache keys
- *
- * Not suitable for:
- * - passwords
- * - secrets
- * - adversarial collision resistance
- */
-export function defaultHashText(input: string): string {
-    if (typeof input !== "string") {
-        throw new Error("[ids] defaultHashText requires a string");
-    }
-
-    const bytes = utf8Encode(input);
-    let hash = FNV64_OFFSET_BASIS;
-    for (let i = 0; i < bytes.length; i += 1) {
-        hash ^= BigInt(bytes[i] ?? 0);
-        hash = BigInt.asUintN(64, hash * FNV64_PRIME);
-    }
-
-    return `fnv1a64_${hash.toString(16).padStart(16, "0")}`;
-}
-
-/**
- * Convenience helper for optional text.
- * Returns null for nullish / blank values, otherwise hashed text.
- */
-export function defaultHashNullableText(input: string | null | undefined): string | null {
-    if (!isNonEmptyString(input)) return null;
-    return defaultHashText(input);
-}
-
-export function toSelectionHash(value: string): SelectionHash {
-    if (!isSelectionHash(value)) {
-        throw new Error("[ids] invalid SelectionHash");
-    }
-    return value as SelectionHash;
-}
-
-export function isSelectionHash(value: unknown): value is SelectionHash {
-    return typeof value === "string" && /^fnv1a64_[0-9a-f]{16}$/u.test(value);
-}
-
-export function assertSelectionHash(value: unknown): asserts value is SelectionHash {
-    if (!isSelectionHash(value)) {
-        throw new Error("[ids] invalid SelectionHash");
+function assertNonNegativeIntegerOrNull(value: unknown, label: string): asserts value is number | null {
+    if (value !== null && (typeof value !== "number" || !Number.isInteger(value) || value < 0)) {
+        throw new Error(`[span] ${label} must be null or a non-negative integer`);
     }
 }
 
-/* ============================================================================
-   Internal constants
-============================================================================ */
-
-const SAFE_PREFIX_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/u;
-const ID_BODY_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/u;
-
-const CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-const TIME_PART_LEN = 10;
-const RANDOM_PART_LEN = 16;
-
-const FNV64_OFFSET_BASIS = 0xcbf29ce484222325n;
-const FNV64_PRIME = 0x100000001b3n;
-
-/* ============================================================================
-   Internal monotonic ID state
-============================================================================ */
-
-let lastTimestampMs = -1;
-let lastRandomDigits: number[] | null = null;
-
-/* ============================================================================
-   Internal helpers
-============================================================================ */
-
-function isNonEmptyString(value: unknown): value is string {
-    return typeof value === "string" && value.trim().length > 0;
+function assertPositiveInteger(value: unknown, label: string): asserts value is number {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+        throw new Error(`[span] ${label} must be a positive integer`);
+    }
 }
 
-function normalizePrefix(prefix: string): string {
-    const normalized = String(prefix)
-        .normalize("NFKC")
-        .trim()
-        .toLowerCase()
-        .replace(/\s+/g, "_")
-        .replace(/[^a-z0-9_-]/g, "_")
-        .replace(/_+/g, "_")
-        .replace(/^_+|_+$/g, "");
-
-    if (normalized.length === 0) return "id";
-    return normalized.slice(0, 24);
+function assertNonEmptyString(value: unknown, label: string): asserts value is string {
+    if (typeof value !== "string" || value.trim().length === 0) {
+        throw new Error(`[span] ${label} must be a non-empty string`);
+    }
 }
 
-function makeKnownId(prefix: KnownIdPrefix, nowMs = Date.now()): string {
-    return `${prefix}_${makeMonotonicBody(nowMs)}`;
+function normalizeNullableText(value: string | null | undefined): string | null {
+    if (value == null) return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
 }
 
-function makeMonotonicBody(nowMs: number): string {
-    assertValidTimestamp(nowMs);
-
-    const timePart = encodeTime48(nowMs);
-    const randomDigits = nextRandomDigits(nowMs);
-    const randomPart = encodeDigits(randomDigits);
-
-    return `${timePart}${randomPart}`;
+function canonicalBoundary(input: AnnotationBoundary): AnnotationBoundary {
+    assertAnnotationBoundary(input);
+    return {
+        verseOrd: input.verseOrd,
+        verseKey: input.verseKey.trim(),
+        tokenIndex: input.tokenIndex,
+        charOffset: input.charOffset,
+    };
 }
 
-function nextRandomDigits(nowMs: number): number[] {
-    if (nowMs === lastTimestampMs && lastRandomDigits !== null) {
-        const next = lastRandomDigits.slice();
-        incrementBase32Digits(next);
-        lastRandomDigits = next;
-        return next;
+function compareNullableNumber(a: number | null, b: number | null): number {
+    if (a === b) return 0;
+    if (a === null) return -1;
+    if (b === null) return 1;
+    return a - b;
+}
+
+export function compareAnnotationBoundaries(a: AnnotationBoundary, b: AnnotationBoundary): number {
+    if (a.verseOrd !== b.verseOrd) return a.verseOrd - b.verseOrd;
+    const tokenDelta = compareNullableNumber(a.tokenIndex, b.tokenIndex);
+    if (tokenDelta !== 0) return tokenDelta;
+    return compareNullableNumber(a.charOffset, b.charOffset);
+}
+
+export function assertAnnotationBoundary(value: unknown): asserts value is AnnotationBoundary {
+    if (typeof value !== "object" || value === null) {
+        throw new Error("[span] boundary must be an object");
+    }
+    const input = value as Record<string, unknown>;
+    assertPositiveInteger(input.verseOrd, "boundary.verseOrd");
+    assertNonEmptyString(input.verseKey, "boundary.verseKey");
+    assertNonNegativeIntegerOrNull(input.tokenIndex ?? null, "boundary.tokenIndex");
+    assertNonNegativeIntegerOrNull(input.charOffset ?? null, "boundary.charOffset");
+}
+
+export function normalizeSelectionAnchorInput(input: SelectionAnchorInput): SelectionAnchorInput {
+    assertSelectionAnchorInput(input);
+    const start = canonicalBoundary(input.start);
+    const end = canonicalBoundary(input.end);
+    const ordered = compareAnnotationBoundaries(start, end) <= 0
+        ? { start, end }
+        : { start: end, end: start };
+
+    return {
+        start: ordered.start,
+        end: ordered.end,
+        text: normalizeNullableText(input.text),
+        translationId: normalizeNullableText(input.translationId),
+    };
+}
+
+export function assertSelectionAnchorInput(value: unknown): asserts value is SelectionAnchorInput {
+    if (typeof value !== "object" || value === null) {
+        throw new Error("[span] selection anchor input must be an object");
+    }
+    const input = value as Record<string, unknown>;
+    assertAnnotationBoundary(input.start);
+    assertAnnotationBoundary(input.end);
+    if (input.text != null && typeof input.text !== "string") {
+        throw new Error("[span] text must be null or a string");
+    }
+    if (input.translationId != null && typeof input.translationId !== "string") {
+        throw new Error("[span] translationId must be null or a string");
+    }
+}
+
+export function createAnnotationSpan(input: AnnotationSpanInput, now = Date.now()): AnnotationSpan {
+    const selection = normalizeSelectionAnchorInput({
+        start: input.start,
+        end: input.end,
+        text: input.text ?? null,
+        translationId: input.translationId ?? null,
+    });
+
+    const createdAt = input.createdAt ?? now;
+    const updatedAt = input.updatedAt ?? createdAt;
+    const deletedAt = input.deletedAt ?? null;
+    const span: AnnotationSpan = {
+        spanId: input.spanId ?? createSpanId(selection.start.verseKey),
+        ordinal: input.ordinal ?? 1,
+        start: selection.start,
+        end: selection.end,
+        text: selection.text,
+        translationId: selection.translationId,
+        createdAt,
+        updatedAt,
+        deletedAt,
+    };
+    assertAnnotationSpan(span);
+    return span;
+}
+
+export function assertAnnotationSpan(value: unknown): asserts value is AnnotationSpan {
+    if (typeof value !== "object" || value === null) {
+        throw new Error("[span] annotation span must be an object");
     }
 
-    const next = randomBase32Digits(RANDOM_PART_LEN);
-    lastTimestampMs = nowMs;
-    lastRandomDigits = next;
+    const input = value as Record<string, unknown>;
+    toSpanId(input.spanId);
+    assertPositiveInteger(input.ordinal, "ordinal");
+    assertAnnotationBoundary(input.start);
+    assertAnnotationBoundary(input.end);
+    if (compareAnnotationBoundaries(input.start as AnnotationBoundary, input.end as AnnotationBoundary) > 0) {
+        throw new Error("[span] start must not sort after end");
+    }
+    if (input.text != null && typeof input.text !== "string") {
+        throw new Error("[span] text must be null or a string");
+    }
+    if (input.translationId != null && typeof input.translationId !== "string") {
+        throw new Error("[span] translationId must be null or a string");
+    }
+    assertFiniteInteger(input.createdAt, "createdAt");
+    assertFiniteInteger(input.updatedAt, "updatedAt");
+    assertNonNegativeIntegerOrNull(input.deletedAt ?? null, "deletedAt");
+
+    const createdAt = input.createdAt as number;
+    const updatedAt = input.updatedAt as number;
+    const deletedAt = (input.deletedAt ?? null) as number | null;
+    if (updatedAt < createdAt) {
+        throw new Error("[span] updatedAt must be >= createdAt");
+    }
+    if (deletedAt !== null && deletedAt < createdAt) {
+        throw new Error("[span] deletedAt must be >= createdAt");
+    }
+}
+
+export function annotationSpanToRow(span: AnnotationSpan): AnnotationSpanRow {
+    assertAnnotationSpan(span);
+    return {
+        span_id: span.spanId,
+        ordinal: span.ordinal,
+        start_verse_ord: span.start.verseOrd,
+        start_verse_key: span.start.verseKey,
+        start_token_index: span.start.tokenIndex,
+        start_char_offset: span.start.charOffset,
+        end_verse_ord: span.end.verseOrd,
+        end_verse_key: span.end.verseKey,
+        end_token_index: span.end.tokenIndex,
+        end_char_offset: span.end.charOffset,
+        quote_text: span.text,
+        translation_id: span.translationId,
+        created_at: span.createdAt,
+        updated_at: span.updatedAt,
+        deleted_at: span.deletedAt,
+    };
+}
+
+export function annotationSpanFromRow(row: AnnotationSpanRow): AnnotationSpan {
+    return createAnnotationSpan({
+        spanId: toSpanId(row.span_id),
+        ordinal: row.ordinal,
+        start: {
+            verseOrd: row.start_verse_ord,
+            verseKey: row.start_verse_key,
+            tokenIndex: row.start_token_index,
+            charOffset: row.start_char_offset,
+        },
+        end: {
+            verseOrd: row.end_verse_ord,
+            verseKey: row.end_verse_key,
+            tokenIndex: row.end_token_index,
+            charOffset: row.end_char_offset,
+        },
+        text: row.quote_text,
+        translationId: row.translation_id,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        deletedAt: row.deleted_at,
+    });
+}
+
+export function sortAnnotationSpans(spans: readonly AnnotationSpan[]): AnnotationSpan[] {
+    return [...spans].sort((a, b) => {
+        if (a.ordinal !== b.ordinal) return a.ordinal - b.ordinal;
+        const startDelta = compareAnnotationBoundaries(a.start, b.start);
+        if (startDelta !== 0) return startDelta;
+        const endDelta = compareAnnotationBoundaries(a.end, b.end);
+        if (endDelta !== 0) return endDelta;
+        return a.spanId.localeCompare(b.spanId);
+    });
+}
+
+export function normalizeSpanOrdinals(spans: readonly AnnotationSpan[]): AnnotationSpan[] {
+    return sortAnnotationSpans(spans).map((span, index) => ({
+        ...span,
+        ordinal: index + 1,
+    }));
+}
+```
+
+### packages/annotation/src/model/stroke.ts
+
+```ts
+import type { AnnotationId, PaletteId, StrokeId } from "./ids";
+import {
+    createStrokeId,
+    defaultHashText,
+    toAnnotationId,
+    toPaletteId,
+    toStrokeId,
+} from "./ids";
+
+export const INK_TOOL = {
+    PEN: "PEN",
+    HIGHLIGHTER: "HIGHLIGHTER",
+    ERASER: "ERASER",
+} as const;
+
+export type InkTool = (typeof INK_TOOL)[keyof typeof INK_TOOL];
+
+export const INK_STORAGE_MODE = {
+    INLINE: "INLINE",
+    CHUNKED: "CHUNKED",
+} as const;
+
+export type InkStorageMode = (typeof INK_STORAGE_MODE)[keyof typeof INK_STORAGE_MODE];
+
+export interface InkPoint {
+    x: number;
+    y: number;
+    t: number | null;
+    pressure: number | null;
+    tiltX: number | null;
+    tiltY: number | null;
+}
+
+export interface InkBBox {
+    minX: number;
+    minY: number;
+    maxX: number;
+    maxY: number;
+}
+
+export interface InkStroke {
+    strokeId: StrokeId;
+    annotationId: AnnotationId;
+    ordinal: number;
+    tool: InkTool;
+    storageMode: InkStorageMode;
+    color: string | null;
+    width: number;
+    opacity: number;
+    paletteId: PaletteId | null;
+    pointCount: number;
+    bbox: InkBBox | null;
+    contentHash: string;
+    points: readonly InkPoint[] | null;
+    chunkRefs: readonly string[] | null;
+    clientKey: string | null;
+    createdAt: number;
+    deletedAt: number | null;
+}
+
+export interface InkStrokeInput {
+    strokeId?: StrokeId;
+    annotationId: AnnotationId;
+    ordinal?: number;
+    tool?: InkTool;
+    storageMode?: InkStorageMode;
+    color?: string | null;
+    width?: number;
+    opacity?: number;
+    paletteId?: PaletteId | null;
+    points?: readonly InkPoint[] | null;
+    chunkRefs?: readonly string[] | null;
+    clientKey?: string | null;
+    createdAt?: number;
+    deletedAt?: number | null;
+}
+
+export interface InkStrokePatch {
+    tool?: InkTool;
+    storageMode?: InkStorageMode;
+    color?: string | null;
+    width?: number;
+    opacity?: number;
+    paletteId?: PaletteId | null;
+    points?: readonly InkPoint[] | null;
+    chunkRefs?: readonly string[] | null;
+    clientKey?: string | null;
+    deletedAt?: number | null;
+}
+
+export interface InkStrokeRow {
+    stroke_id: string;
+    annotation_id: string;
+    ordinal: number;
+    tool: InkTool;
+    storage_mode: InkStorageMode;
+    color: string | null;
+    width: number;
+    opacity: number;
+    palette_id: string | null;
+    point_count: number;
+    bbox_json: string | null;
+    content_hash: string;
+    points_json: string | null;
+    chunk_refs_json: string | null;
+    client_key: string | null;
+    created_at: number;
+    deleted_at: number | null;
+}
+
+function assertInteger(value: unknown, label: string): asserts value is number {
+    if (typeof value !== "number" || !Number.isInteger(value)) {
+        throw new Error(`[stroke] ${label} must be an integer`);
+    }
+}
+
+function assertPositiveInteger(value: unknown, label: string): asserts value is number {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+        throw new Error(`[stroke] ${label} must be a positive integer`);
+    }
+}
+
+function assertNullableIntegerGte(value: unknown, minimum: number, label: string): asserts value is number | null {
+    if (value !== null && (typeof value !== "number" || !Number.isInteger(value) || value < minimum)) {
+        throw new Error(`[stroke] ${label} must be null or an integer >= ${minimum}`);
+    }
+}
+
+function assertFinitePositiveNumber(value: unknown, label: string): asserts value is number {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        throw new Error(`[stroke] ${label} must be a finite positive number`);
+    }
+}
+
+function assertFiniteUnitNumber(value: unknown, label: string): asserts value is number {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+        throw new Error(`[stroke] ${label} must be a finite number in [0..1]`);
+    }
+}
+
+function assertTool(value: unknown): asserts value is InkTool {
+    if (value !== INK_TOOL.PEN && value !== INK_TOOL.HIGHLIGHTER && value !== INK_TOOL.ERASER) {
+        throw new Error("[stroke] tool must be PEN, HIGHLIGHTER, or ERASER");
+    }
+}
+
+function assertStorageMode(value: unknown): asserts value is InkStorageMode {
+    if (value !== INK_STORAGE_MODE.INLINE && value !== INK_STORAGE_MODE.CHUNKED) {
+        throw new Error("[stroke] storageMode must be INLINE or CHUNKED");
+    }
+}
+
+function normalizeNullableString(value: string | null | undefined): string | null {
+    if (value == null) return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeInkPoint(point: InkPoint): InkPoint {
+    assertInkPoint(point);
+    return {
+        x: point.x,
+        y: point.y,
+        t: point.t,
+        pressure: point.pressure,
+        tiltX: point.tiltX,
+        tiltY: point.tiltY,
+    };
+}
+
+function compareBBox(a: InkBBox | null, b: InkBBox | null): boolean {
+    if (a === b) return true;
+    if (a == null || b == null) return false;
+    return a.minX === b.minX && a.minY === b.minY && a.maxX === b.maxX && a.maxY === b.maxY;
+}
+
+function serializePoints(points: readonly InkPoint[]): string {
+    return JSON.stringify(points.map((point) => [point.x, point.y, point.t, point.pressure, point.tiltX, point.tiltY]));
+}
+
+export function assertInkPoint(value: unknown): asserts value is InkPoint {
+    if (typeof value !== "object" || value === null) {
+        throw new Error("[stroke] point must be an object");
+    }
+    const point = value as Record<string, unknown>;
+    assertFiniteUnitNumber(point.x, "point.x");
+    assertFiniteUnitNumber(point.y, "point.y");
+    assertNullableIntegerGte(point.t ?? null, 0, "point.t");
+    if (point.pressure !== null && point.pressure !== undefined) {
+        assertFiniteUnitNumber(point.pressure, "point.pressure");
+    }
+    if (point.tiltX !== null && point.tiltX !== undefined && (typeof point.tiltX !== "number" || !Number.isFinite(point.tiltX))) {
+        throw new Error("[stroke] point.tiltX must be null or a finite number");
+    }
+    if (point.tiltY !== null && point.tiltY !== undefined && (typeof point.tiltY !== "number" || !Number.isFinite(point.tiltY))) {
+        throw new Error("[stroke] point.tiltY must be null or a finite number");
+    }
+}
+
+export function computeInkBBox(points: readonly InkPoint[]): InkBBox | null {
+    if (points.length === 0) return null;
+    let minX = points[0]!.x;
+    let minY = points[0]!.y;
+    let maxX = points[0]!.x;
+    let maxY = points[0]!.y;
+    for (let i = 1; i < points.length; i += 1) {
+        const point = points[i]!;
+        if (point.x < minX) minX = point.x;
+        if (point.y < minY) minY = point.y;
+        if (point.x > maxX) maxX = point.x;
+        if (point.y > maxY) maxY = point.y;
+    }
+    return { minX, minY, maxX, maxY };
+}
+
+export function createInkStroke(input: InkStrokeInput, now = Date.now()): InkStroke {
+    const storageMode = input.storageMode ?? INK_STORAGE_MODE.INLINE;
+    const points = storageMode === INK_STORAGE_MODE.INLINE
+        ? (input.points ?? []).map(normalizeInkPoint)
+        : null;
+    const bbox = points ? computeInkBBox(points) : null;
+    const pointCount = points ? points.length : 0;
+    const createdAt = input.createdAt ?? now;
+    const deletedAt = input.deletedAt ?? null;
+    const chunkRefs = storageMode === INK_STORAGE_MODE.CHUNKED
+        ? [...new Set((input.chunkRefs ?? []).map((value) => value.trim()).filter((value) => value.length > 0))]
+        : null;
+
+    const stroke: InkStroke = {
+        strokeId: input.strokeId ?? createStrokeId(input.annotationId),
+        annotationId: input.annotationId,
+        ordinal: input.ordinal ?? 1,
+        tool: input.tool ?? INK_TOOL.PEN,
+        storageMode,
+        color: normalizeNullableString(input.color),
+        width: input.width ?? 1,
+        opacity: input.opacity ?? 1,
+        paletteId: input.paletteId ?? null,
+        pointCount,
+        bbox,
+        contentHash: points ? defaultHashText(serializePoints(points)) : defaultHashText(JSON.stringify(chunkRefs ?? [])),
+        points,
+        chunkRefs,
+        clientKey: normalizeNullableString(input.clientKey),
+        createdAt,
+        deletedAt,
+    };
+    assertInkStroke(stroke);
+    return stroke;
+}
+
+export function patchInkStroke(stroke: InkStroke, patch: InkStrokePatch): InkStroke {
+    assertInkStroke(stroke);
+    const nextStorageMode = patch.storageMode ?? stroke.storageMode;
+    const points = nextStorageMode === INK_STORAGE_MODE.INLINE
+        ? (patch.points ?? stroke.points ?? []).map(normalizeInkPoint)
+        : null;
+    const chunkRefs = nextStorageMode === INK_STORAGE_MODE.CHUNKED
+        ? [...new Set((patch.chunkRefs ?? stroke.chunkRefs ?? []).map((value) => value.trim()).filter((value) => value.length > 0))]
+        : null;
+    const bbox = points ? computeInkBBox(points) : null;
+    const pointCount = points ? points.length : 0;
+
+    const next: InkStroke = {
+        ...stroke,
+        tool: patch.tool ?? stroke.tool,
+        storageMode: nextStorageMode,
+        color: patch.color !== undefined ? normalizeNullableString(patch.color) : stroke.color,
+        width: patch.width ?? stroke.width,
+        opacity: patch.opacity ?? stroke.opacity,
+        paletteId: patch.paletteId !== undefined ? patch.paletteId : stroke.paletteId,
+        pointCount,
+        bbox,
+        contentHash: points ? defaultHashText(serializePoints(points)) : defaultHashText(JSON.stringify(chunkRefs ?? [])),
+        points,
+        chunkRefs,
+        clientKey: patch.clientKey !== undefined ? normalizeNullableString(patch.clientKey) : stroke.clientKey,
+        deletedAt: patch.deletedAt !== undefined ? patch.deletedAt : stroke.deletedAt,
+    };
+    assertInkStroke(next);
     return next;
 }
 
-function incrementBase32Digits(digits: number[]): void {
-    for (let i = digits.length - 1; i >= 0; i -= 1) {
-        const digit = digits[i] ?? 0;
-        if (digit < 31) {
-            digits[i] = digit + 1;
-            return;
+export function assertInkStroke(value: unknown): asserts value is InkStroke {
+    if (typeof value !== "object" || value === null) {
+        throw new Error("[stroke] stroke must be an object");
+    }
+    const stroke = value as Record<string, unknown>;
+    toStrokeId(stroke.strokeId);
+    toAnnotationId(stroke.annotationId);
+    assertPositiveInteger(stroke.ordinal, "ordinal");
+    assertTool(stroke.tool);
+    assertStorageMode(stroke.storageMode);
+    if (stroke.color != null && typeof stroke.color !== "string") {
+        throw new Error("[stroke] color must be null or a string");
+    }
+    assertFinitePositiveNumber(stroke.width, "width");
+    assertFiniteUnitNumber(stroke.opacity, "opacity");
+    if (stroke.paletteId != null) {
+        toPaletteId(stroke.paletteId);
+    }
+    assertInteger(stroke.pointCount, "pointCount");
+    if (typeof stroke.contentHash !== "string" || stroke.contentHash.trim().length === 0) {
+        throw new Error("[stroke] contentHash must be a non-empty string");
+    }
+    if (stroke.clientKey != null && typeof stroke.clientKey !== "string") {
+        throw new Error("[stroke] clientKey must be null or a string");
+    }
+    assertInteger(stroke.createdAt, "createdAt");
+    assertNullableIntegerGte(stroke.deletedAt ?? null, stroke.createdAt as number, "deletedAt");
+
+    const storageMode = stroke.storageMode as InkStorageMode;
+    const points = (stroke.points ?? null) as readonly InkPoint[] | null;
+    const bbox = (stroke.bbox ?? null) as InkBBox | null;
+    const pointCount = stroke.pointCount as number;
+    const chunkRefs = (stroke.chunkRefs ?? null) as readonly string[] | null;
+
+    if (storageMode === INK_STORAGE_MODE.INLINE) {
+        if (!Array.isArray(points)) {
+            throw new Error("[stroke] INLINE strokes must carry points");
         }
-        digits[i] = 0;
-    }
-
-    throw new Error("[ids] monotonic id overflow within the same millisecond");
-}
-
-function randomBase32Digits(length: number): number[] {
-    const out = new Array<number>(length);
-    const bytes = getRandomBytes(length);
-
-    for (let i = 0; i < length; i += 1) {
-        out[i] = (bytes[i] ?? 0) & 31;
-    }
-
-    return out;
-}
-
-function encodeTime48(nowMs: number): string {
-    let value = Math.trunc(nowMs);
-    let out = "";
-
-    for (let i = 0; i < TIME_PART_LEN; i += 1) {
-        out = alphabetChar(value % 32) + out;
-        value = Math.floor(value / 32);
-    }
-
-    return out;
-}
-
-function encodeDigits(digits: readonly number[]): string {
-    let out = "";
-    for (let i = 0; i < digits.length; i += 1) {
-        out += alphabetChar(digits[i] ?? 0);
-    }
-    return out;
-}
-
-function alphabetChar(index: number): string {
-    if (!Number.isInteger(index) || index < 0 || index >= 32) {
-        throw new Error("[ids] invalid base32 alphabet index");
-    }
-
-    const char = CROCKFORD32.charAt(index);
-    if (!char) {
-        throw new Error("[ids] base32 alphabet lookup failed");
-    }
-
-    return char;
-}
-
-function assertValidTimestamp(value: number): void {
-    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
-        throw new Error("[ids] timestamp must be a non-negative integer millisecond value");
-    }
-
-    // 48-bit ULID-compatible time ceiling.
-    if (value > 281_474_976_710_655) {
-        throw new Error("[ids] timestamp exceeds 48-bit time range");
-    }
-}
-
-function getRandomBytes(length: number): Uint8Array {
-    const g = globalThis as {
-        crypto?: {
-            getRandomValues?: (array: Uint8Array) => Uint8Array;
-        };
-    };
-
-    const cryptoLike = g.crypto;
-    if (cryptoLike && typeof cryptoLike.getRandomValues === "function") {
-        return cryptoLike.getRandomValues(new Uint8Array(length));
-    }
-
-    // Fallback only for unusual runtimes without crypto.
-    // Fine for local uniqueness; crypto-backed runtimes are preferred.
-    const out = new Uint8Array(length);
-    for (let i = 0; i < length; i += 1) {
-        out[i] = Math.floor(Math.random() * 256);
-    }
-    return out;
-}
-
-/**
- * UTF-8 encoder with no dependency on DOM typings.
- */
-function utf8Encode(input: string): Uint8Array {
-    const bytes: number[] = [];
-
-    for (let i = 0; i < input.length; i += 1) {
-        let codePoint = input.charCodeAt(i);
-
-        // surrogate pair
-        if (codePoint >= 0xd800 && codePoint <= 0xdbff && i + 1 < input.length) {
-            const next = input.charCodeAt(i + 1);
-            if (next >= 0xdc00 && next <= 0xdfff) {
-                codePoint = 0x10000 + ((codePoint - 0xd800) << 10) + (next - 0xdc00);
-                i += 1;
+        if (pointCount !== points.length) {
+            throw new Error("[stroke] pointCount must equal points.length for INLINE strokes");
+        }
+        for (const point of points) assertInkPoint(point);
+        const computed = computeInkBBox(points);
+        if (!compareBBox(computed, bbox)) {
+            throw new Error("[stroke] bbox must match points for INLINE strokes");
+        }
+    } else {
+        if (points !== null) {
+            throw new Error("[stroke] CHUNKED strokes must not carry inline points");
+        }
+        if (pointCount !== 0) {
+            throw new Error("[stroke] CHUNKED strokes must have pointCount 0 in the base row");
+        }
+        if (chunkRefs !== null) {
+            if (!Array.isArray(chunkRefs)) throw new Error("[stroke] chunkRefs must be null or a string array");
+            for (const chunkRef of chunkRefs) {
+                if (typeof chunkRef !== "string" || chunkRef.trim().length === 0) {
+                    throw new Error("[stroke] chunkRefs must contain non-empty strings");
+                }
             }
         }
+        if (bbox !== null) {
+            throw new Error("[stroke] CHUNKED strokes must not carry bbox in the base row");
+        }
+    }
+}
 
-        if (codePoint <= 0x7f) {
-            bytes.push(codePoint);
-            continue;
+export function inkStrokeToRow(stroke: InkStroke): InkStrokeRow {
+    assertInkStroke(stroke);
+    return {
+        stroke_id: stroke.strokeId,
+        annotation_id: stroke.annotationId,
+        ordinal: stroke.ordinal,
+        tool: stroke.tool,
+        storage_mode: stroke.storageMode,
+        color: stroke.color,
+        width: stroke.width,
+        opacity: stroke.opacity,
+        palette_id: stroke.paletteId,
+        point_count: stroke.pointCount,
+        bbox_json: stroke.bbox ? JSON.stringify(stroke.bbox) : null,
+        content_hash: stroke.contentHash,
+        points_json: stroke.points ? JSON.stringify(stroke.points) : null,
+        chunk_refs_json: stroke.chunkRefs ? JSON.stringify(stroke.chunkRefs) : null,
+        client_key: stroke.clientKey,
+        created_at: stroke.createdAt,
+        deleted_at: stroke.deletedAt,
+    };
+}
+
+export function inkStrokeFromRow(row: InkStrokeRow): InkStroke {
+    return createInkStroke({
+        strokeId: toStrokeId(row.stroke_id),
+        annotationId: toAnnotationId(row.annotation_id),
+        ordinal: row.ordinal,
+        tool: row.tool,
+        storageMode: row.storage_mode,
+        color: row.color,
+        width: row.width,
+        opacity: row.opacity,
+        paletteId: row.palette_id ? toPaletteId(row.palette_id) : null,
+        points: row.points_json ? (JSON.parse(row.points_json) as InkPoint[]) : null,
+        chunkRefs: row.chunk_refs_json ? (JSON.parse(row.chunk_refs_json) as string[]) : null,
+        clientKey: row.client_key,
+        createdAt: row.created_at,
+        deletedAt: row.deleted_at,
+    });
+}
+
+export function normalizeStrokeOrdinals(strokes: readonly InkStroke[]): InkStroke[] {
+    return [...strokes]
+        .sort((a, b) => {
+            if (a.ordinal !== b.ordinal) return a.ordinal - b.ordinal;
+            if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
+            return a.strokeId.localeCompare(b.strokeId);
+        })
+        .map((stroke, index) => ({
+            ...stroke,
+            ordinal: index + 1,
+        }));
+}
+```
+
+### packages/annotation/src/reducer.ts
+
+```ts
+import {
+    patchNoteAnnotation,
+    replaceAnnotationSpans,
+    restoreAnnotation,
+    softDeleteAnnotation,
+    upsertAnnotationSpan,
+    upsertAnnotationStroke,
+    removeAnnotationSpan,
+    removeAnnotationStroke,
+} from "./model/annotation";
+import type { Annotation } from "./model/annotation";
+import { patchInkStroke } from "./model/stroke";
+import type { AnnotationEvent } from "./events";
+import { ANNOTATION_EVENT_TYPE, assertAnnotationEvent } from "./events";
+import type { AnnotationId } from "./model/ids";
+
+export interface AnnotationSnapshot {
+    annotations: ReadonlyMap<AnnotationId, Annotation>;
+    labels: ReadonlyMap<string, readonly AnnotationId[]>;
+    collections: ReadonlyMap<string, readonly AnnotationId[]>;
+}
+
+function cloneAnnotations(source: ReadonlyMap<AnnotationId, Annotation>): Map<AnnotationId, Annotation> {
+    return new Map(source);
+}
+
+function rebuildIndexes(annotations: ReadonlyMap<AnnotationId, Annotation>): Pick<AnnotationSnapshot, "labels" | "collections"> {
+    const labels = new Map<string, Set<AnnotationId>>();
+    const collections = new Map<string, Set<AnnotationId>>();
+
+    for (const [annotationId, annotation] of annotations) {
+        if (annotation.deletedAt !== null) continue;
+
+        for (const label of annotation.labels) {
+            const bucket = labels.get(label) ?? new Set<AnnotationId>();
+            bucket.add(annotationId);
+            labels.set(label, bucket);
         }
 
-        if (codePoint <= 0x7ff) {
-            bytes.push(
-                0xc0 | (codePoint >> 6),
-                0x80 | (codePoint & 0x3f),
-            );
-            continue;
+        for (const collectionId of annotation.collectionIds) {
+            const bucket = collections.get(collectionId) ?? new Set<AnnotationId>();
+            bucket.add(annotationId);
+            collections.set(collectionId, bucket);
         }
-
-        if (codePoint <= 0xffff) {
-            bytes.push(
-                0xe0 | (codePoint >> 12),
-                0x80 | ((codePoint >> 6) & 0x3f),
-                0x80 | (codePoint & 0x3f),
-            );
-            continue;
-        }
-
-        bytes.push(
-            0xf0 | (codePoint >> 18),
-            0x80 | ((codePoint >> 12) & 0x3f),
-            0x80 | ((codePoint >> 6) & 0x3f),
-            0x80 | (codePoint & 0x3f),
-        );
     }
 
-    return Uint8Array.from(bytes);
+    const materialize = (source: Map<string, Set<AnnotationId>>): ReadonlyMap<string, readonly AnnotationId[]> => {
+        const next = new Map<string, readonly AnnotationId[]>();
+        for (const [key, ids] of source) {
+            next.set(key, [...ids].sort((a, b) => a.localeCompare(b)));
+        }
+        return next;
+    };
+
+    return {
+        labels: materialize(labels),
+        collections: materialize(collections),
+    };
+}
+
+function requireAnnotation(annotations: ReadonlyMap<AnnotationId, Annotation>, annotationId: AnnotationId): Annotation {
+    const annotation = annotations.get(annotationId);
+    if (!annotation) {
+        throw new Error(`[reducer] annotation not found: ${annotationId}`);
+    }
+    return annotation;
+}
+
+export function emptyAnnotationSnapshot(): AnnotationSnapshot {
+    return {
+        annotations: new Map(),
+        labels: new Map(),
+        collections: new Map(),
+    };
+}
+
+export function reduceAnnotationEvent(snapshot: AnnotationSnapshot, event: AnnotationEvent): AnnotationSnapshot {
+    assertAnnotationEvent(event);
+
+    const annotations = cloneAnnotations(snapshot.annotations);
+    const mutationMeta = {
+        updatedAt: event.createdAt,
+        updatedByUserId: event.userId,
+        deviceId: event.deviceId,
+    };
+
+    switch (event.type) {
+        case ANNOTATION_EVENT_TYPE.ANNOTATION_CREATED: {
+            if (annotations.has(event.annotationId)) {
+                throw new Error(`[reducer] duplicate annotation create: ${event.annotationId}`);
+            }
+            annotations.set(event.annotationId, event.payload.annotation);
+            break;
+        }
+        case ANNOTATION_EVENT_TYPE.ANNOTATION_PATCHED: {
+            const annotation = requireAnnotation(annotations, event.annotationId);
+            annotations.set(event.annotationId, patchNoteAnnotation(annotation, event.payload.patch, mutationMeta));
+            break;
+        }
+        case ANNOTATION_EVENT_TYPE.ANNOTATION_SOFT_DELETED: {
+            const annotation = requireAnnotation(annotations, event.annotationId);
+            annotations.set(event.annotationId, softDeleteAnnotation(annotation, mutationMeta, event.payload.deletedAt ?? event.createdAt));
+            break;
+        }
+        case ANNOTATION_EVENT_TYPE.ANNOTATION_RESTORED: {
+            const annotation = requireAnnotation(annotations, event.annotationId);
+            annotations.set(event.annotationId, restoreAnnotation(annotation, { ...mutationMeta, updatedAt: event.payload.restoredAt ?? event.createdAt }));
+            break;
+        }
+        case ANNOTATION_EVENT_TYPE.SPANS_REPLACED: {
+            const annotation = requireAnnotation(annotations, event.annotationId);
+            annotations.set(event.annotationId, replaceAnnotationSpans(annotation, event.payload.spans, mutationMeta));
+            break;
+        }
+        case ANNOTATION_EVENT_TYPE.SPAN_UPSERTED: {
+            const annotation = requireAnnotation(annotations, event.annotationId);
+            annotations.set(event.annotationId, upsertAnnotationSpan(annotation, event.payload.span, mutationMeta));
+            break;
+        }
+        case ANNOTATION_EVENT_TYPE.SPAN_REMOVED: {
+            const annotation = requireAnnotation(annotations, event.annotationId);
+            annotations.set(event.annotationId, removeAnnotationSpan(annotation, event.payload.spanId, mutationMeta));
+            break;
+        }
+        case ANNOTATION_EVENT_TYPE.STROKE_CREATED: {
+            const annotation = requireAnnotation(annotations, event.annotationId);
+            annotations.set(event.annotationId, upsertAnnotationStroke(annotation, event.payload.stroke, mutationMeta));
+            break;
+        }
+        case ANNOTATION_EVENT_TYPE.STROKE_PATCHED: {
+            const annotation = requireAnnotation(annotations, event.annotationId);
+            const currentStroke = annotation.strokes.find((stroke) => stroke.strokeId === event.payload.strokeId);
+            if (!currentStroke) {
+                throw new Error(`[reducer] stroke not found: ${event.payload.strokeId}`);
+            }
+            const patched = patchInkStroke(currentStroke, event.payload.patch);
+            annotations.set(event.annotationId, upsertAnnotationStroke(annotation, patched, mutationMeta));
+            break;
+        }
+        case ANNOTATION_EVENT_TYPE.STROKE_REMOVED: {
+            const annotation = requireAnnotation(annotations, event.annotationId);
+            annotations.set(event.annotationId, removeAnnotationStroke(annotation, event.payload.strokeId, mutationMeta));
+            break;
+        }
+        default: {
+            const exhaustive: never = event;
+            throw new Error(`[reducer] unhandled event: ${JSON.stringify(exhaustive)}`);
+        }
+    }
+
+    return {
+        annotations,
+        ...rebuildIndexes(annotations),
+    };
+}
+
+export function reduceAnnotationEvents(events: readonly AnnotationEvent[], seed = emptyAnnotationSnapshot()): AnnotationSnapshot {
+    let snapshot = seed;
+    for (const event of events) {
+        snapshot = reduceAnnotationEvent(snapshot, event);
+    }
+    return snapshot;
 }
 ```
 
@@ -25277,43 +27428,21 @@ function utf8Encode(input: string): Uint8Array {
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2022"],
-
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
-
     "strict": true,
-    "noImplicitOverride": true,
-    "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
-    "noFallthroughCasesInSwitch": true,
-
-    "composite": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-
-    "rootDir": "src",
     "outDir": "dist",
-    "tsBuildInfoFile": "dist/.tsbuildinfo",
-
-    "verbatimModuleSyntax": true,
-    "isolatedModules": true,
-    "useDefineForClassFields": true,
-    "forceConsistentCasingInFileNames": true,
-
-    "skipLibCheck": true,
-    "noEmitOnError": true
+    "rootDir": "src"
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx"],
-  "exclude": [
-    "dist",
-    "node_modules",
-    "**/*.test.ts",
-    "**/*.test.tsx",
-    "**/*.spec.ts",
-    "**/*.spec.tsx"
-  ]
+  "include": ["src/**/*"]
 }
 ```
 
