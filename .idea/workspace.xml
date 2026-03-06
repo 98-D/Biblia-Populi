@@ -7,6 +7,9 @@
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
+  <component name="PackageJsonUpdateNotifier">
+    <dismissed value="$PROJECT_DIR$/apps/api/package.json" />
+  </component>
   <component name="ProblemsViewState">
     <option name="selectedTabId" value="CurrentFile" />
   </component>
@@ -69,7 +72,7 @@
       <workItem from="1772661589386" duration="880000" />
       <workItem from="1772747332416" duration="4394000" />
       <workItem from="1772825613519" duration="6750000" />
-      <workItem from="1772833137577" duration="6012000" />
+      <workItem from="1772833137577" duration="7893000" />
     </task>
     <servers />
   </component>

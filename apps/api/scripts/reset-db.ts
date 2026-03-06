@@ -11,6 +11,7 @@
 // - Handles WAL / SHM / JOURNAL artifacts
 // - Refuses to delete ":memory:" paths (will fall back to default file path)
 // - Uses Bun.spawn (bun-only), no Node child_process
+// - On Windows, resolves the real Bun executable path instead of assuming "bun" is on spawn PATH
 
 import * as path from "node:path";
 import * as fs from "node:fs";
@@ -36,18 +37,37 @@ function isMemoryDb(p: string): boolean {
 function resolveDbPath(): string {
     const raw = (process.env.BP_DB_PATH ?? "").trim();
 
-    // default
     if (!raw) return path.resolve(process.cwd(), "data", "biblia.sqlite");
-
-    // if user points to memory db, resetting a file db still makes sense
     if (isMemoryDb(raw)) return path.resolve(process.cwd(), "data", "biblia.sqlite");
 
     return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
 }
 
+function resolveBunExecutable(): string {
+    // Bun exposes the current executable path here in Bun runtime.
+    const fromExecPath = (process.execPath ?? "").trim();
+    if (fromExecPath) return fromExecPath;
+
+    const fromWhich = Bun.which("bun");
+    if (fromWhich) return fromWhich;
+
+    fatal(
+        "unable to resolve Bun executable path.",
+        JSON.stringify({
+            processExecPath: process.execPath ?? null,
+            hint: "Run this script with Bun, not node.",
+        }),
+    );
+}
+
 async function run(cmd: string[], env?: Record<string, string>) {
+    const bunExe = resolveBunExecutable();
+    const fullCmd = [bunExe, ...cmd];
+
+    log("spawn:", fullCmd.join(" "));
+
     const p: Spawned = Bun.spawn({
-        cmd,
+        cmd: fullCmd,
         cwd: process.cwd(),
         stdout: "inherit",
         stderr: "inherit",
@@ -55,14 +75,14 @@ async function run(cmd: string[], env?: Record<string, string>) {
     });
 
     const code = await p.exited;
-    if (code !== 0) fatal("command failed:", cmd.join(" "), "exit", code);
+    if (code !== 0) fatal("command failed:", fullCmd.join(" "), "exit", code);
 }
 
 function safeUnlink(filePath: string): void {
     try {
         fs.unlinkSync(filePath);
     } catch (e: any) {
-        if (e?.code === "ENOENT") return; // already gone
+        if (e?.code === "ENOENT") return;
         throw e;
     }
 }
@@ -76,7 +96,6 @@ function safeMkdir(dir: string): void {
 }
 
 function deleteDbArtifacts(dbPath: string) {
-    // main file
     if (fs.existsSync(dbPath)) {
         log("deleting:", dbPath);
         safeUnlink(dbPath);
@@ -84,7 +103,6 @@ function deleteDbArtifacts(dbPath: string) {
         log("no db file to delete");
     }
 
-    // WAL mode artifacts (and legacy journal)
     safeUnlink(dbPath + "-wal");
     safeUnlink(dbPath + "-shm");
     safeUnlink(dbPath + "-journal");
@@ -104,10 +122,8 @@ async function main() {
         fatal("failed to delete db artifacts:", e);
     }
 
-    // Recreate schema + extras + seed metadata
-    // (We call TS entrypoints directly so it works the same in dev/prod)
-    await run(["bun", "src/db/migrate.ts"]);
-    await run(["bun", "src/db/seed.ts"]);
+    await run(["src/db/migrate.ts"]);
+    await run(["src/db/seed.ts"]);
 
     log("done.");
 }

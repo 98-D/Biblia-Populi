@@ -60,98 +60,13 @@ import {
 } from "./db/schema";
 import { bpUser, bpAuthAccount, bpSession } from "./db/authSchema";
 
-/* --------------------------------- Config --------------------------------- */
-
-const PORT = parseEnvInt(process.env.PORT, 3000, { min: 1, max: 65535 });
-const NODE_ENV = (process.env.NODE_ENV ?? "development").trim().toLowerCase();
-const IS_PROD = NODE_ENV === "production";
-
-// Public URLs
-const BP_PUBLIC_URL = trimTrailingSlash(process.env.BP_PUBLIC_URL ?? `http://localhost:${PORT}`);
-const BP_WEB_ORIGIN_RAW = (process.env.BP_WEB_ORIGIN ?? process.env.BP_CORS_ORIGIN ?? "").trim();
-
-// Explicit env default translation, else DB default.
-const ENV_TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "").trim();
-
-// CORS
-const CORS_LIST = splitCsv(BP_WEB_ORIGIN_RAW);
-const CORS_WILDCARD = CORS_LIST.length === 0 || CORS_LIST.includes("*");
-
-// Auth
-const AUTH_ENABLED = parseEnvBool(process.env.BP_AUTH_ENABLED, true);
-const AUTH_COOKIE = nonEmptyOr(process.env.BP_AUTH_COOKIE, "bp_session");
-const AUTH_COOKIE_DOMAIN = nonEmptyOrUndefined(process.env.BP_AUTH_COOKIE_DOMAIN);
-const AUTH_COOKIE_PATH = nonEmptyOr(process.env.BP_AUTH_COOKIE_PATH, "/");
-const AUTH_COOKIE_SECURE = parseEnvBool(
-    process.env.BP_AUTH_COOKIE_SECURE,
-    IS_PROD,
-);
-const AUTH_SESSION_DAYS = parseEnvInt(process.env.BP_AUTH_SESSION_DAYS, 30, { min: 1, max: 365 });
-
-// Cookie signing
-const AUTH_COOKIE_SECRET = (process.env.BP_AUTH_COOKIE_SECRET ?? "").trim();
-const AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE = parseEnvBool(
-    process.env.BP_AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE,
-    !IS_PROD,
-);
-
-// Google OAuth
-const GOOGLE_CLIENT_ID = (process.env.BP_GOOGLE_CLIENT_ID ?? process.env.GOOGLE_CLIENT_ID ?? "").trim();
-const GOOGLE_CLIENT_SECRET = (process.env.BP_GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_CLIENT_SECRET ?? "").trim();
-const GOOGLE_REDIRECT_URI = (
-    process.env.BP_GOOGLE_REDIRECT_URI ??
-    process.env.GOOGLE_REDIRECT_URI ??
-    `${BP_PUBLIC_URL}/auth/google/callback`
-).trim();
-const GOOGLE_SCOPES = ["openid", "email", "profile"] as const;
-
-// Redirects
-const AUTH_AFTER_LOGIN_URL = (
-    process.env.BP_AUTH_AFTER_LOGIN_URL ??
-    (CORS_WILDCARD ? "" : `${CORS_LIST[0]}/reader`)
-).trim();
-const AUTH_AFTER_LOGOUT_URL = (
-    process.env.BP_AUTH_AFTER_LOGOUT_URL ??
-    (CORS_WILDCARD ? "" : `${CORS_LIST[0]}/`)
-).trim();
-
-// Bun listen
-const LISTEN = parseEnvBool(process.env.BP_API_LISTEN, true);
-
-// Network timeouts
-const OAUTH_FETCH_TIMEOUT_MS = parseEnvInt(process.env.BP_OAUTH_FETCH_TIMEOUT_MS, 10_000, {
-    min: 1_000,
-    max: 60_000,
-});
-
-// Basic in-memory rate limits
-const AUTH_RATE_LIMIT_WINDOW_MS = parseEnvInt(process.env.BP_AUTH_RATE_LIMIT_WINDOW_MS, 60_000, {
-    min: 5_000,
-    max: 3600_000,
-});
-const AUTH_RATE_LIMIT_MAX = parseEnvInt(process.env.BP_AUTH_RATE_LIMIT_MAX, 30, {
-    min: 1,
-    max: 10_000,
-});
-const SEARCH_RATE_LIMIT_WINDOW_MS = parseEnvInt(process.env.BP_SEARCH_RATE_LIMIT_WINDOW_MS, 60_000, {
-    min: 5_000,
-    max: 3600_000,
-});
-const SEARCH_RATE_LIMIT_MAX = parseEnvInt(process.env.BP_SEARCH_RATE_LIMIT_MAX, 120, {
-    min: 1,
-    max: 10_000,
-});
-
-/* ------------------------------ Startup checks ----------------------------- */
-
-validateStartup();
-
 /* --------------------------------- Helpers -------------------------------- */
 
 type ApiOk<T> = Readonly<{ ok: true; data: T }>;
 type ApiErr = Readonly<{ ok: false; error: { code: string; message: string } }>;
 
 type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500;
+type PortSource = "BP_API_PORT" | "PORT" | "default";
 
 function toJsonStatus(n: number): JsonStatus {
     if (n === 200) return 200;
@@ -167,7 +82,11 @@ function toJsonStatus(n: number): JsonStatus {
 }
 
 function jsonOk<T>(c: Context, data: T, extraHeaders?: Record<string, string>, status: 200 | 201 = 200) {
-    if (extraHeaders) for (const [k, v] of Object.entries(extraHeaders)) c.header(k, v);
+    if (extraHeaders) {
+        for (const [k, v] of Object.entries(extraHeaders)) {
+            c.header(k, v);
+        }
+    }
     const body: ApiOk<T> = { ok: true, data };
     return c.json(body, { status });
 }
@@ -211,11 +130,43 @@ function parseEnvInt(
     fallback: number,
     bounds?: { min?: number; max?: number },
 ): number {
-    const n = Number((v ?? "").trim());
+    const s = (v ?? "").trim();
+    const n = Number(s);
     let out = Number.isFinite(n) ? Math.trunc(n) : fallback;
     if (bounds?.min != null && out < bounds.min) out = bounds.min;
     if (bounds?.max != null && out > bounds.max) out = bounds.max;
     return out;
+}
+
+function parsePortCandidate(raw: string | undefined): number | null {
+    const s = (raw ?? "").trim();
+    if (!s) return null;
+    if (!/^\d+$/.test(s)) return null;
+
+    const n = Number(s);
+    if (!Number.isInteger(n)) return null;
+
+    // Avoid low ports like 1 unless someone explicitly hardcodes via code.
+    if (n < 1024 || n > 65535) return null;
+
+    return n;
+}
+
+function resolveListenPort(): { port: number; source: PortSource; raw: string | null } {
+    const bpApiPortRaw = process.env.BP_API_PORT;
+    const portRaw = process.env.PORT;
+
+    const appPort = parsePortCandidate(bpApiPortRaw);
+    if (appPort != null) {
+        return { port: appPort, source: "BP_API_PORT", raw: bpApiPortRaw ?? null };
+    }
+
+    const genericPort = parsePortCandidate(portRaw);
+    if (genericPort != null) {
+        return { port: genericPort, source: "PORT", raw: portRaw ?? null };
+    }
+
+    return { port: 3000, source: "default", raw: null };
 }
 
 function assertAbsoluteHttpUrl(name: string, value: string): void {
@@ -227,34 +178,6 @@ function assertAbsoluteHttpUrl(name: string, value: string): void {
     }
     if (u.protocol !== "http:" && u.protocol !== "https:") {
         throw new Error(`[api] ${name} must use http or https`);
-    }
-}
-
-function validateStartup(): void {
-    assertAbsoluteHttpUrl("BP_PUBLIC_URL", BP_PUBLIC_URL);
-
-    if (AUTH_ENABLED) {
-        if (CORS_WILDCARD) {
-            throw new Error(
-                "[api] Auth is enabled but BP_WEB_ORIGIN/BP_CORS_ORIGIN resolves to wildcard/empty. Cookies require a specific origin.",
-            );
-        }
-
-        for (const origin of CORS_LIST) {
-            assertAbsoluteHttpUrl("BP_WEB_ORIGIN/BP_CORS_ORIGIN entry", origin);
-        }
-
-        assertAbsoluteHttpUrl("AUTH_AFTER_LOGIN_URL", AUTH_AFTER_LOGIN_URL);
-        assertAbsoluteHttpUrl("AUTH_AFTER_LOGOUT_URL", AUTH_AFTER_LOGOUT_URL);
-
-        if (IS_PROD && !AUTH_COOKIE_SECRET) {
-            throw new Error("[api] BP_AUTH_COOKIE_SECRET is required in production when auth is enabled.");
-        }
-
-        if (!GOOGLE_REDIRECT_URI) {
-            throw new Error("[api] GOOGLE_REDIRECT_URI resolved empty.");
-        }
-        assertAbsoluteHttpUrl("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI);
     }
 }
 
@@ -304,7 +227,9 @@ function daysMs(days: number): number {
     return Math.max(1, Math.trunc(d)) * 24 * 60 * 60 * 1000;
 }
 
-function cookieOpts(expiresAt?: Date): CookieOptions {
+function cookieOpts(
+    expiresAt?: Date,
+): CookieOptions {
     const base: CookieOptions = {
         httpOnly: true,
         sameSite: "Lax",
@@ -325,6 +250,119 @@ function getClientIp(c: Context): string {
     const xr = c.req.header("x-real-ip")?.trim();
     if (xr) return xr;
     return "unknown";
+}
+
+/* --------------------------------- Config --------------------------------- */
+
+const PORT_INFO = resolveListenPort();
+const PORT = PORT_INFO.port;
+
+const NODE_ENV = (process.env.NODE_ENV ?? "development").trim().toLowerCase();
+const IS_PROD = NODE_ENV === "production";
+
+// Public URLs
+const BP_PUBLIC_URL = trimTrailingSlash(process.env.BP_PUBLIC_URL ?? `http://localhost:${PORT}`);
+const BP_WEB_ORIGIN_RAW = (process.env.BP_WEB_ORIGIN ?? process.env.BP_CORS_ORIGIN ?? "").trim();
+
+// Explicit env default translation, else DB default.
+const ENV_TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "").trim();
+
+// CORS
+const CORS_LIST = splitCsv(BP_WEB_ORIGIN_RAW);
+const CORS_WILDCARD = CORS_LIST.length === 0 || CORS_LIST.includes("*");
+
+// Auth
+const AUTH_ENABLED = parseEnvBool(process.env.BP_AUTH_ENABLED, true);
+const AUTH_COOKIE = nonEmptyOr(process.env.BP_AUTH_COOKIE, "bp_session");
+const AUTH_COOKIE_DOMAIN = nonEmptyOrUndefined(process.env.BP_AUTH_COOKIE_DOMAIN);
+const AUTH_COOKIE_PATH = nonEmptyOr(process.env.BP_AUTH_COOKIE_PATH, "/");
+const AUTH_COOKIE_SECURE = parseEnvBool(process.env.BP_AUTH_COOKIE_SECURE, IS_PROD);
+const AUTH_SESSION_DAYS = parseEnvInt(process.env.BP_AUTH_SESSION_DAYS, 30, { min: 1, max: 365 });
+
+// Cookie signing
+const AUTH_COOKIE_SECRET = (process.env.BP_AUTH_COOKIE_SECRET ?? "").trim();
+const AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE = parseEnvBool(
+    process.env.BP_AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE,
+    !IS_PROD,
+);
+
+// Google OAuth
+const GOOGLE_CLIENT_ID = (process.env.BP_GOOGLE_CLIENT_ID ?? process.env.GOOGLE_CLIENT_ID ?? "").trim();
+const GOOGLE_CLIENT_SECRET = (process.env.BP_GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_CLIENT_SECRET ?? "").trim();
+const GOOGLE_REDIRECT_URI = (
+    process.env.BP_GOOGLE_REDIRECT_URI ??
+    process.env.GOOGLE_REDIRECT_URI ??
+    `${BP_PUBLIC_URL}/auth/google/callback`
+).trim();
+const GOOGLE_SCOPES = ["openid", "email", "profile"] as const;
+
+// Redirects
+const AUTH_AFTER_LOGIN_URL = (
+    process.env.BP_AUTH_AFTER_LOGIN_URL ??
+    (CORS_WILDCARD ? "" : `${CORS_LIST[0]}/reader`)
+).trim();
+const AUTH_AFTER_LOGOUT_URL = (
+    process.env.BP_AUTH_AFTER_LOGOUT_URL ??
+    (CORS_WILDCARD ? "" : `${CORS_LIST[0]}/`)
+).trim();
+
+// Bun listen
+const LISTEN = parseEnvBool(process.env.BP_API_LISTEN, true);
+
+// Network timeouts
+const OAUTH_FETCH_TIMEOUT_MS = parseEnvInt(process.env.BP_OAUTH_FETCH_TIMEOUT_MS, 10_000, {
+    min: 1_000,
+    max: 60_000,
+});
+
+// Basic in-memory rate limits
+const AUTH_RATE_LIMIT_WINDOW_MS = parseEnvInt(process.env.BP_AUTH_RATE_LIMIT_WINDOW_MS, 60_000, {
+    min: 5_000,
+    max: 3_600_000,
+});
+const AUTH_RATE_LIMIT_MAX = parseEnvInt(process.env.BP_AUTH_RATE_LIMIT_MAX, 30, {
+    min: 1,
+    max: 10_000,
+});
+const SEARCH_RATE_LIMIT_WINDOW_MS = parseEnvInt(process.env.BP_SEARCH_RATE_LIMIT_WINDOW_MS, 60_000, {
+    min: 5_000,
+    max: 3_600_000,
+});
+const SEARCH_RATE_LIMIT_MAX = parseEnvInt(process.env.BP_SEARCH_RATE_LIMIT_MAX, 120, {
+    min: 1,
+    max: 10_000,
+});
+
+/* ------------------------------ Startup checks ----------------------------- */
+
+validateStartup();
+
+function validateStartup(): void {
+    assertAbsoluteHttpUrl("BP_PUBLIC_URL", BP_PUBLIC_URL);
+
+    if (AUTH_ENABLED) {
+        if (CORS_WILDCARD) {
+            throw new Error(
+                "[api] Auth is enabled but BP_WEB_ORIGIN/BP_CORS_ORIGIN resolves to wildcard/empty. Cookies require a specific origin.",
+            );
+        }
+
+        for (const origin of CORS_LIST) {
+            assertAbsoluteHttpUrl("BP_WEB_ORIGIN/BP_CORS_ORIGIN entry", origin);
+        }
+
+        assertAbsoluteHttpUrl("AUTH_AFTER_LOGIN_URL", AUTH_AFTER_LOGIN_URL);
+        assertAbsoluteHttpUrl("AUTH_AFTER_LOGOUT_URL", AUTH_AFTER_LOGOUT_URL);
+
+        if (IS_PROD && !AUTH_COOKIE_SECRET) {
+            throw new Error("[api] BP_AUTH_COOKIE_SECRET is required in production when auth is enabled.");
+        }
+
+        if (!GOOGLE_REDIRECT_URI) {
+            throw new Error("[api] GOOGLE_REDIRECT_URI resolved empty.");
+        }
+        assertAbsoluteHttpUrl("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI);
+    }
 }
 
 /* ------------------------------ Cookie signing ----------------------------- */
@@ -491,6 +529,7 @@ function getTranslationsCached(): Readonly<{
 }
 
 let _resolvedTranslationId: string | null = null;
+
 async function resolveDefaultTranslationId(): Promise<string | null> {
     if (_resolvedTranslationId) return _resolvedTranslationId;
 
@@ -555,6 +594,7 @@ async function pickTranslation(c: Context): Promise<PickedTranslation | Response
 /* ----------------------------- Other fast caches ---------------------------- */
 
 let _hasFts: boolean | null = null;
+
 function hasFts(): boolean {
     if (_hasFts != null) return _hasFts;
 
@@ -697,7 +737,10 @@ class MemoryRateLimiter {
         private readonly maxHits: number,
     ) {}
 
-    hit(key: string, now = Date.now()): { ok: true; remaining: number; resetAt: number } | { ok: false; retryAfterSec: number; resetAt: number } {
+    hit(
+        key: string,
+        now = Date.now(),
+    ): { ok: true; remaining: number; resetAt: number } | { ok: false; retryAfterSec: number; resetAt: number } {
         const cur = this.buckets.get(key);
         if (!cur || now >= cur.resetAt) {
             const resetAt = now + this.windowMs;
@@ -731,17 +774,20 @@ const searchLimiter = new MemoryRateLimiter(SEARCH_RATE_LIMIT_WINDOW_MS, SEARCH_
 
 function withRateLimit(name: "auth" | "search") {
     const limiter = name === "auth" ? authLimiter : searchLimiter;
+    const limit = name === "auth" ? AUTH_RATE_LIMIT_MAX : SEARCH_RATE_LIMIT_MAX;
 
     return async (c: Context, next: Next) => {
         const key = `${name}:${getClientIp(c)}`;
         const hit = limiter.hit(key);
+
         if (!hit.ok) {
             c.header("Retry-After", String(hit.retryAfterSec));
-            c.header("X-RateLimit-Limit", String(name === "auth" ? AUTH_RATE_LIMIT_MAX : SEARCH_RATE_LIMIT_MAX));
+            c.header("X-RateLimit-Limit", String(limit));
             c.header("X-RateLimit-Reset", String(hit.resetAt));
             return jsonErr(c, 429, "RATE_LIMITED", "Too many requests.");
         }
-        c.header("X-RateLimit-Limit", String(name === "auth" ? AUTH_RATE_LIMIT_MAX : SEARCH_RATE_LIMIT_MAX));
+
+        c.header("X-RateLimit-Limit", String(limit));
         c.header("X-RateLimit-Remaining", String(hit.remaining));
         c.header("X-RateLimit-Reset", String(hit.resetAt));
         return next();
@@ -854,14 +900,13 @@ const OAUTH_TMP_MS = 10 * 60 * 1000;
 
 function oauthTmpCookieOpts(): CookieOptions {
     const exp = new Date(Date.now() + OAUTH_TMP_MS);
-    const base: CookieOptions = {
+    return {
         ...cookieOpts(exp),
         httpOnly: true,
         sameSite: "Lax",
         secure: AUTH_COOKIE_SECURE,
         path: "/",
     };
-    return base;
 }
 
 function sha256Base64Url(s: string): string {
@@ -940,10 +985,12 @@ async function googleFetchUserInfo(accessToken: string): Promise<GoogleUserInfo>
         },
         OAUTH_FETCH_TIMEOUT_MS,
     );
+
     if (!res.ok) {
         const text = await res.text().catch(() => "");
         throw new Error(`google userinfo failed: ${res.status} ${text}`);
     }
+
     return (await res.json()) as GoogleUserInfo;
 }
 
@@ -1072,7 +1119,6 @@ app.use(
     }),
 );
 
-// Session middleware
 app.use("*", async (c, next) => {
     if (!AUTH_ENABLED) {
         c.set("user", null);
@@ -1123,25 +1169,21 @@ app.onError((err, c) => {
 
 /* ---------------------------------- Routes -------------------------------- */
 
-// Root
 app.get("/", (c) => {
     cacheNoStore(c);
     return c.redirect("/health", 302);
 });
 
-// Health
 app.get("/health", (c) => {
     cacheNoStore(c);
     return c.text("ok");
 });
 
-// Auth: me
 app.get("/auth/me", (c) => {
     cacheNoStore(c);
     return jsonOk(c, { user: c.get("user") });
 });
 
-// Auth: start google
 app.get("/auth/google/start", withRateLimit("auth"), (c) => {
     cacheNoStore(c);
 
@@ -1164,7 +1206,6 @@ app.get("/auth/google/start", withRateLimit("auth"), (c) => {
     return c.redirect(googleAuthUrl(state, challenge), 302);
 });
 
-// Auth: callback
 app.get("/auth/google/callback", withRateLimit("auth"), async (c) => {
     cacheNoStore(c);
 
@@ -1219,7 +1260,6 @@ app.get("/auth/google/callback", withRateLimit("auth"), async (c) => {
     }
 });
 
-// Auth: logout
 app.post("/auth/logout", withRateLimit("auth"), async (c) => {
     cacheNoStore(c);
     const sid = c.get("sessionId");
@@ -1227,14 +1267,12 @@ app.post("/auth/logout", withRateLimit("auth"), async (c) => {
     return jsonOk(c, { redirect: AUTH_AFTER_LOGOUT_URL });
 });
 
-// List available translations
 app.get("/translations", (c) => {
     cachePublic(c, 60);
     const cached = getTranslationsCached();
     return jsonOk(c, { translations: cached.rows.map(toTranslationMeta) });
 });
 
-// Meta
 app.get("/meta", async (c) => {
     cacheNoStore(c);
 
@@ -1252,16 +1290,18 @@ app.get("/meta", async (c) => {
             enabled: AUTH_ENABLED,
             user: c.get("user"),
         },
+        listen: {
+            port: PORT,
+            source: PORT_INFO.source,
+        },
     });
 });
 
-// Spine
 app.get("/spine", (c) => {
     cachePublic(c, 30);
     return jsonOk(c, getSpineStats());
 });
 
-// Slice
 app.get("/slice", async (c) => {
     cachePublic(c, 10);
 
@@ -1328,7 +1368,6 @@ app.get("/slice", async (c) => {
     return jsonOk(c, { translationId, fromOrd, limit, verses, done, nextFromOrd, spine });
 });
 
-// Resolve ref to verse_ord
 app.get("/loc", async (c) => {
     cachePublic(c, 60);
 
@@ -1394,7 +1433,6 @@ app.get("/loc", async (c) => {
     return jsonOk(c, first ?? null);
 });
 
-// Books
 app.get("/books", async (c) => {
     cachePublic(c, 60);
 
@@ -1415,7 +1453,6 @@ app.get("/books", async (c) => {
     return jsonOk(c, { books });
 });
 
-// Chapters
 app.get("/chapters/:bookId", async (c) => {
     cachePublic(c, 60);
 
@@ -1438,7 +1475,6 @@ app.get("/chapters/:bookId", async (c) => {
     return jsonOk(c, { bookId, chapters: rows });
 });
 
-// Chapter payload
 app.get("/chapter/:bookId/:chapter", async (c) => {
     cachePublic(c, 30);
 
@@ -1544,7 +1580,6 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
     });
 });
 
-// PERSON drawer
 app.get("/people/:id", async (c) => {
     cachePublic(c, 60);
     const id = c.req.param("id");
@@ -1583,7 +1618,6 @@ app.get("/people/:id", async (c) => {
     return jsonOk(c, { ...base, relations: { from: relFrom, to: relTo } });
 });
 
-// PLACE drawer
 app.get("/places/:id", async (c) => {
     cachePublic(c, 60);
     const id = c.req.param("id");
@@ -1609,7 +1643,6 @@ app.get("/places/:id", async (c) => {
     return jsonOk(c, { ...base, geos });
 });
 
-// EVENT drawer
 app.get("/events/:id", async (c) => {
     cachePublic(c, 60);
     const id = c.req.param("id");
@@ -1644,7 +1677,6 @@ app.get("/events/:id", async (c) => {
     return jsonOk(c, { event: ev[0], participants });
 });
 
-// Search
 app.get("/search", withRateLimit("search"), async (c) => {
     cachePrivate(c, 10);
 
@@ -1715,7 +1747,7 @@ app.get("/search", withRateLimit("search"), async (c) => {
             verse: r.verse,
             verseKey: r.verseKey,
             verseOrd: r.verseOrd,
-            snippet: text.length > 200 ? text.slice(0, 197) + "…" : text,
+            snippet: text.length > 200 ? `${text.slice(0, 197)}…` : text,
         };
     });
 
@@ -1735,7 +1767,11 @@ if (LISTEN) {
     const server = Bun.serve({ port: PORT, fetch: apiFetch });
 
     // eslint-disable-next-line no-console
-    console.log(`[api] listening on http://localhost:${server.port}`);
+    console.log(
+        `[api] listening on http://localhost:${server.port} (source=${PORT_INFO.source}${
+            PORT_INFO.raw ? ` raw=${JSON.stringify(PORT_INFO.raw)}` : ""
+        })`,
+    );
 
     // eslint-disable-next-line no-console
     console.log(
@@ -1769,7 +1805,6 @@ if (LISTEN) {
 
 /* ------------------------------- Dev exports ------------------------------- */
 
-// Useful for tests/admin hooks if you later add them.
 export const __internal = {
     invalidateTranslationsCache,
     invalidateSpineStats,

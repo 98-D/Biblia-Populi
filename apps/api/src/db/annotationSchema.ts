@@ -18,7 +18,12 @@
 // - All timestamps are INTEGER ms epoch.
 // - JSON payloads are stored as TEXT.
 // - Do not treat viewport pixels as truth.
+//
+// SQLite caveat:
+// - CHECK constraints in DDL cannot contain bound parameters.
+// - Any numeric constants used inside reusable sql fragments must be inlined.
 
+import { sql, type SQL } from "drizzle-orm";
 import {
     sqliteTable,
     text,
@@ -30,13 +35,19 @@ import {
     check,
     foreignKey,
 } from "drizzle-orm/sqlite-core";
-import { sql } from "drizzle-orm";
 import { bpUser } from "./authSchema";
 
 /* --------------------------------- Helpers --------------------------------- */
 
+function intLiteral(n: number): SQL {
+    if (!Number.isInteger(n)) {
+        throw new Error(`[annotationSchema] expected integer literal, got ${n}`);
+    }
+    return sql.raw(String(n));
+}
+
 const lenGt0 = (col: unknown) => sql`length(${col as any}) > 0`;
-const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${n}`;
+const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${intLiteral(n)}`;
 const jsonNonEmptyArrayish = (col: unknown) => sql`length(trim(${col as any})) >= 2`;
 
 /* ---------------------------------- Enums ---------------------------------- */
@@ -165,13 +176,9 @@ export const bpAnnotation = sqliteTable(
 
         kind: text("kind").notNull(), // AnnotationKind
 
-        // Optimistic concurrency / sync revision.
         rev: integer("rev").notNull().default(1),
-
-        // Idempotent write support.
         idempotencyKey: text("idempotency_key"),
 
-        // Device / client metadata for debugging + sync reconciliation.
         createdDeviceId: text("created_device_id"),
         updatedDeviceId: text("updated_device_id"),
         clientCreatedAt: integer("client_created_at"),
@@ -188,21 +195,16 @@ export const bpAnnotation = sqliteTable(
 
         title: text("title"),
 
-        // Visual style.
         color: text("color"),
         opacity: real("opacity"),
         paletteId: text("palette_id"),
         styleJson: text("style_json"),
 
-        // NOTE / BOOKMARK payload
         noteText: text("note_text"),
         noteFormat: text("note_format"),
-        noteHtml: text("note_html"), // cached / derived render surface
+        noteHtml: text("note_html"),
 
-        // Derived, denormalized search surface for quick LIKE/FTS pipelines.
         textSearch: text("text_search"),
-
-        // Optional user sort override / pin order inside a collection or view.
         sortOrdinal: integer("sort_ordinal"),
     },
     (t) => ({
@@ -265,27 +267,20 @@ export const bpAnnotationSpan = sqliteTable(
             .notNull()
             .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        spanOrdinal: integer("span_ordinal").notNull(), // 1..N
-
+        spanOrdinal: integer("span_ordinal").notNull(),
         anchorKind: text("anchor_kind").notNull().default("RANGE"),
 
-        // Null means translation-agnostic structural anchor.
-        // Set for token-precise, translation-specific anchoring.
         translationId: text("translation_id"),
 
-        // Structural truth.
         startVerseOrd: integer("start_verse_ord").notNull(),
         endVerseOrd: integer("end_verse_ord").notNull(),
 
-        // Convenience / export / debugging snapshots.
         startVerseKey: text("start_verse_key"),
         endVerseKey: text("end_verse_key"),
 
-        // Optional exact token anchoring.
         startTokenIndex: integer("start_token_index"),
         endTokenIndex: integer("end_token_index"),
 
-        // Optional char offsets inside start/end verse text.
         startCharOffset: integer("start_char_offset"),
         endCharOffset: integer("end_char_offset"),
 
@@ -293,7 +288,6 @@ export const bpAnnotationSpan = sqliteTable(
         selectedTextHash: text("selected_text_hash"),
         selectionVersion: integer("selection_version"),
 
-        // Logical pin inside local span space [0..1]; never viewport pixels.
         pinX: real("pin_x"),
         pinY: real("pin_y"),
     },
@@ -540,10 +534,7 @@ export const bpAnnotationInkStroke = sqliteTable(
         paletteId: text("palette_id"),
         color: text("color"),
         opacity: real("opacity"),
-
-        // Width in normalized local-span units.
         width: real("width"),
-
         brushJson: text("brush_json"),
 
         minX: real("min_x"),
@@ -552,9 +543,6 @@ export const bpAnnotationInkStroke = sqliteTable(
         maxY: real("max_y"),
 
         pointCount: integer("point_count"),
-
-        // INLINE mode: full payload here.
-        // CHUNKED mode: null here; use chunk rows.
         pointsJson: text("points_json"),
 
         createdAt: integer("created_at").notNull(),
@@ -608,17 +596,17 @@ export const bpAnnotationInkStroke = sqliteTable(
                 (
                     ${t.minX} is null and ${t.minY} is null and ${t.maxX} is null and ${t.maxY} is null
                 ) or (
-                    ${t.minX} is not null and ${t.minY} is not null and ${t.maxX} is not null and ${t.maxY} is not null
-                    and ${t.minX} <= ${t.maxX}
-                    and ${t.minY} <= ${t.maxY}
+                ${t.minX} is not null and ${t.minY} is not null and ${t.maxX} is not null and ${t.maxY} is not null
+                and ${t.minX} <= ${t.maxX}
+                and ${t.minY} <= ${t.maxY}
                 )
             `,
         ),
         storagePayloadCheck: check(
             "bp_annotation_ink_storage_payload_check",
             sql`
-                (${t.storageMode} = 'INLINE' and ${t.pointsJson} is not null)
-                or (${t.storageMode} = 'CHUNKED' and ${t.pointsJson} is null)
+                    (${t.storageMode} = 'INLINE' and ${t.pointsJson} is not null)
+                    or (${t.storageMode} = 'CHUNKED' and ${t.pointsJson} is null)
             `,
         ),
         deletedChronologyCheck: check(
@@ -658,7 +646,7 @@ export const bpAnnotationAttachment = sqliteTable(
             .notNull()
             .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        kind: text("kind").notNull(), // image | audio | file | ...
+        kind: text("kind").notNull(),
         mime: text("mime"),
         byteSize: integer("byte_size"),
         storageKey: text("storage_key").notNull(),
@@ -700,10 +688,8 @@ export const bpAnnotationShare = sqliteTable(
         privacy: text("privacy").notNull().default("PRIVATE"),
         scope: text("scope").notNull().default("ANNOTATIONS"),
 
-        // Optional stable slug / token for public or shared-link retrieval.
         shareSlug: text("share_slug"),
 
-        // For collection-scoped shares.
         collectionId: text("collection_id").references(() => bpAnnotationCollection.collectionId, {
             onDelete: "set null",
             onUpdate: "cascade",
@@ -780,12 +766,10 @@ export const bpAnnotationEvent = sqliteTable(
         kind: text("kind").notNull(),
         at: integer("at").notNull(),
 
-        // Client / sync metadata
         clientAt: integer("client_at"),
         deviceId: text("device_id"),
         idempotencyKey: text("idempotency_key"),
 
-        // Optional detailed links
         strokeId: text("stroke_id"),
         labelId: text("label_id"),
         collectionId: text("collection_id"),

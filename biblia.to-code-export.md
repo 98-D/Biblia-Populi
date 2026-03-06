@@ -1,11 +1,11 @@
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-06T23:20:16.277Z
+Generated: 2026-03-06T23:40:23.222Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
-Total files: 71
-Total raw bytes (all included files): 1805857
+Total files: 70
+Total raw bytes (all included files): 1996629
 Truncated/skipped files: 1
-Export time: 17ms
+Export time: 62ms
 
 ## Notes
 
@@ -186,78 +186,14 @@ vite.config.ts.timestamp-*
 ### apps/api/drizzle.config.ts
 
 ```ts
-// apps/api/drizzle.config.ts
 import type { Config } from "drizzle-kit";
-import * as path from "node:path";
-import * as fs from "node:fs";
-
-/**
- * Drizzle Kit runs under Node (bunx), so use file-based paths.
- *
- * Schema:
- * - ./src/db/schema.ts       (core Biblia Populi tables)
- * - ./src/db/authSchema.ts   (bp_user / bp_auth_account / bp_session)
- *
- * Migrations output: ./drizzle
- *
- * DB path resolution:
- * - If BP_DB_PATH is set:
- *    - ":memory:" is NOT supported by drizzle-kit (needs a file), so we fall back to repo-local file.
- *    - Relative paths are resolved against process.cwd().
- * - Otherwise:
- *    - Use apps/api/data/biblia.sqlite (relative to repo root if you run from root)
- *
- * IMPORTANT:
- * - drizzle-kit resolves schema paths relative to process.cwd().
- * - To make this robust whether you run bunx from repo root OR from apps/api,
- *   we generate absolute paths for schema + migrations folder.
- */
-
-const HERE = path.dirname(new URL(import.meta.url).pathname);
-
-// On Windows, URL pathname starts with /C:/...; normalize it.
-function normalizeHere(p: string): string {
-    if (process.platform === "win32" && p.startsWith("/")) return p.slice(1);
-    return p;
-}
-
-const HERE_FS = normalizeHere(HERE);
-const API_DIR = path.resolve(HERE_FS); // .../apps/api
-
-function isMemoryDb(p: string): boolean {
-    return p === ":memory:" || p.startsWith("file::memory:");
-}
-
-function resolveDbPath(): string {
-    const raw = (process.env.BP_DB_PATH ?? "").trim();
-
-    // default: repo-local file (works when running from repo root OR apps/api)
-    if (!raw) return path.resolve(API_DIR, "data", "biblia.sqlite");
-
-    // drizzle-kit needs a file path, not in-memory
-    if (isMemoryDb(raw)) return path.resolve(API_DIR, "data", "biblia.sqlite");
-
-    return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
-}
-
-const dbPath = resolveDbPath();
-
-// Ensure directory exists so drizzle-kit can create the DB file if needed
-try {
-    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-} catch {
-    // ignore; drizzle-kit will error if it truly can't write
-}
-
-const schemaCore = path.resolve(API_DIR, "src", "db", "schema.ts");
-const schemaAuth = path.resolve(API_DIR, "src", "db", "authSchema.ts");
 
 export default {
-    schema: [schemaCore, schemaAuth],
-    out: path.resolve(API_DIR, "drizzle"),
+    schema: "./src/db/schema.ts",
+    out: "./drizzle",
     dialect: "sqlite",
     dbCredentials: {
-        url: dbPath,
+        url: "./data/biblia.sqlite",
     },
     strict: true,
     verbose: true,
@@ -274,35 +210,21 @@ export default {
     {
       "idx": 0,
       "version": "6",
-      "when": 1772236618451,
-      "tag": "0000_lazy_blue_blade",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "6",
-      "when": 1772414275083,
-      "tag": "0001_bizarre_next_avengers",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "6",
-      "when": 1772556186504,
-      "tag": "0002_romantic_prowler",
+      "when": 1772840253164,
+      "tag": "0000_sweet_triathlon",
       "breakpoints": true
     }
   ]
 }
 ```
 
-### apps/api/drizzle/meta/0001_snapshot.json
+### apps/api/drizzle/meta/0000_snapshot.json
 
 ```json
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "7bc98a87-3de5-4d07-9b7e-3689df2821aa",
+  "id": "67b2a2dd-86c7-4ec2-90ba-23ef9745aa94",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "bp_audit": {
@@ -375,6 +297,22 @@ export default {
             "created_at"
           ],
           "isUnique": false
+        },
+        "bp_audit_action_idx": {
+          "name": "bp_audit_action_idx",
+          "columns": [
+            "action",
+            "created_at"
+          ],
+          "isUnique": false
+        },
+        "bp_audit_source_idx": {
+          "name": "bp_audit_source_idx",
+          "columns": [
+            "source_id",
+            "created_at"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -383,7 +321,7 @@ export default {
       "checkConstraints": {
         "bp_audit_action_check": {
           "name": "bp_audit_action_check",
-          "value": "\"bp_audit\".\"action\" in ('INSERT','UPDATE','DELETE')"
+          "value": "\"bp_audit\".\"action\" in ('INSERT', 'UPDATE', 'DELETE')"
         }
       }
     },
@@ -470,11 +408,19 @@ export default {
         },
         "bp_book_testament_check": {
           "name": "bp_book_testament_check",
-          "value": "\"bp_book\".\"testament\" in ('OT','NT')"
+          "value": "\"bp_book\".\"testament\" in ('OT', 'NT')"
         },
         "bp_book_book_id_check": {
           "name": "bp_book_book_id_check",
           "value": "length(\"bp_book\".\"book_id\") between 2 and 8"
+        },
+        "bp_book_name_check": {
+          "name": "bp_book_name_check",
+          "value": "length(\"bp_book\".\"name\") > 0"
+        },
+        "bp_book_name_short_check": {
+          "name": "bp_book_name_short_check",
+          "value": "length(\"bp_book\".\"name_short\") > 0"
         }
       }
     },
@@ -493,6 +439,13 @@ export default {
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "chapter_ord": {
+          "name": "chapter_ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "start_verse_ord": {
@@ -518,6 +471,13 @@ export default {
         }
       },
       "indexes": {
+        "bp_chapter_chapter_ord_uniq": {
+          "name": "bp_chapter_chapter_ord_uniq",
+          "columns": [
+            "chapter_ord"
+          ],
+          "isUnique": true
+        },
         "bp_chapter_range_idx": {
           "name": "bp_chapter_range_idx",
           "columns": [
@@ -543,6 +503,10 @@ export default {
         "bp_chapter_chapter_check": {
           "name": "bp_chapter_chapter_check",
           "value": "\"bp_chapter\".\"chapter\" >= 1"
+        },
+        "bp_chapter_chapter_ord_check": {
+          "name": "bp_chapter_chapter_ord_check",
+          "value": "\"bp_chapter\".\"chapter_ord\" is null or \"bp_chapter\".\"chapter_ord\" >= 1"
         },
         "bp_chapter_verse_count_check": {
           "name": "bp_chapter_verse_count_check",
@@ -598,20 +562,36 @@ export default {
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "note_neutral": {
+          "name": "note_neutral",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
         "bp_crossref_from_idx": {
           "name": "bp_crossref_from_idx",
           "columns": [
-            "from_range_id"
+            "from_range_id",
+            "kind"
           ],
           "isUnique": false
         },
         "bp_crossref_to_idx": {
           "name": "bp_crossref_to_idx",
           "columns": [
-            "to_range_id"
+            "to_range_id",
+            "kind"
+          ],
+          "isUnique": false
+        },
+        "bp_crossref_kind_idx": {
+          "name": "bp_crossref_kind_idx",
+          "columns": [
+            "kind"
           ],
           "isUnique": false
         }
@@ -622,11 +602,15 @@ export default {
       "checkConstraints": {
         "bp_crossref_kind_check": {
           "name": "bp_crossref_kind_check",
-          "value": "\"bp_crossref\".\"kind\" in ('PARALLEL','QUOTE','ALLUSION','TOPICAL')"
+          "value": "\"bp_crossref\".\"kind\" in ('PARALLEL', 'QUOTE', 'ALLUSION', 'TOPICAL')"
         },
         "bp_crossref_conf_check": {
           "name": "bp_crossref_conf_check",
           "value": "\"bp_crossref\".\"confidence\" is null or (\"bp_crossref\".\"confidence\" >= 0 and \"bp_crossref\".\"confidence\" <= 1)"
+        },
+        "bp_crossref_not_self_check": {
+          "name": "bp_crossref_not_self_check",
+          "value": "not (\"bp_crossref\".\"from_range_id\" = \"bp_crossref\".\"to_range_id\" and \"bp_crossref\".\"kind\" = 'PARALLEL')"
         }
       }
     },
@@ -674,6 +658,20 @@ export default {
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "parent_unit_id": {
+          "name": "parent_unit_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
@@ -681,6 +679,20 @@ export default {
           "name": "bp_doc_unit_range_idx",
           "columns": [
             "range_id"
+          ],
+          "isUnique": false
+        },
+        "bp_doc_unit_ord_idx": {
+          "name": "bp_doc_unit_ord_idx",
+          "columns": [
+            "ordinal"
+          ],
+          "isUnique": false
+        },
+        "bp_doc_unit_parent_idx": {
+          "name": "bp_doc_unit_parent_idx",
+          "columns": [
+            "parent_unit_id"
           ],
           "isUnique": false
         }
@@ -691,11 +703,19 @@ export default {
       "checkConstraints": {
         "bp_doc_unit_kind_check": {
           "name": "bp_doc_unit_kind_check",
-          "value": "\"bp_doc_unit\".\"kind\" in ('SECTION','SPEECH','SONG','LETTER_PART','NARRATIVE_BLOCK')"
+          "value": "\"bp_doc_unit\".\"kind\" in ('SECTION', 'SPEECH', 'SONG', 'LETTER_PART', 'NARRATIVE_BLOCK')"
         },
         "bp_doc_unit_conf_check": {
           "name": "bp_doc_unit_conf_check",
           "value": "\"bp_doc_unit\".\"confidence\" is null or (\"bp_doc_unit\".\"confidence\" >= 0 and \"bp_doc_unit\".\"confidence\" <= 1)"
+        },
+        "bp_doc_unit_ordinal_check": {
+          "name": "bp_doc_unit_ordinal_check",
+          "value": "\"bp_doc_unit\".\"ordinal\" is null or \"bp_doc_unit\".\"ordinal\" >= 0"
+        },
+        "bp_doc_unit_not_self_check": {
+          "name": "bp_doc_unit_not_self_check",
+          "value": "\"bp_doc_unit\".\"parent_unit_id\" is null or \"bp_doc_unit\".\"parent_unit_id\" <> \"bp_doc_unit\".\"unit_id\""
         }
       }
     },
@@ -751,6 +771,14 @@ export default {
           "notNull": true,
           "autoincrement": false,
           "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
         }
       },
       "indexes": {
@@ -760,6 +788,20 @@ export default {
             "slug"
           ],
           "isUnique": true
+        },
+        "bp_entity_name_idx": {
+          "name": "bp_entity_name_idx",
+          "columns": [
+            "canonical_name"
+          ],
+          "isUnique": false
+        },
+        "bp_entity_kind_idx": {
+          "name": "bp_entity_kind_idx",
+          "columns": [
+            "kind"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -768,7 +810,7 @@ export default {
       "checkConstraints": {
         "bp_entity_kind_check": {
           "name": "bp_entity_kind_check",
-          "value": "\"bp_entity\".\"kind\" in ('PERSON','PLACE','GROUP','DYNASTY','EMPIRE','REGION','ARTIFACT','OFFICE')"
+          "value": "\"bp_entity\".\"kind\" in ('PERSON', 'PLACE', 'GROUP', 'DYNASTY', 'EMPIRE', 'REGION', 'ARTIFACT', 'OFFICE')"
         },
         "bp_entity_conf_check": {
           "name": "bp_entity_conf_check",
@@ -777,6 +819,10 @@ export default {
         "bp_entity_name_check": {
           "name": "bp_entity_name_check",
           "value": "length(\"bp_entity\".\"canonical_name\") > 0"
+        },
+        "bp_entity_slug_check": {
+          "name": "bp_entity_slug_check",
+          "value": "length(\"bp_entity\".\"slug\") > 0"
         }
       }
     },
@@ -852,2144 +898,8 @@ export default {
         "bp_entity_name_entity_idx": {
           "name": "bp_entity_name_entity_idx",
           "columns": [
-            "entity_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_entity_name_conf_check": {
-          "name": "bp_entity_name_conf_check",
-          "value": "\"bp_entity_name\".\"confidence\" is null or (\"bp_entity_name\".\"confidence\" >= 0 and \"bp_entity_name\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_entity_relation": {
-      "name": "bp_entity_relation",
-      "columns": {
-        "relation_id": {
-          "name": "relation_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "from_entity_id": {
-          "name": "from_entity_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "to_entity_id": {
-          "name": "to_entity_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "kind": {
-          "name": "kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "time_span_id": {
-          "name": "time_span_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "note_neutral": {
-          "name": "note_neutral",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_entity_relation_from_idx": {
-          "name": "bp_entity_relation_from_idx",
-          "columns": [
-            "from_entity_id"
-          ],
-          "isUnique": false
-        },
-        "bp_entity_relation_to_idx": {
-          "name": "bp_entity_relation_to_idx",
-          "columns": [
-            "to_entity_id"
-          ],
-          "isUnique": false
-        },
-        "bp_entity_relation_kind_idx": {
-          "name": "bp_entity_relation_kind_idx",
-          "columns": [
-            "kind"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_entity_relation_kind_check": {
-          "name": "bp_entity_relation_kind_check",
-          "value": "\"bp_entity_relation\".\"kind\" in ('PARENT_OF','CHILD_OF','SPOUSE_OF','SIBLING_OF','RULES_OVER','MEMBER_OF','ALLY_OF','ENEMY_OF','SUCCEEDS')"
-        },
-        "bp_entity_relation_not_self": {
-          "name": "bp_entity_relation_not_self",
-          "value": "not (\"bp_entity_relation\".\"from_entity_id\" = \"bp_entity_relation\".\"to_entity_id\")"
-        },
-        "bp_entity_relation_conf_check": {
-          "name": "bp_entity_relation_conf_check",
-          "value": "\"bp_entity_relation\".\"confidence\" is null or (\"bp_entity_relation\".\"confidence\" >= 0 and \"bp_entity_relation\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_event": {
-      "name": "bp_event",
-      "columns": {
-        "event_id": {
-          "name": "event_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "canonical_title": {
-          "name": "canonical_title",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "kind": {
-          "name": "kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "primary_range_id": {
-          "name": "primary_range_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "time_span_id": {
-          "name": "time_span_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "primary_place_id": {
-          "name": "primary_place_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_event_range_idx": {
-          "name": "bp_event_range_idx",
-          "columns": [
-            "primary_range_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_event_kind_check": {
-          "name": "bp_event_kind_check",
-          "value": "\"bp_event\".\"kind\" in (\n    'BIRTH','DEATH','BATTLE','COVENANT','EXODUS','MIGRATION','SPEECH','MIRACLE','PROPHECY',\n        'CAPTIVITY','RETURN','CRUCIFIXION','RESURRECTION','MISSION_JOURNEY','COUNCIL','LETTER_WRITTEN','OTHER'\n)"
-        },
-        "bp_event_conf_check": {
-          "name": "bp_event_conf_check",
-          "value": "\"bp_event\".\"confidence\" is null or (\"bp_event\".\"confidence\" >= 0 and \"bp_event\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_event_participant": {
-      "name": "bp_event_participant",
-      "columns": {
-        "event_participant_id": {
-          "name": "event_participant_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "event_id": {
-          "name": "event_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "entity_id": {
-          "name": "entity_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "role": {
-          "name": "role",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_event_participant_event_idx": {
-          "name": "bp_event_participant_event_idx",
-          "columns": [
-            "event_id"
-          ],
-          "isUnique": false
-        },
-        "bp_event_participant_entity_idx": {
-          "name": "bp_event_participant_entity_idx",
-          "columns": [
-            "entity_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_event_participant_role_check": {
-          "name": "bp_event_participant_role_check",
-          "value": "\"bp_event_participant\".\"role\" in ('SUBJECT','AGENT','WITNESS','OPPONENT','RULER','PEOPLE','OTHER')"
-        },
-        "bp_event_participant_conf_check": {
-          "name": "bp_event_participant_conf_check",
-          "value": "\"bp_event_participant\".\"confidence\" is null or (\"bp_event_participant\".\"confidence\" >= 0 and \"bp_event_participant\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_link": {
-      "name": "bp_link",
-      "columns": {
-        "link_id": {
-          "name": "link_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "range_id": {
-          "name": "range_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "target_kind": {
-          "name": "target_kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "target_id": {
-          "name": "target_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "link_kind": {
-          "name": "link_kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "weight": {
-          "name": "weight",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 1
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_link_range_idx": {
-          "name": "bp_link_range_idx",
-          "columns": [
-            "range_id"
-          ],
-          "isUnique": false
-        },
-        "bp_link_target_idx": {
-          "name": "bp_link_target_idx",
-          "columns": [
-            "target_kind",
-            "target_id"
-          ],
-          "isUnique": false
-        },
-        "bp_link_kind_idx": {
-          "name": "bp_link_kind_idx",
-          "columns": [
-            "link_kind"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_link_target_kind_check": {
-          "name": "bp_link_target_kind_check",
-          "value": "\"bp_link\".\"target_kind\" in ('ENTITY','EVENT','ROUTE','PLACE_GEO')"
-        },
-        "bp_link_link_kind_check": {
-          "name": "bp_link_link_kind_check",
-          "value": "\"bp_link\".\"link_kind\" in (\n    'MENTIONS','PRIMARY_SUBJECT','LOCATION','SETTING','JOURNEY_STEP',\n        'PARALLEL_ACCOUNT','QUOTE_SOURCE','QUOTE_TARGET'\n)"
-        },
-        "bp_link_weight_check": {
-          "name": "bp_link_weight_check",
-          "value": "\"bp_link\".\"weight\" >= 1"
-        },
-        "bp_link_conf_check": {
-          "name": "bp_link_conf_check",
-          "value": "\"bp_link\".\"confidence\" is null or (\"bp_link\".\"confidence\" >= 0 and \"bp_link\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_paragraph": {
-      "name": "bp_paragraph",
-      "columns": {
-        "paragraph_id": {
-          "name": "paragraph_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "translation_id": {
-          "name": "translation_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "range_id": {
-          "name": "range_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "style": {
-          "name": "style",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "indent": {
-          "name": "indent",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_paragraph_range_idx": {
-          "name": "bp_paragraph_range_idx",
-          "columns": [
-            "translation_id",
-            "range_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_paragraph_style_check": {
-          "name": "bp_paragraph_style_check",
-          "value": "\"bp_paragraph\".\"style\" in ('PROSE','POETRY','LIST','QUOTE','LETTER')"
-        },
-        "bp_paragraph_indent_check": {
-          "name": "bp_paragraph_indent_check",
-          "value": "\"bp_paragraph\".\"indent\" >= 0"
-        }
-      }
-    },
-    "bp_pericope": {
-      "name": "bp_pericope",
-      "columns": {
-        "pericope_id": {
-          "name": "pericope_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "book_id": {
-          "name": "book_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "range_id": {
-          "name": "range_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "title": {
-          "name": "title",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "rank": {
-          "name": "rank",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_pericope_book_idx": {
-          "name": "bp_pericope_book_idx",
-          "columns": [
-            "book_id"
-          ],
-          "isUnique": false
-        },
-        "bp_pericope_range_idx": {
-          "name": "bp_pericope_range_idx",
-          "columns": [
-            "range_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_pericope_conf_check": {
-          "name": "bp_pericope_conf_check",
-          "value": "\"bp_pericope\".\"confidence\" is null or (\"bp_pericope\".\"confidence\" >= 0 and \"bp_pericope\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_place_geo": {
-      "name": "bp_place_geo",
-      "columns": {
-        "place_geo_id": {
-          "name": "place_geo_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "entity_id": {
-          "name": "entity_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "geo_type": {
-          "name": "geo_type",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "lat": {
-          "name": "lat",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "lng": {
-          "name": "lng",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "bbox": {
-          "name": "bbox",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "polygon": {
-          "name": "polygon",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "precision_m": {
-          "name": "precision_m",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_place_geo_entity_idx": {
-          "name": "bp_place_geo_entity_idx",
-          "columns": [
-            "entity_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_place_geo_type_check": {
-          "name": "bp_place_geo_type_check",
-          "value": "\"bp_place_geo\".\"geo_type\" in ('POINT','BBOX','REGION_POLYGON')"
-        },
-        "bp_place_geo_conf_check": {
-          "name": "bp_place_geo_conf_check",
-          "value": "\"bp_place_geo\".\"confidence\" is null or (\"bp_place_geo\".\"confidence\" >= 0 and \"bp_place_geo\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_range": {
-      "name": "bp_range",
-      "columns": {
-        "range_id": {
-          "name": "range_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "start_verse_ord": {
-          "name": "start_verse_ord",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "end_verse_ord": {
-          "name": "end_verse_ord",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "start_verse_key": {
-          "name": "start_verse_key",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "end_verse_key": {
-          "name": "end_verse_key",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "label": {
-          "name": "label",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
-        }
-      },
-      "indexes": {
-        "bp_range_ord_idx": {
-          "name": "bp_range_ord_idx",
-          "columns": [
-            "start_verse_ord",
-            "end_verse_ord"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_range_span_check": {
-          "name": "bp_range_span_check",
-          "value": "\"bp_range\".\"start_verse_ord\" <= \"bp_range\".\"end_verse_ord\""
-        }
-      }
-    },
-    "bp_reader_event": {
-      "name": "bp_reader_event",
-      "columns": {
-        "reader_event_id": {
-          "name": "reader_event_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "anon_id": {
-          "name": "anon_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "event_type": {
-          "name": "event_type",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "translation_id": {
-          "name": "translation_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "verse_key": {
-          "name": "verse_key",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "range_id": {
-          "name": "range_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "entity_id": {
-          "name": "entity_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "duration_ms": {
-          "name": "duration_ms",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
-        }
-      },
-      "indexes": {
-        "bp_reader_event_anon_idx": {
-          "name": "bp_reader_event_anon_idx",
-          "columns": [
-            "anon_id",
-            "created_at"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_reader_event_type_check": {
-          "name": "bp_reader_event_type_check",
-          "value": "\"bp_reader_event\".\"event_type\" in (\n    'VIEW_VERSE','VIEW_CHAPTER','SCROLL_BACK','COPY_TEXT','OPEN_ENTITY','OPEN_MAP','OPEN_TIMELINE','SEARCH'\n)"
-        },
-        "bp_reader_event_duration_check": {
-          "name": "bp_reader_event_duration_check",
-          "value": "\"bp_reader_event\".\"duration_ms\" is null or \"bp_reader_event\".\"duration_ms\" >= 0"
-        }
-      }
-    },
-    "bp_route": {
-      "name": "bp_route",
-      "columns": {
-        "route_id": {
-          "name": "route_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "title": {
-          "name": "title",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_route_conf_check": {
-          "name": "bp_route_conf_check",
-          "value": "\"bp_route\".\"confidence\" is null or (\"bp_route\".\"confidence\" >= 0 and \"bp_route\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_route_step": {
-      "name": "bp_route_step",
-      "columns": {
-        "route_step_id": {
-          "name": "route_step_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "route_id": {
-          "name": "route_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "ordinal": {
-          "name": "ordinal",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "place_entity_id": {
-          "name": "place_entity_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "range_id": {
-          "name": "range_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "note_neutral": {
-          "name": "note_neutral",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_route_step_ord_uniq": {
-          "name": "bp_route_step_ord_uniq",
-          "columns": [
-            "route_id",
-            "ordinal"
-          ],
-          "isUnique": true
-        },
-        "bp_route_step_route_idx": {
-          "name": "bp_route_step_route_idx",
-          "columns": [
-            "route_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_route_step_ord_check": {
-          "name": "bp_route_step_ord_check",
-          "value": "\"bp_route_step\".\"ordinal\" >= 1"
-        }
-      }
-    },
-    "bp_search_query_log": {
-      "name": "bp_search_query_log",
-      "columns": {
-        "query_id": {
-          "name": "query_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "anon_id": {
-          "name": "anon_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "query": {
-          "name": "query",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "query_norm": {
-          "name": "query_norm",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "translation_id": {
-          "name": "translation_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "hits": {
-          "name": "hits",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
-        }
-      },
-      "indexes": {
-        "bp_search_query_log_norm_idx": {
-          "name": "bp_search_query_log_norm_idx",
-          "columns": [
-            "query_norm"
-          ],
-          "isUnique": false
-        },
-        "bp_search_query_log_created_idx": {
-          "name": "bp_search_query_log_created_idx",
-          "columns": [
-            "created_at"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_search_query_log_hits_check": {
-          "name": "bp_search_query_log_hits_check",
-          "value": "\"bp_search_query_log\".\"hits\" >= 0"
-        }
-      }
-    },
-    "bp_source": {
-      "name": "bp_source",
-      "columns": {
-        "source_id": {
-          "name": "source_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "name": {
-          "name": "name",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "kind": {
-          "name": "kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "version": {
-          "name": "version",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "url": {
-          "name": "url",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "license": {
-          "name": "license",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "notes": {
-          "name": "notes",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_source_kind_check": {
-          "name": "bp_source_kind_check",
-          "value": "\"bp_source\".\"kind\" in ('IMPORT','MANUAL','DATASET')"
-        }
-      }
-    },
-    "bp_time_span": {
-      "name": "bp_time_span",
-      "columns": {
-        "time_span_id": {
-          "name": "time_span_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "start_year": {
-          "name": "start_year",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "end_year": {
-          "name": "end_year",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "start_year_min": {
-          "name": "start_year_min",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "start_year_max": {
-          "name": "start_year_max",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "end_year_min": {
-          "name": "end_year_min",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "end_year_max": {
-          "name": "end_year_max",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "calendar": {
-          "name": "calendar",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "'BCE_CE'"
-        },
-        "era_tag": {
-          "name": "era_tag",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_time_span_calendar_check": {
-          "name": "bp_time_span_calendar_check",
-          "value": "\"bp_time_span\".\"calendar\" in ('BCE_CE','ANNO_MUNDI')"
-        },
-        "bp_time_span_era_check": {
-          "name": "bp_time_span_era_check",
-          "value": "\"bp_time_span\".\"era_tag\" is null or \"bp_time_span\".\"era_tag\" in (\n            'PRIMEVAL','PATRIARCHS','EXODUS_WILDERNESS','CONQUEST_JUDGES','UNITED_MONARCHY',\n            'DIVIDED_KINGDOM','EXILE','SECOND_TEMPLE','GOSPELS','APOSTOLIC'\n            )"
-        },
-        "bp_time_span_conf_check": {
-          "name": "bp_time_span_conf_check",
-          "value": "\"bp_time_span\".\"confidence\" is null or (\"bp_time_span\".\"confidence\" >= 0 and \"bp_time_span\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_timeline_anchor": {
-      "name": "bp_timeline_anchor",
-      "columns": {
-        "anchor_id": {
-          "name": "anchor_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "range_id": {
-          "name": "range_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "time_span_id": {
-          "name": "time_span_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "kind": {
-          "name": "kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_timeline_anchor_range_idx": {
-          "name": "bp_timeline_anchor_range_idx",
-          "columns": [
-            "range_id"
-          ],
-          "isUnique": false
-        },
-        "bp_timeline_anchor_time_idx": {
-          "name": "bp_timeline_anchor_time_idx",
-          "columns": [
-            "time_span_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_timeline_anchor_kind_check": {
-          "name": "bp_timeline_anchor_kind_check",
-          "value": "\"bp_timeline_anchor\".\"kind\" in ('SETTING','EVENT_WINDOW','REIGN','JOURNEY_WINDOW')"
-        },
-        "bp_timeline_anchor_conf_check": {
-          "name": "bp_timeline_anchor_conf_check",
-          "value": "\"bp_timeline_anchor\".\"confidence\" is null or (\"bp_timeline_anchor\".\"confidence\" >= 0 and \"bp_timeline_anchor\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_token": {
-      "name": "bp_token",
-      "columns": {
-        "translation_id": {
-          "name": "translation_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "verse_key": {
-          "name": "verse_key",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "token_index": {
-          "name": "token_index",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "token": {
-          "name": "token",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "token_norm": {
-          "name": "token_norm",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_token_norm_idx": {
-          "name": "bp_token_norm_idx",
-          "columns": [
-            "token_norm"
-          ],
-          "isUnique": false
-        },
-        "bp_token_idx": {
-          "name": "bp_token_idx",
-          "columns": [
-            "translation_id",
-            "verse_key"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "bp_token_translation_id_verse_key_token_index_pk": {
-          "columns": [
-            "translation_id",
-            "verse_key",
-            "token_index"
-          ],
-          "name": "bp_token_translation_id_verse_key_token_index_pk"
-        }
-      },
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_token_token_check": {
-          "name": "bp_token_token_check",
-          "value": "length(\"bp_token\".\"token\") > 0"
-        }
-      }
-    },
-    "bp_translation": {
-      "name": "bp_translation",
-      "columns": {
-        "translation_id": {
-          "name": "translation_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "name": {
-          "name": "name",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "language": {
-          "name": "language",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "derived_from": {
-          "name": "derived_from",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "license_kind": {
-          "name": "license_kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "license_text": {
-          "name": "license_text",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "source_url": {
-          "name": "source_url",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "is_default": {
-          "name": "is_default",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_translation_license_kind_check": {
-          "name": "bp_translation_license_kind_check",
-          "value": "\"bp_translation\".\"license_kind\" in ('PUBLIC_DOMAIN','LICENSED','CUSTOM')"
-        },
-        "bp_translation_id_check": {
-          "name": "bp_translation_id_check",
-          "value": "length(\"bp_translation\".\"translation_id\") > 0"
-        }
-      }
-    },
-    "bp_verse": {
-      "name": "bp_verse",
-      "columns": {
-        "verse_key": {
-          "name": "verse_key",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "book_id": {
-          "name": "book_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "chapter": {
-          "name": "chapter",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "verse": {
-          "name": "verse",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "verse_ord": {
-          "name": "verse_ord",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "chapter_ord": {
-          "name": "chapter_ord",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "is_superscription": {
-          "name": "is_superscription",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": false
-        },
-        "is_deuterocanon": {
-          "name": "is_deuterocanon",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": false
-        }
-      },
-      "indexes": {
-        "bp_verse_ord_uniq": {
-          "name": "bp_verse_ord_uniq",
-          "columns": [
-            "verse_ord"
-          ],
-          "isUnique": true
-        },
-        "bp_verse_bcv_uniq": {
-          "name": "bp_verse_bcv_uniq",
-          "columns": [
-            "book_id",
-            "chapter",
-            "verse"
-          ],
-          "isUnique": true
-        },
-        "bp_verse_book_idx": {
-          "name": "bp_verse_book_idx",
-          "columns": [
-            "book_id",
-            "chapter",
-            "verse"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_verse_chapter_check": {
-          "name": "bp_verse_chapter_check",
-          "value": "\"bp_verse\".\"chapter\" >= 1"
-        },
-        "bp_verse_verse_check": {
-          "name": "bp_verse_verse_check",
-          "value": "\"bp_verse\".\"verse\" >= 1"
-        },
-        "bp_verse_ord_check": {
-          "name": "bp_verse_ord_check",
-          "value": "\"bp_verse\".\"verse_ord\" >= 1"
-        }
-      }
-    },
-    "bp_verse_text": {
-      "name": "bp_verse_text",
-      "columns": {
-        "translation_id": {
-          "name": "translation_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "verse_key": {
-          "name": "verse_key",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "text": {
-          "name": "text",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "text_norm": {
-          "name": "text_norm",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "hash": {
-          "name": "hash",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
-        }
-      },
-      "indexes": {
-        "bp_verse_text_idx": {
-          "name": "bp_verse_text_idx",
-          "columns": [
-            "translation_id",
-            "verse_key"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "bp_verse_text_translation_id_verse_key_pk": {
-          "columns": [
-            "translation_id",
-            "verse_key"
-          ],
-          "name": "bp_verse_text_translation_id_verse_key_pk"
-        }
-      },
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_verse_text_text_check": {
-          "name": "bp_verse_text_text_check",
-          "value": "length(\"bp_verse_text\".\"text\") > 0"
-        }
-      }
-    }
-  },
-  "views": {},
-  "enums": {},
-  "_meta": {
-    "schemas": {},
-    "tables": {},
-    "columns": {}
-  },
-  "internal": {
-    "indexes": {}
-  }
-}
-```
-
-### apps/api/drizzle/meta/0002_snapshot.json
-
-```json
-{
-  "version": "6",
-  "dialect": "sqlite",
-  "id": "82440984-78d8-4dff-b385-0142dfe5a433",
-  "prevId": "7bc98a87-3de5-4d07-9b7e-3689df2821aa",
-  "tables": {
-    "bp_audit": {
-      "name": "bp_audit",
-      "columns": {
-        "audit_id": {
-          "name": "audit_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "entity_kind": {
-          "name": "entity_kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "entity_id": {
-          "name": "entity_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "action": {
-          "name": "action",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "before": {
-          "name": "before",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "after": {
-          "name": "after",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "source_id": {
-          "name": "source_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
-        }
-      },
-      "indexes": {
-        "bp_audit_entity_idx": {
-          "name": "bp_audit_entity_idx",
-          "columns": [
-            "entity_kind",
             "entity_id",
-            "created_at"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_audit_action_check": {
-          "name": "bp_audit_action_check",
-          "value": "\"bp_audit\".\"action\" in ('INSERT','UPDATE','DELETE')"
-        }
-      }
-    },
-    "bp_book": {
-      "name": "bp_book",
-      "columns": {
-        "book_id": {
-          "name": "book_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "ordinal": {
-          "name": "ordinal",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "testament": {
-          "name": "testament",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "name": {
-          "name": "name",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "name_short": {
-          "name": "name_short",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "chapters": {
-          "name": "chapters",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "osised": {
-          "name": "osised",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "abbrs": {
-          "name": "abbrs",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_book_ordinal_uniq": {
-          "name": "bp_book_ordinal_uniq",
-          "columns": [
-            "ordinal"
-          ],
-          "isUnique": true
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_book_ordinal_check": {
-          "name": "bp_book_ordinal_check",
-          "value": "\"bp_book\".\"ordinal\" >= 1"
-        },
-        "bp_book_chapters_check": {
-          "name": "bp_book_chapters_check",
-          "value": "\"bp_book\".\"chapters\" >= 1"
-        },
-        "bp_book_testament_check": {
-          "name": "bp_book_testament_check",
-          "value": "\"bp_book\".\"testament\" in ('OT','NT')"
-        },
-        "bp_book_book_id_check": {
-          "name": "bp_book_book_id_check",
-          "value": "length(\"bp_book\".\"book_id\") between 2 and 8"
-        }
-      }
-    },
-    "bp_chapter": {
-      "name": "bp_chapter",
-      "columns": {
-        "book_id": {
-          "name": "book_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "chapter": {
-          "name": "chapter",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "start_verse_ord": {
-          "name": "start_verse_ord",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "end_verse_ord": {
-          "name": "end_verse_ord",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "verse_count": {
-          "name": "verse_count",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_chapter_range_idx": {
-          "name": "bp_chapter_range_idx",
-          "columns": [
-            "book_id",
-            "start_verse_ord",
-            "end_verse_ord"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "bp_chapter_book_id_chapter_pk": {
-          "columns": [
-            "book_id",
-            "chapter"
-          ],
-          "name": "bp_chapter_book_id_chapter_pk"
-        }
-      },
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_chapter_chapter_check": {
-          "name": "bp_chapter_chapter_check",
-          "value": "\"bp_chapter\".\"chapter\" >= 1"
-        },
-        "bp_chapter_verse_count_check": {
-          "name": "bp_chapter_verse_count_check",
-          "value": "\"bp_chapter\".\"verse_count\" >= 1"
-        },
-        "bp_chapter_span_check": {
-          "name": "bp_chapter_span_check",
-          "value": "\"bp_chapter\".\"start_verse_ord\" <= \"bp_chapter\".\"end_verse_ord\""
-        }
-      }
-    },
-    "bp_crossref": {
-      "name": "bp_crossref",
-      "columns": {
-        "crossref_id": {
-          "name": "crossref_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "from_range_id": {
-          "name": "from_range_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "to_range_id": {
-          "name": "to_range_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "kind": {
-          "name": "kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_crossref_from_idx": {
-          "name": "bp_crossref_from_idx",
-          "columns": [
-            "from_range_id"
-          ],
-          "isUnique": false
-        },
-        "bp_crossref_to_idx": {
-          "name": "bp_crossref_to_idx",
-          "columns": [
-            "to_range_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_crossref_kind_check": {
-          "name": "bp_crossref_kind_check",
-          "value": "\"bp_crossref\".\"kind\" in ('PARALLEL','QUOTE','ALLUSION','TOPICAL')"
-        },
-        "bp_crossref_conf_check": {
-          "name": "bp_crossref_conf_check",
-          "value": "\"bp_crossref\".\"confidence\" is null or (\"bp_crossref\".\"confidence\" >= 0 and \"bp_crossref\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_doc_unit": {
-      "name": "bp_doc_unit",
-      "columns": {
-        "unit_id": {
-          "name": "unit_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "kind": {
-          "name": "kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "title": {
-          "name": "title",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "range_id": {
-          "name": "range_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_doc_unit_range_idx": {
-          "name": "bp_doc_unit_range_idx",
-          "columns": [
-            "range_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_doc_unit_kind_check": {
-          "name": "bp_doc_unit_kind_check",
-          "value": "\"bp_doc_unit\".\"kind\" in ('SECTION','SPEECH','SONG','LETTER_PART','NARRATIVE_BLOCK')"
-        },
-        "bp_doc_unit_conf_check": {
-          "name": "bp_doc_unit_conf_check",
-          "value": "\"bp_doc_unit\".\"confidence\" is null or (\"bp_doc_unit\".\"confidence\" >= 0 and \"bp_doc_unit\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_entity": {
-      "name": "bp_entity",
-      "columns": {
-        "entity_id": {
-          "name": "entity_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "kind": {
-          "name": "kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "canonical_name": {
-          "name": "canonical_name",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "slug": {
-          "name": "slug",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "summary_neutral": {
-          "name": "summary_neutral",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
-        }
-      },
-      "indexes": {
-        "bp_entity_slug_uniq": {
-          "name": "bp_entity_slug_uniq",
-          "columns": [
-            "slug"
-          ],
-          "isUnique": true
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_entity_kind_check": {
-          "name": "bp_entity_kind_check",
-          "value": "\"bp_entity\".\"kind\" in ('PERSON','PLACE','GROUP','DYNASTY','EMPIRE','REGION','ARTIFACT','OFFICE')"
-        },
-        "bp_entity_conf_check": {
-          "name": "bp_entity_conf_check",
-          "value": "\"bp_entity\".\"confidence\" is null or (\"bp_entity\".\"confidence\" >= 0 and \"bp_entity\".\"confidence\" <= 1)"
-        },
-        "bp_entity_name_check": {
-          "name": "bp_entity_name_check",
-          "value": "length(\"bp_entity\".\"canonical_name\") > 0"
-        }
-      }
-    },
-    "bp_entity_name": {
-      "name": "bp_entity_name",
-      "columns": {
-        "entity_name_id": {
-          "name": "entity_name_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "entity_id": {
-          "name": "entity_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "name": {
-          "name": "name",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "name_norm": {
-          "name": "name_norm",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "language": {
-          "name": "language",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "is_primary": {
-          "name": "is_primary",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_entity_name_norm_idx": {
-          "name": "bp_entity_name_norm_idx",
-          "columns": [
-            "name_norm"
-          ],
-          "isUnique": false
-        },
-        "bp_entity_name_entity_idx": {
-          "name": "bp_entity_name_entity_idx",
-          "columns": [
-            "entity_id"
+            "is_primary"
           ],
           "isUnique": false
         }
@@ -3001,6 +911,14 @@ export default {
         "bp_entity_name_conf_check": {
           "name": "bp_entity_name_conf_check",
           "value": "\"bp_entity_name\".\"confidence\" is null or (\"bp_entity_name\".\"confidence\" >= 0 and \"bp_entity_name\".\"confidence\" <= 1)"
+        },
+        "bp_entity_name_name_check": {
+          "name": "bp_entity_name_name_check",
+          "value": "length(\"bp_entity_name\".\"name\") > 0"
+        },
+        "bp_entity_name_name_norm_check": {
+          "name": "bp_entity_name_name_norm_check",
+          "value": "length(\"bp_entity_name\".\"name_norm\") >= 0"
         }
       }
     },
@@ -3068,14 +986,16 @@ export default {
         "bp_entity_relation_from_idx": {
           "name": "bp_entity_relation_from_idx",
           "columns": [
-            "from_entity_id"
+            "from_entity_id",
+            "kind"
           ],
           "isUnique": false
         },
         "bp_entity_relation_to_idx": {
           "name": "bp_entity_relation_to_idx",
           "columns": [
-            "to_entity_id"
+            "to_entity_id",
+            "kind"
           ],
           "isUnique": false
         },
@@ -3093,7 +1013,7 @@ export default {
       "checkConstraints": {
         "bp_entity_relation_kind_check": {
           "name": "bp_entity_relation_kind_check",
-          "value": "\"bp_entity_relation\".\"kind\" in ('PARENT_OF','CHILD_OF','SPOUSE_OF','SIBLING_OF','RULES_OVER','MEMBER_OF','ALLY_OF','ENEMY_OF','SUCCEEDS')"
+          "value": "\"bp_entity_relation\".\"kind\" in ('PARENT_OF', 'CHILD_OF', 'SPOUSE_OF', 'SIBLING_OF', 'RULES_OVER', 'MEMBER_OF', 'ALLY_OF', 'ENEMY_OF', 'SUCCEEDS')"
         },
         "bp_entity_relation_not_self": {
           "name": "bp_entity_relation_not_self",
@@ -3163,13 +1083,41 @@ export default {
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "summary_neutral": {
+          "name": "summary_neutral",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
+        "bp_event_kind_idx": {
+          "name": "bp_event_kind_idx",
+          "columns": [
+            "kind"
+          ],
+          "isUnique": false
+        },
         "bp_event_range_idx": {
           "name": "bp_event_range_idx",
           "columns": [
             "primary_range_id"
+          ],
+          "isUnique": false
+        },
+        "bp_event_place_idx": {
+          "name": "bp_event_place_idx",
+          "columns": [
+            "primary_place_id"
+          ],
+          "isUnique": false
+        },
+        "bp_event_time_idx": {
+          "name": "bp_event_time_idx",
+          "columns": [
+            "time_span_id"
           ],
           "isUnique": false
         }
@@ -3180,11 +1128,15 @@ export default {
       "checkConstraints": {
         "bp_event_kind_check": {
           "name": "bp_event_kind_check",
-          "value": "\"bp_event\".\"kind\" in (\n    'BIRTH','DEATH','BATTLE','COVENANT','EXODUS','MIGRATION','SPEECH','MIRACLE','PROPHECY',\n    'CAPTIVITY','RETURN','CRUCIFIXION','RESURRECTION','MISSION_JOURNEY','COUNCIL','LETTER_WRITTEN','OTHER'\n)"
+          "value": "\"bp_event\".\"kind\" in ('BIRTH', 'DEATH', 'BATTLE', 'COVENANT', 'EXODUS', 'MIGRATION', 'SPEECH', 'MIRACLE', 'PROPHECY', 'CAPTIVITY', 'RETURN', 'CRUCIFIXION', 'RESURRECTION', 'MISSION_JOURNEY', 'COUNCIL', 'LETTER_WRITTEN', 'OTHER')"
         },
         "bp_event_conf_check": {
           "name": "bp_event_conf_check",
           "value": "\"bp_event\".\"confidence\" is null or (\"bp_event\".\"confidence\" >= 0 and \"bp_event\".\"confidence\" <= 1)"
+        },
+        "bp_event_title_check": {
+          "name": "bp_event_title_check",
+          "value": "length(\"bp_event\".\"canonical_title\") > 0"
         }
       }
     },
@@ -3241,6 +1193,13 @@ export default {
             "entity_id"
           ],
           "isUnique": false
+        },
+        "bp_event_participant_role_idx": {
+          "name": "bp_event_participant_role_idx",
+          "columns": [
+            "role"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -3249,7 +1208,7 @@ export default {
       "checkConstraints": {
         "bp_event_participant_role_check": {
           "name": "bp_event_participant_role_check",
-          "value": "\"bp_event_participant\".\"role\" in ('SUBJECT','AGENT','WITNESS','OPPONENT','RULER','PEOPLE','OTHER')"
+          "value": "\"bp_event_participant\".\"role\" in ('SUBJECT', 'AGENT', 'WITNESS', 'OPPONENT', 'RULER', 'PEOPLE', 'OTHER')"
         },
         "bp_event_participant_conf_check": {
           "name": "bp_event_participant_conf_check",
@@ -3322,7 +1281,8 @@ export default {
         "bp_link_range_idx": {
           "name": "bp_link_range_idx",
           "columns": [
-            "range_id"
+            "range_id",
+            "link_kind"
           ],
           "isUnique": false
         },
@@ -3348,11 +1308,11 @@ export default {
       "checkConstraints": {
         "bp_link_target_kind_check": {
           "name": "bp_link_target_kind_check",
-          "value": "\"bp_link\".\"target_kind\" in ('ENTITY','EVENT','ROUTE','PLACE_GEO')"
+          "value": "\"bp_link\".\"target_kind\" in ('ENTITY', 'EVENT', 'ROUTE', 'PLACE_GEO')"
         },
         "bp_link_link_kind_check": {
           "name": "bp_link_link_kind_check",
-          "value": "\"bp_link\".\"link_kind\" in (\n    'MENTIONS','PRIMARY_SUBJECT','LOCATION','SETTING','JOURNEY_STEP',\n    'PARALLEL_ACCOUNT','QUOTE_SOURCE','QUOTE_TARGET'\n)"
+          "value": "\"bp_link\".\"link_kind\" in ('MENTIONS', 'PRIMARY_SUBJECT', 'LOCATION', 'SETTING', 'JOURNEY_STEP', 'PARALLEL_ACCOUNT', 'QUOTE_SOURCE', 'QUOTE_TARGET')"
         },
         "bp_link_weight_check": {
           "name": "bp_link_weight_check",
@@ -3409,6 +1369,20 @@ export default {
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
+        },
+        "source_revision": {
+          "name": "source_revision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
@@ -3419,6 +1393,14 @@ export default {
             "range_id"
           ],
           "isUnique": false
+        },
+        "bp_paragraph_ord_idx": {
+          "name": "bp_paragraph_ord_idx",
+          "columns": [
+            "translation_id",
+            "ordinal"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -3427,11 +1409,15 @@ export default {
       "checkConstraints": {
         "bp_paragraph_style_check": {
           "name": "bp_paragraph_style_check",
-          "value": "\"bp_paragraph\".\"style\" in ('PROSE','POETRY','LIST','QUOTE','LETTER')"
+          "value": "\"bp_paragraph\".\"style\" in ('PROSE', 'POETRY', 'LIST', 'QUOTE', 'LETTER')"
         },
         "bp_paragraph_indent_check": {
           "name": "bp_paragraph_indent_check",
           "value": "\"bp_paragraph\".\"indent\" >= 0"
+        },
+        "bp_paragraph_ordinal_check": {
+          "name": "bp_paragraph_ordinal_check",
+          "value": "\"bp_paragraph\".\"ordinal\" is null or \"bp_paragraph\".\"ordinal\" >= 0"
         }
       }
     },
@@ -3486,13 +1472,21 @@ export default {
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "source_revision": {
+          "name": "source_revision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
         "bp_pericope_book_idx": {
           "name": "bp_pericope_book_idx",
           "columns": [
-            "book_id"
+            "book_id",
+            "rank"
           ],
           "isUnique": false
         },
@@ -3508,9 +1502,17 @@ export default {
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {
+        "bp_pericope_rank_check": {
+          "name": "bp_pericope_rank_check",
+          "value": "\"bp_pericope\".\"rank\" is null or \"bp_pericope\".\"rank\" >= 0"
+        },
         "bp_pericope_conf_check": {
           "name": "bp_pericope_conf_check",
           "value": "\"bp_pericope\".\"confidence\" is null or (\"bp_pericope\".\"confidence\" >= 0 and \"bp_pericope\".\"confidence\" <= 1)"
+        },
+        "bp_pericope_title_check": {
+          "name": "bp_pericope_title_check",
+          "value": "length(\"bp_pericope\".\"title\") > 0"
         }
       }
     },
@@ -3603,7 +1605,19 @@ export default {
       "checkConstraints": {
         "bp_place_geo_type_check": {
           "name": "bp_place_geo_type_check",
-          "value": "\"bp_place_geo\".\"geo_type\" in ('POINT','BBOX','REGION_POLYGON')"
+          "value": "\"bp_place_geo\".\"geo_type\" in ('POINT', 'BBOX', 'REGION_POLYGON')"
+        },
+        "bp_place_geo_lat_check": {
+          "name": "bp_place_geo_lat_check",
+          "value": "\"bp_place_geo\".\"lat\" is null or (\"bp_place_geo\".\"lat\" >= -90 and \"bp_place_geo\".\"lat\" <= 90)"
+        },
+        "bp_place_geo_lng_check": {
+          "name": "bp_place_geo_lng_check",
+          "value": "\"bp_place_geo\".\"lng\" is null or (\"bp_place_geo\".\"lng\" >= -180 and \"bp_place_geo\".\"lng\" <= 180)"
+        },
+        "bp_place_geo_precision_check": {
+          "name": "bp_place_geo_precision_check",
+          "value": "\"bp_place_geo\".\"precision_m\" is null or \"bp_place_geo\".\"precision_m\" >= 0"
         },
         "bp_place_geo_conf_check": {
           "name": "bp_place_geo_conf_check",
@@ -3656,6 +1670,20 @@ export default {
           "notNull": false,
           "autoincrement": false
         },
+        "verse_count": {
+          "name": "verse_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "chapter_count": {
+          "name": "chapter_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "text",
@@ -3673,6 +1701,14 @@ export default {
             "end_verse_ord"
           ],
           "isUnique": false
+        },
+        "bp_range_start_key_idx": {
+          "name": "bp_range_start_key_idx",
+          "columns": [
+            "start_verse_key",
+            "end_verse_key"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -3682,6 +1718,14 @@ export default {
         "bp_range_span_check": {
           "name": "bp_range_span_check",
           "value": "\"bp_range\".\"start_verse_ord\" <= \"bp_range\".\"end_verse_ord\""
+        },
+        "bp_range_verse_count_check": {
+          "name": "bp_range_verse_count_check",
+          "value": "\"bp_range\".\"verse_count\" is null or \"bp_range\".\"verse_count\" >= 1"
+        },
+        "bp_range_chapter_count_check": {
+          "name": "bp_range_chapter_count_check",
+          "value": "\"bp_range\".\"chapter_count\" is null or \"bp_range\".\"chapter_count\" >= 1"
         }
       }
     },
@@ -3761,6 +1805,23 @@ export default {
             "created_at"
           ],
           "isUnique": false
+        },
+        "bp_reader_event_type_idx": {
+          "name": "bp_reader_event_type_idx",
+          "columns": [
+            "event_type",
+            "created_at"
+          ],
+          "isUnique": false
+        },
+        "bp_reader_event_verse_idx": {
+          "name": "bp_reader_event_verse_idx",
+          "columns": [
+            "translation_id",
+            "verse_key",
+            "created_at"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -3769,7 +1830,7 @@ export default {
       "checkConstraints": {
         "bp_reader_event_type_check": {
           "name": "bp_reader_event_type_check",
-          "value": "\"bp_reader_event\".\"event_type\" in (\n    'VIEW_VERSE','VIEW_CHAPTER','SCROLL_BACK','COPY_TEXT','OPEN_ENTITY','OPEN_MAP','OPEN_TIMELINE','SEARCH'\n)"
+          "value": "\"bp_reader_event\".\"event_type\" in ('VIEW_VERSE', 'VIEW_CHAPTER', 'SCROLL_BACK', 'COPY_TEXT', 'OPEN_ENTITY', 'OPEN_MAP', 'OPEN_TIMELINE', 'SEARCH')"
         },
         "bp_reader_event_duration_check": {
           "name": "bp_reader_event_duration_check",
@@ -3807,9 +1868,24 @@ export default {
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "summary_neutral": {
+          "name": "summary_neutral",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "bp_route_title_idx": {
+          "name": "bp_route_title_idx",
+          "columns": [
+            "title"
+          ],
+          "isUnique": false
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
@@ -3817,6 +1893,10 @@ export default {
         "bp_route_conf_check": {
           "name": "bp_route_conf_check",
           "value": "\"bp_route\".\"confidence\" is null or (\"bp_route\".\"confidence\" >= 0 and \"bp_route\".\"confidence\" <= 1)"
+        },
+        "bp_route_title_check": {
+          "name": "bp_route_title_check",
+          "value": "length(\"bp_route\".\"title\") > 0"
         }
       }
     },
@@ -3864,6 +1944,13 @@ export default {
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "distance_km": {
+          "name": "distance_km",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
@@ -3878,7 +1965,15 @@ export default {
         "bp_route_step_route_idx": {
           "name": "bp_route_step_route_idx",
           "columns": [
-            "route_id"
+            "route_id",
+            "ordinal"
+          ],
+          "isUnique": false
+        },
+        "bp_route_step_place_idx": {
+          "name": "bp_route_step_place_idx",
+          "columns": [
+            "place_entity_id"
           ],
           "isUnique": false
         }
@@ -3890,6 +1985,10 @@ export default {
         "bp_route_step_ord_check": {
           "name": "bp_route_step_ord_check",
           "value": "\"bp_route_step\".\"ordinal\" >= 1"
+        },
+        "bp_route_step_distance_check": {
+          "name": "bp_route_step_distance_check",
+          "value": "\"bp_route_step\".\"distance_km\" is null or \"bp_route_step\".\"distance_km\" >= 0"
         }
       }
     },
@@ -3962,6 +2061,14 @@ export default {
             "created_at"
           ],
           "isUnique": false
+        },
+        "bp_search_query_log_translation_idx": {
+          "name": "bp_search_query_log_translation_idx",
+          "columns": [
+            "translation_id",
+            "created_at"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -3971,6 +2078,10 @@ export default {
         "bp_search_query_log_hits_check": {
           "name": "bp_search_query_log_hits_check",
           "value": "\"bp_search_query_log\".\"hits\" >= 0"
+        },
+        "bp_search_query_log_query_check": {
+          "name": "bp_search_query_log_query_check",
+          "value": "length(\"bp_search_query_log\".\"query\") > 0"
         }
       }
     },
@@ -4027,14 +2138,26 @@ export default {
           "autoincrement": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "bp_source_name_idx": {
+          "name": "bp_source_name_idx",
+          "columns": [
+            "name"
+          ],
+          "isUnique": false
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {
         "bp_source_kind_check": {
           "name": "bp_source_kind_check",
-          "value": "\"bp_source\".\"kind\" in ('IMPORT','MANUAL','DATASET')"
+          "value": "\"bp_source\".\"kind\" in ('IMPORT', 'MANUAL', 'DATASET')"
+        },
+        "bp_source_name_check": {
+          "name": "bp_source_name_check",
+          "value": "length(\"bp_source\".\"name\") > 0"
         }
       }
     },
@@ -4127,11 +2250,11 @@ export default {
       "checkConstraints": {
         "bp_time_span_calendar_check": {
           "name": "bp_time_span_calendar_check",
-          "value": "\"bp_time_span\".\"calendar\" in ('BCE_CE','ANNO_MUNDI')"
+          "value": "\"bp_time_span\".\"calendar\" in ('BCE_CE', 'ANNO_MUNDI')"
         },
         "bp_time_span_era_check": {
           "name": "bp_time_span_era_check",
-          "value": "\"bp_time_span\".\"era_tag\" is null or \"bp_time_span\".\"era_tag\" in (\n            'PRIMEVAL','PATRIARCHS','EXODUS_WILDERNESS','CONQUEST_JUDGES','UNITED_MONARCHY',\n            'DIVIDED_KINGDOM','EXILE','SECOND_TEMPLE','GOSPELS','APOSTOLIC'\n            )"
+          "value": "\"bp_time_span\".\"era_tag\" is null or \"bp_time_span\".\"era_tag\" in ('PRIMEVAL', 'PATRIARCHS', 'EXODUS_WILDERNESS', 'CONQUEST_JUDGES', 'UNITED_MONARCHY', 'DIVIDED_KINGDOM', 'EXILE', 'SECOND_TEMPLE', 'GOSPELS', 'APOSTOLIC')"
         },
         "bp_time_span_conf_check": {
           "name": "bp_time_span_conf_check",
@@ -4199,6 +2322,13 @@ export default {
             "time_span_id"
           ],
           "isUnique": false
+        },
+        "bp_timeline_anchor_kind_idx": {
+          "name": "bp_timeline_anchor_kind_idx",
+          "columns": [
+            "kind"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -4207,7 +2337,7 @@ export default {
       "checkConstraints": {
         "bp_timeline_anchor_kind_check": {
           "name": "bp_timeline_anchor_kind_check",
-          "value": "\"bp_timeline_anchor\".\"kind\" in ('SETTING','EVENT_WINDOW','REIGN','JOURNEY_WINDOW')"
+          "value": "\"bp_timeline_anchor\".\"kind\" in ('SETTING', 'EVENT_WINDOW', 'REIGN', 'JOURNEY_WINDOW')"
         },
         "bp_timeline_anchor_conf_check": {
           "name": "bp_timeline_anchor_conf_check",
@@ -4252,9 +2382,77 @@ export default {
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
+        },
+        "token_kind": {
+          "name": "token_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'WORD'"
+        },
+        "char_start": {
+          "name": "char_start",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "char_end": {
+          "name": "char_end",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "is_word_like": {
+          "name": "is_word_like",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": true
+        },
+        "break_after": {
+          "name": "break_after",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
+        },
+        "surface_group": {
+          "name": "surface_group",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "line_ordinal": {
+          "name": "line_ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "hash": {
+          "name": "hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
+        "bp_token_idx": {
+          "name": "bp_token_idx",
+          "columns": [
+            "translation_id",
+            "verse_key",
+            "token_index"
+          ],
+          "isUnique": false
+        },
         "bp_token_norm_idx": {
           "name": "bp_token_norm_idx",
           "columns": [
@@ -4262,11 +2460,21 @@ export default {
           ],
           "isUnique": false
         },
-        "bp_token_idx": {
-          "name": "bp_token_idx",
+        "bp_token_char_idx": {
+          "name": "bp_token_char_idx",
           "columns": [
             "translation_id",
-            "verse_key"
+            "verse_key",
+            "char_start",
+            "char_end"
+          ],
+          "isUnique": false
+        },
+        "bp_token_kind_idx": {
+          "name": "bp_token_kind_idx",
+          "columns": [
+            "translation_id",
+            "token_kind"
           ],
           "isUnique": false
         }
@@ -4287,6 +2495,154 @@ export default {
         "bp_token_token_check": {
           "name": "bp_token_token_check",
           "value": "length(\"bp_token\".\"token\") > 0"
+        },
+        "bp_token_norm_check": {
+          "name": "bp_token_norm_check",
+          "value": "length(\"bp_token\".\"token_norm\") >= 0"
+        },
+        "bp_token_token_index_check": {
+          "name": "bp_token_token_index_check",
+          "value": "\"bp_token\".\"token_index\" >= 0"
+        },
+        "bp_token_kind_check": {
+          "name": "bp_token_kind_check",
+          "value": "\"bp_token\".\"token_kind\" in ('WORD', 'PUNCT', 'SPACE', 'LINEBREAK', 'MARKER', 'NUMBER', 'SYMBOL')"
+        },
+        "bp_token_char_start_check": {
+          "name": "bp_token_char_start_check",
+          "value": "\"bp_token\".\"char_start\" >= 0"
+        },
+        "bp_token_char_end_check": {
+          "name": "bp_token_char_end_check",
+          "value": "\"bp_token\".\"char_end\" > \"bp_token\".\"char_start\""
+        },
+        "bp_token_surface_group_check": {
+          "name": "bp_token_surface_group_check",
+          "value": "\"bp_token\".\"surface_group\" is null or \"bp_token\".\"surface_group\" >= 0"
+        },
+        "bp_token_line_ordinal_check": {
+          "name": "bp_token_line_ordinal_check",
+          "value": "\"bp_token\".\"line_ordinal\" is null or \"bp_token\".\"line_ordinal\" >= 0"
+        }
+      }
+    },
+    "bp_token_span": {
+      "name": "bp_token_span",
+      "columns": {
+        "translation_id": {
+          "name": "translation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "verse_key": {
+          "name": "verse_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "span_id": {
+          "name": "span_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "start_token_index": {
+          "name": "start_token_index",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "end_token_index": {
+          "name": "end_token_index",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "char_start": {
+          "name": "char_start",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "char_end": {
+          "name": "char_end",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "text": {
+          "name": "text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "hash": {
+          "name": "hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_token_span_idx": {
+          "name": "bp_token_span_idx",
+          "columns": [
+            "translation_id",
+            "verse_key",
+            "start_token_index",
+            "end_token_index"
+          ],
+          "isUnique": false
+        },
+        "bp_token_span_char_idx": {
+          "name": "bp_token_span_char_idx",
+          "columns": [
+            "translation_id",
+            "verse_key",
+            "char_start",
+            "char_end"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "bp_token_span_translation_id_verse_key_span_id_pk": {
+          "columns": [
+            "translation_id",
+            "verse_key",
+            "span_id"
+          ],
+          "name": "bp_token_span_translation_id_verse_key_span_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_token_span_start_check": {
+          "name": "bp_token_span_start_check",
+          "value": "\"bp_token_span\".\"start_token_index\" >= 0"
+        },
+        "bp_token_span_end_check": {
+          "name": "bp_token_span_end_check",
+          "value": "\"bp_token_span\".\"end_token_index\" >= \"bp_token_span\".\"start_token_index\""
+        },
+        "bp_token_span_char_start_check": {
+          "name": "bp_token_span_char_start_check",
+          "value": "\"bp_token_span\".\"char_start\" >= 0"
+        },
+        "bp_token_span_char_end_check": {
+          "name": "bp_token_span_char_end_check",
+          "value": "\"bp_token_span\".\"char_end\" > \"bp_token_span\".\"char_start\""
         }
       }
     },
@@ -4342,6 +2698,35 @@ export default {
           "notNull": false,
           "autoincrement": false
         },
+        "publisher": {
+          "name": "publisher",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "edition_label": {
+          "name": "edition_label",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "abbreviation": {
+          "name": "abbreviation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "normalization_form": {
+          "name": "normalization_form",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'SIMPLE'"
+        },
         "is_default": {
           "name": "is_default",
           "type": "integer",
@@ -4350,6 +2735,14 @@ export default {
           "autoincrement": false,
           "default": false
         },
+        "is_public": {
+          "name": "is_public",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": true
+        },
         "created_at": {
           "name": "created_at",
           "type": "text",
@@ -4357,20 +2750,56 @@ export default {
           "notNull": true,
           "autoincrement": false,
           "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
         }
       },
-      "indexes": {},
+      "indexes": {
+        "bp_translation_name_idx": {
+          "name": "bp_translation_name_idx",
+          "columns": [
+            "name"
+          ],
+          "isUnique": false
+        },
+        "bp_translation_public_idx": {
+          "name": "bp_translation_public_idx",
+          "columns": [
+            "is_public",
+            "is_default"
+          ],
+          "isUnique": false
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {
         "bp_translation_license_kind_check": {
           "name": "bp_translation_license_kind_check",
-          "value": "\"bp_translation\".\"license_kind\" in ('PUBLIC_DOMAIN','LICENSED','CUSTOM')"
+          "value": "\"bp_translation\".\"license_kind\" in ('PUBLIC_DOMAIN', 'LICENSED', 'CUSTOM')"
+        },
+        "bp_translation_normalization_form_check": {
+          "name": "bp_translation_normalization_form_check",
+          "value": "\"bp_translation\".\"normalization_form\" in ('NONE', 'SIMPLE', 'SEARCH_V1')"
         },
         "bp_translation_id_check": {
           "name": "bp_translation_id_check",
           "value": "length(\"bp_translation\".\"translation_id\") > 0"
+        },
+        "bp_translation_name_check": {
+          "name": "bp_translation_name_check",
+          "value": "length(\"bp_translation\".\"name\") > 0"
+        },
+        "bp_translation_language_check": {
+          "name": "bp_translation_language_check",
+          "value": "length(\"bp_translation\".\"language\") >= 2"
         }
       }
     },
@@ -4434,6 +2863,27 @@ export default {
           "notNull": true,
           "autoincrement": false,
           "default": false
+        },
+        "source_book_ordinal": {
+          "name": "source_book_ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source_chapter_ordinal": {
+          "name": "source_chapter_ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source_verse_ordinal": {
+          "name": "source_verse_ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
@@ -4461,6 +2911,14 @@ export default {
             "verse"
           ],
           "isUnique": false
+        },
+        "bp_verse_chapter_ord_idx": {
+          "name": "bp_verse_chapter_ord_idx",
+          "columns": [
+            "chapter_ord",
+            "verse_ord"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -4478,6 +2936,18 @@ export default {
         "bp_verse_ord_check": {
           "name": "bp_verse_ord_check",
           "value": "\"bp_verse\".\"verse_ord\" >= 1"
+        },
+        "bp_verse_source_book_ordinal_check": {
+          "name": "bp_verse_source_book_ordinal_check",
+          "value": "\"bp_verse\".\"source_book_ordinal\" is null or \"bp_verse\".\"source_book_ordinal\" >= 1"
+        },
+        "bp_verse_source_chapter_ordinal_check": {
+          "name": "bp_verse_source_chapter_ordinal_check",
+          "value": "\"bp_verse\".\"source_chapter_ordinal\" is null or \"bp_verse\".\"source_chapter_ordinal\" >= 1"
+        },
+        "bp_verse_source_verse_ordinal_check": {
+          "name": "bp_verse_source_verse_ordinal_check",
+          "value": "\"bp_verse\".\"source_verse_ordinal\" is null or \"bp_verse\".\"source_verse_ordinal\" >= 1"
         }
       }
     },
@@ -4519,6 +2989,41 @@ export default {
           "notNull": false,
           "autoincrement": false
         },
+        "text_length": {
+          "name": "text_length",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "token_count": {
+          "name": "token_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "word_count": {
+          "name": "word_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source": {
+          "name": "source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source_revision": {
+          "name": "source_revision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "updated_at": {
           "name": "updated_at",
           "type": "text",
@@ -4534,6 +3039,20 @@ export default {
           "columns": [
             "translation_id",
             "verse_key"
+          ],
+          "isUnique": false
+        },
+        "bp_verse_text_updated_idx": {
+          "name": "bp_verse_text_updated_idx",
+          "columns": [
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "bp_verse_text_hash_idx": {
+          "name": "bp_verse_text_hash_idx",
+          "columns": [
+            "hash"
           ],
           "isUnique": false
         }
@@ -4553,6 +3072,18 @@ export default {
         "bp_verse_text_text_check": {
           "name": "bp_verse_text_text_check",
           "value": "length(\"bp_verse_text\".\"text\") > 0"
+        },
+        "bp_verse_text_length_check": {
+          "name": "bp_verse_text_length_check",
+          "value": "\"bp_verse_text\".\"text_length\" is null or \"bp_verse_text\".\"text_length\" >= 0"
+        },
+        "bp_verse_text_token_count_check": {
+          "name": "bp_verse_text_token_count_check",
+          "value": "\"bp_verse_text\".\"token_count\" is null or \"bp_verse_text\".\"token_count\" >= 0"
+        },
+        "bp_verse_text_word_count_check": {
+          "name": "bp_verse_text_word_count_check",
+          "value": "\"bp_verse_text\".\"word_count\" is null or \"bp_verse_text\".\"word_count\" >= 0"
         }
       }
     },
@@ -4638,6 +3169,21 @@ export default {
           ],
           "isUnique": false
         },
+        "bp_auth_account_provider_lookup_idx": {
+          "name": "bp_auth_account_provider_lookup_idx",
+          "columns": [
+            "provider",
+            "provider_user_id"
+          ],
+          "isUnique": false
+        },
+        "bp_auth_account_access_exp_idx": {
+          "name": "bp_auth_account_access_exp_idx",
+          "columns": [
+            "access_token_expires_at"
+          ],
+          "isUnique": false
+        },
         "bp_auth_account_provider_uq": {
           "name": "bp_auth_account_provider_uq",
           "columns": [
@@ -4647,10 +3193,32 @@ export default {
           "isUnique": true
         }
       },
-      "foreignKeys": {},
+      "foreignKeys": {
+        "bp_auth_account_user_id_bp_user_id_fk": {
+          "name": "bp_auth_account_user_id_bp_user_id_fk",
+          "tableFrom": "bp_auth_account",
+          "tableTo": "bp_user",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {
+        "bp_auth_account_id_check": {
+          "name": "bp_auth_account_id_check",
+          "value": "length(\"bp_auth_account\".\"id\") > 0"
+        },
+        "bp_auth_account_user_id_check": {
+          "name": "bp_auth_account_user_id_check",
+          "value": "length(\"bp_auth_account\".\"user_id\") > 0"
+        },
         "bp_auth_account_provider_check": {
           "name": "bp_auth_account_provider_check",
           "value": "length(\"bp_auth_account\".\"provider\") > 0"
@@ -4659,9 +3227,17 @@ export default {
           "name": "bp_auth_account_provider_user_id_check",
           "value": "length(\"bp_auth_account\".\"provider_user_id\") > 0"
         },
-        "bp_auth_account_user_id_check": {
-          "name": "bp_auth_account_user_id_check",
-          "value": "length(\"bp_auth_account\".\"user_id\") > 0"
+        "bp_auth_account_chronology_check": {
+          "name": "bp_auth_account_chronology_check",
+          "value": "\"bp_auth_account\".\"updated_at\" >= \"bp_auth_account\".\"created_at\""
+        },
+        "bp_auth_account_access_token_expires_check": {
+          "name": "bp_auth_account_access_token_expires_check",
+          "value": "\"bp_auth_account\".\"access_token_expires_at\" is null or \"bp_auth_account\".\"access_token_expires_at\" >= \"bp_auth_account\".\"created_at\""
+        },
+        "bp_auth_account_scope_check": {
+          "name": "bp_auth_account_scope_check",
+          "value": "\"bp_auth_account\".\"scope\" is null or length(trim(\"bp_auth_account\".\"scope\")) > 0"
         }
       }
     },
@@ -4719,6 +3295,14 @@ export default {
           ],
           "isUnique": false
         },
+        "bp_session_user_exp_idx": {
+          "name": "bp_session_user_exp_idx",
+          "columns": [
+            "user_id",
+            "expires_at"
+          ],
+          "isUnique": false
+        },
         "bp_session_exp_idx": {
           "name": "bp_session_exp_idx",
           "columns": [
@@ -4727,7 +3311,21 @@ export default {
           "isUnique": false
         }
       },
-      "foreignKeys": {},
+      "foreignKeys": {
+        "bp_session_user_id_bp_user_id_fk": {
+          "name": "bp_session_user_id_bp_user_id_fk",
+          "tableFrom": "bp_session",
+          "tableTo": "bp_user",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {
@@ -4742,6 +3340,14 @@ export default {
         "bp_session_expires_check": {
           "name": "bp_session_expires_check",
           "value": "\"bp_session\".\"expires_at\" > \"bp_session\".\"created_at\""
+        },
+        "bp_session_ip_check": {
+          "name": "bp_session_ip_check",
+          "value": "\"bp_session\".\"ip\" is null or length(trim(\"bp_session\".\"ip\")) > 0"
+        },
+        "bp_session_ua_check": {
+          "name": "bp_session_ua_check",
+          "value": "\"bp_session\".\"ua\" is null or length(trim(\"bp_session\".\"ua\")) > 0"
         }
       }
     },
@@ -4812,6 +3418,27 @@ export default {
             "email"
           ],
           "isUnique": true
+        },
+        "bp_user_updated_idx": {
+          "name": "bp_user_updated_idx",
+          "columns": [
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "bp_user_email_idx": {
+          "name": "bp_user_email_idx",
+          "columns": [
+            "email"
+          ],
+          "isUnique": false
+        },
+        "bp_user_disabled_idx": {
+          "name": "bp_user_disabled_idx",
+          "columns": [
+            "disabled_at"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -4824,7 +3451,2035 @@ export default {
         },
         "bp_user_email_check": {
           "name": "bp_user_email_check",
-          "value": "\"bp_user\".\"email\" is null or length(\"bp_user\".\"email\") > 3"
+          "value": "\"bp_user\".\"email\" is null or length(trim(\"bp_user\".\"email\")) >= 3"
+        },
+        "bp_user_display_name_check": {
+          "name": "bp_user_display_name_check",
+          "value": "\"bp_user\".\"display_name\" is null or length(trim(\"bp_user\".\"display_name\")) > 0"
+        },
+        "bp_user_chronology_check": {
+          "name": "bp_user_chronology_check",
+          "value": "\"bp_user\".\"updated_at\" >= \"bp_user\".\"created_at\""
+        },
+        "bp_user_email_verified_check": {
+          "name": "bp_user_email_verified_check",
+          "value": "\"bp_user\".\"email_verified_at\" is null or \"bp_user\".\"email_verified_at\" >= \"bp_user\".\"created_at\""
+        },
+        "bp_user_disabled_check": {
+          "name": "bp_user_disabled_check",
+          "value": "\"bp_user\".\"disabled_at\" is null or \"bp_user\".\"disabled_at\" >= \"bp_user\".\"created_at\""
+        }
+      }
+    },
+    "bp_annotation": {
+      "name": "bp_annotation",
+      "columns": {
+        "annotation_id": {
+          "name": "annotation_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "rev": {
+          "name": "rev",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 1
+        },
+        "idempotency_key": {
+          "name": "idempotency_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_device_id": {
+          "name": "created_device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "updated_device_id": {
+          "name": "updated_device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "client_created_at": {
+          "name": "client_created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "client_updated_at": {
+          "name": "client_updated_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "collection_id": {
+          "name": "collection_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "title": {
+          "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "color": {
+          "name": "color",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "opacity": {
+          "name": "opacity",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "palette_id": {
+          "name": "palette_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "style_json": {
+          "name": "style_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "note_text": {
+          "name": "note_text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "note_format": {
+          "name": "note_format",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "note_html": {
+          "name": "note_html",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "text_search": {
+          "name": "text_search",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "sort_ordinal": {
+          "name": "sort_ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_user_idx": {
+          "name": "bp_annotation_user_idx",
+          "columns": [
+            "user_id",
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_user_kind_idx": {
+          "name": "bp_annotation_user_kind_idx",
+          "columns": [
+            "user_id",
+            "kind",
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_user_collection_idx": {
+          "name": "bp_annotation_user_collection_idx",
+          "columns": [
+            "user_id",
+            "collection_id",
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_updated_idx": {
+          "name": "bp_annotation_updated_idx",
+          "columns": [
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_deleted_idx": {
+          "name": "bp_annotation_deleted_idx",
+          "columns": [
+            "deleted_at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_idem_uq": {
+          "name": "bp_annotation_idem_uq",
+          "columns": [
+            "user_id",
+            "idempotency_key"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_user_id_bp_user_id_fk": {
+          "name": "bp_annotation_user_id_bp_user_id_fk",
+          "tableFrom": "bp_annotation",
+          "tableTo": "bp_user",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        },
+        "bp_annotation_collection_id_bp_annotation_collection_collection_id_fk": {
+          "name": "bp_annotation_collection_id_bp_annotation_collection_collection_id_fk",
+          "tableFrom": "bp_annotation",
+          "tableTo": "bp_annotation_collection",
+          "columnsFrom": [
+            "collection_id"
+          ],
+          "columnsTo": [
+            "collection_id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_kind_check": {
+          "name": "bp_annotation_kind_check",
+          "value": "\"bp_annotation\".\"kind\" in ('HIGHLIGHT','NOTE','INK','BOOKMARK')"
+        },
+        "bp_annotation_rev_check": {
+          "name": "bp_annotation_rev_check",
+          "value": "\"bp_annotation\".\"rev\" >= 1"
+        },
+        "bp_annotation_opacity_check": {
+          "name": "bp_annotation_opacity_check",
+          "value": "\"bp_annotation\".\"opacity\" is null or (\"bp_annotation\".\"opacity\" >= 0 and \"bp_annotation\".\"opacity\" <= 1)"
+        },
+        "bp_annotation_id_check": {
+          "name": "bp_annotation_id_check",
+          "value": "length(\"bp_annotation\".\"annotation_id\") > 0"
+        },
+        "bp_annotation_user_id_check": {
+          "name": "bp_annotation_user_id_check",
+          "value": "length(\"bp_annotation\".\"user_id\") > 0"
+        },
+        "bp_annotation_note_format_check": {
+          "name": "bp_annotation_note_format_check",
+          "value": "\"bp_annotation\".\"note_format\" is null or \"bp_annotation\".\"note_format\" in ('plain','md')"
+        },
+        "bp_annotation_sort_check": {
+          "name": "bp_annotation_sort_check",
+          "value": "\"bp_annotation\".\"sort_ordinal\" is null or \"bp_annotation\".\"sort_ordinal\" >= 0"
+        },
+        "bp_annotation_chronology_check": {
+          "name": "bp_annotation_chronology_check",
+          "value": "\"bp_annotation\".\"updated_at\" >= \"bp_annotation\".\"created_at\""
+        },
+        "bp_annotation_client_chronology_check": {
+          "name": "bp_annotation_client_chronology_check",
+          "value": "\"bp_annotation\".\"client_created_at\" is null or \"bp_annotation\".\"client_updated_at\" is null or \"bp_annotation\".\"client_updated_at\" >= \"bp_annotation\".\"client_created_at\""
+        },
+        "bp_annotation_deleted_chronology_check": {
+          "name": "bp_annotation_deleted_chronology_check",
+          "value": "\"bp_annotation\".\"deleted_at\" is null or \"bp_annotation\".\"deleted_at\" >= \"bp_annotation\".\"created_at\""
+        },
+        "bp_annotation_note_payload_check": {
+          "name": "bp_annotation_note_payload_check",
+          "value": "\n                \"bp_annotation\".\"kind\" != 'NOTE'\n                or \"bp_annotation\".\"note_text\" is not null\n                or \"bp_annotation\".\"note_html\" is not null\n                or \"bp_annotation\".\"title\" is not null\n            "
+        }
+      }
+    },
+    "bp_annotation_attachment": {
+      "name": "bp_annotation_attachment",
+      "columns": {
+        "attachment_id": {
+          "name": "attachment_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "annotation_id": {
+          "name": "annotation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "mime": {
+          "name": "mime",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "byte_size": {
+          "name": "byte_size",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "storage_key": {
+          "name": "storage_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "original_name": {
+          "name": "original_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "sha256": {
+          "name": "sha256",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_attachment_ann_idx": {
+          "name": "bp_annotation_attachment_ann_idx",
+          "columns": [
+            "annotation_id"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_attachment_kind_idx": {
+          "name": "bp_annotation_attachment_kind_idx",
+          "columns": [
+            "kind"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_attachment_storage_uq": {
+          "name": "bp_annotation_attachment_storage_uq",
+          "columns": [
+            "storage_key"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_attachment_annotation_id_bp_annotation_annotation_id_fk": {
+          "name": "bp_annotation_attachment_annotation_id_bp_annotation_annotation_id_fk",
+          "tableFrom": "bp_annotation_attachment",
+          "tableTo": "bp_annotation",
+          "columnsFrom": [
+            "annotation_id"
+          ],
+          "columnsTo": [
+            "annotation_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_attachment_id_check": {
+          "name": "bp_annotation_attachment_id_check",
+          "value": "length(\"bp_annotation_attachment\".\"attachment_id\") > 0"
+        },
+        "bp_annotation_attachment_kind_check": {
+          "name": "bp_annotation_attachment_kind_check",
+          "value": "length(\"bp_annotation_attachment\".\"kind\") > 0"
+        },
+        "bp_annotation_attachment_storage_check": {
+          "name": "bp_annotation_attachment_storage_check",
+          "value": "length(\"bp_annotation_attachment\".\"storage_key\") > 0"
+        },
+        "bp_annotation_attachment_size_check": {
+          "name": "bp_annotation_attachment_size_check",
+          "value": "\"bp_annotation_attachment\".\"byte_size\" is null or \"bp_annotation_attachment\".\"byte_size\" >= 0"
+        },
+        "bp_annotation_attachment_deleted_chronology_check": {
+          "name": "bp_annotation_attachment_deleted_chronology_check",
+          "value": "\"bp_annotation_attachment\".\"deleted_at\" is null or \"bp_annotation_attachment\".\"deleted_at\" >= \"bp_annotation_attachment\".\"created_at\""
+        }
+      }
+    },
+    "bp_annotation_collection": {
+      "name": "bp_annotation_collection",
+      "columns": {
+        "collection_id": {
+          "name": "collection_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name_norm": {
+          "name": "name_norm",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "description": {
+          "name": "description",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "color": {
+          "name": "color",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "icon": {
+          "name": "icon",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "sort_ordinal": {
+          "name": "sort_ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_collection_user_idx": {
+          "name": "bp_annotation_collection_user_idx",
+          "columns": [
+            "user_id",
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_collection_user_sort_idx": {
+          "name": "bp_annotation_collection_user_sort_idx",
+          "columns": [
+            "user_id",
+            "sort_ordinal",
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_collection_name_uq": {
+          "name": "bp_annotation_collection_name_uq",
+          "columns": [
+            "user_id",
+            "name_norm"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_collection_user_id_bp_user_id_fk": {
+          "name": "bp_annotation_collection_user_id_bp_user_id_fk",
+          "tableFrom": "bp_annotation_collection",
+          "tableTo": "bp_user",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_collection_id_check": {
+          "name": "bp_annotation_collection_id_check",
+          "value": "length(\"bp_annotation_collection\".\"collection_id\") > 0"
+        },
+        "bp_annotation_collection_name_check": {
+          "name": "bp_annotation_collection_name_check",
+          "value": "length(\"bp_annotation_collection\".\"name\") > 0"
+        },
+        "bp_annotation_collection_name_norm_check": {
+          "name": "bp_annotation_collection_name_norm_check",
+          "value": "length(\"bp_annotation_collection\".\"name_norm\") > 0"
+        },
+        "bp_annotation_collection_sort_check": {
+          "name": "bp_annotation_collection_sort_check",
+          "value": "\"bp_annotation_collection\".\"sort_ordinal\" is null or \"bp_annotation_collection\".\"sort_ordinal\" >= 0"
+        },
+        "bp_annotation_collection_chronology_check": {
+          "name": "bp_annotation_collection_chronology_check",
+          "value": "\"bp_annotation_collection\".\"updated_at\" >= \"bp_annotation_collection\".\"created_at\""
+        },
+        "bp_annotation_collection_deleted_chronology_check": {
+          "name": "bp_annotation_collection_deleted_chronology_check",
+          "value": "\"bp_annotation_collection\".\"deleted_at\" is null or \"bp_annotation_collection\".\"deleted_at\" >= \"bp_annotation_collection\".\"created_at\""
+        }
+      }
+    },
+    "bp_annotation_event": {
+      "name": "bp_annotation_event",
+      "columns": {
+        "event_id": {
+          "name": "event_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "annotation_id": {
+          "name": "annotation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "annotation_rev": {
+          "name": "annotation_rev",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "at": {
+          "name": "at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "client_at": {
+          "name": "client_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "device_id": {
+          "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "idempotency_key": {
+          "name": "idempotency_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "stroke_id": {
+          "name": "stroke_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "label_id": {
+          "name": "label_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "collection_id": {
+          "name": "collection_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "payload_json": {
+          "name": "payload_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_event_user_idx": {
+          "name": "bp_annotation_event_user_idx",
+          "columns": [
+            "user_id",
+            "at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_event_ann_idx": {
+          "name": "bp_annotation_event_ann_idx",
+          "columns": [
+            "annotation_id",
+            "at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_event_kind_idx": {
+          "name": "bp_annotation_event_kind_idx",
+          "columns": [
+            "kind",
+            "at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_event_ann_rev_idx": {
+          "name": "bp_annotation_event_ann_rev_idx",
+          "columns": [
+            "annotation_id",
+            "annotation_rev"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_event_user_id_bp_user_id_fk": {
+          "name": "bp_annotation_event_user_id_bp_user_id_fk",
+          "tableFrom": "bp_annotation_event",
+          "tableTo": "bp_user",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_event_kind_check": {
+          "name": "bp_annotation_event_kind_check",
+          "value": "\"bp_annotation_event\".\"kind\" in (\n                'CREATE','UPDATE','DELETE','RESTORE',\n                'ADD_STROKE','DEL_STROKE',\n                'ADD_LABEL','DEL_LABEL',\n                'MOVE_COLLECTION'\n            )"
+        },
+        "bp_annotation_event_rev_check": {
+          "name": "bp_annotation_event_rev_check",
+          "value": "\"bp_annotation_event\".\"annotation_rev\" is null or \"bp_annotation_event\".\"annotation_rev\" >= 1"
+        }
+      }
+    },
+    "bp_annotation_ink_stroke": {
+      "name": "bp_annotation_ink_stroke",
+      "columns": {
+        "stroke_id": {
+          "name": "stroke_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "annotation_id": {
+          "name": "annotation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "tool": {
+          "name": "tool",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'PEN'"
+        },
+        "storage_mode": {
+          "name": "storage_mode",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'INLINE'"
+        },
+        "palette_id": {
+          "name": "palette_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "color": {
+          "name": "color",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "opacity": {
+          "name": "opacity",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "width": {
+          "name": "width",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "brush_json": {
+          "name": "brush_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "min_x": {
+          "name": "min_x",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "min_y": {
+          "name": "min_y",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "max_x": {
+          "name": "max_x",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "max_y": {
+          "name": "max_y",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "point_count": {
+          "name": "point_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "points_json": {
+          "name": "points_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_ink_ann_idx": {
+          "name": "bp_annotation_ink_ann_idx",
+          "columns": [
+            "annotation_id"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_ink_ord_uq": {
+          "name": "bp_annotation_ink_ord_uq",
+          "columns": [
+            "annotation_id",
+            "ordinal"
+          ],
+          "isUnique": true
+        },
+        "bp_annotation_ink_deleted_idx": {
+          "name": "bp_annotation_ink_deleted_idx",
+          "columns": [
+            "annotation_id",
+            "deleted_at"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_ink_stroke_annotation_id_bp_annotation_annotation_id_fk": {
+          "name": "bp_annotation_ink_stroke_annotation_id_bp_annotation_annotation_id_fk",
+          "tableFrom": "bp_annotation_ink_stroke",
+          "tableTo": "bp_annotation",
+          "columnsFrom": [
+            "annotation_id"
+          ],
+          "columnsTo": [
+            "annotation_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_ink_storage_mode_check": {
+          "name": "bp_annotation_ink_storage_mode_check",
+          "value": "\"bp_annotation_ink_stroke\".\"storage_mode\" in ('INLINE','CHUNKED')"
+        },
+        "bp_annotation_ink_tool_check": {
+          "name": "bp_annotation_ink_tool_check",
+          "value": "\"bp_annotation_ink_stroke\".\"tool\" in ('PEN','HIGHLIGHTER','ERASER')"
+        },
+        "bp_annotation_ink_ord_check": {
+          "name": "bp_annotation_ink_ord_check",
+          "value": "\"bp_annotation_ink_stroke\".\"ordinal\" >= 1"
+        },
+        "bp_annotation_ink_opacity_check": {
+          "name": "bp_annotation_ink_opacity_check",
+          "value": "\"bp_annotation_ink_stroke\".\"opacity\" is null or (\"bp_annotation_ink_stroke\".\"opacity\" >= 0 and \"bp_annotation_ink_stroke\".\"opacity\" <= 1)"
+        },
+        "bp_annotation_ink_width_check": {
+          "name": "bp_annotation_ink_width_check",
+          "value": "\"bp_annotation_ink_stroke\".\"width\" is null or \"bp_annotation_ink_stroke\".\"width\" >= 0"
+        },
+        "bp_annotation_ink_point_count_check": {
+          "name": "bp_annotation_ink_point_count_check",
+          "value": "\"bp_annotation_ink_stroke\".\"point_count\" is null or \"bp_annotation_ink_stroke\".\"point_count\" >= 0"
+        },
+        "bp_annotation_ink_min_x_check": {
+          "name": "bp_annotation_ink_min_x_check",
+          "value": "\"bp_annotation_ink_stroke\".\"min_x\" is null or (\"bp_annotation_ink_stroke\".\"min_x\" >= 0 and \"bp_annotation_ink_stroke\".\"min_x\" <= 1)"
+        },
+        "bp_annotation_ink_min_y_check": {
+          "name": "bp_annotation_ink_min_y_check",
+          "value": "\"bp_annotation_ink_stroke\".\"min_y\" is null or (\"bp_annotation_ink_stroke\".\"min_y\" >= 0 and \"bp_annotation_ink_stroke\".\"min_y\" <= 1)"
+        },
+        "bp_annotation_ink_max_x_check": {
+          "name": "bp_annotation_ink_max_x_check",
+          "value": "\"bp_annotation_ink_stroke\".\"max_x\" is null or (\"bp_annotation_ink_stroke\".\"max_x\" >= 0 and \"bp_annotation_ink_stroke\".\"max_x\" <= 1)"
+        },
+        "bp_annotation_ink_max_y_check": {
+          "name": "bp_annotation_ink_max_y_check",
+          "value": "\"bp_annotation_ink_stroke\".\"max_y\" is null or (\"bp_annotation_ink_stroke\".\"max_y\" >= 0 and \"bp_annotation_ink_stroke\".\"max_y\" <= 1)"
+        },
+        "bp_annotation_ink_bbox_order_check": {
+          "name": "bp_annotation_ink_bbox_order_check",
+          "value": "\n                (\n                    \"bp_annotation_ink_stroke\".\"min_x\" is null and \"bp_annotation_ink_stroke\".\"min_y\" is null and \"bp_annotation_ink_stroke\".\"max_x\" is null and \"bp_annotation_ink_stroke\".\"max_y\" is null\n                ) or (\n                \"bp_annotation_ink_stroke\".\"min_x\" is not null and \"bp_annotation_ink_stroke\".\"min_y\" is not null and \"bp_annotation_ink_stroke\".\"max_x\" is not null and \"bp_annotation_ink_stroke\".\"max_y\" is not null\n                and \"bp_annotation_ink_stroke\".\"min_x\" <= \"bp_annotation_ink_stroke\".\"max_x\"\n                and \"bp_annotation_ink_stroke\".\"min_y\" <= \"bp_annotation_ink_stroke\".\"max_y\"\n                )\n            "
+        },
+        "bp_annotation_ink_storage_payload_check": {
+          "name": "bp_annotation_ink_storage_payload_check",
+          "value": "\n                    (\"bp_annotation_ink_stroke\".\"storage_mode\" = 'INLINE' and \"bp_annotation_ink_stroke\".\"points_json\" is not null)\n                    or (\"bp_annotation_ink_stroke\".\"storage_mode\" = 'CHUNKED' and \"bp_annotation_ink_stroke\".\"points_json\" is null)\n            "
+        },
+        "bp_annotation_ink_deleted_chronology_check": {
+          "name": "bp_annotation_ink_deleted_chronology_check",
+          "value": "\"bp_annotation_ink_stroke\".\"deleted_at\" is null or \"bp_annotation_ink_stroke\".\"deleted_at\" >= \"bp_annotation_ink_stroke\".\"created_at\""
+        }
+      }
+    },
+    "bp_annotation_ink_stroke_chunk": {
+      "name": "bp_annotation_ink_stroke_chunk",
+      "columns": {
+        "stroke_id": {
+          "name": "stroke_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "chunk_index": {
+          "name": "chunk_index",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "points_json": {
+          "name": "points_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_ink_stroke_chunk_idx": {
+          "name": "bp_annotation_ink_stroke_chunk_idx",
+          "columns": [
+            "stroke_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_ink_stroke_chunk_stroke_id_bp_annotation_ink_stroke_stroke_id_fk": {
+          "name": "bp_annotation_ink_stroke_chunk_stroke_id_bp_annotation_ink_stroke_stroke_id_fk",
+          "tableFrom": "bp_annotation_ink_stroke_chunk",
+          "tableTo": "bp_annotation_ink_stroke",
+          "columnsFrom": [
+            "stroke_id"
+          ],
+          "columnsTo": [
+            "stroke_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {
+        "bp_annotation_ink_stroke_chunk_stroke_id_chunk_index_pk": {
+          "columns": [
+            "stroke_id",
+            "chunk_index"
+          ],
+          "name": "bp_annotation_ink_stroke_chunk_stroke_id_chunk_index_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_ink_stroke_chunk_check": {
+          "name": "bp_annotation_ink_stroke_chunk_check",
+          "value": "\"bp_annotation_ink_stroke_chunk\".\"chunk_index\" >= 0"
+        },
+        "bp_annotation_ink_stroke_chunk_points_check": {
+          "name": "bp_annotation_ink_stroke_chunk_points_check",
+          "value": "length(\"bp_annotation_ink_stroke_chunk\".\"points_json\") > 0"
+        }
+      }
+    },
+    "bp_annotation_label": {
+      "name": "bp_annotation_label",
+      "columns": {
+        "label_id": {
+          "name": "label_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name_norm": {
+          "name": "name_norm",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "color": {
+          "name": "color",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_label_user_idx": {
+          "name": "bp_annotation_label_user_idx",
+          "columns": [
+            "user_id",
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_label_norm_uq": {
+          "name": "bp_annotation_label_norm_uq",
+          "columns": [
+            "user_id",
+            "name_norm"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_label_user_id_bp_user_id_fk": {
+          "name": "bp_annotation_label_user_id_bp_user_id_fk",
+          "tableFrom": "bp_annotation_label",
+          "tableTo": "bp_user",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_label_id_check": {
+          "name": "bp_annotation_label_id_check",
+          "value": "length(\"bp_annotation_label\".\"label_id\") > 0"
+        },
+        "bp_annotation_label_name_check": {
+          "name": "bp_annotation_label_name_check",
+          "value": "length(\"bp_annotation_label\".\"name\") > 0"
+        },
+        "bp_annotation_label_name_norm_check": {
+          "name": "bp_annotation_label_name_norm_check",
+          "value": "length(\"bp_annotation_label\".\"name_norm\") > 0"
+        },
+        "bp_annotation_label_chronology_check": {
+          "name": "bp_annotation_label_chronology_check",
+          "value": "\"bp_annotation_label\".\"updated_at\" >= \"bp_annotation_label\".\"created_at\""
+        },
+        "bp_annotation_label_deleted_chronology_check": {
+          "name": "bp_annotation_label_deleted_chronology_check",
+          "value": "\"bp_annotation_label\".\"deleted_at\" is null or \"bp_annotation_label\".\"deleted_at\" >= \"bp_annotation_label\".\"created_at\""
+        }
+      }
+    },
+    "bp_annotation_label_link": {
+      "name": "bp_annotation_label_link",
+      "columns": {
+        "annotation_id": {
+          "name": "annotation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "label_id": {
+          "name": "label_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_label_link_ann_idx": {
+          "name": "bp_annotation_label_link_ann_idx",
+          "columns": [
+            "annotation_id"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_label_link_label_idx": {
+          "name": "bp_annotation_label_link_label_idx",
+          "columns": [
+            "label_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_label_link_annotation_id_bp_annotation_annotation_id_fk": {
+          "name": "bp_annotation_label_link_annotation_id_bp_annotation_annotation_id_fk",
+          "tableFrom": "bp_annotation_label_link",
+          "tableTo": "bp_annotation",
+          "columnsFrom": [
+            "annotation_id"
+          ],
+          "columnsTo": [
+            "annotation_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        },
+        "bp_annotation_label_link_label_id_bp_annotation_label_label_id_fk": {
+          "name": "bp_annotation_label_link_label_id_bp_annotation_label_label_id_fk",
+          "tableFrom": "bp_annotation_label_link",
+          "tableTo": "bp_annotation_label",
+          "columnsFrom": [
+            "label_id"
+          ],
+          "columnsTo": [
+            "label_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {
+        "bp_annotation_label_link_annotation_id_label_id_pk": {
+          "columns": [
+            "annotation_id",
+            "label_id"
+          ],
+          "name": "bp_annotation_label_link_annotation_id_label_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "bp_annotation_palette": {
+      "name": "bp_annotation_palette",
+      "columns": {
+        "palette_id": {
+          "name": "palette_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name_norm": {
+          "name": "name_norm",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "color": {
+          "name": "color",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "opacity": {
+          "name": "opacity",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_palette_user_idx": {
+          "name": "bp_annotation_palette_user_idx",
+          "columns": [
+            "user_id",
+            "kind",
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_palette_name_uq": {
+          "name": "bp_annotation_palette_name_uq",
+          "columns": [
+            "user_id",
+            "kind",
+            "name_norm"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_palette_user_id_bp_user_id_fk": {
+          "name": "bp_annotation_palette_user_id_bp_user_id_fk",
+          "tableFrom": "bp_annotation_palette",
+          "tableTo": "bp_user",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_palette_kind_check": {
+          "name": "bp_annotation_palette_kind_check",
+          "value": "\"bp_annotation_palette\".\"kind\" in ('HIGHLIGHT','INK','TAG')"
+        },
+        "bp_annotation_palette_id_check": {
+          "name": "bp_annotation_palette_id_check",
+          "value": "length(\"bp_annotation_palette\".\"palette_id\") > 0"
+        },
+        "bp_annotation_palette_name_check": {
+          "name": "bp_annotation_palette_name_check",
+          "value": "length(\"bp_annotation_palette\".\"name\") > 0"
+        },
+        "bp_annotation_palette_name_norm_check": {
+          "name": "bp_annotation_palette_name_norm_check",
+          "value": "length(\"bp_annotation_palette\".\"name_norm\") > 0"
+        },
+        "bp_annotation_palette_color_check": {
+          "name": "bp_annotation_palette_color_check",
+          "value": "length(\"bp_annotation_palette\".\"color\") >= 4"
+        },
+        "bp_annotation_palette_opacity_check": {
+          "name": "bp_annotation_palette_opacity_check",
+          "value": "\"bp_annotation_palette\".\"opacity\" is null or (\"bp_annotation_palette\".\"opacity\" >= 0 and \"bp_annotation_palette\".\"opacity\" <= 1)"
+        },
+        "bp_annotation_palette_chronology_check": {
+          "name": "bp_annotation_palette_chronology_check",
+          "value": "\"bp_annotation_palette\".\"updated_at\" >= \"bp_annotation_palette\".\"created_at\""
+        },
+        "bp_annotation_palette_deleted_chronology_check": {
+          "name": "bp_annotation_palette_deleted_chronology_check",
+          "value": "\"bp_annotation_palette\".\"deleted_at\" is null or \"bp_annotation_palette\".\"deleted_at\" >= \"bp_annotation_palette\".\"created_at\""
+        }
+      }
+    },
+    "bp_annotation_share": {
+      "name": "bp_annotation_share",
+      "columns": {
+        "share_id": {
+          "name": "share_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "privacy": {
+          "name": "privacy",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'PRIVATE'"
+        },
+        "scope": {
+          "name": "scope",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'ANNOTATIONS'"
+        },
+        "share_slug": {
+          "name": "share_slug",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "collection_id": {
+          "name": "collection_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "title": {
+          "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_share_user_idx": {
+          "name": "bp_annotation_share_user_idx",
+          "columns": [
+            "user_id",
+            "updated_at"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_share_slug_uq": {
+          "name": "bp_annotation_share_slug_uq",
+          "columns": [
+            "share_slug"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_share_user_id_bp_user_id_fk": {
+          "name": "bp_annotation_share_user_id_bp_user_id_fk",
+          "tableFrom": "bp_annotation_share",
+          "tableTo": "bp_user",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        },
+        "bp_annotation_share_collection_id_bp_annotation_collection_collection_id_fk": {
+          "name": "bp_annotation_share_collection_id_bp_annotation_collection_collection_id_fk",
+          "tableFrom": "bp_annotation_share",
+          "tableTo": "bp_annotation_collection",
+          "columnsFrom": [
+            "collection_id"
+          ],
+          "columnsTo": [
+            "collection_id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_share_privacy_check": {
+          "name": "bp_annotation_share_privacy_check",
+          "value": "\"bp_annotation_share\".\"privacy\" in ('PRIVATE','SHARED_LINK','PUBLIC')"
+        },
+        "bp_annotation_share_scope_check": {
+          "name": "bp_annotation_share_scope_check",
+          "value": "\"bp_annotation_share\".\"scope\" in ('ANNOTATIONS','COLLECTION')"
+        },
+        "bp_annotation_share_chronology_check": {
+          "name": "bp_annotation_share_chronology_check",
+          "value": "\"bp_annotation_share\".\"updated_at\" >= \"bp_annotation_share\".\"created_at\""
+        },
+        "bp_annotation_share_revoked_chronology_check": {
+          "name": "bp_annotation_share_revoked_chronology_check",
+          "value": "\"bp_annotation_share\".\"revoked_at\" is null or \"bp_annotation_share\".\"revoked_at\" >= \"bp_annotation_share\".\"created_at\""
+        },
+        "bp_annotation_share_collection_scope_check": {
+          "name": "bp_annotation_share_collection_scope_check",
+          "value": "\"bp_annotation_share\".\"scope\" != 'COLLECTION' or \"bp_annotation_share\".\"collection_id\" is not null"
+        }
+      }
+    },
+    "bp_annotation_share_item": {
+      "name": "bp_annotation_share_item",
+      "columns": {
+        "share_id": {
+          "name": "share_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "annotation_id": {
+          "name": "annotation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_share_item_ord_uq": {
+          "name": "bp_annotation_share_item_ord_uq",
+          "columns": [
+            "share_id",
+            "ordinal"
+          ],
+          "isUnique": true
+        },
+        "bp_annotation_share_item_ann_idx": {
+          "name": "bp_annotation_share_item_ann_idx",
+          "columns": [
+            "annotation_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_share_item_share_id_bp_annotation_share_share_id_fk": {
+          "name": "bp_annotation_share_item_share_id_bp_annotation_share_share_id_fk",
+          "tableFrom": "bp_annotation_share_item",
+          "tableTo": "bp_annotation_share",
+          "columnsFrom": [
+            "share_id"
+          ],
+          "columnsTo": [
+            "share_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        },
+        "bp_annotation_share_item_annotation_id_bp_annotation_annotation_id_fk": {
+          "name": "bp_annotation_share_item_annotation_id_bp_annotation_annotation_id_fk",
+          "tableFrom": "bp_annotation_share_item",
+          "tableTo": "bp_annotation",
+          "columnsFrom": [
+            "annotation_id"
+          ],
+          "columnsTo": [
+            "annotation_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {
+        "bp_annotation_share_item_share_id_annotation_id_pk": {
+          "columns": [
+            "share_id",
+            "annotation_id"
+          ],
+          "name": "bp_annotation_share_item_share_id_annotation_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_share_item_ord_check": {
+          "name": "bp_annotation_share_item_ord_check",
+          "value": "\"bp_annotation_share_item\".\"ordinal\" >= 1"
+        }
+      }
+    },
+    "bp_annotation_span": {
+      "name": "bp_annotation_span",
+      "columns": {
+        "annotation_id": {
+          "name": "annotation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "span_ordinal": {
+          "name": "span_ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "anchor_kind": {
+          "name": "anchor_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'RANGE'"
+        },
+        "translation_id": {
+          "name": "translation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "start_verse_ord": {
+          "name": "start_verse_ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "end_verse_ord": {
+          "name": "end_verse_ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "start_verse_key": {
+          "name": "start_verse_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "end_verse_key": {
+          "name": "end_verse_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "start_token_index": {
+          "name": "start_token_index",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "end_token_index": {
+          "name": "end_token_index",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "start_char_offset": {
+          "name": "start_char_offset",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "end_char_offset": {
+          "name": "end_char_offset",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "selected_text": {
+          "name": "selected_text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "selected_text_hash": {
+          "name": "selected_text_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "selection_version": {
+          "name": "selection_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "pin_x": {
+          "name": "pin_x",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "pin_y": {
+          "name": "pin_y",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_span_ann_idx": {
+          "name": "bp_annotation_span_ann_idx",
+          "columns": [
+            "annotation_id"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_span_ord_idx": {
+          "name": "bp_annotation_span_ord_idx",
+          "columns": [
+            "start_verse_ord",
+            "end_verse_ord"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_span_trans_idx": {
+          "name": "bp_annotation_span_trans_idx",
+          "columns": [
+            "translation_id",
+            "start_verse_ord",
+            "end_verse_ord"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_span_start_key_idx": {
+          "name": "bp_annotation_span_start_key_idx",
+          "columns": [
+            "translation_id",
+            "start_verse_key"
+          ],
+          "isUnique": false
+        },
+        "bp_annotation_span_end_key_idx": {
+          "name": "bp_annotation_span_end_key_idx",
+          "columns": [
+            "translation_id",
+            "end_verse_key"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_span_annotation_id_bp_annotation_annotation_id_fk": {
+          "name": "bp_annotation_span_annotation_id_bp_annotation_annotation_id_fk",
+          "tableFrom": "bp_annotation_span",
+          "tableTo": "bp_annotation",
+          "columnsFrom": [
+            "annotation_id"
+          ],
+          "columnsTo": [
+            "annotation_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {
+        "bp_annotation_span_annotation_id_span_ordinal_pk": {
+          "columns": [
+            "annotation_id",
+            "span_ordinal"
+          ],
+          "name": "bp_annotation_span_annotation_id_span_ordinal_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_span_anchor_kind_check": {
+          "name": "bp_annotation_span_anchor_kind_check",
+          "value": "\"bp_annotation_span\".\"anchor_kind\" in ('RANGE','TOKEN_SPAN','LOCATION')"
+        },
+        "bp_annotation_span_ordinal_check": {
+          "name": "bp_annotation_span_ordinal_check",
+          "value": "\"bp_annotation_span\".\"span_ordinal\" >= 1"
+        },
+        "bp_annotation_span_check": {
+          "name": "bp_annotation_span_check",
+          "value": "\"bp_annotation_span\".\"start_verse_ord\" <= \"bp_annotation_span\".\"end_verse_ord\""
+        },
+        "bp_annotation_span_tok_start_check": {
+          "name": "bp_annotation_span_tok_start_check",
+          "value": "\"bp_annotation_span\".\"start_token_index\" is null or \"bp_annotation_span\".\"start_token_index\" >= 0"
+        },
+        "bp_annotation_span_tok_end_check": {
+          "name": "bp_annotation_span_tok_end_check",
+          "value": "\"bp_annotation_span\".\"end_token_index\" is null or \"bp_annotation_span\".\"end_token_index\" >= 0"
+        },
+        "bp_annotation_span_char_start_check": {
+          "name": "bp_annotation_span_char_start_check",
+          "value": "\"bp_annotation_span\".\"start_char_offset\" is null or \"bp_annotation_span\".\"start_char_offset\" >= 0"
+        },
+        "bp_annotation_span_char_end_check": {
+          "name": "bp_annotation_span_char_end_check",
+          "value": "\"bp_annotation_span\".\"end_char_offset\" is null or \"bp_annotation_span\".\"end_char_offset\" >= 0"
+        },
+        "bp_annotation_span_token_pair_check": {
+          "name": "bp_annotation_span_token_pair_check",
+          "value": "(\"bp_annotation_span\".\"start_token_index\" is null) = (\"bp_annotation_span\".\"end_token_index\" is null)"
+        },
+        "bp_annotation_span_char_pair_check": {
+          "name": "bp_annotation_span_char_pair_check",
+          "value": "(\"bp_annotation_span\".\"start_char_offset\" is null) = (\"bp_annotation_span\".\"end_char_offset\" is null)"
+        },
+        "bp_annotation_span_token_requires_translation_check": {
+          "name": "bp_annotation_span_token_requires_translation_check",
+          "value": "\"bp_annotation_span\".\"anchor_kind\" != 'TOKEN_SPAN' or \"bp_annotation_span\".\"translation_id\" is not null"
+        },
+        "bp_annotation_span_token_requires_tokens_check": {
+          "name": "bp_annotation_span_token_requires_tokens_check",
+          "value": "\"bp_annotation_span\".\"anchor_kind\" != 'TOKEN_SPAN' or (\"bp_annotation_span\".\"start_token_index\" is not null and \"bp_annotation_span\".\"end_token_index\" is not null)"
+        },
+        "bp_annotation_span_location_single_verse_check": {
+          "name": "bp_annotation_span_location_single_verse_check",
+          "value": "\"bp_annotation_span\".\"anchor_kind\" != 'LOCATION' or \"bp_annotation_span\".\"start_verse_ord\" = \"bp_annotation_span\".\"end_verse_ord\""
+        },
+        "bp_annotation_span_same_verse_token_order_check": {
+          "name": "bp_annotation_span_same_verse_token_order_check",
+          "value": "\n                \"bp_annotation_span\".\"start_token_index\" is null\n                or \"bp_annotation_span\".\"end_token_index\" is null\n                or \"bp_annotation_span\".\"start_verse_ord\" != \"bp_annotation_span\".\"end_verse_ord\"\n                or \"bp_annotation_span\".\"start_token_index\" <= \"bp_annotation_span\".\"end_token_index\"\n            "
+        },
+        "bp_annotation_span_same_verse_char_order_check": {
+          "name": "bp_annotation_span_same_verse_char_order_check",
+          "value": "\n                \"bp_annotation_span\".\"start_char_offset\" is null\n                or \"bp_annotation_span\".\"end_char_offset\" is null\n                or \"bp_annotation_span\".\"start_verse_ord\" != \"bp_annotation_span\".\"end_verse_ord\"\n                or \"bp_annotation_span\".\"start_char_offset\" <= \"bp_annotation_span\".\"end_char_offset\"\n            "
+        },
+        "bp_annotation_span_selection_version_check": {
+          "name": "bp_annotation_span_selection_version_check",
+          "value": "\"bp_annotation_span\".\"selection_version\" is null or \"bp_annotation_span\".\"selection_version\" >= 1"
+        },
+        "bp_annotation_span_pin_x_check": {
+          "name": "bp_annotation_span_pin_x_check",
+          "value": "\"bp_annotation_span\".\"pin_x\" is null or (\"bp_annotation_span\".\"pin_x\" >= 0 and \"bp_annotation_span\".\"pin_x\" <= 1)"
+        },
+        "bp_annotation_span_pin_y_check": {
+          "name": "bp_annotation_span_pin_y_check",
+          "value": "\"bp_annotation_span\".\"pin_y\" is null or (\"bp_annotation_span\".\"pin_y\" >= 0 and \"bp_annotation_span\".\"pin_y\" <= 1)"
+        }
+      }
+    },
+    "bp_annotation_span_bbox": {
+      "name": "bp_annotation_span_bbox",
+      "columns": {
+        "annotation_id": {
+          "name": "annotation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "span_ordinal": {
+          "name": "span_ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "min_x": {
+          "name": "min_x",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "min_y": {
+          "name": "min_y",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "max_x": {
+          "name": "max_x",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "max_y": {
+          "name": "max_y",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "bp_annotation_span_bbox_idx": {
+          "name": "bp_annotation_span_bbox_idx",
+          "columns": [
+            "annotation_id",
+            "span_ordinal"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "bp_annotation_span_bbox_span_fk": {
+          "name": "bp_annotation_span_bbox_span_fk",
+          "tableFrom": "bp_annotation_span_bbox",
+          "tableTo": "bp_annotation_span",
+          "columnsFrom": [
+            "annotation_id",
+            "span_ordinal"
+          ],
+          "columnsTo": [
+            "annotation_id",
+            "span_ordinal"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {
+        "bp_annotation_span_bbox_annotation_id_span_ordinal_pk": {
+          "columns": [
+            "annotation_id",
+            "span_ordinal"
+          ],
+          "name": "bp_annotation_span_bbox_annotation_id_span_ordinal_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_annotation_span_bbox_min_x_check": {
+          "name": "bp_annotation_span_bbox_min_x_check",
+          "value": "\"bp_annotation_span_bbox\".\"min_x\" >= 0 and \"bp_annotation_span_bbox\".\"min_x\" <= 1"
+        },
+        "bp_annotation_span_bbox_min_y_check": {
+          "name": "bp_annotation_span_bbox_min_y_check",
+          "value": "\"bp_annotation_span_bbox\".\"min_y\" >= 0 and \"bp_annotation_span_bbox\".\"min_y\" <= 1"
+        },
+        "bp_annotation_span_bbox_max_x_check": {
+          "name": "bp_annotation_span_bbox_max_x_check",
+          "value": "\"bp_annotation_span_bbox\".\"max_x\" >= 0 and \"bp_annotation_span_bbox\".\"max_x\" <= 1"
+        },
+        "bp_annotation_span_bbox_max_y_check": {
+          "name": "bp_annotation_span_bbox_max_y_check",
+          "value": "\"bp_annotation_span_bbox\".\"max_y\" >= 0 and \"bp_annotation_span_bbox\".\"max_y\" <= 1"
+        },
+        "bp_annotation_span_bbox_span_check": {
+          "name": "bp_annotation_span_bbox_span_check",
+          "value": "\"bp_annotation_span_bbox\".\"min_x\" <= \"bp_annotation_span_bbox\".\"max_x\" and \"bp_annotation_span_bbox\".\"min_y\" <= \"bp_annotation_span_bbox\".\"max_y\""
         }
       }
     }
@@ -5533,6 +6188,7 @@ main().catch((e) => fatal(e));
 // - Handles WAL / SHM / JOURNAL artifacts
 // - Refuses to delete ":memory:" paths (will fall back to default file path)
 // - Uses Bun.spawn (bun-only), no Node child_process
+// - On Windows, resolves the real Bun executable path instead of assuming "bun" is on spawn PATH
 
 import * as path from "node:path";
 import * as fs from "node:fs";
@@ -5558,18 +6214,37 @@ function isMemoryDb(p: string): boolean {
 function resolveDbPath(): string {
     const raw = (process.env.BP_DB_PATH ?? "").trim();
 
-    // default
     if (!raw) return path.resolve(process.cwd(), "data", "biblia.sqlite");
-
-    // if user points to memory db, resetting a file db still makes sense
     if (isMemoryDb(raw)) return path.resolve(process.cwd(), "data", "biblia.sqlite");
 
     return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
 }
 
+function resolveBunExecutable(): string {
+    // Bun exposes the current executable path here in Bun runtime.
+    const fromExecPath = (process.execPath ?? "").trim();
+    if (fromExecPath) return fromExecPath;
+
+    const fromWhich = Bun.which("bun");
+    if (fromWhich) return fromWhich;
+
+    fatal(
+        "unable to resolve Bun executable path.",
+        JSON.stringify({
+            processExecPath: process.execPath ?? null,
+            hint: "Run this script with Bun, not node.",
+        }),
+    );
+}
+
 async function run(cmd: string[], env?: Record<string, string>) {
+    const bunExe = resolveBunExecutable();
+    const fullCmd = [bunExe, ...cmd];
+
+    log("spawn:", fullCmd.join(" "));
+
     const p: Spawned = Bun.spawn({
-        cmd,
+        cmd: fullCmd,
         cwd: process.cwd(),
         stdout: "inherit",
         stderr: "inherit",
@@ -5577,14 +6252,14 @@ async function run(cmd: string[], env?: Record<string, string>) {
     });
 
     const code = await p.exited;
-    if (code !== 0) fatal("command failed:", cmd.join(" "), "exit", code);
+    if (code !== 0) fatal("command failed:", fullCmd.join(" "), "exit", code);
 }
 
 function safeUnlink(filePath: string): void {
     try {
         fs.unlinkSync(filePath);
     } catch (e: any) {
-        if (e?.code === "ENOENT") return; // already gone
+        if (e?.code === "ENOENT") return;
         throw e;
     }
 }
@@ -5598,7 +6273,6 @@ function safeMkdir(dir: string): void {
 }
 
 function deleteDbArtifacts(dbPath: string) {
-    // main file
     if (fs.existsSync(dbPath)) {
         log("deleting:", dbPath);
         safeUnlink(dbPath);
@@ -5606,7 +6280,6 @@ function deleteDbArtifacts(dbPath: string) {
         log("no db file to delete");
     }
 
-    // WAL mode artifacts (and legacy journal)
     safeUnlink(dbPath + "-wal");
     safeUnlink(dbPath + "-shm");
     safeUnlink(dbPath + "-journal");
@@ -5626,10 +6299,8 @@ async function main() {
         fatal("failed to delete db artifacts:", e);
     }
 
-    // Recreate schema + extras + seed metadata
-    // (We call TS entrypoints directly so it works the same in dev/prod)
-    await run(["bun", "src/db/migrate.ts"]);
-    await run(["bun", "src/db/seed.ts"]);
+    await run(["src/db/migrate.ts"]);
+    await run(["src/db/seed.ts"]);
 
     log("done.");
 }
@@ -5853,7 +6524,12 @@ main().catch((e) => fatal(e));
 // - All timestamps are INTEGER ms epoch.
 // - JSON payloads are stored as TEXT.
 // - Do not treat viewport pixels as truth.
+//
+// SQLite caveat:
+// - CHECK constraints in DDL cannot contain bound parameters.
+// - Any numeric constants used inside reusable sql fragments must be inlined.
 
+import { sql, type SQL } from "drizzle-orm";
 import {
     sqliteTable,
     text,
@@ -5865,13 +6541,19 @@ import {
     check,
     foreignKey,
 } from "drizzle-orm/sqlite-core";
-import { sql } from "drizzle-orm";
 import { bpUser } from "./authSchema";
 
 /* --------------------------------- Helpers --------------------------------- */
 
+function intLiteral(n: number): SQL {
+    if (!Number.isInteger(n)) {
+        throw new Error(`[annotationSchema] expected integer literal, got ${n}`);
+    }
+    return sql.raw(String(n));
+}
+
 const lenGt0 = (col: unknown) => sql`length(${col as any}) > 0`;
-const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${n}`;
+const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${intLiteral(n)}`;
 const jsonNonEmptyArrayish = (col: unknown) => sql`length(trim(${col as any})) >= 2`;
 
 /* ---------------------------------- Enums ---------------------------------- */
@@ -6000,13 +6682,9 @@ export const bpAnnotation = sqliteTable(
 
         kind: text("kind").notNull(), // AnnotationKind
 
-        // Optimistic concurrency / sync revision.
         rev: integer("rev").notNull().default(1),
-
-        // Idempotent write support.
         idempotencyKey: text("idempotency_key"),
 
-        // Device / client metadata for debugging + sync reconciliation.
         createdDeviceId: text("created_device_id"),
         updatedDeviceId: text("updated_device_id"),
         clientCreatedAt: integer("client_created_at"),
@@ -6023,21 +6701,16 @@ export const bpAnnotation = sqliteTable(
 
         title: text("title"),
 
-        // Visual style.
         color: text("color"),
         opacity: real("opacity"),
         paletteId: text("palette_id"),
         styleJson: text("style_json"),
 
-        // NOTE / BOOKMARK payload
         noteText: text("note_text"),
         noteFormat: text("note_format"),
-        noteHtml: text("note_html"), // cached / derived render surface
+        noteHtml: text("note_html"),
 
-        // Derived, denormalized search surface for quick LIKE/FTS pipelines.
         textSearch: text("text_search"),
-
-        // Optional user sort override / pin order inside a collection or view.
         sortOrdinal: integer("sort_ordinal"),
     },
     (t) => ({
@@ -6100,27 +6773,20 @@ export const bpAnnotationSpan = sqliteTable(
             .notNull()
             .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        spanOrdinal: integer("span_ordinal").notNull(), // 1..N
-
+        spanOrdinal: integer("span_ordinal").notNull(),
         anchorKind: text("anchor_kind").notNull().default("RANGE"),
 
-        // Null means translation-agnostic structural anchor.
-        // Set for token-precise, translation-specific anchoring.
         translationId: text("translation_id"),
 
-        // Structural truth.
         startVerseOrd: integer("start_verse_ord").notNull(),
         endVerseOrd: integer("end_verse_ord").notNull(),
 
-        // Convenience / export / debugging snapshots.
         startVerseKey: text("start_verse_key"),
         endVerseKey: text("end_verse_key"),
 
-        // Optional exact token anchoring.
         startTokenIndex: integer("start_token_index"),
         endTokenIndex: integer("end_token_index"),
 
-        // Optional char offsets inside start/end verse text.
         startCharOffset: integer("start_char_offset"),
         endCharOffset: integer("end_char_offset"),
 
@@ -6128,7 +6794,6 @@ export const bpAnnotationSpan = sqliteTable(
         selectedTextHash: text("selected_text_hash"),
         selectionVersion: integer("selection_version"),
 
-        // Logical pin inside local span space [0..1]; never viewport pixels.
         pinX: real("pin_x"),
         pinY: real("pin_y"),
     },
@@ -6375,10 +7040,7 @@ export const bpAnnotationInkStroke = sqliteTable(
         paletteId: text("palette_id"),
         color: text("color"),
         opacity: real("opacity"),
-
-        // Width in normalized local-span units.
         width: real("width"),
-
         brushJson: text("brush_json"),
 
         minX: real("min_x"),
@@ -6387,9 +7049,6 @@ export const bpAnnotationInkStroke = sqliteTable(
         maxY: real("max_y"),
 
         pointCount: integer("point_count"),
-
-        // INLINE mode: full payload here.
-        // CHUNKED mode: null here; use chunk rows.
         pointsJson: text("points_json"),
 
         createdAt: integer("created_at").notNull(),
@@ -6443,17 +7102,17 @@ export const bpAnnotationInkStroke = sqliteTable(
                 (
                     ${t.minX} is null and ${t.minY} is null and ${t.maxX} is null and ${t.maxY} is null
                 ) or (
-                    ${t.minX} is not null and ${t.minY} is not null and ${t.maxX} is not null and ${t.maxY} is not null
-                    and ${t.minX} <= ${t.maxX}
-                    and ${t.minY} <= ${t.maxY}
+                ${t.minX} is not null and ${t.minY} is not null and ${t.maxX} is not null and ${t.maxY} is not null
+                and ${t.minX} <= ${t.maxX}
+                and ${t.minY} <= ${t.maxY}
                 )
             `,
         ),
         storagePayloadCheck: check(
             "bp_annotation_ink_storage_payload_check",
             sql`
-                (${t.storageMode} = 'INLINE' and ${t.pointsJson} is not null)
-                or (${t.storageMode} = 'CHUNKED' and ${t.pointsJson} is null)
+                    (${t.storageMode} = 'INLINE' and ${t.pointsJson} is not null)
+                    or (${t.storageMode} = 'CHUNKED' and ${t.pointsJson} is null)
             `,
         ),
         deletedChronologyCheck: check(
@@ -6493,7 +7152,7 @@ export const bpAnnotationAttachment = sqliteTable(
             .notNull()
             .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        kind: text("kind").notNull(), // image | audio | file | ...
+        kind: text("kind").notNull(),
         mime: text("mime"),
         byteSize: integer("byte_size"),
         storageKey: text("storage_key").notNull(),
@@ -6535,10 +7194,8 @@ export const bpAnnotationShare = sqliteTable(
         privacy: text("privacy").notNull().default("PRIVATE"),
         scope: text("scope").notNull().default("ANNOTATIONS"),
 
-        // Optional stable slug / token for public or shared-link retrieval.
         shareSlug: text("share_slug"),
 
-        // For collection-scoped shares.
         collectionId: text("collection_id").references(() => bpAnnotationCollection.collectionId, {
             onDelete: "set null",
             onUpdate: "cascade",
@@ -6615,12 +7272,10 @@ export const bpAnnotationEvent = sqliteTable(
         kind: text("kind").notNull(),
         at: integer("at").notNull(),
 
-        // Client / sync metadata
         clientAt: integer("client_at"),
         deviceId: text("device_id"),
         idempotencyKey: text("idempotency_key"),
 
-        // Optional detailed links
         strokeId: text("stroke_id"),
         labelId: text("label_id"),
         collectionId: text("collection_id"),
@@ -6697,14 +7352,26 @@ export const annotationSchema = {
 // Notes:
 // - SQLite UNIQUE allows multiple NULLs, so email remains “unique when present”.
 // - Canon data is intentionally separate; auth is app/user infrastructure only.
+//
+// SQLite caveat:
+// - CHECK constraints in DDL cannot contain bound parameters.
+// - So any numeric literals used inside sql template fragments for CHECKs must be inlined
+//   with sql.raw(...), not interpolated as normal parameters.
 
+import { sql, type SQL } from "drizzle-orm";
 import { sqliteTable, text, integer, index, uniqueIndex, check } from "drizzle-orm/sqlite-core";
-import { sql } from "drizzle-orm";
 
 /* -------------------------------- Helpers --------------------------------- */
 
+function intLiteral(n: number): SQL {
+    if (!Number.isInteger(n)) {
+        throw new Error(`[authSchema] expected integer literal, got ${n}`);
+    }
+    return sql.raw(String(n));
+}
+
 const lenGt0 = (col: unknown) => sql`length(${col as any}) > 0`;
-const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${n}`;
+const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${intLiteral(n)}`;
 
 /* --------------------------------- Users ---------------------------------- */
 
@@ -6738,7 +7405,7 @@ export const bpUser = sqliteTable(
         idCheck: check("bp_user_id_check", lenGt0(t.id)),
         emailCheck: check(
             "bp_user_email_check",
-            sql`${t.email} is null or length(trim(${t.email})) >= 3`,
+            sql`${t.email} is null or length(trim(${t.email})) >= ${intLiteral(3)}`,
         ),
         displayNameCheck: check(
             "bp_user_display_name_check",
@@ -7783,19 +8450,13 @@ main().catch((err) => fatal(err));
 // - Uncertainty is first-class (time + geo precision/confidence)
 // - No interpretation layer in canon (no commentary / doctrine / devotionals)
 //
-// Upgrades in this version:
-// - Stronger tokenization model for partial selection / annotation anchoring
-// - More exact text-layer metadata (hashes, source, revision-ish timestamps)
-// - Safer uniqueness/indexes for common read paths
-// - Cleaner checks and export surface
-// - Fixed schema export typo
-//
-// NOTE:
-// - Auth/Identity tables live in ./authSchema.ts
-// - Reader annotations live in ./annotationSchema.ts (user data, not canon)
-// - Re-exported here so the rest of the app can import from one surface.
+// Hardened notes:
+// - Avoid bound params inside CHECK DDL for SQLite.
+// - Keep reusable CHECK helpers inline-safe with sql.raw literals only.
+// - Re-export auth + annotation schema from here as the app's single DB surface.
+// - Avoid symbol collisions with annotation schema exports (e.g. AnchorKind).
 
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import {
     sqliteTable,
     text,
@@ -7813,10 +8474,42 @@ export * from "./annotationSchema";
 
 const nowIso = sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`;
 
+/* --------------------------------- Helpers --------------------------------- */
+
+function intLiteral(n: number): SQL {
+    if (!Number.isInteger(n)) {
+        throw new Error(`[schema] expected integer literal, got ${n}`);
+    }
+    return sql.raw(String(n));
+}
+
+function stringLiteral(value: string): SQL {
+    return sql.raw(`'${value.replace(/'/g, "''")}'`);
+}
+
+function inStringSet(col: unknown, values: readonly string[]): SQL {
+    return sql`${col as any} in (${sql.join(values.map(stringLiteral), sql.raw(", "))})`;
+}
+
+const lenGt0 = (col: unknown) => sql`length(${col as any}) > 0`;
+const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${intLiteral(n)}`;
+const lenBetween = (col: unknown, min: number, max: number) =>
+    sql`length(${col as any}) between ${intLiteral(min)} and ${intLiteral(max)}`;
+const intGe = (col: unknown, n: number) => sql`${col as any} >= ${intLiteral(n)}`;
+const intMaybeGe = (col: unknown, n: number) => sql`${col as any} is null or ${col as any} >= ${intLiteral(n)}`;
+const realMaybeGe = (col: unknown, n: number) => {
+    if (!Number.isFinite(n)) {
+        throw new Error(`[schema] expected finite numeric literal, got ${n}`);
+    }
+    return sql`${col as any} is null or ${col as any} >= ${sql.raw(String(n))}`;
+};
+const confidence01 = (col: unknown) => sql`${col as any} is null or (${col as any} >= 0 and ${col as any} <= 1)`;
+
 /* ---------------------------------- Enums ---------------------------------- */
 
 export const Testament = { OT: "OT", NT: "NT" } as const;
 export type Testament = (typeof Testament)[keyof typeof Testament];
+const TESTAMENT_VALUES = Object.values(Testament);
 
 export const LicenseKind = {
     PUBLIC_DOMAIN: "PUBLIC_DOMAIN",
@@ -7824,6 +8517,7 @@ export const LicenseKind = {
     CUSTOM: "CUSTOM",
 } as const;
 export type LicenseKind = (typeof LicenseKind)[keyof typeof LicenseKind];
+const LICENSE_KIND_VALUES = Object.values(LicenseKind);
 
 export const ParagraphStyle = {
     PROSE: "PROSE",
@@ -7833,6 +8527,7 @@ export const ParagraphStyle = {
     LETTER: "LETTER",
 } as const;
 export type ParagraphStyle = (typeof ParagraphStyle)[keyof typeof ParagraphStyle];
+const PARAGRAPH_STYLE_VALUES = Object.values(ParagraphStyle);
 
 export const DocUnitKind = {
     SECTION: "SECTION",
@@ -7842,6 +8537,7 @@ export const DocUnitKind = {
     NARRATIVE_BLOCK: "NARRATIVE_BLOCK",
 } as const;
 export type DocUnitKind = (typeof DocUnitKind)[keyof typeof DocUnitKind];
+const DOC_UNIT_KIND_VALUES = Object.values(DocUnitKind);
 
 export const EntityKind = {
     PERSON: "PERSON",
@@ -7854,6 +8550,7 @@ export const EntityKind = {
     OFFICE: "OFFICE",
 } as const;
 export type EntityKind = (typeof EntityKind)[keyof typeof EntityKind];
+const ENTITY_KIND_VALUES = Object.values(EntityKind);
 
 export const RelationKind = {
     PARENT_OF: "PARENT_OF",
@@ -7867,6 +8564,7 @@ export const RelationKind = {
     SUCCEEDS: "SUCCEEDS",
 } as const;
 export type RelationKind = (typeof RelationKind)[keyof typeof RelationKind];
+const RELATION_KIND_VALUES = Object.values(RelationKind);
 
 export const GeoType = {
     POINT: "POINT",
@@ -7874,12 +8572,14 @@ export const GeoType = {
     REGION_POLYGON: "REGION_POLYGON",
 } as const;
 export type GeoType = (typeof GeoType)[keyof typeof GeoType];
+const GEO_TYPE_VALUES = Object.values(GeoType);
 
 export const CalendarKind = {
     BCE_CE: "BCE_CE",
     ANNO_MUNDI: "ANNO_MUNDI",
 } as const;
 export type CalendarKind = (typeof CalendarKind)[keyof typeof CalendarKind];
+const CALENDAR_KIND_VALUES = Object.values(CalendarKind);
 
 export const EraTag = {
     PRIMEVAL: "PRIMEVAL",
@@ -7894,14 +8594,17 @@ export const EraTag = {
     APOSTOLIC: "APOSTOLIC",
 } as const;
 export type EraTag = (typeof EraTag)[keyof typeof EraTag];
+const ERA_TAG_VALUES = Object.values(EraTag);
 
-export const AnchorKind = {
+// Important: do not export plain AnchorKind here because annotationSchema already exports AnchorKind.
+export const TimelineAnchorKind = {
     SETTING: "SETTING",
     EVENT_WINDOW: "EVENT_WINDOW",
     REIGN: "REIGN",
     JOURNEY_WINDOW: "JOURNEY_WINDOW",
 } as const;
-export type AnchorKind = (typeof AnchorKind)[keyof typeof AnchorKind];
+export type TimelineAnchorKind = (typeof TimelineAnchorKind)[keyof typeof TimelineAnchorKind];
+const TIMELINE_ANCHOR_KIND_VALUES = Object.values(TimelineAnchorKind);
 
 export const EventKind = {
     BIRTH: "BIRTH",
@@ -7923,6 +8626,7 @@ export const EventKind = {
     OTHER: "OTHER",
 } as const;
 export type EventKind = (typeof EventKind)[keyof typeof EventKind];
+const EVENT_KIND_VALUES = Object.values(EventKind);
 
 export const ParticipantRole = {
     SUBJECT: "SUBJECT",
@@ -7934,6 +8638,7 @@ export const ParticipantRole = {
     OTHER: "OTHER",
 } as const;
 export type ParticipantRole = (typeof ParticipantRole)[keyof typeof ParticipantRole];
+const PARTICIPANT_ROLE_VALUES = Object.values(ParticipantRole);
 
 export const LinkTargetKind = {
     ENTITY: "ENTITY",
@@ -7942,6 +8647,7 @@ export const LinkTargetKind = {
     PLACE_GEO: "PLACE_GEO",
 } as const;
 export type LinkTargetKind = (typeof LinkTargetKind)[keyof typeof LinkTargetKind];
+const LINK_TARGET_KIND_VALUES = Object.values(LinkTargetKind);
 
 export const LinkKind = {
     MENTIONS: "MENTIONS",
@@ -7954,6 +8660,7 @@ export const LinkKind = {
     QUOTE_TARGET: "QUOTE_TARGET",
 } as const;
 export type LinkKind = (typeof LinkKind)[keyof typeof LinkKind];
+const LINK_KIND_VALUES = Object.values(LinkKind);
 
 export const CrossrefKind = {
     PARALLEL: "PARALLEL",
@@ -7962,6 +8669,7 @@ export const CrossrefKind = {
     TOPICAL: "TOPICAL",
 } as const;
 export type CrossrefKind = (typeof CrossrefKind)[keyof typeof CrossrefKind];
+const CROSSREF_KIND_VALUES = Object.values(CrossrefKind);
 
 export const ReaderEventType = {
     VIEW_VERSE: "VIEW_VERSE",
@@ -7974,6 +8682,7 @@ export const ReaderEventType = {
     SEARCH: "SEARCH",
 } as const;
 export type ReaderEventType = (typeof ReaderEventType)[keyof typeof ReaderEventType];
+const READER_EVENT_TYPE_VALUES = Object.values(ReaderEventType);
 
 export const SourceKind = {
     IMPORT: "IMPORT",
@@ -7981,6 +8690,7 @@ export const SourceKind = {
     DATASET: "DATASET",
 } as const;
 export type SourceKind = (typeof SourceKind)[keyof typeof SourceKind];
+const SOURCE_KIND_VALUES = Object.values(SourceKind);
 
 export const AuditAction = {
     INSERT: "INSERT",
@@ -7988,12 +8698,8 @@ export const AuditAction = {
     DELETE: "DELETE",
 } as const;
 export type AuditAction = (typeof AuditAction)[keyof typeof AuditAction];
+const AUDIT_ACTION_VALUES = Object.values(AuditAction);
 
-/**
- * Text/token layer enums
- * These are canon-safe because they describe textual structure and offsets,
- * not commentary or interpretation.
- */
 export const TokenKind = {
     WORD: "WORD",
     PUNCT: "PUNCT",
@@ -8004,6 +8710,7 @@ export const TokenKind = {
     SYMBOL: "SYMBOL",
 } as const;
 export type TokenKind = (typeof TokenKind)[keyof typeof TokenKind];
+const TOKEN_KIND_VALUES = Object.values(TokenKind);
 
 export const NormalizationForm = {
     NONE: "NONE",
@@ -8011,46 +8718,46 @@ export const NormalizationForm = {
     SEARCH_V1: "SEARCH_V1",
 } as const;
 export type NormalizationForm = (typeof NormalizationForm)[keyof typeof NormalizationForm];
+const NORMALIZATION_FORM_VALUES = Object.values(NormalizationForm);
 
 /* ------------------------- 1) Canonical Scripture Layer ---------------------- */
 
 export const bpBook = sqliteTable(
     "bp_book",
     {
-        bookId: text("book_id").primaryKey(), // GEN, EXO, ...
-        ordinal: integer("ordinal").notNull(), // 1..66
-        testament: text("testament").notNull(), // OT | NT
+        bookId: text("book_id").primaryKey(),
+        ordinal: integer("ordinal").notNull(),
+        testament: text("testament").notNull(),
         name: text("name").notNull(),
         nameShort: text("name_short").notNull(),
         chapters: integer("chapters").notNull(),
         osised: text("osised"),
-        abbrs: text("abbrs"), // JSON array string
+        abbrs: text("abbrs"),
     },
     (t) => ({
         ordinalUniq: uniqueIndex("bp_book_ordinal_uniq").on(t.ordinal),
-        ordCheck: check("bp_book_ordinal_check", sql`${t.ordinal} >= 1`),
-        chaptersCheck: check("bp_book_chapters_check", sql`${t.chapters} >= 1`),
-        testamentCheck: check("bp_book_testament_check", sql`${t.testament} in ('OT','NT')`),
-        bookIdCheck: check("bp_book_book_id_check", sql`length(${t.bookId}) between 2 and 8`),
-        nameCheck: check("bp_book_name_check", sql`length(${t.name}) > 0`),
-        shortNameCheck: check("bp_book_name_short_check", sql`length(${t.nameShort}) > 0`),
+        ordCheck: check("bp_book_ordinal_check", intGe(t.ordinal, 1)),
+        chaptersCheck: check("bp_book_chapters_check", intGe(t.chapters, 1)),
+        testamentCheck: check("bp_book_testament_check", inStringSet(t.testament, TESTAMENT_VALUES)),
+        bookIdCheck: check("bp_book_book_id_check", lenBetween(t.bookId, 2, 8)),
+        nameCheck: check("bp_book_name_check", lenGt0(t.name)),
+        shortNameCheck: check("bp_book_name_short_check", lenGt0(t.nameShort)),
     }),
 );
 
 export const bpVerse = sqliteTable(
     "bp_verse",
     {
-        verseKey: text("verse_key").primaryKey(), // BOOK.CHAPTER.VERSE (GEN.1.1)
+        verseKey: text("verse_key").primaryKey(),
         bookId: text("book_id").notNull(),
         chapter: integer("chapter").notNull(),
         verse: integer("verse").notNull(),
-        verseOrd: integer("verse_ord").notNull(), // SQLite INTEGER is 64-bit
+        verseOrd: integer("verse_ord").notNull(),
         chapterOrd: integer("chapter_ord"),
 
         isSuperscription: integer("is_superscription", { mode: "boolean" }).notNull().default(false),
         isDeuterocanon: integer("is_deuterocanon", { mode: "boolean" }).notNull().default(false),
 
-        // Optional exact source ordering helpers for specialized exports/imports
         sourceBookOrdinal: integer("source_book_ordinal"),
         sourceChapterOrdinal: integer("source_chapter_ordinal"),
         sourceVerseOrdinal: integer("source_verse_ordinal"),
@@ -8060,21 +8767,12 @@ export const bpVerse = sqliteTable(
         byBcvUniq: uniqueIndex("bp_verse_bcv_uniq").on(t.bookId, t.chapter, t.verse),
         bookIdx: index("bp_verse_book_idx").on(t.bookId, t.chapter, t.verse),
         chapterOrdIdx: index("bp_verse_chapter_ord_idx").on(t.chapterOrd, t.verseOrd),
-        chapterCheck: check("bp_verse_chapter_check", sql`${t.chapter} >= 1`),
-        verseCheck: check("bp_verse_verse_check", sql`${t.verse} >= 1`),
-        ordCheck: check("bp_verse_ord_check", sql`${t.verseOrd} >= 1`),
-        sourceBookOrdCheck: check(
-            "bp_verse_source_book_ordinal_check",
-            sql`${t.sourceBookOrdinal} is null or ${t.sourceBookOrdinal} >= 1`,
-        ),
-        sourceChapterOrdCheck: check(
-            "bp_verse_source_chapter_ordinal_check",
-            sql`${t.sourceChapterOrdinal} is null or ${t.sourceChapterOrdinal} >= 1`,
-        ),
-        sourceVerseOrdCheck: check(
-            "bp_verse_source_verse_ordinal_check",
-            sql`${t.sourceVerseOrdinal} is null or ${t.sourceVerseOrdinal} >= 1`,
-        ),
+        chapterCheck: check("bp_verse_chapter_check", intGe(t.chapter, 1)),
+        verseCheck: check("bp_verse_verse_check", intGe(t.verse, 1)),
+        ordCheck: check("bp_verse_ord_check", intGe(t.verseOrd, 1)),
+        sourceBookOrdCheck: check("bp_verse_source_book_ordinal_check", intMaybeGe(t.sourceBookOrdinal, 1)),
+        sourceChapterOrdCheck: check("bp_verse_source_chapter_ordinal_check", intMaybeGe(t.sourceChapterOrdinal, 1)),
+        sourceVerseOrdCheck: check("bp_verse_source_verse_ordinal_check", intMaybeGe(t.sourceVerseOrdinal, 1)),
     }),
 );
 
@@ -8092,12 +8790,9 @@ export const bpChapter = sqliteTable(
         pk: primaryKey({ columns: [t.bookId, t.chapter] }),
         chapterOrdUniq: uniqueIndex("bp_chapter_chapter_ord_uniq").on(t.chapterOrd),
         rangeIdx: index("bp_chapter_range_idx").on(t.bookId, t.startVerseOrd, t.endVerseOrd),
-        chapterCheck: check("bp_chapter_chapter_check", sql`${t.chapter} >= 1`),
-        chapterOrdCheck: check(
-            "bp_chapter_chapter_ord_check",
-            sql`${t.chapterOrd} is null or ${t.chapterOrd} >= 1`,
-        ),
-        countCheck: check("bp_chapter_verse_count_check", sql`${t.verseCount} >= 1`),
+        chapterCheck: check("bp_chapter_chapter_check", intGe(t.chapter, 1)),
+        chapterOrdCheck: check("bp_chapter_chapter_ord_check", intMaybeGe(t.chapterOrd, 1)),
+        countCheck: check("bp_chapter_verse_count_check", intGe(t.verseCount, 1)),
         spanCheck: check("bp_chapter_span_check", sql`${t.startVerseOrd} <= ${t.endVerseOrd}`),
     }),
 );
@@ -8107,9 +8802,9 @@ export const bpChapter = sqliteTable(
 export const bpTranslation = sqliteTable(
     "bp_translation",
     {
-        translationId: text("translation_id").primaryKey(), // KJV, ESV, BP1, ...
+        translationId: text("translation_id").primaryKey(),
         name: text("name").notNull(),
-        language: text("language").notNull(), // ISO-ish, e.g. en
+        language: text("language").notNull(),
         derivedFrom: text("derived_from"),
 
         licenseKind: text("license_kind").notNull(),
@@ -8120,7 +8815,7 @@ export const bpTranslation = sqliteTable(
         editionLabel: text("edition_label"),
         abbreviation: text("abbreviation"),
 
-        normalizationForm: text("normalization_form").notNull().default("SIMPLE"),
+        normalizationForm: text("normalization_form").notNull().default(NormalizationForm.SIMPLE),
 
         isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
         isPublic: integer("is_public", { mode: "boolean" }).notNull().default(true),
@@ -8131,17 +8826,11 @@ export const bpTranslation = sqliteTable(
     (t) => ({
         nameIdx: index("bp_translation_name_idx").on(t.name),
         publicIdx: index("bp_translation_public_idx").on(t.isPublic, t.isDefault),
-        licenseKindCheck: check(
-            "bp_translation_license_kind_check",
-            sql`${t.licenseKind} in ('PUBLIC_DOMAIN','LICENSED','CUSTOM')`,
-        ),
-        normFormCheck: check(
-            "bp_translation_normalization_form_check",
-            sql`${t.normalizationForm} in ('NONE','SIMPLE','SEARCH_V1')`,
-        ),
-        idCheck: check("bp_translation_id_check", sql`length(${t.translationId}) > 0`),
-        nameCheck: check("bp_translation_name_check", sql`length(${t.name}) > 0`),
-        langCheck: check("bp_translation_language_check", sql`length(${t.language}) >= 2`),
+        licenseKindCheck: check("bp_translation_license_kind_check", inStringSet(t.licenseKind, LICENSE_KIND_VALUES)),
+        normFormCheck: check("bp_translation_normalization_form_check", inStringSet(t.normalizationForm, NORMALIZATION_FORM_VALUES)),
+        idCheck: check("bp_translation_id_check", lenGt0(t.translationId)),
+        nameCheck: check("bp_translation_name_check", lenGt0(t.name)),
+        langCheck: check("bp_translation_language_check", lenGe(t.language, 2)),
     }),
 );
 
@@ -8154,10 +8843,10 @@ export const bpVerseText = sqliteTable(
         text: text("text").notNull(),
         textNorm: text("text_norm"),
 
-        hash: text("hash"), // canonical verse text hash
-        textLength: integer("text_length"), // character count
-        tokenCount: integer("token_count"), // populated after tokenization
-        wordCount: integer("word_count"), // populated after tokenization
+        hash: text("hash"),
+        textLength: integer("text_length"),
+        tokenCount: integer("token_count"),
+        wordCount: integer("word_count"),
 
         source: text("source"),
         sourceRevision: text("source_revision"),
@@ -8169,25 +8858,13 @@ export const bpVerseText = sqliteTable(
         idx: index("bp_verse_text_idx").on(t.translationId, t.verseKey),
         updatedIdx: index("bp_verse_text_updated_idx").on(t.updatedAt),
         hashIdx: index("bp_verse_text_hash_idx").on(t.hash),
-        textCheck: check("bp_verse_text_text_check", sql`length(${t.text}) > 0`),
-        lengthCheck: check("bp_verse_text_length_check", sql`${t.textLength} is null or ${t.textLength} >= 0`),
-        tokenCountCheck: check("bp_verse_text_token_count_check", sql`${t.tokenCount} is null or ${t.tokenCount} >= 0`),
-        wordCountCheck: check("bp_verse_text_word_count_check", sql`${t.wordCount} is null or ${t.wordCount} >= 0`),
+        textCheck: check("bp_verse_text_text_check", lenGt0(t.text)),
+        lengthCheck: check("bp_verse_text_length_check", intMaybeGe(t.textLength, 0)),
+        tokenCountCheck: check("bp_verse_text_token_count_check", intMaybeGe(t.tokenCount, 0)),
+        wordCountCheck: check("bp_verse_text_word_count_check", intMaybeGe(t.wordCount, 0)),
     }),
 );
 
-/**
- * Rich tokenization layer for:
- * - partial highlighting
- * - exact copy/export of sub-verse selections
- * - stable annotation anchoring
- * - better search/lookup/debugging
- *
- * IMPORTANT:
- * - tokenIndex is the stable display-order token ordinal within a verse.
- * - charStart/charEnd are offsets into bp_verse_text.text (UTF-16 JS offsets if generated in TS).
- * - Tokens may include spaces/punctuation. Do NOT discard them if exact reconstruction matters.
- */
 export const bpToken = sqliteTable(
     "bp_token",
     {
@@ -8197,15 +8874,14 @@ export const bpToken = sqliteTable(
 
         token: text("token").notNull(),
         tokenNorm: text("token_norm").notNull(),
-        tokenKind: text("token_kind").notNull().default("WORD"),
+        tokenKind: text("token_kind").notNull().default(TokenKind.WORD),
 
         charStart: integer("char_start").notNull(),
-        charEnd: integer("char_end").notNull(), // exclusive
+        charEnd: integer("char_end").notNull(),
 
         isWordLike: integer("is_word_like", { mode: "boolean" }).notNull().default(true),
         breakAfter: integer("break_after", { mode: "boolean" }).notNull().default(false),
 
-        // Optional grouping helpers
         surfaceGroup: integer("surface_group"),
         lineOrdinal: integer("line_ordinal"),
 
@@ -8218,43 +8894,29 @@ export const bpToken = sqliteTable(
         charIdx: index("bp_token_char_idx").on(t.translationId, t.verseKey, t.charStart, t.charEnd),
         kindIdx: index("bp_token_kind_idx").on(t.translationId, t.tokenKind),
 
-        tokCheck: check("bp_token_token_check", sql`length(${t.token}) > 0`),
+        tokCheck: check("bp_token_token_check", lenGt0(t.token)),
         normCheck: check("bp_token_norm_check", sql`length(${t.tokenNorm}) >= 0`),
-        tokenIndexCheck: check("bp_token_token_index_check", sql`${t.tokenIndex} >= 0`),
-        kindCheck: check(
-            "bp_token_kind_check",
-            sql`${t.tokenKind} in ('WORD','PUNCT','SPACE','LINEBREAK','MARKER','NUMBER','SYMBOL')`,
-        ),
-        charStartCheck: check("bp_token_char_start_check", sql`${t.charStart} >= 0`),
+        tokenIndexCheck: check("bp_token_token_index_check", intGe(t.tokenIndex, 0)),
+        kindCheck: check("bp_token_kind_check", inStringSet(t.tokenKind, TOKEN_KIND_VALUES)),
+        charStartCheck: check("bp_token_char_start_check", intGe(t.charStart, 0)),
         charEndCheck: check("bp_token_char_end_check", sql`${t.charEnd} > ${t.charStart}`),
-        surfaceGroupCheck: check(
-            "bp_token_surface_group_check",
-            sql`${t.surfaceGroup} is null or ${t.surfaceGroup} >= 0`,
-        ),
-        lineOrdinalCheck: check(
-            "bp_token_line_ordinal_check",
-            sql`${t.lineOrdinal} is null or ${t.lineOrdinal} >= 0`,
-        ),
+        surfaceGroupCheck: check("bp_token_surface_group_check", intMaybeGe(t.surfaceGroup, 0)),
+        lineOrdinalCheck: check("bp_token_line_ordinal_check", intMaybeGe(t.lineOrdinal, 0)),
     }),
 );
 
-/**
- * Optional span map for quick lookup of common token spans inside a verse.
- * Useful later for fast partial range reconstruction, cached text selections,
- * and selection snapping without re-scanning token arrays every time.
- */
 export const bpTokenSpan = sqliteTable(
     "bp_token_span",
     {
         translationId: text("translation_id").notNull(),
         verseKey: text("verse_key").notNull(),
-        spanId: text("span_id").notNull(), // app-generated stable id
+        spanId: text("span_id").notNull(),
 
         startTokenIndex: integer("start_token_index").notNull(),
-        endTokenIndex: integer("end_token_index").notNull(), // inclusive
+        endTokenIndex: integer("end_token_index").notNull(),
 
         charStart: integer("char_start").notNull(),
-        charEnd: integer("char_end").notNull(), // exclusive
+        charEnd: integer("char_end").notNull(),
 
         text: text("text"),
         hash: text("hash"),
@@ -8263,9 +8925,9 @@ export const bpTokenSpan = sqliteTable(
         pk: primaryKey({ columns: [t.translationId, t.verseKey, t.spanId] }),
         idx: index("bp_token_span_idx").on(t.translationId, t.verseKey, t.startTokenIndex, t.endTokenIndex),
         charIdx: index("bp_token_span_char_idx").on(t.translationId, t.verseKey, t.charStart, t.charEnd),
-        startCheck: check("bp_token_span_start_check", sql`${t.startTokenIndex} >= 0`),
+        startCheck: check("bp_token_span_start_check", intGe(t.startTokenIndex, 0)),
         endCheck: check("bp_token_span_end_check", sql`${t.endTokenIndex} >= ${t.startTokenIndex}`),
-        charStartCheck: check("bp_token_span_char_start_check", sql`${t.charStart} >= 0`),
+        charStartCheck: check("bp_token_span_char_start_check", intGe(t.charStart, 0)),
         charEndCheck: check("bp_token_span_char_end_check", sql`${t.charEnd} > ${t.charStart}`),
     }),
 );
@@ -8275,7 +8937,7 @@ export const bpTokenSpan = sqliteTable(
 export const bpRange = sqliteTable(
     "bp_range",
     {
-        rangeId: text("range_id").primaryKey(), // uuid / cuid
+        rangeId: text("range_id").primaryKey(),
         startVerseOrd: integer("start_verse_ord").notNull(),
         endVerseOrd: integer("end_verse_ord").notNull(),
         startVerseKey: text("start_verse_key").notNull(),
@@ -8292,8 +8954,8 @@ export const bpRange = sqliteTable(
         ordIdx: index("bp_range_ord_idx").on(t.startVerseOrd, t.endVerseOrd),
         startKeyIdx: index("bp_range_start_key_idx").on(t.startVerseKey, t.endVerseKey),
         spanCheck: check("bp_range_span_check", sql`${t.startVerseOrd} <= ${t.endVerseOrd}`),
-        verseCountCheck: check("bp_range_verse_count_check", sql`${t.verseCount} is null or ${t.verseCount} >= 1`),
-        chapterCountCheck: check("bp_range_chapter_count_check", sql`${t.chapterCount} is null or ${t.chapterCount} >= 1`),
+        verseCountCheck: check("bp_range_verse_count_check", intMaybeGe(t.verseCount, 1)),
+        chapterCountCheck: check("bp_range_chapter_count_check", intMaybeGe(t.chapterCount, 1)),
     }),
 );
 
@@ -8312,12 +8974,9 @@ export const bpPericope = sqliteTable(
     (t) => ({
         bookIdx: index("bp_pericope_book_idx").on(t.bookId, t.rank),
         rangeIdx: index("bp_pericope_range_idx").on(t.rangeId),
-        rankCheck: check("bp_pericope_rank_check", sql`${t.rank} is null or ${t.rank} >= 0`),
-        confCheck: check(
-            "bp_pericope_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-        titleCheck: check("bp_pericope_title_check", sql`length(${t.title}) > 0`),
+        rankCheck: check("bp_pericope_rank_check", intMaybeGe(t.rank, 0)),
+        confCheck: check("bp_pericope_conf_check", confidence01(t.confidence)),
+        titleCheck: check("bp_pericope_title_check", lenGt0(t.title)),
     }),
 );
 
@@ -8336,12 +8995,9 @@ export const bpParagraph = sqliteTable(
     (t) => ({
         rangeIdx: index("bp_paragraph_range_idx").on(t.translationId, t.rangeId),
         ordIdx: index("bp_paragraph_ord_idx").on(t.translationId, t.ordinal),
-        styleCheck: check(
-            "bp_paragraph_style_check",
-            sql`${t.style} in ('PROSE','POETRY','LIST','QUOTE','LETTER')`,
-        ),
-        indentCheck: check("bp_paragraph_indent_check", sql`${t.indent} >= 0`),
-        ordinalCheck: check("bp_paragraph_ordinal_check", sql`${t.ordinal} is null or ${t.ordinal} >= 0`),
+        styleCheck: check("bp_paragraph_style_check", inStringSet(t.style, PARAGRAPH_STYLE_VALUES)),
+        indentCheck: check("bp_paragraph_indent_check", intGe(t.indent, 0)),
+        ordinalCheck: check("bp_paragraph_ordinal_check", intMaybeGe(t.ordinal, 0)),
     }),
 );
 
@@ -8358,22 +9014,13 @@ export const bpDocUnit = sqliteTable(
         parentUnitId: text("parent_unit_id"),
     },
     (t) => ({
-        kindCheck: check(
-            "bp_doc_unit_kind_check",
-            sql`${t.kind} in ('SECTION','SPEECH','SONG','LETTER_PART','NARRATIVE_BLOCK')`,
-        ),
+        kindCheck: check("bp_doc_unit_kind_check", inStringSet(t.kind, DOC_UNIT_KIND_VALUES)),
         rangeIdx: index("bp_doc_unit_range_idx").on(t.rangeId),
         ordIdx: index("bp_doc_unit_ord_idx").on(t.ordinal),
         parentIdx: index("bp_doc_unit_parent_idx").on(t.parentUnitId),
-        confCheck: check(
-            "bp_doc_unit_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-        ordinalCheck: check("bp_doc_unit_ordinal_check", sql`${t.ordinal} is null or ${t.ordinal} >= 0`),
-        notSelfCheck: check(
-            "bp_doc_unit_not_self_check",
-            sql`${t.parentUnitId} is null or ${t.parentUnitId} <> ${t.unitId}`,
-        ),
+        confCheck: check("bp_doc_unit_conf_check", confidence01(t.confidence)),
+        ordinalCheck: check("bp_doc_unit_ordinal_check", intMaybeGe(t.ordinal, 0)),
+        notSelfCheck: check("bp_doc_unit_not_self_check", sql`${t.parentUnitId} is null or ${t.parentUnitId} <> ${t.unitId}`),
     }),
 );
 
@@ -8395,16 +9042,10 @@ export const bpEntity = sqliteTable(
         slugUniq: uniqueIndex("bp_entity_slug_uniq").on(t.slug),
         nameIdx: index("bp_entity_name_idx").on(t.canonicalName),
         kindIdx: index("bp_entity_kind_idx").on(t.kind),
-        kindCheck: check(
-            "bp_entity_kind_check",
-            sql`${t.kind} in ('PERSON','PLACE','GROUP','DYNASTY','EMPIRE','REGION','ARTIFACT','OFFICE')`,
-        ),
-        confCheck: check(
-            "bp_entity_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-        nameCheck: check("bp_entity_name_check", sql`length(${t.canonicalName}) > 0`),
-        slugCheck: check("bp_entity_slug_check", sql`length(${t.slug}) > 0`),
+        kindCheck: check("bp_entity_kind_check", inStringSet(t.kind, ENTITY_KIND_VALUES)),
+        confCheck: check("bp_entity_conf_check", confidence01(t.confidence)),
+        nameCheck: check("bp_entity_name_check", lenGt0(t.canonicalName)),
+        slugCheck: check("bp_entity_slug_check", lenGt0(t.slug)),
     }),
 );
 
@@ -8423,11 +9064,8 @@ export const bpEntityName = sqliteTable(
     (t) => ({
         normIdx: index("bp_entity_name_norm_idx").on(t.nameNorm),
         entityIdx: index("bp_entity_name_entity_idx").on(t.entityId, t.isPrimary),
-        confCheck: check(
-            "bp_entity_name_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-        nameCheck: check("bp_entity_name_name_check", sql`length(${t.name}) > 0`),
+        confCheck: check("bp_entity_name_conf_check", confidence01(t.confidence)),
+        nameCheck: check("bp_entity_name_name_check", lenGt0(t.name)),
         nameNormCheck: check("bp_entity_name_name_norm_check", sql`length(${t.nameNorm}) >= 0`),
     }),
 );
@@ -8448,15 +9086,9 @@ export const bpEntityRelation = sqliteTable(
         fromIdx: index("bp_entity_relation_from_idx").on(t.fromEntityId, t.kind),
         toIdx: index("bp_entity_relation_to_idx").on(t.toEntityId, t.kind),
         kindIdx: index("bp_entity_relation_kind_idx").on(t.kind),
-        kindCheck: check(
-            "bp_entity_relation_kind_check",
-            sql`${t.kind} in ('PARENT_OF','CHILD_OF','SPOUSE_OF','SIBLING_OF','RULES_OVER','MEMBER_OF','ALLY_OF','ENEMY_OF','SUCCEEDS')`,
-        ),
+        kindCheck: check("bp_entity_relation_kind_check", inStringSet(t.kind, RELATION_KIND_VALUES)),
         notSelf: check("bp_entity_relation_not_self", sql`not (${t.fromEntityId} = ${t.toEntityId})`),
-        confCheck: check(
-            "bp_entity_relation_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
+        confCheck: check("bp_entity_relation_conf_check", confidence01(t.confidence)),
     }),
 );
 
@@ -8466,14 +9098,14 @@ export const bpPlaceGeo = sqliteTable(
     "bp_place_geo",
     {
         placeGeoId: text("place_geo_id").primaryKey(),
-        entityId: text("entity_id").notNull(), // bp_entity(kind=PLACE)
+        entityId: text("entity_id").notNull(),
         geoType: text("geo_type").notNull(),
 
         lat: real("lat"),
         lng: real("lng"),
 
-        bbox: text("bbox"), // JSON
-        polygon: text("polygon"), // GeoJSON
+        bbox: text("bbox"),
+        polygon: text("polygon"),
 
         precisionM: real("precision_m"),
         source: text("source").notNull(),
@@ -8481,17 +9113,11 @@ export const bpPlaceGeo = sqliteTable(
     },
     (t) => ({
         entityIdx: index("bp_place_geo_entity_idx").on(t.entityId),
-        typeCheck: check("bp_place_geo_type_check", sql`${t.geoType} in ('POINT','BBOX','REGION_POLYGON')`),
+        typeCheck: check("bp_place_geo_type_check", inStringSet(t.geoType, GEO_TYPE_VALUES)),
         latCheck: check("bp_place_geo_lat_check", sql`${t.lat} is null or (${t.lat} >= -90 and ${t.lat} <= 90)`),
         lngCheck: check("bp_place_geo_lng_check", sql`${t.lng} is null or (${t.lng} >= -180 and ${t.lng} <= 180)`),
-        precisionCheck: check(
-            "bp_place_geo_precision_check",
-            sql`${t.precisionM} is null or ${t.precisionM} >= 0`,
-        ),
-        confCheck: check(
-            "bp_place_geo_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
+        precisionCheck: check("bp_place_geo_precision_check", realMaybeGe(t.precisionM, 0)),
+        confCheck: check("bp_place_geo_conf_check", confidence01(t.confidence)),
     }),
 );
 
@@ -8506,11 +9132,8 @@ export const bpRoute = sqliteTable(
     },
     (t) => ({
         titleIdx: index("bp_route_title_idx").on(t.title),
-        confCheck: check(
-            "bp_route_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-        titleCheck: check("bp_route_title_check", sql`length(${t.title}) > 0`),
+        confCheck: check("bp_route_conf_check", confidence01(t.confidence)),
+        titleCheck: check("bp_route_title_check", lenGt0(t.title)),
     }),
 );
 
@@ -8529,11 +9152,8 @@ export const bpRouteStep = sqliteTable(
         ordUniq: uniqueIndex("bp_route_step_ord_uniq").on(t.routeId, t.ordinal),
         routeIdx: index("bp_route_step_route_idx").on(t.routeId, t.ordinal),
         placeIdx: index("bp_route_step_place_idx").on(t.placeEntityId),
-        ordCheck: check("bp_route_step_ord_check", sql`${t.ordinal} >= 1`),
-        distanceCheck: check(
-            "bp_route_step_distance_check",
-            sql`${t.distanceKm} is null or ${t.distanceKm} >= 0`,
-        ),
+        ordCheck: check("bp_route_step_ord_check", intGe(t.ordinal, 1)),
+        distanceCheck: check("bp_route_step_distance_check", realMaybeGe(t.distanceKm, 0)),
     }),
 );
 
@@ -8552,25 +9172,16 @@ export const bpTimeSpan = sqliteTable(
         endYearMin: integer("end_year_min"),
         endYearMax: integer("end_year_max"),
 
-        calendar: text("calendar").notNull().default("BCE_CE"),
+        calendar: text("calendar").notNull().default(CalendarKind.BCE_CE),
         eraTag: text("era_tag"),
 
         source: text("source").notNull(),
         confidence: real("confidence"),
     },
     (t) => ({
-        calCheck: check("bp_time_span_calendar_check", sql`${t.calendar} in ('BCE_CE','ANNO_MUNDI')`),
-        eraCheck: check(
-            "bp_time_span_era_check",
-            sql`${t.eraTag} is null or ${t.eraTag} in (
-                'PRIMEVAL','PATRIARCHS','EXODUS_WILDERNESS','CONQUEST_JUDGES','UNITED_MONARCHY',
-                'DIVIDED_KINGDOM','EXILE','SECOND_TEMPLE','GOSPELS','APOSTOLIC'
-            )`,
-        ),
-        confCheck: check(
-            "bp_time_span_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
+        calCheck: check("bp_time_span_calendar_check", inStringSet(t.calendar, CALENDAR_KIND_VALUES)),
+        eraCheck: check("bp_time_span_era_check", sql`${t.eraTag} is null or ${inStringSet(t.eraTag, ERA_TAG_VALUES)}`),
+        confCheck: check("bp_time_span_conf_check", confidence01(t.confidence)),
     }),
 );
 
@@ -8588,14 +9199,8 @@ export const bpTimelineAnchor = sqliteTable(
         rangeIdx: index("bp_timeline_anchor_range_idx").on(t.rangeId),
         timeIdx: index("bp_timeline_anchor_time_idx").on(t.timeSpanId),
         kindIdx: index("bp_timeline_anchor_kind_idx").on(t.kind),
-        kindCheck: check(
-            "bp_timeline_anchor_kind_check",
-            sql`${t.kind} in ('SETTING','EVENT_WINDOW','REIGN','JOURNEY_WINDOW')`,
-        ),
-        confCheck: check(
-            "bp_timeline_anchor_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
+        kindCheck: check("bp_timeline_anchor_kind_check", inStringSet(t.kind, TIMELINE_ANCHOR_KIND_VALUES)),
+        confCheck: check("bp_timeline_anchor_conf_check", confidence01(t.confidence)),
     }),
 );
 
@@ -8609,7 +9214,7 @@ export const bpEvent = sqliteTable(
         kind: text("kind").notNull(),
         primaryRangeId: text("primary_range_id").notNull(),
         timeSpanId: text("time_span_id"),
-        primaryPlaceId: text("primary_place_id"), // entity_id(kind=PLACE)
+        primaryPlaceId: text("primary_place_id"),
         source: text("source").notNull(),
         confidence: real("confidence"),
         summaryNeutral: text("summary_neutral"),
@@ -8619,18 +9224,9 @@ export const bpEvent = sqliteTable(
         rangeIdx: index("bp_event_range_idx").on(t.primaryRangeId),
         placeIdx: index("bp_event_place_idx").on(t.primaryPlaceId),
         timeIdx: index("bp_event_time_idx").on(t.timeSpanId),
-        kindCheck: check(
-            "bp_event_kind_check",
-            sql`${t.kind} in (
-                'BIRTH','DEATH','BATTLE','COVENANT','EXODUS','MIGRATION','SPEECH','MIRACLE','PROPHECY',
-                'CAPTIVITY','RETURN','CRUCIFIXION','RESURRECTION','MISSION_JOURNEY','COUNCIL','LETTER_WRITTEN','OTHER'
-            )`,
-        ),
-        confCheck: check(
-            "bp_event_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-        titleCheck: check("bp_event_title_check", sql`length(${t.canonicalTitle}) > 0`),
+        kindCheck: check("bp_event_kind_check", inStringSet(t.kind, EVENT_KIND_VALUES)),
+        confCheck: check("bp_event_conf_check", confidence01(t.confidence)),
+        titleCheck: check("bp_event_title_check", lenGt0(t.canonicalTitle)),
     }),
 );
 
@@ -8647,14 +9243,8 @@ export const bpEventParticipant = sqliteTable(
         eventIdx: index("bp_event_participant_event_idx").on(t.eventId),
         entityIdx: index("bp_event_participant_entity_idx").on(t.entityId),
         roleIdx: index("bp_event_participant_role_idx").on(t.role),
-        roleCheck: check(
-            "bp_event_participant_role_check",
-            sql`${t.role} in ('SUBJECT','AGENT','WITNESS','OPPONENT','RULER','PEOPLE','OTHER')`,
-        ),
-        confCheck: check(
-            "bp_event_participant_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
+        roleCheck: check("bp_event_participant_role_check", inStringSet(t.role, PARTICIPANT_ROLE_VALUES)),
+        confCheck: check("bp_event_participant_conf_check", confidence01(t.confidence)),
     }),
 );
 
@@ -8676,22 +9266,10 @@ export const bpLink = sqliteTable(
         rangeIdx: index("bp_link_range_idx").on(t.rangeId, t.linkKind),
         targetIdx: index("bp_link_target_idx").on(t.targetKind, t.targetId),
         kindIdx: index("bp_link_kind_idx").on(t.linkKind),
-        targetKindCheck: check(
-            "bp_link_target_kind_check",
-            sql`${t.targetKind} in ('ENTITY','EVENT','ROUTE','PLACE_GEO')`,
-        ),
-        linkKindCheck: check(
-            "bp_link_link_kind_check",
-            sql`${t.linkKind} in (
-                'MENTIONS','PRIMARY_SUBJECT','LOCATION','SETTING','JOURNEY_STEP',
-                'PARALLEL_ACCOUNT','QUOTE_SOURCE','QUOTE_TARGET'
-            )`,
-        ),
-        weightCheck: check("bp_link_weight_check", sql`${t.weight} >= 1`),
-        confCheck: check(
-            "bp_link_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
+        targetKindCheck: check("bp_link_target_kind_check", inStringSet(t.targetKind, LINK_TARGET_KIND_VALUES)),
+        linkKindCheck: check("bp_link_link_kind_check", inStringSet(t.linkKind, LINK_KIND_VALUES)),
+        weightCheck: check("bp_link_weight_check", intGe(t.weight, 1)),
+        confCheck: check("bp_link_conf_check", confidence01(t.confidence)),
     }),
 );
 
@@ -8710,15 +9288,9 @@ export const bpCrossref = sqliteTable(
         fromIdx: index("bp_crossref_from_idx").on(t.fromRangeId, t.kind),
         toIdx: index("bp_crossref_to_idx").on(t.toRangeId, t.kind),
         kindIdx: index("bp_crossref_kind_idx").on(t.kind),
-        kindCheck: check("bp_crossref_kind_check", sql`${t.kind} in ('PARALLEL','QUOTE','ALLUSION','TOPICAL')`),
-        confCheck: check(
-            "bp_crossref_conf_check",
-            sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
-        ),
-        notSelfCheck: check(
-            "bp_crossref_not_self_check",
-            sql`not (${t.fromRangeId} = ${t.toRangeId} and ${t.kind} = 'PARALLEL')`,
-        ),
+        kindCheck: check("bp_crossref_kind_check", inStringSet(t.kind, CROSSREF_KIND_VALUES)),
+        confCheck: check("bp_crossref_conf_check", confidence01(t.confidence)),
+        notSelfCheck: check("bp_crossref_not_self_check", sql`not (${t.fromRangeId} = ${t.toRangeId} and ${t.kind} = 'PARALLEL')`),
     }),
 );
 
@@ -8739,8 +9311,8 @@ export const bpSearchQueryLog = sqliteTable(
         normIdx: index("bp_search_query_log_norm_idx").on(t.queryNorm),
         createdIdx: index("bp_search_query_log_created_idx").on(t.createdAt),
         translationIdx: index("bp_search_query_log_translation_idx").on(t.translationId, t.createdAt),
-        hitsCheck: check("bp_search_query_log_hits_check", sql`${t.hits} >= 0`),
-        queryCheck: check("bp_search_query_log_query_check", sql`length(${t.query}) > 0`),
+        hitsCheck: check("bp_search_query_log_hits_check", intGe(t.hits, 0)),
+        queryCheck: check("bp_search_query_log_query_check", lenGt0(t.query)),
     }),
 );
 
@@ -8763,13 +9335,8 @@ export const bpReaderEvent = sqliteTable(
         anonIdx: index("bp_reader_event_anon_idx").on(t.anonId, t.createdAt),
         typeIdx: index("bp_reader_event_type_idx").on(t.eventType, t.createdAt),
         verseIdx: index("bp_reader_event_verse_idx").on(t.translationId, t.verseKey, t.createdAt),
-        typeCheck: check(
-            "bp_reader_event_type_check",
-            sql`${t.eventType} in (
-                'VIEW_VERSE','VIEW_CHAPTER','SCROLL_BACK','COPY_TEXT','OPEN_ENTITY','OPEN_MAP','OPEN_TIMELINE','SEARCH'
-            )`,
-        ),
-        durCheck: check("bp_reader_event_duration_check", sql`${t.durationMs} is null or ${t.durationMs} >= 0`),
+        typeCheck: check("bp_reader_event_type_check", inStringSet(t.eventType, READER_EVENT_TYPE_VALUES)),
+        durCheck: check("bp_reader_event_duration_check", intMaybeGe(t.durationMs, 0)),
     }),
 );
 
@@ -8788,8 +9355,8 @@ export const bpSource = sqliteTable(
     },
     (t) => ({
         nameIdx: index("bp_source_name_idx").on(t.name),
-        kindCheck: check("bp_source_kind_check", sql`${t.kind} in ('IMPORT','MANUAL','DATASET')`),
-        nameCheck: check("bp_source_name_check", sql`length(${t.name}) > 0`),
+        kindCheck: check("bp_source_kind_check", inStringSet(t.kind, SOURCE_KIND_VALUES)),
+        nameCheck: check("bp_source_name_check", lenGt0(t.name)),
     }),
 );
 
@@ -8800,8 +9367,8 @@ export const bpAudit = sqliteTable(
         entityKind: text("entity_kind").notNull(),
         entityId: text("entity_id").notNull(),
         action: text("action").notNull(),
-        before: text("before"), // JSON
-        after: text("after"), // JSON
+        before: text("before"),
+        after: text("after"),
         sourceId: text("source_id"),
         createdAt: text("created_at").notNull().default(nowIso),
     },
@@ -8809,20 +9376,12 @@ export const bpAudit = sqliteTable(
         entIdx: index("bp_audit_entity_idx").on(t.entityKind, t.entityId, t.createdAt),
         actionIdx: index("bp_audit_action_idx").on(t.action, t.createdAt),
         sourceIdx: index("bp_audit_source_idx").on(t.sourceId, t.createdAt),
-        actionCheck: check("bp_audit_action_check", sql`${t.action} in ('INSERT','UPDATE','DELETE')`),
+        actionCheck: check("bp_audit_action_check", inStringSet(t.action, AUDIT_ACTION_VALUES)),
     }),
 );
 
 /* ------------------------------------ FTS ----------------------------------- */
-/**
- * Optional FTS5 extras for verse text search.
- * Applied by migrate.ts (extras runner), not by Drizzle schema.
- *
- * Notes:
- * - Keeps translation-aware verse text search
- * - Adds optional token FTS for future word/phrase acceleration
- * - token FTS intentionally excludes SPACE/LINEBREAK rows
- */
+
 export const FTS_MIGRATION_SQL = `
 -- ---------------------------------------------------------------------------
 -- Verse text FTS
@@ -8854,8 +9413,7 @@ CREATE TRIGGER IF NOT EXISTS bp_verse_text_au AFTER UPDATE ON bp_verse_text BEGI
 END;
 
 -- ---------------------------------------------------------------------------
--- Token FTS (optional but very useful for exact token/word search debugging,
--- selection tooling, and future word-level retrieval optimizations)
+-- Token FTS
 -- ---------------------------------------------------------------------------
 CREATE VIRTUAL TABLE IF NOT EXISTS bp_token_fts USING fts5(
   translation_id UNINDEXED,
@@ -8898,50 +9456,40 @@ END;
 /* ---------------------------- Export convenience ---------------------------- */
 
 export const schema = {
-    // Canonical scripture
     bpBook,
     bpVerse,
     bpChapter,
 
-    // Translation + text
     bpTranslation,
     bpVerseText,
     bpToken,
     bpTokenSpan,
 
-    // Structural/range layer
     bpRange,
     bpPericope,
     bpParagraph,
     bpDocUnit,
 
-    // Entity universe
     bpEntity,
     bpEntityName,
     bpEntityRelation,
 
-    // Geography
     bpPlaceGeo,
     bpRoute,
     bpRouteStep,
 
-    // Time / chronology
     bpTimeSpan,
     bpTimelineAnchor,
 
-    // Events
     bpEvent,
     bpEventParticipant,
 
-    // Orientation graph
     bpLink,
     bpCrossref,
 
-    // Search / telemetry
     bpSearchQueryLog,
     bpReaderEvent,
 
-    // Provenance / audit
     bpSource,
     bpAudit,
 } as const;
@@ -23645,15 +24193,15 @@ export default defineConfig({
 
 ### biblia.to-code-export.md
 
-> TRUNCATED: file was 926523 bytes; showing first 48000 chars
+> TRUNCATED: file was 1088834 bytes; showing first 48000 chars
 
 ```md
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-06T23:09:01.871Z
+Generated: 2026-03-06T23:25:32.060Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
-Total files: 70
-Total raw bytes (all included files): 1782874
+Total files: 72
+Total raw bytes (all included files): 1968108
 Truncated/skipped files: 1
 Export time: 17ms
 
@@ -23838,76 +24386,13 @@ vite.config.ts.timestamp-*
 ```ts
 // apps/api/drizzle.config.ts
 import type { Config } from "drizzle-kit";
-import * as path from "node:path";
-import * as fs from "node:fs";
-
-/**
- * Drizzle Kit runs under Node (bunx), so use file-based paths.
- *
- * Schema:
- * - ./src/db/schema.ts       (core Biblia Populi tables)
- * - ./src/db/authSchema.ts   (bp_user / bp_auth_account / bp_session)
- *
- * Migrations output: ./drizzle
- *
- * DB path resolution:
- * - If BP_DB_PATH is set:
- *    - ":memory:" is NOT supported by drizzle-kit (needs a file), so we fall back to repo-local file.
- *    - Relative paths are resolved against process.cwd().
- * - Otherwise:
- *    - Use apps/api/data/biblia.sqlite (relative to repo root if you run from root)
- *
- * IMPORTANT:
- * - drizzle-kit resolves schema paths relative to process.cwd().
- * - To make this robust whether you run bunx from repo root OR from apps/api,
- *   we generate absolute paths for schema + migrations folder.
- */
-
-const HERE = path.dirname(new URL(import.meta.url).pathname);
-
-// On Windows, URL pathname starts with /C:/...; normalize it.
-function normalizeHere(p: string): string {
-    if (process.platform === "win32" && p.startsWith("/")) return p.slice(1);
-    return p;
-}
-
-const HERE_FS = normalizeHere(HERE);
-const API_DIR = path.resolve(HERE_FS); // .../apps/api
-
-function isMemoryDb(p: string): boolean {
-    return p === ":memory:" || p.startsWith("file::memory:");
-}
-
-function resolveDbPath(): string {
-    const raw = (process.env.BP_DB_PATH ?? "").trim();
-
-    // default: repo-local file (works when running from repo root OR apps/api)
-    if (!raw) return path.resolve(API_DIR, "data", "biblia.sqlite");
-
-    // drizzle-kit needs a file path, not in-memory
-    if (isMemoryDb(raw)) return path.resolve(API_DIR, "data", "biblia.sqlite");
-
-    return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
-}
-
-const dbPath = resolveDbPath();
-
-// Ensure directory exists so drizzle-kit can create the DB file if needed
-try {
-    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-} catch {
-    // ignore; drizzle-kit will error if it truly can't write
-}
-
-const schemaCore = path.resolve(API_DIR, "src", "db", "schema.ts");
-const schemaAuth = path.resolve(API_DIR, "src", "db", "authSchema.ts");
 
 export default {
-    schema: [schemaCore, schemaAuth],
-    out: path.resolve(API_DIR, "drizzle"),
+    schema: ["./src/db/schema.ts", "./src/db/authSchema.ts"],
+    out: "./drizzle",
     dialect: "sqlite",
     dbCredentials: {
-        url: dbPath,
+        url: "./data/biblia.sqlite",
     },
     strict: true,
     verbose: true,
@@ -23940,6 +24425,13 @@ export default {
       "version": "6",
       "when": 1772556186504,
       "tag": "0002_romantic_prowler",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1772839421817,
+      "tag": "0003_sparkling_rumiko_fujikawa",
       "breakpoints": true
     }
   ]
@@ -25455,7 +25947,86 @@ export default {
         "created_at": {
           "name": "created_at",
           "type": "text",
-          "primaryKey":
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        }
+      },
+      "indexes": {
+        "bp_search_query_log_norm_idx": {
+          "name": "bp_search_query_log_norm_idx",
+          "columns": [
+            "query_norm"
+          ],
+          "isUnique": false
+        },
+        "bp_search_query_log_created_idx": {
+          "name": "bp_search_query_log_created_idx",
+          "columns": [
+            "created_at"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "bp_search_query_log_hits_check": {
+          "name": "bp_search_query_log_hits_check",
+          "value": "\"bp_search_query_log\".\"hits\" >= 0"
+        }
+      }
+    },
+    "bp_source": {
+      "name": "bp_source",
+      "columns": {
+        "source_id": {
+          "name": "source_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "version": {
+          "name": "version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "url": {
+          "name": "url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "license": {
+          "name": "license",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "notes": {
+          "name": "notes",
+          "type": "text",
 ```
 
 ### export-repo.ts

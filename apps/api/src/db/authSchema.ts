@@ -17,14 +17,26 @@
 // Notes:
 // - SQLite UNIQUE allows multiple NULLs, so email remains “unique when present”.
 // - Canon data is intentionally separate; auth is app/user infrastructure only.
+//
+// SQLite caveat:
+// - CHECK constraints in DDL cannot contain bound parameters.
+// - So any numeric literals used inside sql template fragments for CHECKs must be inlined
+//   with sql.raw(...), not interpolated as normal parameters.
 
+import { sql, type SQL } from "drizzle-orm";
 import { sqliteTable, text, integer, index, uniqueIndex, check } from "drizzle-orm/sqlite-core";
-import { sql } from "drizzle-orm";
 
 /* -------------------------------- Helpers --------------------------------- */
 
+function intLiteral(n: number): SQL {
+    if (!Number.isInteger(n)) {
+        throw new Error(`[authSchema] expected integer literal, got ${n}`);
+    }
+    return sql.raw(String(n));
+}
+
 const lenGt0 = (col: unknown) => sql`length(${col as any}) > 0`;
-const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${n}`;
+const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${intLiteral(n)}`;
 
 /* --------------------------------- Users ---------------------------------- */
 
@@ -58,7 +70,7 @@ export const bpUser = sqliteTable(
         idCheck: check("bp_user_id_check", lenGt0(t.id)),
         emailCheck: check(
             "bp_user_email_check",
-            sql`${t.email} is null or length(trim(${t.email})) >= 3`,
+            sql`${t.email} is null or length(trim(${t.email})) >= ${intLiteral(3)}`,
         ),
         displayNameCheck: check(
             "bp_user_display_name_check",
