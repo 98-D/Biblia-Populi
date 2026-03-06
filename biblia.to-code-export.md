@@ -1,11 +1,11 @@
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-05T23:36:18.235Z
+Generated: 2026-03-06T21:58:44.247Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
-Total files: 54
-Total raw bytes (all included files): 1290421
+Total files: 60
+Total raw bytes (all included files): 1621988
 Truncated/skipped files: 1
-Export time: 21ms
+Export time: 22ms
 
 ## Notes
 
@@ -29,6 +29,10 @@ Export time: 21ms
 │   │   │   ├── auth/
 │   │   │   ├── reader/
 │   │   │   │   ├── prefs/
+├── packages/
+│   ├── annotation/
+│   │   ├── src/
+│   │   │   ├── model/
 ├── scripts/
 ```
 
@@ -4842,24 +4846,40 @@ export default {
 
 ```json
 {
-  "name": "@bp/api",
+  "name": "@biblia/api",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "bun --watch src/server.ts",
     "start": "bun src/server.ts",
+
+    "build": "bun build src/server.ts --outdir dist --target bun",
+    "start:dist": "bun dist/server.js",
+
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "bun run typecheck",
+
     "db:gen": "bunx drizzle-kit generate --config ./drizzle.config.ts",
+    "drizzle:generate": "bun run db:gen",
+
     "db:studio": "bunx drizzle-kit studio --config ./drizzle.config.ts",
+    "drizzle:studio": "bun run db:studio",
+
     "db:migrate": "bun src/db/migrate.ts",
     "db:seed": "bun src/db/seed.ts",
-    "db:bootstrap": "bun src/db/migrate.ts && bun src/db/seed.ts",
+    "db:bootstrap": "bun run db:migrate && bun run db:seed",
+
     "import:osis": "bun scripts/import-osis.ts",
+
     "db:reset": "bun scripts/reset-db.ts",
     "db:verify": "bun scripts/verify-db.ts",
-    "db:build": "bun scripts/reset-db.ts && bun scripts/import-osis.ts && bun scripts/verify-db.ts"
+    "db:build": "bun run db:reset && bun run import:osis && bun run db:verify",
+
+    "clean": "bun x rimraf dist"
   },
   "dependencies": {
+    "@biblia/annotation": "workspace:*",
     "drizzle-orm": "^0.45.1",
     "hono": "^4.12.3",
     "saxes": "^6.0.0",
@@ -4868,7 +4888,11 @@ export default {
   "devDependencies": {
     "@types/bun": "^1.3.9",
     "drizzle-kit": "^0.31.9",
+    "rimraf": "^6.0.1",
     "typescript": "^5.9.3"
+  },
+  "engines": {
+    "bun": ">=1.3.10"
   }
 }
 ```
@@ -5812,34 +5836,66 @@ main().catch((e) => fatal(e));
 // apps/api/src/db/annotationSchema.ts
 // Biblia.to — Reader Annotations schema (user data; NOT canon)
 //
-// Goals:
-// - Works with a virtualized reader (ranges/tokens; no dependence on pixel layout)
-// - Supports: highlights, notes, drawings/ink
-// - Stable anchors: verse-ord ranges + optional token spans
-// - Sync-friendly: revision, updatedAtMs, soft delete
+// Hardened goals:
+// - Virtualization-safe anchors: verse-ord truth + optional token spans + optional char offsets
+// - Durable user data that survives canon/token rebuilds
+// - Stronger invariants between related fields
+// - Sync-friendly writes: rev, tombstones, idempotency, device/client metadata
+// - Better relational structure for collections + sharing
+// - Ink storage supports both inline and chunked payloads
 //
-// Notes on anchoring strategy:
-// - Primary anchor is ALWAYS scripture-structural: startVerseOrd/endVerseOrd.
-// - If you tokenize (bp_token), store start/end token indices for exactness.
-// - For drawings, we store normalized points in [0..1] coords for a per-annotation “canvas”
-//   defined by an anchor range. UI can map it to whatever layout it renders.
+// Important:
+// - This module references bpUser from authSchema.
+// - It intentionally does NOT FK to canon tables (bp_verse, bp_token, etc.).
+//   Annotation durability matters more than rebuild-coupled referential integrity.
+//
+// SQLite / Drizzle:
+// - All timestamps are INTEGER ms epoch.
+// - JSON payloads are stored as TEXT.
+// - Do not treat viewport pixels as truth.
 
-import { sqliteTable, text, integer, real, index, uniqueIndex, primaryKey, check } from "drizzle-orm/sqlite-core";
+import {
+    sqliteTable,
+    text,
+    integer,
+    real,
+    index,
+    uniqueIndex,
+    primaryKey,
+    check,
+    foreignKey,
+} from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 import { bpUser } from "./authSchema";
+
+/* --------------------------------- Helpers --------------------------------- */
+
+const lenGt0 = (col: unknown) => sql`length(${col as any}) > 0`;
+const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${n}`;
+const jsonNonEmptyArrayish = (col: unknown) => sql`length(trim(${col as any})) >= 2`;
+
+/* ---------------------------------- Enums ---------------------------------- */
 
 export const AnnotationKind = {
     HIGHLIGHT: "HIGHLIGHT",
     NOTE: "NOTE",
     INK: "INK",
+    BOOKMARK: "BOOKMARK",
 } as const;
 export type AnnotationKind = (typeof AnnotationKind)[keyof typeof AnnotationKind];
 
 export const AnchorKind = {
-    RANGE: "RANGE", // verse-ord range (required)
-    TOKEN_SPAN: "TOKEN_SPAN", // within verse-ord range (optional token indices)
+    RANGE: "RANGE",
+    TOKEN_SPAN: "TOKEN_SPAN",
+    LOCATION: "LOCATION",
 } as const;
 export type AnchorKind = (typeof AnchorKind)[keyof typeof AnchorKind];
+
+export const NoteFormat = {
+    PLAIN: "plain",
+    MD: "md",
+} as const;
+export type NoteFormat = (typeof NoteFormat)[keyof typeof NoteFormat];
 
 export const InkTool = {
     PEN: "PEN",
@@ -5848,51 +5904,195 @@ export const InkTool = {
 } as const;
 export type InkTool = (typeof InkTool)[keyof typeof InkTool];
 
-export const bpAnnotation = sqliteTable(
-    "bp_annotation",
+export const PrivacyLevel = {
+    PRIVATE: "PRIVATE",
+    SHARED_LINK: "SHARED_LINK",
+    PUBLIC: "PUBLIC",
+} as const;
+export type PrivacyLevel = (typeof PrivacyLevel)[keyof typeof PrivacyLevel];
+
+export const PaletteKind = {
+    HIGHLIGHT: "HIGHLIGHT",
+    INK: "INK",
+    TAG: "TAG",
+} as const;
+export type PaletteKind = (typeof PaletteKind)[keyof typeof PaletteKind];
+
+export const AnnotationShareScope = {
+    ANNOTATIONS: "ANNOTATIONS",
+    COLLECTION: "COLLECTION",
+} as const;
+export type AnnotationShareScope = (typeof AnnotationShareScope)[keyof typeof AnnotationShareScope];
+
+export const InkStorageMode = {
+    INLINE: "INLINE",
+    CHUNKED: "CHUNKED",
+} as const;
+export type InkStorageMode = (typeof InkStorageMode)[keyof typeof InkStorageMode];
+
+export const AnnotationEventKind = {
+    CREATE: "CREATE",
+    UPDATE: "UPDATE",
+    DELETE: "DELETE",
+    RESTORE: "RESTORE",
+    ADD_STROKE: "ADD_STROKE",
+    DEL_STROKE: "DEL_STROKE",
+    ADD_LABEL: "ADD_LABEL",
+    DEL_LABEL: "DEL_LABEL",
+    MOVE_COLLECTION: "MOVE_COLLECTION",
+} as const;
+export type AnnotationEventKind = (typeof AnnotationEventKind)[keyof typeof AnnotationEventKind];
+
+/* -------------------------- Collections / Notebooks ------------------------- */
+
+export const bpAnnotationCollection = sqliteTable(
+    "bp_annotation_collection",
     {
-        annotationId: text("annotation_id").primaryKey(), // uuid / cuid
+        collectionId: text("collection_id").primaryKey(), // uuid/cuid/ulid
         userId: text("user_id")
             .notNull()
             .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        kind: text("kind").notNull(), // HIGHLIGHT | NOTE | INK
-        rev: integer("rev").notNull().default(1), // optimistic sync revision (monotonic per annotation)
+        name: text("name").notNull(),
+        nameNorm: text("name_norm").notNull(),
 
-        createdAt: integer("created_at").notNull(), // ms epoch
-        updatedAt: integer("updated_at").notNull(), // ms epoch
-        deletedAt: integer("deleted_at"), // ms epoch (nullable; soft delete)
+        description: text("description"),
+        color: text("color"),
+        icon: text("icon"),
 
-        // Optional visual styling
-        color: text("color"), // e.g. "#FFD54A"
-        opacity: real("opacity"), // 0..1
-        styleJson: text("style_json"), // JSON blob: tool presets, underline, etc.
-
-        // Optional content
-        noteText: text("note_text"), // for NOTE
-        noteFormat: text("note_format"), // "plain" | "md" (optional)
+        sortOrdinal: integer("sort_ordinal"),
+        createdAt: integer("created_at").notNull(),
+        updatedAt: integer("updated_at").notNull(),
+        deletedAt: integer("deleted_at"),
     },
     (t) => ({
-        userIdx: index("bp_annotation_user_idx").on(t.userId, t.updatedAt),
-        kindIdx: index("bp_annotation_kind_idx").on(t.kind),
-        updatedIdx: index("bp_annotation_updated_idx").on(t.updatedAt),
+        userIdx: index("bp_annotation_collection_user_idx").on(t.userId, t.updatedAt),
+        userSortIdx: index("bp_annotation_collection_user_sort_idx").on(t.userId, t.sortOrdinal, t.updatedAt),
+        nameUq: uniqueIndex("bp_annotation_collection_name_uq").on(t.userId, t.nameNorm),
 
-        kindCheck: check("bp_annotation_kind_check", sql`${t.kind} in ('HIGHLIGHT','NOTE','INK')`),
-        revCheck: check("bp_annotation_rev_check", sql`${t.rev} >= 1`),
-        opacityCheck: check("bp_annotation_opacity_check", sql`${t.opacity} is null or (${t.opacity} >= 0 and ${t.opacity} <= 1)`),
+        idCheck: check("bp_annotation_collection_id_check", lenGt0(t.collectionId)),
+        nameCheck: check("bp_annotation_collection_name_check", lenGt0(t.name)),
+        nameNormCheck: check("bp_annotation_collection_name_norm_check", lenGt0(t.nameNorm)),
+        sortCheck: check(
+            "bp_annotation_collection_sort_check",
+            sql`${t.sortOrdinal} is null or ${t.sortOrdinal} >= 0`,
+        ),
+        chronologyCheck: check(
+            "bp_annotation_collection_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_collection_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
+        ),
     }),
 );
 
-/**
- * A single annotation can target one or more spans (most will be exactly 1).
- * Span is anchored by verse ordinals; optional token indices tighten the selection.
- *
- * token indices are relative to bp_token(token_index) for the SAME (translation_id, verse_key).
- * If your tokenization is per-verse, a token span that crosses verses can be represented as:
- * - start token index in the start verse
- * - end token index in the end verse
- * - span still anchored via ordinals for ordering.
- */
+/* ----------------------------- Core Annotation ------------------------------ */
+
+export const bpAnnotation = sqliteTable(
+    "bp_annotation",
+    {
+        annotationId: text("annotation_id").primaryKey(), // uuid/cuid/ksuid/ulid
+        userId: text("user_id")
+            .notNull()
+            .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        kind: text("kind").notNull(), // AnnotationKind
+
+        // Optimistic concurrency / sync revision.
+        rev: integer("rev").notNull().default(1),
+
+        // Idempotent write support.
+        idempotencyKey: text("idempotency_key"),
+
+        // Device / client metadata for debugging + sync reconciliation.
+        createdDeviceId: text("created_device_id"),
+        updatedDeviceId: text("updated_device_id"),
+        clientCreatedAt: integer("client_created_at"),
+        clientUpdatedAt: integer("client_updated_at"),
+
+        createdAt: integer("created_at").notNull(),
+        updatedAt: integer("updated_at").notNull(),
+        deletedAt: integer("deleted_at"),
+
+        collectionId: text("collection_id").references(() => bpAnnotationCollection.collectionId, {
+            onDelete: "set null",
+            onUpdate: "cascade",
+        }),
+
+        title: text("title"),
+
+        // Visual style.
+        color: text("color"),
+        opacity: real("opacity"),
+        paletteId: text("palette_id"),
+        styleJson: text("style_json"),
+
+        // NOTE / BOOKMARK payload
+        noteText: text("note_text"),
+        noteFormat: text("note_format"),
+        noteHtml: text("note_html"), // cached / derived render surface
+
+        // Derived, denormalized search surface for quick LIKE/FTS pipelines.
+        textSearch: text("text_search"),
+
+        // Optional user sort override / pin order inside a collection or view.
+        sortOrdinal: integer("sort_ordinal"),
+    },
+    (t) => ({
+        userIdx: index("bp_annotation_user_idx").on(t.userId, t.updatedAt),
+        userKindIdx: index("bp_annotation_user_kind_idx").on(t.userId, t.kind, t.updatedAt),
+        userCollectionIdx: index("bp_annotation_user_collection_idx").on(t.userId, t.collectionId, t.updatedAt),
+        updatedIdx: index("bp_annotation_updated_idx").on(t.updatedAt),
+        deletedIdx: index("bp_annotation_deleted_idx").on(t.deletedAt),
+        idemUq: uniqueIndex("bp_annotation_idem_uq").on(t.userId, t.idempotencyKey),
+
+        kindCheck: check(
+            "bp_annotation_kind_check",
+            sql`${t.kind} in ('HIGHLIGHT','NOTE','INK','BOOKMARK')`,
+        ),
+        revCheck: check("bp_annotation_rev_check", sql`${t.rev} >= 1`),
+        opacityCheck: check(
+            "bp_annotation_opacity_check",
+            sql`${t.opacity} is null or (${t.opacity} >= 0 and ${t.opacity} <= 1)`,
+        ),
+        idCheck: check("bp_annotation_id_check", lenGt0(t.annotationId)),
+        userIdCheck: check("bp_annotation_user_id_check", lenGt0(t.userId)),
+        noteFormatCheck: check(
+            "bp_annotation_note_format_check",
+            sql`${t.noteFormat} is null or ${t.noteFormat} in ('plain','md')`,
+        ),
+        sortCheck: check(
+            "bp_annotation_sort_check",
+            sql`${t.sortOrdinal} is null or ${t.sortOrdinal} >= 0`,
+        ),
+        chronologyCheck: check(
+            "bp_annotation_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        clientChronologyCheck: check(
+            "bp_annotation_client_chronology_check",
+            sql`${t.clientCreatedAt} is null or ${t.clientUpdatedAt} is null or ${t.clientUpdatedAt} >= ${t.clientCreatedAt}`,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
+        ),
+        notePayloadCheck: check(
+            "bp_annotation_note_payload_check",
+            sql`
+                ${t.kind} != 'NOTE'
+                or ${t.noteText} is not null
+                or ${t.noteHtml} is not null
+                or ${t.title} is not null
+            `,
+        ),
+    }),
+);
+
+/* ------------------------------ Span Anchors -------------------------------- */
+
 export const bpAnnotationSpan = sqliteTable(
     "bp_annotation_span",
     {
@@ -5900,37 +6100,54 @@ export const bpAnnotationSpan = sqliteTable(
             .notNull()
             .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        spanOrdinal: integer("span_ordinal").notNull(), // 1..N ordering of spans
+        spanOrdinal: integer("span_ordinal").notNull(), // 1..N
 
         anchorKind: text("anchor_kind").notNull().default("RANGE"),
 
-        translationId: text("translation_id"), // optional; null = applies to any translation (rare)
-        // Required structural anchor:
+        // Null means translation-agnostic structural anchor.
+        // Set for token-precise, translation-specific anchoring.
+        translationId: text("translation_id"),
+
+        // Structural truth.
         startVerseOrd: integer("start_verse_ord").notNull(),
         endVerseOrd: integer("end_verse_ord").notNull(),
 
-        // Optional: for convenience / debugging / export
+        // Convenience / export / debugging snapshots.
         startVerseKey: text("start_verse_key"),
         endVerseKey: text("end_verse_key"),
 
-        // Optional token anchoring (recommended for “partial verse” highlights)
+        // Optional exact token anchoring.
         startTokenIndex: integer("start_token_index"),
         endTokenIndex: integer("end_token_index"),
 
-        // Optional exactness helpers (do not rely on these for identity)
-        selectedText: text("selected_text"), // snapshot (can be null)
-        selectedTextHash: text("selected_text_hash"), // hash of snapshot (optional)
+        // Optional char offsets inside start/end verse text.
+        startCharOffset: integer("start_char_offset"),
+        endCharOffset: integer("end_char_offset"),
+
+        selectedText: text("selected_text"),
+        selectedTextHash: text("selected_text_hash"),
+        selectionVersion: integer("selection_version"),
+
+        // Logical pin inside local span space [0..1]; never viewport pixels.
+        pinX: real("pin_x"),
+        pinY: real("pin_y"),
     },
     (t) => ({
         pk: primaryKey({ columns: [t.annotationId, t.spanOrdinal] }),
+
         annIdx: index("bp_annotation_span_ann_idx").on(t.annotationId),
         ordIdx: index("bp_annotation_span_ord_idx").on(t.startVerseOrd, t.endVerseOrd),
+        transIdx: index("bp_annotation_span_trans_idx").on(t.translationId, t.startVerseOrd, t.endVerseOrd),
+        startKeyIdx: index("bp_annotation_span_start_key_idx").on(t.translationId, t.startVerseKey),
+        endKeyIdx: index("bp_annotation_span_end_key_idx").on(t.translationId, t.endVerseKey),
 
-        anchorKindCheck: check("bp_annotation_span_anchor_kind_check", sql`${t.anchorKind} in ('RANGE','TOKEN_SPAN')`),
+        anchorKindCheck: check(
+            "bp_annotation_span_anchor_kind_check",
+            sql`${t.anchorKind} in ('RANGE','TOKEN_SPAN','LOCATION')`,
+        ),
         spanOrdCheck: check("bp_annotation_span_ordinal_check", sql`${t.spanOrdinal} >= 1`),
         spanCheck: check("bp_annotation_span_check", sql`${t.startVerseOrd} <= ${t.endVerseOrd}`),
 
-        // token span sanity (if provided)
         tokStartCheck: check(
             "bp_annotation_span_tok_start_check",
             sql`${t.startTokenIndex} is null or ${t.startTokenIndex} >= 0`,
@@ -5939,48 +6156,523 @@ export const bpAnnotationSpan = sqliteTable(
             "bp_annotation_span_tok_end_check",
             sql`${t.endTokenIndex} is null or ${t.endTokenIndex} >= 0`,
         ),
+
+        charStartCheck: check(
+            "bp_annotation_span_char_start_check",
+            sql`${t.startCharOffset} is null or ${t.startCharOffset} >= 0`,
+        ),
+        charEndCheck: check(
+            "bp_annotation_span_char_end_check",
+            sql`${t.endCharOffset} is null or ${t.endCharOffset} >= 0`,
+        ),
+
+        tokenPairCheck: check(
+            "bp_annotation_span_token_pair_check",
+            sql`(${t.startTokenIndex} is null) = (${t.endTokenIndex} is null)`,
+        ),
+        charPairCheck: check(
+            "bp_annotation_span_char_pair_check",
+            sql`(${t.startCharOffset} is null) = (${t.endCharOffset} is null)`,
+        ),
+
+        tokenSpanRequiresTranslationCheck: check(
+            "bp_annotation_span_token_requires_translation_check",
+            sql`${t.anchorKind} != 'TOKEN_SPAN' or ${t.translationId} is not null`,
+        ),
+        tokenSpanRequiresTokensCheck: check(
+            "bp_annotation_span_token_requires_tokens_check",
+            sql`${t.anchorKind} != 'TOKEN_SPAN' or (${t.startTokenIndex} is not null and ${t.endTokenIndex} is not null)`,
+        ),
+        locationSingleVerseCheck: check(
+            "bp_annotation_span_location_single_verse_check",
+            sql`${t.anchorKind} != 'LOCATION' or ${t.startVerseOrd} = ${t.endVerseOrd}`,
+        ),
+
+        sameVerseTokenOrderCheck: check(
+            "bp_annotation_span_same_verse_token_order_check",
+            sql`
+                ${t.startTokenIndex} is null
+                or ${t.endTokenIndex} is null
+                or ${t.startVerseOrd} != ${t.endVerseOrd}
+                or ${t.startTokenIndex} <= ${t.endTokenIndex}
+            `,
+        ),
+        sameVerseCharOrderCheck: check(
+            "bp_annotation_span_same_verse_char_order_check",
+            sql`
+                ${t.startCharOffset} is null
+                or ${t.endCharOffset} is null
+                or ${t.startVerseOrd} != ${t.endVerseOrd}
+                or ${t.startCharOffset} <= ${t.endCharOffset}
+            `,
+        ),
+
+        selectionVersionCheck: check(
+            "bp_annotation_span_selection_version_check",
+            sql`${t.selectionVersion} is null or ${t.selectionVersion} >= 1`,
+        ),
+
+        pinXCheck: check(
+            "bp_annotation_span_pin_x_check",
+            sql`${t.pinX} is null or (${t.pinX} >= 0 and ${t.pinX} <= 1)`,
+        ),
+        pinYCheck: check(
+            "bp_annotation_span_pin_y_check",
+            sql`${t.pinY} is null or (${t.pinY} >= 0 and ${t.pinY} <= 1)`,
+        ),
     }),
 );
 
-/**
- * INK payload: one annotation can have many strokes.
- * Points are stored as JSON (array of points).
- * - x/y are normalized to [0..1] in the local “ink canvas” of the span.
- * - You can optionally include t (time ms offset) and p (pressure 0..1) in each point.
- */
-export const bpAnnotationInkStroke = sqliteTable(
-    "bp_annotation_ink_stroke",
+export const bpAnnotationSpanBBox = sqliteTable(
+    "bp_annotation_span_bbox",
     {
-        strokeId: text("stroke_id").primaryKey(), // uuid / cuid
+        annotationId: text("annotation_id").notNull(),
+        spanOrdinal: integer("span_ordinal").notNull(),
+
+        minX: real("min_x").notNull(),
+        minY: real("min_y").notNull(),
+        maxX: real("max_x").notNull(),
+        maxY: real("max_y").notNull(),
+
+        updatedAt: integer("updated_at").notNull(),
+    },
+    (t) => ({
+        pk: primaryKey({ columns: [t.annotationId, t.spanOrdinal] }),
+        spanFk: foreignKey({
+            columns: [t.annotationId, t.spanOrdinal],
+            foreignColumns: [bpAnnotationSpan.annotationId, bpAnnotationSpan.spanOrdinal],
+            name: "bp_annotation_span_bbox_span_fk",
+        }).onDelete("cascade").onUpdate("cascade"),
+        idx: index("bp_annotation_span_bbox_idx").on(t.annotationId, t.spanOrdinal),
+
+        minXCheck: check("bp_annotation_span_bbox_min_x_check", sql`${t.minX} >= 0 and ${t.minX} <= 1`),
+        minYCheck: check("bp_annotation_span_bbox_min_y_check", sql`${t.minY} >= 0 and ${t.minY} <= 1`),
+        maxXCheck: check("bp_annotation_span_bbox_max_x_check", sql`${t.maxX} >= 0 and ${t.maxX} <= 1`),
+        maxYCheck: check("bp_annotation_span_bbox_max_y_check", sql`${t.maxY} >= 0 and ${t.maxY} <= 1`),
+        spanCheck: check(
+            "bp_annotation_span_bbox_span_check",
+            sql`${t.minX} <= ${t.maxX} and ${t.minY} <= ${t.maxY}`,
+        ),
+    }),
+);
+
+/* ------------------------------ Labels / Tags ------------------------------- */
+
+export const bpAnnotationLabel = sqliteTable(
+    "bp_annotation_label",
+    {
+        labelId: text("label_id").primaryKey(),
+        userId: text("user_id")
+            .notNull()
+            .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        name: text("name").notNull(),
+        nameNorm: text("name_norm").notNull(),
+
+        color: text("color"),
+        createdAt: integer("created_at").notNull(),
+        updatedAt: integer("updated_at").notNull(),
+        deletedAt: integer("deleted_at"),
+    },
+    (t) => ({
+        userIdx: index("bp_annotation_label_user_idx").on(t.userId, t.updatedAt),
+        normUq: uniqueIndex("bp_annotation_label_norm_uq").on(t.userId, t.nameNorm),
+
+        idCheck: check("bp_annotation_label_id_check", lenGt0(t.labelId)),
+        nameCheck: check("bp_annotation_label_name_check", lenGt0(t.name)),
+        nameNormCheck: check("bp_annotation_label_name_norm_check", lenGt0(t.nameNorm)),
+        chronologyCheck: check(
+            "bp_annotation_label_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_label_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
+        ),
+    }),
+);
+
+export const bpAnnotationLabelLink = sqliteTable(
+    "bp_annotation_label_link",
+    {
         annotationId: text("annotation_id")
             .notNull()
             .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        ordinal: integer("ordinal").notNull(), // 1..N ordering within annotation
-        tool: text("tool").notNull().default("PEN"), // PEN | HIGHLIGHTER | ERASER
+        labelId: text("label_id")
+            .notNull()
+            .references(() => bpAnnotationLabel.labelId, { onDelete: "cascade", onUpdate: "cascade" }),
 
+        createdAt: integer("created_at").notNull(),
+    },
+    (t) => ({
+        pk: primaryKey({ columns: [t.annotationId, t.labelId] }),
+        annIdx: index("bp_annotation_label_link_ann_idx").on(t.annotationId),
+        labelIdx: index("bp_annotation_label_link_label_idx").on(t.labelId),
+    }),
+);
+
+/* -------------------------------- Palette ---------------------------------- */
+
+export const bpAnnotationPalette = sqliteTable(
+    "bp_annotation_palette",
+    {
+        paletteId: text("palette_id").primaryKey(),
+        userId: text("user_id")
+            .notNull()
+            .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        kind: text("kind").notNull(),
+        name: text("name").notNull(),
+        nameNorm: text("name_norm").notNull(),
+
+        color: text("color").notNull(),
+        opacity: real("opacity"),
+
+        createdAt: integer("created_at").notNull(),
+        updatedAt: integer("updated_at").notNull(),
+        deletedAt: integer("deleted_at"),
+    },
+    (t) => ({
+        userIdx: index("bp_annotation_palette_user_idx").on(t.userId, t.kind, t.updatedAt),
+        nameUq: uniqueIndex("bp_annotation_palette_name_uq").on(t.userId, t.kind, t.nameNorm),
+
+        kindCheck: check("bp_annotation_palette_kind_check", sql`${t.kind} in ('HIGHLIGHT','INK','TAG')`),
+        idCheck: check("bp_annotation_palette_id_check", lenGt0(t.paletteId)),
+        nameCheck: check("bp_annotation_palette_name_check", lenGt0(t.name)),
+        nameNormCheck: check("bp_annotation_palette_name_norm_check", lenGt0(t.nameNorm)),
+        colorCheck: check("bp_annotation_palette_color_check", lenGe(t.color, 4)),
+        opacityCheck: check(
+            "bp_annotation_palette_opacity_check",
+            sql`${t.opacity} is null or (${t.opacity} >= 0 and ${t.opacity} <= 1)`,
+        ),
+        chronologyCheck: check(
+            "bp_annotation_palette_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_palette_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
+        ),
+    }),
+);
+
+/* ----------------------------------- Ink ----------------------------------- */
+
+export const bpAnnotationInkStroke = sqliteTable(
+    "bp_annotation_ink_stroke",
+    {
+        strokeId: text("stroke_id").primaryKey(),
+        annotationId: text("annotation_id")
+            .notNull()
+            .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        ordinal: integer("ordinal").notNull(),
+        tool: text("tool").notNull().default("PEN"),
+
+        storageMode: text("storage_mode").notNull().default("INLINE"),
+
+        paletteId: text("palette_id"),
         color: text("color"),
         opacity: real("opacity"),
-        width: real("width"), // “pen width” in normalized units (UI decides mapping)
 
-        // Bounding box in normalized coords (optional but nice for rendering perf)
+        // Width in normalized local-span units.
+        width: real("width"),
+
+        brushJson: text("brush_json"),
+
         minX: real("min_x"),
         minY: real("min_y"),
         maxX: real("max_x"),
         maxY: real("max_y"),
 
-        pointsJson: text("points_json").notNull(), // JSON array of points
-        createdAt: integer("created_at").notNull(), // ms epoch
+        pointCount: integer("point_count"),
+
+        // INLINE mode: full payload here.
+        // CHUNKED mode: null here; use chunk rows.
+        pointsJson: text("points_json"),
+
+        createdAt: integer("created_at").notNull(),
+        deletedAt: integer("deleted_at"),
     },
     (t) => ({
         annIdx: index("bp_annotation_ink_ann_idx").on(t.annotationId),
         ordUq: uniqueIndex("bp_annotation_ink_ord_uq").on(t.annotationId, t.ordinal),
+        deletedIdx: index("bp_annotation_ink_deleted_idx").on(t.annotationId, t.deletedAt),
 
-        toolCheck: check("bp_annotation_ink_tool_check", sql`${t.tool} in ('PEN','HIGHLIGHTER','ERASER')`),
+        storageModeCheck: check(
+            "bp_annotation_ink_storage_mode_check",
+            sql`${t.storageMode} in ('INLINE','CHUNKED')`,
+        ),
+        toolCheck: check(
+            "bp_annotation_ink_tool_check",
+            sql`${t.tool} in ('PEN','HIGHLIGHTER','ERASER')`,
+        ),
         ordCheck: check("bp_annotation_ink_ord_check", sql`${t.ordinal} >= 1`),
-        opacityCheck: check("bp_annotation_ink_opacity_check", sql`${t.opacity} is null or (${t.opacity} >= 0 and ${t.opacity} <= 1)`),
+        opacityCheck: check(
+            "bp_annotation_ink_opacity_check",
+            sql`${t.opacity} is null or (${t.opacity} >= 0 and ${t.opacity} <= 1)`,
+        ),
+        widthCheck: check(
+            "bp_annotation_ink_width_check",
+            sql`${t.width} is null or ${t.width} >= 0`,
+        ),
+        pointCountCheck: check(
+            "bp_annotation_ink_point_count_check",
+            sql`${t.pointCount} is null or ${t.pointCount} >= 0`,
+        ),
+        bboxMinXCheck: check(
+            "bp_annotation_ink_min_x_check",
+            sql`${t.minX} is null or (${t.minX} >= 0 and ${t.minX} <= 1)`,
+        ),
+        bboxMinYCheck: check(
+            "bp_annotation_ink_min_y_check",
+            sql`${t.minY} is null or (${t.minY} >= 0 and ${t.minY} <= 1)`,
+        ),
+        bboxMaxXCheck: check(
+            "bp_annotation_ink_max_x_check",
+            sql`${t.maxX} is null or (${t.maxX} >= 0 and ${t.maxX} <= 1)`,
+        ),
+        bboxMaxYCheck: check(
+            "bp_annotation_ink_max_y_check",
+            sql`${t.maxY} is null or (${t.maxY} >= 0 and ${t.maxY} <= 1)`,
+        ),
+        bboxOrderCheck: check(
+            "bp_annotation_ink_bbox_order_check",
+            sql`
+                (
+                    ${t.minX} is null and ${t.minY} is null and ${t.maxX} is null and ${t.maxY} is null
+                ) or (
+                    ${t.minX} is not null and ${t.minY} is not null and ${t.maxX} is not null and ${t.maxY} is not null
+                    and ${t.minX} <= ${t.maxX}
+                    and ${t.minY} <= ${t.maxY}
+                )
+            `,
+        ),
+        storagePayloadCheck: check(
+            "bp_annotation_ink_storage_payload_check",
+            sql`
+                (${t.storageMode} = 'INLINE' and ${t.pointsJson} is not null)
+                or (${t.storageMode} = 'CHUNKED' and ${t.pointsJson} is null)
+            `,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_ink_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
+        ),
     }),
 );
+
+export const bpAnnotationInkStrokeChunk = sqliteTable(
+    "bp_annotation_ink_stroke_chunk",
+    {
+        strokeId: text("stroke_id")
+            .notNull()
+            .references(() => bpAnnotationInkStroke.strokeId, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        chunkIndex: integer("chunk_index").notNull(),
+        pointsJson: text("points_json").notNull(),
+
+        createdAt: integer("created_at").notNull(),
+    },
+    (t) => ({
+        pk: primaryKey({ columns: [t.strokeId, t.chunkIndex] }),
+        idx: index("bp_annotation_ink_stroke_chunk_idx").on(t.strokeId),
+        chunkCheck: check("bp_annotation_ink_stroke_chunk_check", sql`${t.chunkIndex} >= 0`),
+        pointsCheck: check("bp_annotation_ink_stroke_chunk_points_check", lenGt0(t.pointsJson)),
+    }),
+);
+
+/* ------------------------------ Attachments -------------------------------- */
+
+export const bpAnnotationAttachment = sqliteTable(
+    "bp_annotation_attachment",
+    {
+        attachmentId: text("attachment_id").primaryKey(),
+        annotationId: text("annotation_id")
+            .notNull()
+            .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        kind: text("kind").notNull(), // image | audio | file | ...
+        mime: text("mime"),
+        byteSize: integer("byte_size"),
+        storageKey: text("storage_key").notNull(),
+        originalName: text("original_name"),
+        sha256: text("sha256"),
+
+        createdAt: integer("created_at").notNull(),
+        deletedAt: integer("deleted_at"),
+    },
+    (t) => ({
+        annIdx: index("bp_annotation_attachment_ann_idx").on(t.annotationId),
+        kindIdx: index("bp_annotation_attachment_kind_idx").on(t.kind),
+        storageIdx: uniqueIndex("bp_annotation_attachment_storage_uq").on(t.storageKey),
+
+        attachmentIdCheck: check("bp_annotation_attachment_id_check", lenGt0(t.attachmentId)),
+        kindCheck: check("bp_annotation_attachment_kind_check", lenGt0(t.kind)),
+        storageCheck: check("bp_annotation_attachment_storage_check", lenGt0(t.storageKey)),
+        sizeCheck: check(
+            "bp_annotation_attachment_size_check",
+            sql`${t.byteSize} is null or ${t.byteSize} >= 0`,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_attachment_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
+        ),
+    }),
+);
+
+/* ------------------------------ Share / Export ------------------------------ */
+
+export const bpAnnotationShare = sqliteTable(
+    "bp_annotation_share",
+    {
+        shareId: text("share_id").primaryKey(),
+        userId: text("user_id")
+            .notNull()
+            .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        privacy: text("privacy").notNull().default("PRIVATE"),
+        scope: text("scope").notNull().default("ANNOTATIONS"),
+
+        // Optional stable slug / token for public or shared-link retrieval.
+        shareSlug: text("share_slug"),
+
+        // For collection-scoped shares.
+        collectionId: text("collection_id").references(() => bpAnnotationCollection.collectionId, {
+            onDelete: "set null",
+            onUpdate: "cascade",
+        }),
+
+        title: text("title"),
+        note: text("note"),
+
+        createdAt: integer("created_at").notNull(),
+        updatedAt: integer("updated_at").notNull(),
+        revokedAt: integer("revoked_at"),
+    },
+    (t) => ({
+        userIdx: index("bp_annotation_share_user_idx").on(t.userId, t.updatedAt),
+        shareSlugUq: uniqueIndex("bp_annotation_share_slug_uq").on(t.shareSlug),
+
+        privacyCheck: check(
+            "bp_annotation_share_privacy_check",
+            sql`${t.privacy} in ('PRIVATE','SHARED_LINK','PUBLIC')`,
+        ),
+        scopeCheck: check(
+            "bp_annotation_share_scope_check",
+            sql`${t.scope} in ('ANNOTATIONS','COLLECTION')`,
+        ),
+        chronologyCheck: check(
+            "bp_annotation_share_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        revokedChronologyCheck: check(
+            "bp_annotation_share_revoked_chronology_check",
+            sql`${t.revokedAt} is null or ${t.revokedAt} >= ${t.createdAt}`,
+        ),
+        collectionScopeCheck: check(
+            "bp_annotation_share_collection_scope_check",
+            sql`${t.scope} != 'COLLECTION' or ${t.collectionId} is not null`,
+        ),
+    }),
+);
+
+export const bpAnnotationShareItem = sqliteTable(
+    "bp_annotation_share_item",
+    {
+        shareId: text("share_id")
+            .notNull()
+            .references(() => bpAnnotationShare.shareId, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        annotationId: text("annotation_id")
+            .notNull()
+            .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        ordinal: integer("ordinal").notNull(),
+        createdAt: integer("created_at").notNull(),
+    },
+    (t) => ({
+        pk: primaryKey({ columns: [t.shareId, t.annotationId] }),
+        shareOrdUq: uniqueIndex("bp_annotation_share_item_ord_uq").on(t.shareId, t.ordinal),
+        annIdx: index("bp_annotation_share_item_ann_idx").on(t.annotationId),
+        ordCheck: check("bp_annotation_share_item_ord_check", sql`${t.ordinal} >= 1`),
+    }),
+);
+
+/* ------------------------------- Event Log --------------------------------- */
+
+export const bpAnnotationEvent = sqliteTable(
+    "bp_annotation_event",
+    {
+        eventId: text("event_id").primaryKey(),
+        userId: text("user_id")
+            .notNull()
+            .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        annotationId: text("annotation_id"),
+        annotationRev: integer("annotation_rev"),
+        kind: text("kind").notNull(),
+        at: integer("at").notNull(),
+
+        // Client / sync metadata
+        clientAt: integer("client_at"),
+        deviceId: text("device_id"),
+        idempotencyKey: text("idempotency_key"),
+
+        // Optional detailed links
+        strokeId: text("stroke_id"),
+        labelId: text("label_id"),
+        collectionId: text("collection_id"),
+
+        payloadJson: text("payload_json"),
+    },
+    (t) => ({
+        userIdx: index("bp_annotation_event_user_idx").on(t.userId, t.at),
+        annIdx: index("bp_annotation_event_ann_idx").on(t.annotationId, t.at),
+        kindIdx: index("bp_annotation_event_kind_idx").on(t.kind, t.at),
+        annRevIdx: index("bp_annotation_event_ann_rev_idx").on(t.annotationId, t.annotationRev),
+
+        kindCheck: check(
+            "bp_annotation_event_kind_check",
+            sql`${t.kind} in (
+                'CREATE','UPDATE','DELETE','RESTORE',
+                'ADD_STROKE','DEL_STROKE',
+                'ADD_LABEL','DEL_LABEL',
+                'MOVE_COLLECTION'
+            )`,
+        ),
+        revCheck: check(
+            "bp_annotation_event_rev_check",
+            sql`${t.annotationRev} is null or ${t.annotationRev} >= 1`,
+        ),
+    }),
+);
+
+/* ---------------------------- Export convenience ---------------------------- */
+
+export const annotationSchema = {
+    bpAnnotationCollection,
+
+    bpAnnotation,
+    bpAnnotationSpan,
+    bpAnnotationSpanBBox,
+
+    bpAnnotationLabel,
+    bpAnnotationLabelLink,
+
+    bpAnnotationPalette,
+
+    bpAnnotationInkStroke,
+    bpAnnotationInkStrokeChunk,
+
+    bpAnnotationAttachment,
+
+    bpAnnotationShare,
+    bpAnnotationShareItem,
+
+    bpAnnotationEvent,
+} as const;
 ```
 
 ### apps/api/src/db/authSchema.ts
@@ -5989,19 +6681,32 @@ export const bpAnnotationInkStroke = sqliteTable(
 // apps/api/src/db/authSchema.ts
 // Biblia.to — Auth/Identity schema (DB-backed sessions + OAuth accounts)
 //
-// Intent:
-// - Minimal + durable identity core
-// - Provider accounts (Google) keyed by (provider, provider_user_id)
+// Goals:
+// - Minimal, durable identity core
+// - Provider accounts keyed by (provider, provider_user_id)
 // - Server-side sessions (opaque id in HttpOnly cookie)
-// - Tokens optional + nullable
+// - Optional provider tokens, nullable
+// - Stronger invariants for timestamps / required fields
+// - Production-friendly indexes for auth/session lookups
 //
 // IMPORTANT:
-// - We store timestamps as INTEGER milliseconds since epoch (number).
+// - Timestamps are stored as INTEGER milliseconds since epoch (number).
 // - Do NOT use { mode: "timestamp_ms" } here, because that types columns as Date
-//   and will fight your server.ts (which uses number ms everywhere).
+//   and conflicts with the rest of the API/server code which uses number ms everywhere.
+//
+// Notes:
+// - SQLite UNIQUE allows multiple NULLs, so email remains “unique when present”.
+// - Canon data is intentionally separate; auth is app/user infrastructure only.
 
 import { sqliteTable, text, integer, index, uniqueIndex, check } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
+
+/* -------------------------------- Helpers --------------------------------- */
+
+const lenGt0 = (col: unknown) => sql`length(${col as any}) > 0`;
+const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${n}`;
+
+/* --------------------------------- Users ---------------------------------- */
 
 export const bpUser = sqliteTable(
     "bp_user",
@@ -6013,7 +6718,7 @@ export const bpUser = sqliteTable(
 
         displayName: text("display_name"),
 
-        // Optional (but common). Unique when present.
+        // Optional, but common. Unique when present.
         email: text("email"),
         emailVerifiedAt: integer("email_verified_at"), // ms epoch (nullable)
 
@@ -6026,10 +6731,35 @@ export const bpUser = sqliteTable(
     (t) => ({
         emailUq: uniqueIndex("bp_user_email_uq").on(t.email),
 
-        idCheck: check("bp_user_id_check", sql`length(${t.id}) > 0`),
-        emailCheck: check("bp_user_email_check", sql`${t.email} is null or length(${t.email}) > 3`),
+        updatedIdx: index("bp_user_updated_idx").on(t.updatedAt),
+        emailIdx: index("bp_user_email_idx").on(t.email),
+        disabledIdx: index("bp_user_disabled_idx").on(t.disabledAt),
+
+        idCheck: check("bp_user_id_check", lenGt0(t.id)),
+        emailCheck: check(
+            "bp_user_email_check",
+            sql`${t.email} is null or length(trim(${t.email})) >= 3`,
+        ),
+        displayNameCheck: check(
+            "bp_user_display_name_check",
+            sql`${t.displayName} is null or length(trim(${t.displayName})) > 0`,
+        ),
+        chronologyCheck: check(
+            "bp_user_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        emailVerifiedCheck: check(
+            "bp_user_email_verified_check",
+            sql`${t.emailVerifiedAt} is null or ${t.emailVerifiedAt} >= ${t.createdAt}`,
+        ),
+        disabledCheck: check(
+            "bp_user_disabled_check",
+            sql`${t.disabledAt} is null or ${t.disabledAt} >= ${t.createdAt}`,
+        ),
     }),
 );
+
+/* ----------------------------- Provider Accounts --------------------------- */
 
 export const bpAuthAccount = sqliteTable(
     "bp_auth_account",
@@ -6043,7 +6773,7 @@ export const bpAuthAccount = sqliteTable(
             .notNull()
             .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        provider: text("provider").notNull(), // "google"
+        provider: text("provider").notNull(), // e.g. "google"
         providerUserId: text("provider_user_id").notNull(), // Google "sub"
 
         // Optional storage (nullable; many apps don't persist these)
@@ -6054,13 +6784,33 @@ export const bpAuthAccount = sqliteTable(
     },
     (t) => ({
         userIdx: index("bp_auth_account_user_idx").on(t.userId),
+        providerLookupIdx: index("bp_auth_account_provider_lookup_idx").on(t.provider, t.providerUserId),
+        accessExpIdx: index("bp_auth_account_access_exp_idx").on(t.accessTokenExpiresAt),
         providerUq: uniqueIndex("bp_auth_account_provider_uq").on(t.provider, t.providerUserId),
 
-        providerCheck: check("bp_auth_account_provider_check", sql`length(${t.provider}) > 0`),
-        providerUserIdCheck: check("bp_auth_account_provider_user_id_check", sql`length(${t.providerUserId}) > 0`),
-        userIdCheck: check("bp_auth_account_user_id_check", sql`length(${t.userId}) > 0`),
+        idCheck: check("bp_auth_account_id_check", lenGt0(t.id)),
+        userIdCheck: check("bp_auth_account_user_id_check", lenGt0(t.userId)),
+        providerCheck: check("bp_auth_account_provider_check", lenGt0(t.provider)),
+        providerUserIdCheck: check(
+            "bp_auth_account_provider_user_id_check",
+            lenGt0(t.providerUserId),
+        ),
+        chronologyCheck: check(
+            "bp_auth_account_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        accessTokenExpiresCheck: check(
+            "bp_auth_account_access_token_expires_check",
+            sql`${t.accessTokenExpiresAt} is null or ${t.accessTokenExpiresAt} >= ${t.createdAt}`,
+        ),
+        scopeCheck: check(
+            "bp_auth_account_scope_check",
+            sql`${t.scope} is null or length(trim(${t.scope})) > 0`,
+        ),
     }),
 );
+
+/* -------------------------------- Sessions -------------------------------- */
 
 export const bpSession = sqliteTable(
     "bp_session",
@@ -6080,34 +6830,57 @@ export const bpSession = sqliteTable(
     },
     (t) => ({
         userIdx: index("bp_session_user_idx").on(t.userId),
+        userExpIdx: index("bp_session_user_exp_idx").on(t.userId, t.expiresAt),
         expIdx: index("bp_session_exp_idx").on(t.expiresAt),
 
-        idCheck: check("bp_session_id_check", sql`length(${t.id}) > 0`),
-        userIdCheck: check("bp_session_user_id_check", sql`length(${t.userId}) > 0`),
-        expiresCheck: check("bp_session_expires_check", sql`${t.expiresAt} > ${t.createdAt}`),
+        idCheck: check("bp_session_id_check", lenGt0(t.id)),
+        userIdCheck: check("bp_session_user_id_check", lenGt0(t.userId)),
+        expiresCheck: check(
+            "bp_session_expires_check",
+            sql`${t.expiresAt} > ${t.createdAt}`,
+        ),
+        ipCheck: check(
+            "bp_session_ip_check",
+            sql`${t.ip} is null or length(trim(${t.ip})) > 0`,
+        ),
+        uaCheck: check(
+            "bp_session_ua_check",
+            sql`${t.ua} is null or length(trim(${t.ua})) > 0`,
+        ),
     }),
 );
+
+/* ----------------------------- Export surface ------------------------------ */
+
+export const authSchema = {
+    bpUser,
+    bpAuthAccount,
+    bpSession,
+} as const;
 ```
 
 ### apps/api/src/db/client.ts
 
 ```ts
 // apps/api/src/db/client.ts
-// Biblia Populi — DB bootstrap (Drizzle + Bun native SQLite)
+// Biblia.to — DB bootstrap (Drizzle + Bun native SQLite)
 //
 // Uses:
 // - bun:sqlite (built-in, fast)
 // - drizzle-orm/bun-sqlite driver
 //
 // Exports:
-// - openDb(dbPath?): { sqlite, db, dbPath, close, pragmas }
-// - default singleton: sqlite, db, dbPath, closeDb, pragmas
+// - openDb(dbPath?): { sqlite, db, dbPath, close, pragmas, readonly, isMemory }
+// - default singleton: sqlite, db, dbPath, closeDb, pragmas, dbReadonly, dbIsMemory
 //
 // Notes:
 // - This file does NOT run migrations. Keep migrations separate.
 // - For production, set BP_DB_PATH to control where the sqlite file lives.
 // - IMPORTANT: defaults are resolved relative to the *apps/api* folder (not process.cwd()).
 // - Determinism: we apply a conservative pragma profile; env can override only explicitly.
+// - Readonly mode avoids mutating pragmas that require write access.
+// - WAL is recommended for normal read/write operation; readonly DBs may open against an
+//   existing -wal / -shm pair depending on SQLite state and filesystem behavior.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -6135,7 +6908,30 @@ export type DbHandle = Readonly<{
     dbPath: string;
     close: () => void;
     pragmas: DbPragmas;
+    readonly: boolean;
+    isMemory: boolean;
 }>;
+
+/* -------------------------------- Constants -------------------------------- */
+
+const ENV = {
+    DB_PATH: "BP_DB_PATH",
+    DB_READONLY: "BP_DB_READONLY",
+    DB_JOURNAL_MODE: "BP_DB_JOURNAL_MODE",
+    DB_SYNCHRONOUS: "BP_DB_SYNCHRONOUS",
+    DB_BUSY_TIMEOUT_MS: "BP_DB_BUSY_TIMEOUT_MS",
+    DB_WAL_AUTOCHECKPOINT: "BP_DB_WAL_AUTOCHECKPOINT",
+    DB_CACHE_SIZE_KIB: "BP_DB_CACHE_SIZE_KIB",
+    DB_MMAP_SIZE_BYTES: "BP_DB_MMAP_SIZE_BYTES",
+} as const;
+
+const DEFAULTS = {
+    JOURNAL_MODE: "WAL" as const,
+    SYNCHRONOUS: "NORMAL" as const,
+    BUSY_TIMEOUT_MS: 5000,
+    WAL_AUTOCHECKPOINT: 1000,
+    DEFAULT_FILENAME: "biblia.sqlite",
+} as const;
 
 /* -------------------------------- Utilities -------------------------------- */
 
@@ -6144,11 +6940,13 @@ function ensureDir(dir: string): void {
 }
 
 function isMemoryDb(p: string): boolean {
-    return p === ":memory:" || p.startsWith("file::memory:");
+    const s = p.trim();
+    return s === ":memory:" || s.startsWith("file::memory:") || s.startsWith("file:memdb");
 }
 
-function envBool(name: string): boolean {
+function envBool(name: string, fallback = false): boolean {
     const v = process.env[name]?.trim().toLowerCase();
+    if (!v) return fallback;
     return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
@@ -6166,6 +6964,61 @@ function envChoice<T extends string>(name: string, allowed: readonly T[], fallba
     return (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
 }
 
+function clampInt(n: number, lo: number, hi: number): number {
+    return Math.max(lo, Math.min(hi, Math.trunc(n)));
+}
+
+function maybePositiveInt(n: number | null): number | undefined {
+    if (n == null) return undefined;
+    if (!Number.isFinite(n)) return undefined;
+    const v = Math.trunc(n);
+    return v > 0 ? v : undefined;
+}
+
+function parseDbPragmasFromEnv(): DbPragmas {
+    const busyTimeoutMs = clampInt(
+        envInt(ENV.DB_BUSY_TIMEOUT_MS) ?? DEFAULTS.BUSY_TIMEOUT_MS,
+        0,
+        300_000,
+    );
+
+    const walAutoCheckpoint = clampInt(
+        envInt(ENV.DB_WAL_AUTOCHECKPOINT) ?? DEFAULTS.WAL_AUTOCHECKPOINT,
+        1,
+        1_000_000,
+    );
+
+    const cacheSizeKiB = maybePositiveInt(envInt(ENV.DB_CACHE_SIZE_KIB));
+    const mmapSizeBytes = maybePositiveInt(envInt(ENV.DB_MMAP_SIZE_BYTES));
+
+    return Object.freeze({
+        journalMode: envChoice(ENV.DB_JOURNAL_MODE, ["WAL", "DELETE"] as const, DEFAULTS.JOURNAL_MODE),
+        synchronous: envChoice(ENV.DB_SYNCHRONOUS, ["NORMAL", "FULL", "OFF"] as const, DEFAULTS.SYNCHRONOUS),
+        foreignKeys: true as const,
+        tempStore: "MEMORY" as const,
+        busyTimeoutMs,
+        walAutoCheckpoint,
+        cacheSizeKiB,
+        mmapSizeBytes,
+    });
+}
+
+function fileExists(p: string): boolean {
+    try {
+        return fs.existsSync(p);
+    } catch {
+        return false;
+    }
+}
+
+function isLikelyApiRoot(dir: string): boolean {
+    return (
+        fileExists(path.join(dir, "src")) &&
+        fileExists(path.join(dir, "package.json")) &&
+        (fileExists(path.join(dir, "drizzle")) || fileExists(path.join(dir, "drizzle.config.ts")))
+    );
+}
+
 /**
  * Find apps/api directory without using import.meta (works with older TS module settings).
  *
@@ -6178,25 +7031,15 @@ function findApiRootFromCwd(): string {
     const cwd = process.cwd();
 
     let cur = cwd;
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 12; i += 1) {
         const direct = cur;
         const nested = path.join(cur, "apps", "api");
 
-        // Case 1: we're already in apps/api (or a subfolder)
-        if (
-            fs.existsSync(path.join(direct, "src")) &&
-            fs.existsSync(path.join(direct, "package.json")) &&
-            (fs.existsSync(path.join(direct, "drizzle")) || fs.existsSync(path.join(direct, "drizzle.config.ts")))
-        ) {
+        if (isLikelyApiRoot(direct)) {
             return direct;
         }
 
-        // Case 2: we're at repo root (or above) and it has apps/api
-        if (
-            fs.existsSync(path.join(nested, "src")) &&
-            fs.existsSync(path.join(nested, "package.json")) &&
-            (fs.existsSync(path.join(nested, "drizzle")) || fs.existsSync(path.join(nested, "drizzle.config.ts")))
-        ) {
+        if (isLikelyApiRoot(nested)) {
             return nested;
         }
 
@@ -6209,7 +7052,7 @@ function findApiRootFromCwd(): string {
 }
 
 function defaultDbPath(): string {
-    return path.join(findApiRootFromCwd(), "data", "biblia.sqlite");
+    return path.join(findApiRootFromCwd(), "data", DEFAULTS.DEFAULT_FILENAME);
 }
 
 /**
@@ -6222,15 +7065,41 @@ function defaultDbPath(): string {
  *
  * Rules:
  * - Absolute paths are used as-is.
- * - Relative paths from arg/env are resolved against process.cwd() (intentional).
- * - ":memory:" is supported.
+ * - Relative paths from arg/env are resolved against process.cwd() intentionally.
+ * - ":memory:" and file::memory: URIs are supported.
  */
 function resolveDbPath(input?: string): string {
-    const envPath = process.env.BP_DB_PATH?.trim();
+    const envPath = process.env[ENV.DB_PATH]?.trim();
     const raw = (input?.trim() || envPath || defaultDbPath()).trim();
 
     if (isMemoryDb(raw)) return raw;
     return path.isAbsolute(raw) ? raw : path.resolve(raw);
+}
+
+function validateResolvedPath(finalPath: string, readonly: boolean, isMem: boolean): void {
+    if (isMem) return;
+
+    if (!finalPath) {
+        throw new Error("[bp/db] resolved DB path is empty");
+    }
+
+    if (readonly && !fileExists(finalPath)) {
+        throw new Error(`[bp/db] readonly DB does not exist: ${finalPath}`);
+    }
+
+    if (!readonly) {
+        ensureDir(path.dirname(finalPath));
+    }
+}
+
+function formatOpenError(finalPath: string, e: unknown): Error {
+    const err = e as SQLiteError | Error | undefined;
+    const msg =
+        typeof err?.message === "string" && err.message.trim()
+            ? err.message.trim()
+            : String(e);
+
+    return new Error(`[bp/db] failed to open DB at ${finalPath}: ${msg}`);
 }
 
 /* -------------------------------- Pragmas ---------------------------------- */
@@ -6245,30 +7114,78 @@ function execSql(sqlite: Database, text: string): void {
     sqlite.exec(text);
 }
 
-function applyPragmas(sqlite: Database, opts: DbPragmas): void {
-    // cache_size: negative means KiB
+function querySingleValue(sqlite: Database, sqlText: string): string | number | null {
+    const row = sqlite.query(sqlText).get() as Record<string, unknown> | undefined;
+    if (!row) return null;
+    const first = Object.values(row)[0];
+    return typeof first === "string" || typeof first === "number" ? first : null;
+}
+
+function setConnectionPragmas(sqlite: Database, opts: DbPragmas): void {
     const cacheStmt =
         typeof opts.cacheSizeKiB === "number" ? `PRAGMA cache_size = -${Math.abs(opts.cacheSizeKiB)};` : "";
 
-    const mmapStmt = typeof opts.mmapSizeBytes === "number" ? `PRAGMA mmap_size = ${opts.mmapSizeBytes};` : "";
+    const mmapStmt =
+        typeof opts.mmapSizeBytes === "number" ? `PRAGMA mmap_size = ${Math.max(0, Math.trunc(opts.mmapSizeBytes))};` : "";
 
     execSql(
         sqlite,
         `
 PRAGMA foreign_keys = ON;
-
-PRAGMA journal_mode = ${opts.journalMode};
-PRAGMA synchronous = ${opts.synchronous};
-
 PRAGMA temp_store = MEMORY;
 PRAGMA busy_timeout = ${opts.busyTimeoutMs};
-
-PRAGMA wal_autocheckpoint = ${opts.walAutoCheckpoint};
-
 ${cacheStmt}
 ${mmapStmt}
 `.trim(),
     );
+}
+
+function setWritablePragmas(sqlite: Database, opts: DbPragmas): void {
+    execSql(
+        sqlite,
+        `
+PRAGMA journal_mode = ${opts.journalMode};
+PRAGMA synchronous = ${opts.synchronous};
+PRAGMA wal_autocheckpoint = ${opts.walAutoCheckpoint};
+`.trim(),
+    );
+}
+
+function verifyCriticalPragmas(sqlite: Database, opts: DbPragmas, readonly: boolean): void {
+    const foreignKeys = String(querySingleValue(sqlite, "PRAGMA foreign_keys;") ?? "");
+    if (foreignKeys !== "1") {
+        throw new Error("[bp/db] failed to enable PRAGMA foreign_keys=ON");
+    }
+
+    const busyTimeout = Number(querySingleValue(sqlite, "PRAGMA busy_timeout;") ?? NaN);
+    if (!Number.isFinite(busyTimeout) || busyTimeout < 0) {
+        throw new Error("[bp/db] failed to apply PRAGMA busy_timeout");
+    }
+
+    if (!readonly) {
+        const journalMode = String(querySingleValue(sqlite, "PRAGMA journal_mode;") ?? "").toUpperCase();
+        if (opts.journalMode === "WAL" && journalMode !== "WAL") {
+            throw new Error(`[bp/db] requested journal_mode=WAL but got '${journalMode || "(empty)"}'`);
+        }
+        if (opts.journalMode === "DELETE" && journalMode !== "DELETE") {
+            throw new Error(`[bp/db] requested journal_mode=DELETE but got '${journalMode || "(empty)"}'`);
+        }
+
+        const synchronous = Number(querySingleValue(sqlite, "PRAGMA synchronous;") ?? NaN);
+        if (!Number.isFinite(synchronous)) {
+            throw new Error("[bp/db] failed to read PRAGMA synchronous");
+        }
+    }
+}
+
+function applyPragmas(sqlite: Database, opts: DbPragmas, readonly: boolean): void {
+    setConnectionPragmas(sqlite, opts);
+
+    if (!readonly) {
+        setWritablePragmas(sqlite, opts);
+    }
+
+    verifyCriticalPragmas(sqlite, opts, readonly);
 }
 
 function safeClose(sqlite: Database): void {
@@ -6291,50 +7208,47 @@ function safeClose(sqlite: Database): void {
  * - BP_DB_SYNCHRONOUS=NORMAL|FULL|OFF
  * - BP_DB_BUSY_TIMEOUT_MS=5000
  * - BP_DB_WAL_AUTOCHECKPOINT=1000
- * - BP_DB_CACHE_SIZE_KIB (negative cache_size KiB)
+ * - BP_DB_CACHE_SIZE_KIB
  * - BP_DB_MMAP_SIZE_BYTES
  */
 export function openDb(dbPath?: string): DbHandle {
     const finalPath = resolveDbPath(dbPath);
-
     const isMem = isMemoryDb(finalPath);
-    const readonly = !isMem && envBool("BP_DB_READONLY");
+    const readonly = !isMem && envBool(ENV.DB_READONLY, false);
 
-    if (!isMem) ensureDir(path.dirname(finalPath));
-
-    if (readonly && !fs.existsSync(finalPath)) {
-        throw new Error(`[bp/db] readonly DB does not exist: ${finalPath}`);
-    }
+    validateResolvedPath(finalPath, readonly, isMem);
 
     let sqlite: Database;
     try {
         sqlite = readonly ? new Database(finalPath, { readonly: true }) : new Database(finalPath);
     } catch (e) {
-        const err = e as SQLiteError;
-        throw new Error(`[bp/db] failed to open DB at ${finalPath}: ${err?.message ?? String(e)}`);
+        throw formatOpenError(finalPath, e);
     }
 
-    const pragmas: DbPragmas = Object.freeze({
-        journalMode: envChoice("BP_DB_JOURNAL_MODE", ["WAL", "DELETE"] as const, "WAL"),
-        synchronous: envChoice("BP_DB_SYNCHRONOUS", ["NORMAL", "FULL", "OFF"] as const, "NORMAL"),
-        foreignKeys: true as const,
-        tempStore: "MEMORY" as const,
-        busyTimeoutMs: envInt("BP_DB_BUSY_TIMEOUT_MS") ?? 5000,
-        walAutoCheckpoint: envInt("BP_DB_WAL_AUTOCHECKPOINT") ?? 1000,
-        cacheSizeKiB: envInt("BP_DB_CACHE_SIZE_KIB") ?? undefined,
-        mmapSizeBytes: envInt("BP_DB_MMAP_SIZE_BYTES") ?? undefined,
-    });
+    const pragmas = parseDbPragmasFromEnv();
 
-    applyPragmas(sqlite, pragmas);
+    try {
+        applyPragmas(sqlite, pragmas, readonly);
+        const db = drizzle(sqlite, { schema });
+        const close = (): void => safeClose(sqlite);
 
-    const db = drizzle(sqlite, { schema });
-
-    const close = (): void => safeClose(sqlite);
-
-    return Object.freeze({ sqlite, db, dbPath: finalPath, close, pragmas });
+        return Object.freeze({
+            sqlite,
+            db,
+            dbPath: finalPath,
+            close,
+            pragmas,
+            readonly,
+            isMemory: isMem,
+        });
+    } catch (e) {
+        safeClose(sqlite);
+        const err = e as Error | undefined;
+        throw new Error(`[bp/db] failed during DB initialization for ${finalPath}: ${err?.message ?? String(e)}`);
+    }
 }
 
-/* --------------------------- Default singleton exports --------------------------- */
+/* ------------------------ Default singleton exports ------------------------ */
 /**
  * Most of the API server wants a single DB handle.
  * Import from "./db/client":
@@ -6346,6 +7260,8 @@ export const sqlite = _handle.sqlite;
 export const db = _handle.db;
 export const dbPath = _handle.dbPath;
 export const pragmas = _handle.pragmas;
+export const dbReadonly = _handle.readonly;
+export const dbIsMemory = _handle.isMemory;
 export const closeDb = _handle.close;
 ```
 
@@ -6353,12 +7269,20 @@ export const closeDb = _handle.close;
 
 ```ts
 // apps/api/src/db/migrate.ts
-// Biblia Populi — Production migrations runner (Bun + Drizzle + bun:sqlite)
+// Biblia.to — Production migrations runner (Bun + Drizzle + bun:sqlite)
 //
-// 1) Opens Bun SQLite (via openDb)
-// 2) Runs Drizzle migrations from ./drizzle
-// 3) Applies "extras" SQL (FTS5 + triggers) with an idempotency stamp
-// 4) Sanity-checks key canon + auth tables exist (auth is optional-but-expected for app infra)
+// Responsibilities:
+// 1) Opens Bun SQLite via openDb()
+// 2) Runs Drizzle migrations from apps/api/drizzle
+// 3) Applies idempotent "extras" SQL (FTS5 + triggers) with hash stamping
+// 4) Verifies key canon + auth infra tables exist
+// 5) Performs post-migration sanity checks and WAL checkpoint best-effort
+//
+// Notes:
+// - This file does NOT generate migrations. It only applies them.
+// - This runner expects a writable DB. It will refuse readonly mode.
+// - Extras are hash-locked by key. If SQL changes incompatibly, bump the extras key.
+// - Auth tables are expected unless BP_AUTH_OPTIONAL=1.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -6370,9 +7294,14 @@ import { FTS_MIGRATION_SQL } from "./schema";
 
 /* -------------------------------- Utilities -------------------------------- */
 
-function log(...args: unknown[]) {
+function log(...args: unknown[]): void {
     // eslint-disable-next-line no-console
     console.log("[db:migrate]", ...args);
+}
+
+function warn(...args: unknown[]): void {
+    // eslint-disable-next-line no-console
+    console.warn("[db:migrate]", ...args);
 }
 
 function fatal(...args: unknown[]): never {
@@ -6386,34 +7315,55 @@ function ensureDir(dir: string): void {
     fs.mkdirSync(dir, { recursive: true });
 }
 
+function fileExists(p: string): boolean {
+    try {
+        return fs.existsSync(p);
+    } catch {
+        return false;
+    }
+}
+
 function isMemoryDb(p: string): boolean {
-    return p === ":memory:" || p.startsWith("file::memory:");
+    const s = p.trim();
+    return s === ":memory:" || s.startsWith("file::memory:") || s.startsWith("file:memdb");
+}
+
+function envBool(name: string, fallback = false): boolean {
+    const v = process.env[name]?.trim().toLowerCase();
+    if (!v) return fallback;
+    return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function envChoice<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
+    const raw = process.env[name]?.trim();
+    if (!raw) return fallback;
+    const v = raw.toUpperCase();
+    return (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
+}
+
+function isLikelyApiRoot(dir: string): boolean {
+    return (
+        fileExists(path.join(dir, "src")) &&
+        (fileExists(path.join(dir, "drizzle")) || fileExists(path.join(dir, "drizzle.config.ts")))
+    );
 }
 
 /**
- * Find apps/api directory without using import.meta (works even if TS module settings are older).
+ * Find apps/api directory without using import.meta.
  */
 function findApiRootFromCwd(): string {
     const cwd = process.cwd();
 
     let cur = cwd;
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 12; i += 1) {
         const direct = cur;
         const nested = path.join(cur, "apps", "api");
 
-        // Case 1: we're already in apps/api (or a subfolder)
-        if (
-            fs.existsSync(path.join(direct, "src")) &&
-            (fs.existsSync(path.join(direct, "drizzle")) || fs.existsSync(path.join(direct, "drizzle.config.ts")))
-        ) {
+        if (isLikelyApiRoot(direct)) {
             return direct;
         }
 
-        // Case 2: we're at repo root (or above) and it has apps/api
-        if (
-            fs.existsSync(path.join(nested, "src")) &&
-            (fs.existsSync(path.join(nested, "drizzle")) || fs.existsSync(path.join(nested, "drizzle.config.ts")))
-        ) {
+        if (isLikelyApiRoot(nested)) {
             return nested;
         }
 
@@ -6429,24 +7379,50 @@ function migrationsDir(): string {
     return path.join(findApiRootFromCwd(), "drizzle");
 }
 
-function requireFileExists(p: string, label: string): void {
-    if (!fs.existsSync(p)) fatal(`${label} missing: ${p}`);
+function requirePathExists(p: string, label: string): void {
+    if (!fileExists(p)) fatal(`${label} missing: ${p}`);
 }
 
-/* ------------------------------- Extras stamp ------------------------------ */
+function requireDirectoryHasMigrationFiles(dir: string): void {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    const hasSomeFile = entries.some((e) => e.isFile());
+    if (!hasSomeFile) {
+        warn("migrations folder exists but appears empty:", dir);
+    }
+}
+
+/* ------------------------------- SQLite shape ------------------------------ */
 
 type SqliteLike = {
     exec: (sql: string) => void;
-    prepare: (sql: string) => { get: (...args: any[]) => any; run: (...args: any[]) => any };
+    prepare: (sql: string) => {
+        get: (...args: any[]) => any;
+        run: (...args: any[]) => any;
+        all?: (...args: any[]) => any[];
+    };
+    query?: (sql: string) => {
+        get?: (...args: any[]) => any;
+        all?: (...args: any[]) => any[];
+    };
 };
 
+/* ------------------------------- Extras stamp ------------------------------ */
+
 const EXTRAS_TABLE_SQL = `
-    CREATE TABLE IF NOT EXISTS __bp_extras (
-                                               key TEXT PRIMARY KEY,
-                                               sha TEXT NOT NULL,
-                                               applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-`;
+CREATE TABLE IF NOT EXISTS __bp_extras (
+    key TEXT PRIMARY KEY,
+    sha TEXT NOT NULL,
+    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+`.trim();
+
+const MIGRATION_RUN_META_SQL = `
+CREATE TABLE IF NOT EXISTS __bp_migration_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+`.trim();
 
 function shaLike(s: string): string {
     return crypto.createHash("sha256").update(s, "utf8").digest("hex");
@@ -6476,7 +7452,7 @@ function runTx(sqlite: SqliteLike, fn: () => void): void {
         try {
             sqlite.exec("ROLLBACK;");
         } catch {
-            // ignore rollback failures
+            // ignore rollback failure
         }
         throw e;
     }
@@ -6487,21 +7463,47 @@ function getExtra(sqlite: SqliteLike, key: string): string | null {
 }
 
 function setExtra(sqlite: SqliteLike, key: string, sha: string): void {
-    sqlite.prepare(`INSERT OR REPLACE INTO __bp_extras(key, sha) VALUES(?, ?);`).run(key, sha);
+    sqlite.prepare(
+        `
+        INSERT INTO __bp_extras(key, sha)
+        VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            sha = excluded.sha,
+            applied_at = (strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+        `,
+    ).run(key, sha);
+}
+
+function setMeta(sqlite: SqliteLike, key: string, value: string): void {
+    sqlite.prepare(
+        `
+        INSERT INTO __bp_migration_meta(key, value)
+        VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+        `,
+    ).run(key, value);
 }
 
 type ExtrasPlan = Readonly<{
     key: string;
     sql: string;
     mode: "apply-once" | "hash-locked";
+    description: string;
 }>;
 
 function planExtras(): ExtrasPlan[] {
     const plans: ExtrasPlan[] = [];
 
-    const ftsKey = "fts_bp_verse_text_v1";
-    if (FTS_MIGRATION_SQL && FTS_MIGRATION_SQL.trim().length > 0) {
-        plans.push({ key: ftsKey, sql: FTS_MIGRATION_SQL, mode: "hash-locked" });
+    const ftsSql = (FTS_MIGRATION_SQL ?? "").trim();
+    if (ftsSql.length > 0) {
+        plans.push({
+            key: "fts_bp_verse_text_v1",
+            sql: ftsSql,
+            mode: "hash-locked",
+            description: "FTS5 and related triggers for bp_verse_text",
+        });
     }
 
     return plans;
@@ -6521,7 +7523,7 @@ function applyExtras(sqlite: SqliteLike): void {
         const existing = getExtra(sqlite, p.key);
 
         if (existing === null) {
-            log("extras: applying", p.key, hash);
+            log("extras: applying", JSON.stringify({ key: p.key, sha: hash, desc: p.description }));
             runTx(sqlite, () => {
                 sqlite.exec(p.sql);
                 setExtra(sqlite, p.key, hash);
@@ -6536,11 +7538,12 @@ function applyExtras(sqlite: SqliteLike): void {
         }
 
         if (existing !== hash) {
-            log("extras: present but hash differs:");
-            log(" - key :", p.key);
-            log(" - db  :", existing);
-            log(" - code:", hash);
-            log("Not reapplying automatically. If intended, bump extras key (v2) or add a manual migration.");
+            warn("extras: present but hash differs");
+            warn(" - key :", p.key);
+            warn(" - db  :", existing);
+            warn(" - code:", hash);
+            warn(" - desc:", p.description);
+            warn("Not reapplying automatically. Bump the extras key (e.g. v2) or add a manual migration.");
             continue;
         }
 
@@ -6548,19 +7551,35 @@ function applyExtras(sqlite: SqliteLike): void {
     }
 }
 
-/* ------------------------------ Canon sanity -------------------------------- */
+/* ------------------------------ Sanity checks ------------------------------ */
 
 function tableExists(sqlite: SqliteLike, name: string): boolean {
     const n = getScalarInt(
         sqlite,
-        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='table' AND name=?`,
+        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='table' AND name = ?`,
+        [name],
+    );
+    return n === 1;
+}
+
+function indexExists(sqlite: SqliteLike, name: string): boolean {
+    const n = getScalarInt(
+        sqlite,
+        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='index' AND name = ?`,
         [name],
     );
     return n === 1;
 }
 
 function verifyCanonTablesExist(sqlite: SqliteLike): void {
-    const required = ["bp_book", "bp_verse", "bp_range", "bp_link"] as const;
+    const required = [
+        "bp_book",
+        "bp_verse",
+        "bp_verse_text",
+        "bp_translation",
+        "bp_range",
+        "bp_link",
+    ] as const;
 
     const missing = required.filter((t) => !tableExists(sqlite, t));
     if (missing.length > 0) {
@@ -6569,8 +7588,7 @@ function verifyCanonTablesExist(sqlite: SqliteLike): void {
 }
 
 function verifyAuthTablesExist(sqlite: SqliteLike): void {
-    // We expect these once auth is enabled. If you want them optional (dev), set BP_AUTH_OPTIONAL=1.
-    const optional = (process.env.BP_AUTH_OPTIONAL ?? "").trim() === "1";
+    const optional = envBool("BP_AUTH_OPTIONAL", false);
 
     const required = ["bp_user", "bp_auth_account", "bp_session"] as const;
     const missing = required.filter((t) => !tableExists(sqlite, t));
@@ -6578,41 +7596,169 @@ function verifyAuthTablesExist(sqlite: SqliteLike): void {
     if (missing.length === 0) return;
 
     if (optional) {
-        log("auth tables missing (optional mode):", JSON.stringify({ missing }));
+        warn("auth tables missing (optional mode):", JSON.stringify({ missing }));
         return;
     }
 
     fatal(
         "auth tables missing after migrations (expected with OAuth/identity enabled):",
-        JSON.stringify({ missing, hint: "Did you generate/apply drizzle migrations after adding authSchema.ts?" }),
+        JSON.stringify({
+            missing,
+            hint: "Did you generate/apply drizzle migrations after adding authSchema.ts?",
+        }),
     );
+}
+
+function verifyDrizzleMetaTables(sqlite: SqliteLike): void {
+    const metaCandidates = ["__drizzle_migrations", "__drizzle_migrations__"] as const;
+    const found = metaCandidates.some((t) => tableExists(sqlite, t));
+    if (!found) {
+        warn("drizzle metadata table not found after migrations; verify your migrator/version expectations.");
+    }
+}
+
+function verifyFtsArtifactsIfConfigured(sqlite: SqliteLike): void {
+    const ftsSql = (FTS_MIGRATION_SQL ?? "").trim();
+    if (!ftsSql) return;
+
+    const expectedTables = ["bp_verse_text_fts"] as const;
+    const missing = expectedTables.filter((t) => !tableExists(sqlite, t));
+    if (missing.length > 0) {
+        fatal("FTS extras configured but expected FTS artifacts are missing:", JSON.stringify({ missing }));
+    }
+}
+
+function verifyCoreRowCounts(sqlite: SqliteLike): void {
+    const bookCount = getScalarInt(sqlite, `SELECT COUNT(*) AS v FROM bp_book`);
+    const verseCount = getScalarInt(sqlite, `SELECT COUNT(*) AS v FROM bp_verse`);
+    const translationCount = getScalarInt(sqlite, `SELECT COUNT(*) AS v FROM bp_translation`);
+
+    if (bookCount <= 0) {
+        warn("bp_book has no rows");
+    }
+    if (verseCount <= 0) {
+        warn("bp_verse has no rows");
+    }
+    if (translationCount <= 0) {
+        warn("bp_translation has no rows");
+    }
+
+    log("row-counts:", JSON.stringify({ bp_book: bookCount, bp_verse: verseCount, bp_translation: translationCount }));
+}
+
+function verifyOptionalIndexes(sqlite: SqliteLike): void {
+    const interesting = [
+        "bp_verse_text_translation_id_verse_key_idx",
+        "bp_verse_text_fts",
+    ] as const;
+
+    const found: string[] = [];
+    for (const name of interesting) {
+        if (tableExists(sqlite, name) || indexExists(sqlite, name)) {
+            found.push(name);
+        }
+    }
+
+    log("artifacts:", JSON.stringify({ found }));
+}
+
+function verifyForeignKeysEnabled(sqlite: SqliteLike): void {
+    const fk = getScalarInt(sqlite, `PRAGMA foreign_keys;`);
+    if (fk !== 1) {
+        fatal("PRAGMA foreign_keys is not enabled after openDb()");
+    }
+}
+
+function verifyIntegrity(sqlite: SqliteLike): void {
+    const integrity = getScalarText(sqlite, `PRAGMA integrity_check;`);
+    if (integrity !== "ok") {
+        fatal("integrity_check failed:", integrity ?? "(null)");
+    }
+}
+
+/* --------------------------- Maintenance / post-run ------------------------- */
+
+function checkpointWalBestEffort(sqlite: SqliteLike): void {
+    try {
+        const mode = String(getScalarText(sqlite, `PRAGMA journal_mode;`) ?? "").toUpperCase();
+        if (mode === "WAL") {
+            sqlite.prepare(`PRAGMA wal_checkpoint(PASSIVE);`).run();
+            log("wal checkpoint: PASSIVE complete");
+        }
+    } catch (e) {
+        warn("wal checkpoint failed (non-fatal):", e);
+    }
+}
+
+function stampRunMeta(sqlite: SqliteLike, dbPath: string, migrationsFolder: string): void {
+    sqlite.exec(MIGRATION_RUN_META_SQL);
+
+    const extrasPlans = planExtras();
+    const extrasHash = shaLike(
+        extrasPlans
+            .map((p) => `${p.key}:${shaLike(p.sql)}`)
+            .sort()
+            .join("\n"),
+    );
+
+    setMeta(sqlite, "last_db_path", dbPath);
+    setMeta(sqlite, "last_migrations_folder", migrationsFolder);
+    setMeta(sqlite, "last_auth_optional", envBool("BP_AUTH_OPTIONAL", false) ? "1" : "0");
+    setMeta(sqlite, "last_extras_hash", extrasHash);
+    setMeta(sqlite, "last_journal_mode", envChoice("BP_DB_JOURNAL_MODE", ["WAL", "DELETE"] as const, "WAL"));
 }
 
 /* ---------------------------------- Main ----------------------------------- */
 
-async function main() {
-    const { sqlite, db, dbPath, close } = openDb();
+async function main(): Promise<void> {
+    const handle = openDb();
+    const { sqlite, db, dbPath, close, readonly, isMemory } = handle;
+
+    if (readonly) {
+        fatal(
+            "migrate runner opened DB in readonly mode.",
+            JSON.stringify({
+                dbPath,
+                hint: "Unset BP_DB_READONLY or set BP_DB_READONLY=0 before running migrations.",
+            }),
+        );
+    }
+
     const migrationsFolder = migrationsDir();
 
     ensureDir(migrationsFolder);
+    requirePathExists(migrationsFolder, "migrations folder");
+    requireDirectoryHasMigrationFiles(migrationsFolder);
 
     log("dbPath:", dbPath);
+    log("memory:", isMemory ? "yes" : "no");
     log("migrations:", migrationsFolder);
 
     try {
-        log("running drizzle migrations…");
-        migrate(db, { migrationsFolder });
+        verifyForeignKeysEnabled(sqlite as unknown as SqliteLike);
+
+        log("running drizzle migrations...");
+        await migrate(db, { migrationsFolder });
         log("drizzle migrations complete.");
 
         const s = sqlite as unknown as SqliteLike;
 
+        verifyDrizzleMetaTables(s);
         verifyCanonTablesExist(s);
         verifyAuthTablesExist(s);
 
         applyExtras(s);
+        verifyFtsArtifactsIfConfigured(s);
+
+        verifyCoreRowCounts(s);
+        verifyOptionalIndexes(s);
+
+        verifyIntegrity(s);
+        stampRunMeta(s, dbPath, migrationsFolder);
+        checkpointWalBestEffort(s);
 
         if (!isMemoryDb(dbPath)) {
-            requireFileExists(dbPath, "db file");
+            requirePathExists(dbPath, "db file");
         }
 
         log("done.");
@@ -6628,14 +7774,21 @@ main().catch((err) => fatal(err));
 
 ```ts
 // apps/api/src/db/schema.ts
-// Biblia.to — Canonical Data Universe Schema v1 (SQLite / Drizzle)
+// Biblia.to — Canonical Data Universe Schema v1.1 (SQLite / Drizzle)
 //
 // Orientation-only canon.
 // - Stable Scripture identity: verse_key + verse_ord
 // - Text is swappable: translation overlays
 // - All links target ranges (ordinals), never strings
 // - Uncertainty is first-class (time + geo precision/confidence)
-// - No interpretation layer in canon (no commentary, no devotional "summary", etc.)
+// - No interpretation layer in canon (no commentary / doctrine / devotionals)
+//
+// Upgrades in this version:
+// - Stronger tokenization model for partial selection / annotation anchoring
+// - More exact text-layer metadata (hashes, source, revision-ish timestamps)
+// - Safer uniqueness/indexes for common read paths
+// - Cleaner checks and export surface
+// - Fixed schema export typo
 //
 // NOTE:
 // - Auth/Identity tables live in ./authSchema.ts
@@ -6722,7 +7875,10 @@ export const GeoType = {
 } as const;
 export type GeoType = (typeof GeoType)[keyof typeof GeoType];
 
-export const CalendarKind = { BCE_CE: "BCE_CE", ANNO_MUNDI: "ANNO_MUNDI" } as const;
+export const CalendarKind = {
+    BCE_CE: "BCE_CE",
+    ANNO_MUNDI: "ANNO_MUNDI",
+} as const;
 export type CalendarKind = (typeof CalendarKind)[keyof typeof CalendarKind];
 
 export const EraTag = {
@@ -6819,11 +7975,42 @@ export const ReaderEventType = {
 } as const;
 export type ReaderEventType = (typeof ReaderEventType)[keyof typeof ReaderEventType];
 
-export const SourceKind = { IMPORT: "IMPORT", MANUAL: "MANUAL", DATASET: "DATASET" } as const;
+export const SourceKind = {
+    IMPORT: "IMPORT",
+    MANUAL: "MANUAL",
+    DATASET: "DATASET",
+} as const;
 export type SourceKind = (typeof SourceKind)[keyof typeof SourceKind];
 
-export const AuditAction = { INSERT: "INSERT", UPDATE: "UPDATE", DELETE: "DELETE" } as const;
+export const AuditAction = {
+    INSERT: "INSERT",
+    UPDATE: "UPDATE",
+    DELETE: "DELETE",
+} as const;
 export type AuditAction = (typeof AuditAction)[keyof typeof AuditAction];
+
+/**
+ * Text/token layer enums
+ * These are canon-safe because they describe textual structure and offsets,
+ * not commentary or interpretation.
+ */
+export const TokenKind = {
+    WORD: "WORD",
+    PUNCT: "PUNCT",
+    SPACE: "SPACE",
+    LINEBREAK: "LINEBREAK",
+    MARKER: "MARKER",
+    NUMBER: "NUMBER",
+    SYMBOL: "SYMBOL",
+} as const;
+export type TokenKind = (typeof TokenKind)[keyof typeof TokenKind];
+
+export const NormalizationForm = {
+    NONE: "NONE",
+    SIMPLE: "SIMPLE",
+    SEARCH_V1: "SEARCH_V1",
+} as const;
+export type NormalizationForm = (typeof NormalizationForm)[keyof typeof NormalizationForm];
 
 /* ------------------------- 1) Canonical Scripture Layer ---------------------- */
 
@@ -6837,7 +8024,7 @@ export const bpBook = sqliteTable(
         nameShort: text("name_short").notNull(),
         chapters: integer("chapters").notNull(),
         osised: text("osised"),
-        abbrs: text("abbrs"), // JSON array string (optional)
+        abbrs: text("abbrs"), // JSON array string
     },
     (t) => ({
         ordinalUniq: uniqueIndex("bp_book_ordinal_uniq").on(t.ordinal),
@@ -6845,6 +8032,8 @@ export const bpBook = sqliteTable(
         chaptersCheck: check("bp_book_chapters_check", sql`${t.chapters} >= 1`),
         testamentCheck: check("bp_book_testament_check", sql`${t.testament} in ('OT','NT')`),
         bookIdCheck: check("bp_book_book_id_check", sql`length(${t.bookId}) between 2 and 8`),
+        nameCheck: check("bp_book_name_check", sql`length(${t.name}) > 0`),
+        shortNameCheck: check("bp_book_name_short_check", sql`length(${t.nameShort}) > 0`),
     }),
 );
 
@@ -6855,18 +8044,37 @@ export const bpVerse = sqliteTable(
         bookId: text("book_id").notNull(),
         chapter: integer("chapter").notNull(),
         verse: integer("verse").notNull(),
-        verseOrd: integer("verse_ord").notNull(), // BIGINT in PG; SQLite uses INTEGER (64-bit)
+        verseOrd: integer("verse_ord").notNull(), // SQLite INTEGER is 64-bit
         chapterOrd: integer("chapter_ord"),
+
         isSuperscription: integer("is_superscription", { mode: "boolean" }).notNull().default(false),
         isDeuterocanon: integer("is_deuterocanon", { mode: "boolean" }).notNull().default(false),
+
+        // Optional exact source ordering helpers for specialized exports/imports
+        sourceBookOrdinal: integer("source_book_ordinal"),
+        sourceChapterOrdinal: integer("source_chapter_ordinal"),
+        sourceVerseOrdinal: integer("source_verse_ordinal"),
     },
     (t) => ({
         ordUniq: uniqueIndex("bp_verse_ord_uniq").on(t.verseOrd),
         byBcvUniq: uniqueIndex("bp_verse_bcv_uniq").on(t.bookId, t.chapter, t.verse),
         bookIdx: index("bp_verse_book_idx").on(t.bookId, t.chapter, t.verse),
+        chapterOrdIdx: index("bp_verse_chapter_ord_idx").on(t.chapterOrd, t.verseOrd),
         chapterCheck: check("bp_verse_chapter_check", sql`${t.chapter} >= 1`),
         verseCheck: check("bp_verse_verse_check", sql`${t.verse} >= 1`),
         ordCheck: check("bp_verse_ord_check", sql`${t.verseOrd} >= 1`),
+        sourceBookOrdCheck: check(
+            "bp_verse_source_book_ordinal_check",
+            sql`${t.sourceBookOrdinal} is null or ${t.sourceBookOrdinal} >= 1`,
+        ),
+        sourceChapterOrdCheck: check(
+            "bp_verse_source_chapter_ordinal_check",
+            sql`${t.sourceChapterOrdinal} is null or ${t.sourceChapterOrdinal} >= 1`,
+        ),
+        sourceVerseOrdCheck: check(
+            "bp_verse_source_verse_ordinal_check",
+            sql`${t.sourceVerseOrdinal} is null or ${t.sourceVerseOrdinal} >= 1`,
+        ),
     }),
 );
 
@@ -6875,14 +8083,20 @@ export const bpChapter = sqliteTable(
     {
         bookId: text("book_id").notNull(),
         chapter: integer("chapter").notNull(),
+        chapterOrd: integer("chapter_ord"),
         startVerseOrd: integer("start_verse_ord").notNull(),
         endVerseOrd: integer("end_verse_ord").notNull(),
         verseCount: integer("verse_count").notNull(),
     },
     (t) => ({
         pk: primaryKey({ columns: [t.bookId, t.chapter] }),
+        chapterOrdUniq: uniqueIndex("bp_chapter_chapter_ord_uniq").on(t.chapterOrd),
         rangeIdx: index("bp_chapter_range_idx").on(t.bookId, t.startVerseOrd, t.endVerseOrd),
         chapterCheck: check("bp_chapter_chapter_check", sql`${t.chapter} >= 1`),
+        chapterOrdCheck: check(
+            "bp_chapter_chapter_ord_check",
+            sql`${t.chapterOrd} is null or ${t.chapterOrd} >= 1`,
+        ),
         countCheck: check("bp_chapter_verse_count_check", sql`${t.verseCount} >= 1`),
         spanCheck: check("bp_chapter_span_check", sql`${t.startVerseOrd} <= ${t.endVerseOrd}`),
     }),
@@ -6893,22 +8107,41 @@ export const bpChapter = sqliteTable(
 export const bpTranslation = sqliteTable(
     "bp_translation",
     {
-        translationId: text("translation_id").primaryKey(), // KJV, BP1, ...
+        translationId: text("translation_id").primaryKey(), // KJV, ESV, BP1, ...
         name: text("name").notNull(),
-        language: text("language").notNull(), // ISO (en)
+        language: text("language").notNull(), // ISO-ish, e.g. en
         derivedFrom: text("derived_from"),
+
         licenseKind: text("license_kind").notNull(),
         licenseText: text("license_text"),
         sourceUrl: text("source_url"),
+
+        publisher: text("publisher"),
+        editionLabel: text("edition_label"),
+        abbreviation: text("abbreviation"),
+
+        normalizationForm: text("normalization_form").notNull().default("SIMPLE"),
+
         isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
+        isPublic: integer("is_public", { mode: "boolean" }).notNull().default(true),
+
         createdAt: text("created_at").notNull().default(nowIso),
+        updatedAt: text("updated_at").notNull().default(nowIso),
     },
     (t) => ({
+        nameIdx: index("bp_translation_name_idx").on(t.name),
+        publicIdx: index("bp_translation_public_idx").on(t.isPublic, t.isDefault),
         licenseKindCheck: check(
             "bp_translation_license_kind_check",
             sql`${t.licenseKind} in ('PUBLIC_DOMAIN','LICENSED','CUSTOM')`,
         ),
+        normFormCheck: check(
+            "bp_translation_normalization_form_check",
+            sql`${t.normalizationForm} in ('NONE','SIMPLE','SEARCH_V1')`,
+        ),
         idCheck: check("bp_translation_id_check", sql`length(${t.translationId}) > 0`),
+        nameCheck: check("bp_translation_name_check", sql`length(${t.name}) > 0`),
+        langCheck: check("bp_translation_language_check", sql`length(${t.language}) >= 2`),
     }),
 );
 
@@ -6917,33 +8150,123 @@ export const bpVerseText = sqliteTable(
     {
         translationId: text("translation_id").notNull(),
         verseKey: text("verse_key").notNull(),
+
         text: text("text").notNull(),
         textNorm: text("text_norm"),
-        hash: text("hash"),
+
+        hash: text("hash"), // canonical verse text hash
+        textLength: integer("text_length"), // character count
+        tokenCount: integer("token_count"), // populated after tokenization
+        wordCount: integer("word_count"), // populated after tokenization
+
+        source: text("source"),
+        sourceRevision: text("source_revision"),
+
         updatedAt: text("updated_at").notNull().default(nowIso),
     },
     (t) => ({
         pk: primaryKey({ columns: [t.translationId, t.verseKey] }),
         idx: index("bp_verse_text_idx").on(t.translationId, t.verseKey),
+        updatedIdx: index("bp_verse_text_updated_idx").on(t.updatedAt),
+        hashIdx: index("bp_verse_text_hash_idx").on(t.hash),
         textCheck: check("bp_verse_text_text_check", sql`length(${t.text}) > 0`),
+        lengthCheck: check("bp_verse_text_length_check", sql`${t.textLength} is null or ${t.textLength} >= 0`),
+        tokenCountCheck: check("bp_verse_text_token_count_check", sql`${t.tokenCount} is null or ${t.tokenCount} >= 0`),
+        wordCountCheck: check("bp_verse_text_word_count_check", sql`${t.wordCount} is null or ${t.wordCount} >= 0`),
     }),
 );
 
-// Optional tokens (for highlighting/search; safe since it’s not interpretive)
+/**
+ * Rich tokenization layer for:
+ * - partial highlighting
+ * - exact copy/export of sub-verse selections
+ * - stable annotation anchoring
+ * - better search/lookup/debugging
+ *
+ * IMPORTANT:
+ * - tokenIndex is the stable display-order token ordinal within a verse.
+ * - charStart/charEnd are offsets into bp_verse_text.text (UTF-16 JS offsets if generated in TS).
+ * - Tokens may include spaces/punctuation. Do NOT discard them if exact reconstruction matters.
+ */
 export const bpToken = sqliteTable(
     "bp_token",
     {
         translationId: text("translation_id").notNull(),
         verseKey: text("verse_key").notNull(),
         tokenIndex: integer("token_index").notNull(),
+
         token: text("token").notNull(),
         tokenNorm: text("token_norm").notNull(),
+        tokenKind: text("token_kind").notNull().default("WORD"),
+
+        charStart: integer("char_start").notNull(),
+        charEnd: integer("char_end").notNull(), // exclusive
+
+        isWordLike: integer("is_word_like", { mode: "boolean" }).notNull().default(true),
+        breakAfter: integer("break_after", { mode: "boolean" }).notNull().default(false),
+
+        // Optional grouping helpers
+        surfaceGroup: integer("surface_group"),
+        lineOrdinal: integer("line_ordinal"),
+
+        hash: text("hash"),
     },
     (t) => ({
         pk: primaryKey({ columns: [t.translationId, t.verseKey, t.tokenIndex] }),
+        idx: index("bp_token_idx").on(t.translationId, t.verseKey, t.tokenIndex),
         normIdx: index("bp_token_norm_idx").on(t.tokenNorm),
-        idx: index("bp_token_idx").on(t.translationId, t.verseKey),
+        charIdx: index("bp_token_char_idx").on(t.translationId, t.verseKey, t.charStart, t.charEnd),
+        kindIdx: index("bp_token_kind_idx").on(t.translationId, t.tokenKind),
+
         tokCheck: check("bp_token_token_check", sql`length(${t.token}) > 0`),
+        normCheck: check("bp_token_norm_check", sql`length(${t.tokenNorm}) >= 0`),
+        tokenIndexCheck: check("bp_token_token_index_check", sql`${t.tokenIndex} >= 0`),
+        kindCheck: check(
+            "bp_token_kind_check",
+            sql`${t.tokenKind} in ('WORD','PUNCT','SPACE','LINEBREAK','MARKER','NUMBER','SYMBOL')`,
+        ),
+        charStartCheck: check("bp_token_char_start_check", sql`${t.charStart} >= 0`),
+        charEndCheck: check("bp_token_char_end_check", sql`${t.charEnd} > ${t.charStart}`),
+        surfaceGroupCheck: check(
+            "bp_token_surface_group_check",
+            sql`${t.surfaceGroup} is null or ${t.surfaceGroup} >= 0`,
+        ),
+        lineOrdinalCheck: check(
+            "bp_token_line_ordinal_check",
+            sql`${t.lineOrdinal} is null or ${t.lineOrdinal} >= 0`,
+        ),
+    }),
+);
+
+/**
+ * Optional span map for quick lookup of common token spans inside a verse.
+ * Useful later for fast partial range reconstruction, cached text selections,
+ * and selection snapping without re-scanning token arrays every time.
+ */
+export const bpTokenSpan = sqliteTable(
+    "bp_token_span",
+    {
+        translationId: text("translation_id").notNull(),
+        verseKey: text("verse_key").notNull(),
+        spanId: text("span_id").notNull(), // app-generated stable id
+
+        startTokenIndex: integer("start_token_index").notNull(),
+        endTokenIndex: integer("end_token_index").notNull(), // inclusive
+
+        charStart: integer("char_start").notNull(),
+        charEnd: integer("char_end").notNull(), // exclusive
+
+        text: text("text"),
+        hash: text("hash"),
+    },
+    (t) => ({
+        pk: primaryKey({ columns: [t.translationId, t.verseKey, t.spanId] }),
+        idx: index("bp_token_span_idx").on(t.translationId, t.verseKey, t.startTokenIndex, t.endTokenIndex),
+        charIdx: index("bp_token_span_char_idx").on(t.translationId, t.verseKey, t.charStart, t.charEnd),
+        startCheck: check("bp_token_span_start_check", sql`${t.startTokenIndex} >= 0`),
+        endCheck: check("bp_token_span_end_check", sql`${t.endTokenIndex} >= ${t.startTokenIndex}`),
+        charStartCheck: check("bp_token_span_char_start_check", sql`${t.charStart} >= 0`),
+        charEndCheck: check("bp_token_span_char_end_check", sql`${t.charEnd} > ${t.charStart}`),
     }),
 );
 
@@ -6952,67 +8275,87 @@ export const bpToken = sqliteTable(
 export const bpRange = sqliteTable(
     "bp_range",
     {
-        rangeId: text("range_id").primaryKey(), // uuid
+        rangeId: text("range_id").primaryKey(), // uuid / cuid
         startVerseOrd: integer("start_verse_ord").notNull(),
         endVerseOrd: integer("end_verse_ord").notNull(),
         startVerseKey: text("start_verse_key").notNull(),
         endVerseKey: text("end_verse_key").notNull(),
+
         label: text("label"),
+
+        verseCount: integer("verse_count"),
+        chapterCount: integer("chapter_count"),
+
         createdAt: text("created_at").notNull().default(nowIso),
     },
     (t) => ({
         ordIdx: index("bp_range_ord_idx").on(t.startVerseOrd, t.endVerseOrd),
+        startKeyIdx: index("bp_range_start_key_idx").on(t.startVerseKey, t.endVerseKey),
         spanCheck: check("bp_range_span_check", sql`${t.startVerseOrd} <= ${t.endVerseOrd}`),
+        verseCountCheck: check("bp_range_verse_count_check", sql`${t.verseCount} is null or ${t.verseCount} >= 1`),
+        chapterCountCheck: check("bp_range_chapter_count_check", sql`${t.chapterCount} is null or ${t.chapterCount} >= 1`),
     }),
 );
 
 export const bpPericope = sqliteTable(
     "bp_pericope",
     {
-        pericopeId: text("pericope_id").primaryKey(), // uuid
+        pericopeId: text("pericope_id").primaryKey(),
         bookId: text("book_id").notNull(),
         rangeId: text("range_id").notNull(),
         title: text("title").notNull(),
         source: text("source").notNull(),
         confidence: real("confidence"),
         rank: integer("rank"),
+        sourceRevision: text("source_revision"),
     },
     (t) => ({
-        bookIdx: index("bp_pericope_book_idx").on(t.bookId),
+        bookIdx: index("bp_pericope_book_idx").on(t.bookId, t.rank),
         rangeIdx: index("bp_pericope_range_idx").on(t.rangeId),
+        rankCheck: check("bp_pericope_rank_check", sql`${t.rank} is null or ${t.rank} >= 0`),
         confCheck: check(
             "bp_pericope_conf_check",
             sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
         ),
+        titleCheck: check("bp_pericope_title_check", sql`length(${t.title}) > 0`),
     }),
 );
 
 export const bpParagraph = sqliteTable(
     "bp_paragraph",
     {
-        paragraphId: text("paragraph_id").primaryKey(), // uuid
+        paragraphId: text("paragraph_id").primaryKey(),
         translationId: text("translation_id").notNull(),
         rangeId: text("range_id").notNull(),
         style: text("style").notNull(),
         indent: integer("indent").notNull().default(0),
         source: text("source").notNull(),
+        sourceRevision: text("source_revision"),
+        ordinal: integer("ordinal"),
     },
     (t) => ({
         rangeIdx: index("bp_paragraph_range_idx").on(t.translationId, t.rangeId),
-        styleCheck: check("bp_paragraph_style_check", sql`${t.style} in ('PROSE','POETRY','LIST','QUOTE','LETTER')`),
+        ordIdx: index("bp_paragraph_ord_idx").on(t.translationId, t.ordinal),
+        styleCheck: check(
+            "bp_paragraph_style_check",
+            sql`${t.style} in ('PROSE','POETRY','LIST','QUOTE','LETTER')`,
+        ),
         indentCheck: check("bp_paragraph_indent_check", sql`${t.indent} >= 0`),
+        ordinalCheck: check("bp_paragraph_ordinal_check", sql`${t.ordinal} is null or ${t.ordinal} >= 0`),
     }),
 );
 
 export const bpDocUnit = sqliteTable(
     "bp_doc_unit",
     {
-        unitId: text("unit_id").primaryKey(), // uuid
+        unitId: text("unit_id").primaryKey(),
         kind: text("kind").notNull(),
         title: text("title").notNull(),
         rangeId: text("range_id").notNull(),
         source: text("source").notNull(),
         confidence: real("confidence"),
+        ordinal: integer("ordinal"),
+        parentUnitId: text("parent_unit_id"),
     },
     (t) => ({
         kindCheck: check(
@@ -7020,9 +8363,16 @@ export const bpDocUnit = sqliteTable(
             sql`${t.kind} in ('SECTION','SPEECH','SONG','LETTER_PART','NARRATIVE_BLOCK')`,
         ),
         rangeIdx: index("bp_doc_unit_range_idx").on(t.rangeId),
+        ordIdx: index("bp_doc_unit_ord_idx").on(t.ordinal),
+        parentIdx: index("bp_doc_unit_parent_idx").on(t.parentUnitId),
         confCheck: check(
             "bp_doc_unit_conf_check",
             sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+        ordinalCheck: check("bp_doc_unit_ordinal_check", sql`${t.ordinal} is null or ${t.ordinal} >= 0`),
+        notSelfCheck: check(
+            "bp_doc_unit_not_self_check",
+            sql`${t.parentUnitId} is null or ${t.parentUnitId} <> ${t.unitId}`,
         ),
     }),
 );
@@ -7032,16 +8382,19 @@ export const bpDocUnit = sqliteTable(
 export const bpEntity = sqliteTable(
     "bp_entity",
     {
-        entityId: text("entity_id").primaryKey(), // uuid
+        entityId: text("entity_id").primaryKey(),
         kind: text("kind").notNull(),
         canonicalName: text("canonical_name").notNull(),
         slug: text("slug").notNull(),
         summaryNeutral: text("summary_neutral"),
         confidence: real("confidence"),
         createdAt: text("created_at").notNull().default(nowIso),
+        updatedAt: text("updated_at").notNull().default(nowIso),
     },
     (t) => ({
         slugUniq: uniqueIndex("bp_entity_slug_uniq").on(t.slug),
+        nameIdx: index("bp_entity_name_idx").on(t.canonicalName),
+        kindIdx: index("bp_entity_kind_idx").on(t.kind),
         kindCheck: check(
             "bp_entity_kind_check",
             sql`${t.kind} in ('PERSON','PLACE','GROUP','DYNASTY','EMPIRE','REGION','ARTIFACT','OFFICE')`,
@@ -7051,13 +8404,14 @@ export const bpEntity = sqliteTable(
             sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
         ),
         nameCheck: check("bp_entity_name_check", sql`length(${t.canonicalName}) > 0`),
+        slugCheck: check("bp_entity_slug_check", sql`length(${t.slug}) > 0`),
     }),
 );
 
 export const bpEntityName = sqliteTable(
     "bp_entity_name",
     {
-        entityNameId: text("entity_name_id").primaryKey(), // uuid
+        entityNameId: text("entity_name_id").primaryKey(),
         entityId: text("entity_id").notNull(),
         name: text("name").notNull(),
         nameNorm: text("name_norm").notNull(),
@@ -7068,18 +8422,20 @@ export const bpEntityName = sqliteTable(
     },
     (t) => ({
         normIdx: index("bp_entity_name_norm_idx").on(t.nameNorm),
-        entityIdx: index("bp_entity_name_entity_idx").on(t.entityId),
+        entityIdx: index("bp_entity_name_entity_idx").on(t.entityId, t.isPrimary),
         confCheck: check(
             "bp_entity_name_conf_check",
             sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
         ),
+        nameCheck: check("bp_entity_name_name_check", sql`length(${t.name}) > 0`),
+        nameNormCheck: check("bp_entity_name_name_norm_check", sql`length(${t.nameNorm}) >= 0`),
     }),
 );
 
 export const bpEntityRelation = sqliteTable(
     "bp_entity_relation",
     {
-        relationId: text("relation_id").primaryKey(), // uuid
+        relationId: text("relation_id").primaryKey(),
         fromEntityId: text("from_entity_id").notNull(),
         toEntityId: text("to_entity_id").notNull(),
         kind: text("kind").notNull(),
@@ -7089,8 +8445,8 @@ export const bpEntityRelation = sqliteTable(
         noteNeutral: text("note_neutral"),
     },
     (t) => ({
-        fromIdx: index("bp_entity_relation_from_idx").on(t.fromEntityId),
-        toIdx: index("bp_entity_relation_to_idx").on(t.toEntityId),
+        fromIdx: index("bp_entity_relation_from_idx").on(t.fromEntityId, t.kind),
+        toIdx: index("bp_entity_relation_to_idx").on(t.toEntityId, t.kind),
         kindIdx: index("bp_entity_relation_kind_idx").on(t.kind),
         kindCheck: check(
             "bp_entity_relation_kind_check",
@@ -7109,13 +8465,16 @@ export const bpEntityRelation = sqliteTable(
 export const bpPlaceGeo = sqliteTable(
     "bp_place_geo",
     {
-        placeGeoId: text("place_geo_id").primaryKey(), // uuid
+        placeGeoId: text("place_geo_id").primaryKey(),
         entityId: text("entity_id").notNull(), // bp_entity(kind=PLACE)
         geoType: text("geo_type").notNull(),
+
         lat: real("lat"),
         lng: real("lng"),
+
         bbox: text("bbox"), // JSON
         polygon: text("polygon"), // GeoJSON
+
         precisionM: real("precision_m"),
         source: text("source").notNull(),
         confidence: real("confidence"),
@@ -7123,6 +8482,12 @@ export const bpPlaceGeo = sqliteTable(
     (t) => ({
         entityIdx: index("bp_place_geo_entity_idx").on(t.entityId),
         typeCheck: check("bp_place_geo_type_check", sql`${t.geoType} in ('POINT','BBOX','REGION_POLYGON')`),
+        latCheck: check("bp_place_geo_lat_check", sql`${t.lat} is null or (${t.lat} >= -90 and ${t.lat} <= 90)`),
+        lngCheck: check("bp_place_geo_lng_check", sql`${t.lng} is null or (${t.lng} >= -180 and ${t.lng} <= 180)`),
+        precisionCheck: check(
+            "bp_place_geo_precision_check",
+            sql`${t.precisionM} is null or ${t.precisionM} >= 0`,
+        ),
         confCheck: check(
             "bp_place_geo_conf_check",
             sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
@@ -7133,33 +8498,42 @@ export const bpPlaceGeo = sqliteTable(
 export const bpRoute = sqliteTable(
     "bp_route",
     {
-        routeId: text("route_id").primaryKey(), // uuid
+        routeId: text("route_id").primaryKey(),
         title: text("title").notNull(),
         source: text("source").notNull(),
         confidence: real("confidence"),
+        summaryNeutral: text("summary_neutral"),
     },
     (t) => ({
+        titleIdx: index("bp_route_title_idx").on(t.title),
         confCheck: check(
             "bp_route_conf_check",
             sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
         ),
+        titleCheck: check("bp_route_title_check", sql`length(${t.title}) > 0`),
     }),
 );
 
 export const bpRouteStep = sqliteTable(
     "bp_route_step",
     {
-        routeStepId: text("route_step_id").primaryKey(), // uuid
+        routeStepId: text("route_step_id").primaryKey(),
         routeId: text("route_id").notNull(),
         ordinal: integer("ordinal").notNull(),
         placeEntityId: text("place_entity_id").notNull(),
         rangeId: text("range_id"),
         noteNeutral: text("note_neutral"),
+        distanceKm: real("distance_km"),
     },
     (t) => ({
         ordUniq: uniqueIndex("bp_route_step_ord_uniq").on(t.routeId, t.ordinal),
-        routeIdx: index("bp_route_step_route_idx").on(t.routeId),
+        routeIdx: index("bp_route_step_route_idx").on(t.routeId, t.ordinal),
+        placeIdx: index("bp_route_step_place_idx").on(t.placeEntityId),
         ordCheck: check("bp_route_step_ord_check", sql`${t.ordinal} >= 1`),
+        distanceCheck: check(
+            "bp_route_step_distance_check",
+            sql`${t.distanceKm} is null or ${t.distanceKm} >= 0`,
+        ),
     }),
 );
 
@@ -7168,15 +8542,19 @@ export const bpRouteStep = sqliteTable(
 export const bpTimeSpan = sqliteTable(
     "bp_time_span",
     {
-        timeSpanId: text("time_span_id").primaryKey(), // uuid
+        timeSpanId: text("time_span_id").primaryKey(),
+
         startYear: integer("start_year"),
         endYear: integer("end_year"),
+
         startYearMin: integer("start_year_min"),
         startYearMax: integer("start_year_max"),
         endYearMin: integer("end_year_min"),
         endYearMax: integer("end_year_max"),
+
         calendar: text("calendar").notNull().default("BCE_CE"),
         eraTag: text("era_tag"),
+
         source: text("source").notNull(),
         confidence: real("confidence"),
     },
@@ -7185,8 +8563,8 @@ export const bpTimeSpan = sqliteTable(
         eraCheck: check(
             "bp_time_span_era_check",
             sql`${t.eraTag} is null or ${t.eraTag} in (
-            'PRIMEVAL','PATRIARCHS','EXODUS_WILDERNESS','CONQUEST_JUDGES','UNITED_MONARCHY',
-            'DIVIDED_KINGDOM','EXILE','SECOND_TEMPLE','GOSPELS','APOSTOLIC'
+                'PRIMEVAL','PATRIARCHS','EXODUS_WILDERNESS','CONQUEST_JUDGES','UNITED_MONARCHY',
+                'DIVIDED_KINGDOM','EXILE','SECOND_TEMPLE','GOSPELS','APOSTOLIC'
             )`,
         ),
         confCheck: check(
@@ -7199,7 +8577,7 @@ export const bpTimeSpan = sqliteTable(
 export const bpTimelineAnchor = sqliteTable(
     "bp_timeline_anchor",
     {
-        anchorId: text("anchor_id").primaryKey(), // uuid
+        anchorId: text("anchor_id").primaryKey(),
         rangeId: text("range_id").notNull(),
         timeSpanId: text("time_span_id").notNull(),
         kind: text("kind").notNull(),
@@ -7209,7 +8587,11 @@ export const bpTimelineAnchor = sqliteTable(
     (t) => ({
         rangeIdx: index("bp_timeline_anchor_range_idx").on(t.rangeId),
         timeIdx: index("bp_timeline_anchor_time_idx").on(t.timeSpanId),
-        kindCheck: check("bp_timeline_anchor_kind_check", sql`${t.kind} in ('SETTING','EVENT_WINDOW','REIGN','JOURNEY_WINDOW')`),
+        kindIdx: index("bp_timeline_anchor_kind_idx").on(t.kind),
+        kindCheck: check(
+            "bp_timeline_anchor_kind_check",
+            sql`${t.kind} in ('SETTING','EVENT_WINDOW','REIGN','JOURNEY_WINDOW')`,
+        ),
         confCheck: check(
             "bp_timeline_anchor_conf_check",
             sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
@@ -7222,35 +8604,40 @@ export const bpTimelineAnchor = sqliteTable(
 export const bpEvent = sqliteTable(
     "bp_event",
     {
-        eventId: text("event_id").primaryKey(), // uuid
+        eventId: text("event_id").primaryKey(),
         canonicalTitle: text("canonical_title").notNull(),
         kind: text("kind").notNull(),
         primaryRangeId: text("primary_range_id").notNull(),
         timeSpanId: text("time_span_id"),
-        primaryPlaceId: text("primary_place_id"), // entity_id (place)
+        primaryPlaceId: text("primary_place_id"), // entity_id(kind=PLACE)
         source: text("source").notNull(),
         confidence: real("confidence"),
+        summaryNeutral: text("summary_neutral"),
     },
     (t) => ({
+        kindIdx: index("bp_event_kind_idx").on(t.kind),
+        rangeIdx: index("bp_event_range_idx").on(t.primaryRangeId),
+        placeIdx: index("bp_event_place_idx").on(t.primaryPlaceId),
+        timeIdx: index("bp_event_time_idx").on(t.timeSpanId),
         kindCheck: check(
             "bp_event_kind_check",
             sql`${t.kind} in (
-    'BIRTH','DEATH','BATTLE','COVENANT','EXODUS','MIGRATION','SPEECH','MIRACLE','PROPHECY',
-    'CAPTIVITY','RETURN','CRUCIFIXION','RESURRECTION','MISSION_JOURNEY','COUNCIL','LETTER_WRITTEN','OTHER'
-)`,
+                'BIRTH','DEATH','BATTLE','COVENANT','EXODUS','MIGRATION','SPEECH','MIRACLE','PROPHECY',
+                'CAPTIVITY','RETURN','CRUCIFIXION','RESURRECTION','MISSION_JOURNEY','COUNCIL','LETTER_WRITTEN','OTHER'
+            )`,
         ),
-        rangeIdx: index("bp_event_range_idx").on(t.primaryRangeId),
         confCheck: check(
             "bp_event_conf_check",
             sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
         ),
+        titleCheck: check("bp_event_title_check", sql`length(${t.canonicalTitle}) > 0`),
     }),
 );
 
 export const bpEventParticipant = sqliteTable(
     "bp_event_participant",
     {
-        eventParticipantId: text("event_participant_id").primaryKey(), // uuid
+        eventParticipantId: text("event_participant_id").primaryKey(),
         eventId: text("event_id").notNull(),
         entityId: text("entity_id").notNull(),
         role: text("role").notNull(),
@@ -7259,6 +8646,7 @@ export const bpEventParticipant = sqliteTable(
     (t) => ({
         eventIdx: index("bp_event_participant_event_idx").on(t.eventId),
         entityIdx: index("bp_event_participant_entity_idx").on(t.entityId),
+        roleIdx: index("bp_event_participant_role_idx").on(t.role),
         roleCheck: check(
             "bp_event_participant_role_check",
             sql`${t.role} in ('SUBJECT','AGENT','WITNESS','OPPONENT','RULER','PEOPLE','OTHER')`,
@@ -7275,7 +8663,7 @@ export const bpEventParticipant = sqliteTable(
 export const bpLink = sqliteTable(
     "bp_link",
     {
-        linkId: text("link_id").primaryKey(), // uuid
+        linkId: text("link_id").primaryKey(),
         rangeId: text("range_id").notNull(),
         targetKind: text("target_kind").notNull(),
         targetId: text("target_id").notNull(),
@@ -7285,16 +8673,19 @@ export const bpLink = sqliteTable(
         confidence: real("confidence"),
     },
     (t) => ({
-        rangeIdx: index("bp_link_range_idx").on(t.rangeId),
+        rangeIdx: index("bp_link_range_idx").on(t.rangeId, t.linkKind),
         targetIdx: index("bp_link_target_idx").on(t.targetKind, t.targetId),
         kindIdx: index("bp_link_kind_idx").on(t.linkKind),
-        targetKindCheck: check("bp_link_target_kind_check", sql`${t.targetKind} in ('ENTITY','EVENT','ROUTE','PLACE_GEO')`),
+        targetKindCheck: check(
+            "bp_link_target_kind_check",
+            sql`${t.targetKind} in ('ENTITY','EVENT','ROUTE','PLACE_GEO')`,
+        ),
         linkKindCheck: check(
             "bp_link_link_kind_check",
             sql`${t.linkKind} in (
-    'MENTIONS','PRIMARY_SUBJECT','LOCATION','SETTING','JOURNEY_STEP',
-    'PARALLEL_ACCOUNT','QUOTE_SOURCE','QUOTE_TARGET'
-)`,
+                'MENTIONS','PRIMARY_SUBJECT','LOCATION','SETTING','JOURNEY_STEP',
+                'PARALLEL_ACCOUNT','QUOTE_SOURCE','QUOTE_TARGET'
+            )`,
         ),
         weightCheck: check("bp_link_weight_check", sql`${t.weight} >= 1`),
         confCheck: check(
@@ -7307,20 +8698,26 @@ export const bpLink = sqliteTable(
 export const bpCrossref = sqliteTable(
     "bp_crossref",
     {
-        crossrefId: text("crossref_id").primaryKey(), // uuid
+        crossrefId: text("crossref_id").primaryKey(),
         fromRangeId: text("from_range_id").notNull(),
         toRangeId: text("to_range_id").notNull(),
         kind: text("kind").notNull(),
         source: text("source").notNull(),
         confidence: real("confidence"),
+        noteNeutral: text("note_neutral"),
     },
     (t) => ({
-        fromIdx: index("bp_crossref_from_idx").on(t.fromRangeId),
-        toIdx: index("bp_crossref_to_idx").on(t.toRangeId),
+        fromIdx: index("bp_crossref_from_idx").on(t.fromRangeId, t.kind),
+        toIdx: index("bp_crossref_to_idx").on(t.toRangeId, t.kind),
+        kindIdx: index("bp_crossref_kind_idx").on(t.kind),
         kindCheck: check("bp_crossref_kind_check", sql`${t.kind} in ('PARALLEL','QUOTE','ALLUSION','TOPICAL')`),
         confCheck: check(
             "bp_crossref_conf_check",
             sql`${t.confidence} is null or (${t.confidence} >= 0 and ${t.confidence} <= 1)`,
+        ),
+        notSelfCheck: check(
+            "bp_crossref_not_self_check",
+            sql`not (${t.fromRangeId} = ${t.toRangeId} and ${t.kind} = 'PARALLEL')`,
         ),
     }),
 );
@@ -7330,7 +8727,7 @@ export const bpCrossref = sqliteTable(
 export const bpSearchQueryLog = sqliteTable(
     "bp_search_query_log",
     {
-        queryId: text("query_id").primaryKey(), // uuid
+        queryId: text("query_id").primaryKey(),
         anonId: text("anon_id"),
         query: text("query").notNull(),
         queryNorm: text("query_norm").notNull(),
@@ -7341,7 +8738,9 @@ export const bpSearchQueryLog = sqliteTable(
     (t) => ({
         normIdx: index("bp_search_query_log_norm_idx").on(t.queryNorm),
         createdIdx: index("bp_search_query_log_created_idx").on(t.createdAt),
+        translationIdx: index("bp_search_query_log_translation_idx").on(t.translationId, t.createdAt),
         hitsCheck: check("bp_search_query_log_hits_check", sql`${t.hits} >= 0`),
+        queryCheck: check("bp_search_query_log_query_check", sql`length(${t.query}) > 0`),
     }),
 );
 
@@ -7350,7 +8749,7 @@ export const bpSearchQueryLog = sqliteTable(
 export const bpReaderEvent = sqliteTable(
     "bp_reader_event",
     {
-        readerEventId: text("reader_event_id").primaryKey(), // uuid
+        readerEventId: text("reader_event_id").primaryKey(),
         anonId: text("anon_id").notNull(),
         eventType: text("event_type").notNull(),
         translationId: text("translation_id"),
@@ -7362,11 +8761,13 @@ export const bpReaderEvent = sqliteTable(
     },
     (t) => ({
         anonIdx: index("bp_reader_event_anon_idx").on(t.anonId, t.createdAt),
+        typeIdx: index("bp_reader_event_type_idx").on(t.eventType, t.createdAt),
+        verseIdx: index("bp_reader_event_verse_idx").on(t.translationId, t.verseKey, t.createdAt),
         typeCheck: check(
             "bp_reader_event_type_check",
             sql`${t.eventType} in (
-    'VIEW_VERSE','VIEW_CHAPTER','SCROLL_BACK','COPY_TEXT','OPEN_ENTITY','OPEN_MAP','OPEN_TIMELINE','SEARCH'
-)`,
+                'VIEW_VERSE','VIEW_CHAPTER','SCROLL_BACK','COPY_TEXT','OPEN_ENTITY','OPEN_MAP','OPEN_TIMELINE','SEARCH'
+            )`,
         ),
         durCheck: check("bp_reader_event_duration_check", sql`${t.durationMs} is null or ${t.durationMs} >= 0`),
     }),
@@ -7377,7 +8778,7 @@ export const bpReaderEvent = sqliteTable(
 export const bpSource = sqliteTable(
     "bp_source",
     {
-        sourceId: text("source_id").primaryKey(), // uuid
+        sourceId: text("source_id").primaryKey(),
         name: text("name").notNull(),
         kind: text("kind").notNull(),
         version: text("version"),
@@ -7386,14 +8787,16 @@ export const bpSource = sqliteTable(
         notes: text("notes"),
     },
     (t) => ({
+        nameIdx: index("bp_source_name_idx").on(t.name),
         kindCheck: check("bp_source_kind_check", sql`${t.kind} in ('IMPORT','MANUAL','DATASET')`),
+        nameCheck: check("bp_source_name_check", sql`length(${t.name}) > 0`),
     }),
 );
 
 export const bpAudit = sqliteTable(
     "bp_audit",
     {
-        auditId: text("audit_id").primaryKey(), // uuid
+        auditId: text("audit_id").primaryKey(),
         entityKind: text("entity_kind").notNull(),
         entityId: text("entity_id").notNull(),
         action: text("action").notNull(),
@@ -7404,6 +8807,8 @@ export const bpAudit = sqliteTable(
     },
     (t) => ({
         entIdx: index("bp_audit_entity_idx").on(t.entityKind, t.entityId, t.createdAt),
+        actionIdx: index("bp_audit_action_idx").on(t.action, t.createdAt),
+        sourceIdx: index("bp_audit_source_idx").on(t.sourceId, t.createdAt),
         actionCheck: check("bp_audit_action_check", sql`${t.action} in ('INSERT','UPDATE','DELETE')`),
     }),
 );
@@ -7412,9 +8817,16 @@ export const bpAudit = sqliteTable(
 /**
  * Optional FTS5 extras for verse text search.
  * Applied by migrate.ts (extras runner), not by Drizzle schema.
+ *
+ * Notes:
+ * - Keeps translation-aware verse text search
+ * - Adds optional token FTS for future word/phrase acceleration
+ * - token FTS intentionally excludes SPACE/LINEBREAK rows
  */
 export const FTS_MIGRATION_SQL = `
--- FTS5 over bp_verse_text.text (translation-aware)
+-- ---------------------------------------------------------------------------
+-- Verse text FTS
+-- ---------------------------------------------------------------------------
 CREATE VIRTUAL TABLE IF NOT EXISTS bp_verse_text_fts USING fts5(
   translation_id UNINDEXED,
   verse_key UNINDEXED,
@@ -7423,7 +8835,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS bp_verse_text_fts USING fts5(
   content_rowid='rowid'
 );
 
--- Sync triggers (recommended)
 CREATE TRIGGER IF NOT EXISTS bp_verse_text_ai AFTER INSERT ON bp_verse_text BEGIN
   INSERT INTO bp_verse_text_fts(rowid, translation_id, verse_key, text)
   VALUES (new.rowid, new.translation_id, new.verse_key, new.text);
@@ -7441,50 +8852,98 @@ CREATE TRIGGER IF NOT EXISTS bp_verse_text_au AFTER UPDATE ON bp_verse_text BEGI
   INSERT INTO bp_verse_text_fts(rowid, translation_id, verse_key, text)
   VALUES (new.rowid, new.translation_id, new.verse_key, new.text);
 END;
+
+-- ---------------------------------------------------------------------------
+-- Token FTS (optional but very useful for exact token/word search debugging,
+-- selection tooling, and future word-level retrieval optimizations)
+-- ---------------------------------------------------------------------------
+CREATE VIRTUAL TABLE IF NOT EXISTS bp_token_fts USING fts5(
+  translation_id UNINDEXED,
+  verse_key UNINDEXED,
+  token_index UNINDEXED,
+  token,
+  token_norm,
+  content=''
+);
+
+CREATE TRIGGER IF NOT EXISTS bp_token_ai AFTER INSERT ON bp_token
+WHEN new.token_kind NOT IN ('SPACE', 'LINEBREAK')
+BEGIN
+  INSERT INTO bp_token_fts(translation_id, verse_key, token_index, token, token_norm)
+  VALUES (new.translation_id, new.verse_key, new.token_index, new.token, new.token_norm);
+END;
+
+CREATE TRIGGER IF NOT EXISTS bp_token_ad AFTER DELETE ON bp_token
+WHEN old.token_kind NOT IN ('SPACE', 'LINEBREAK')
+BEGIN
+  INSERT INTO bp_token_fts(bp_token_fts, rowid, translation_id, verse_key, token_index, token, token_norm)
+  VALUES ('delete', old.rowid, old.translation_id, old.verse_key, old.token_index, old.token, old.token_norm);
+END;
+
+CREATE TRIGGER IF NOT EXISTS bp_token_au AFTER UPDATE ON bp_token
+WHEN old.token_kind NOT IN ('SPACE', 'LINEBREAK')
+BEGIN
+  INSERT INTO bp_token_fts(bp_token_fts, rowid, translation_id, verse_key, token_index, token, token_norm)
+  VALUES ('delete', old.rowid, old.translation_id, old.verse_key, old.token_index, old.token, old.token_norm);
+END;
+
+CREATE TRIGGER IF NOT EXISTS bp_token_au_insert AFTER UPDATE ON bp_token
+WHEN new.token_kind NOT IN ('SPACE', 'LINEBREAK')
+BEGIN
+  INSERT INTO bp_token_fts(translation_id, verse_key, token_index, token, token_norm)
+  VALUES (new.translation_id, new.verse_key, new.token_index, new.token, new.token_norm);
+END;
 `;
 
 /* ---------------------------- Export convenience ---------------------------- */
 
 export const schema = {
-    // Canon
+    // Canonical scripture
     bpBook,
     bpVerse,
     bpChapter,
 
+    // Translation + text
     bpTranslation,
     bpVerseText,
     bpToken,
+    bpTokenSpan,
 
+    // Structural/range layer
     bpRange,
     bpPericope,
     bpParagraph,
     bpDocUnit,
 
+    // Entity universe
     bpEntity,
     bpEntityName,
     bpEntityRelation,
 
+    // Geography
     bpPlaceGeo,
     bpRoute,
     bpRouteStep,
 
+    // Time / chronology
     bpTimeSpan,
     bpTimelineAnchor,
 
+    // Events
     bpEvent,
     bpEventParticipant,
 
+    // Orientation graph
     bpLink,
     bpCrossref,
 
+    // Search / telemetry
     bpSearchQueryLog,
     bpReaderEvent,
 
+    // Provenance / audit
     bpSource,
     bpAudit,
-
-    // Auth + user data are re-exported from modules; if you want them on this object,
-    // import them explicitly here and add them (optional).
 } as const;
 ```
 
@@ -7492,43 +8951,61 @@ export const schema = {
 
 ```ts
 // apps/api/src/db/seed.ts
-// Biblia Populi — Seed / Bootstrap (Bun + Drizzle + bun:sqlite)
+// Biblia.to — Seed / Bootstrap (Bun + Drizzle + bun:sqlite)
 //
 // Seeds (idempotent, metadata-only):
 // - bp_book (66-book canon spine: ids, ordinals, testament, chapter counts)
 // - bp_translation (default translation row, marks is_default)
 //
 // Does NOT seed:
-// - bp_verse_text (you import full KJV)
+// - bp_verse_text (import full translation separately)
 // - bp_verse / bp_chapter / verse_ord spine (importer / builder)
 //
 // Usage:
 //   bun run db:seed
+//
+// Notes:
+// - This runner expects a writable DB; it refuses readonly mode.
+// - This file is intentionally conservative: metadata only, no canon text mutation.
+// - Seeding is transactional.
+// - Translation default behavior is explicit and production-safe.
 
-import {eq, sql} from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
+
 import { openDb } from "./client";
 import { bpBook, bpTranslation } from "./schema";
 
-const TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "KJV").trim();
-const TRANSLATION_NAME = (
-    process.env.BP_TRANSLATION_NAME ??
-    (TRANSLATION_ID.toUpperCase() === "KJV" ? "King James Version" : TRANSLATION_ID)
-).trim();
-const TRANSLATION_LANG = (process.env.BP_TRANSLATION_LANG ?? "en").trim();
+/* --------------------------------- Config --------------------------------- */
 
-// optional: mark KJV-derived translations or custom license text
-const TRANSLATION_LICENSE_KIND = (process.env.BP_TRANSLATION_LICENSE_KIND ?? "PUBLIC_DOMAIN").trim();
+const TRANSLATION_ID = nonEmptyOr(process.env.BP_TRANSLATION_ID, "KJV");
+const TRANSLATION_NAME = nonEmptyOr(
+    process.env.BP_TRANSLATION_NAME,
+    TRANSLATION_ID.toUpperCase() === "KJV" ? "King James Version" : TRANSLATION_ID,
+);
+const TRANSLATION_LANG = nonEmptyOr(process.env.BP_TRANSLATION_LANG, "en");
+
+// Optional metadata
+const TRANSLATION_DERIVED_FROM = nullIfEmpty(process.env.BP_TRANSLATION_DERIVED_FROM);
+const TRANSLATION_LICENSE_KIND = nonEmptyOr(process.env.BP_TRANSLATION_LICENSE_KIND, "PUBLIC_DOMAIN");
 const TRANSLATION_LICENSE_TEXT =
-    (process.env.BP_TRANSLATION_LICENSE_TEXT ??
-        (TRANSLATION_ID.toUpperCase() === "KJV" ? "Public domain (US)" : "")).trim() || null;
-const TRANSLATION_SOURCE_URL = (process.env.BP_TRANSLATION_SOURCE_URL ?? "").trim() || null;
+    nullIfEmpty(process.env.BP_TRANSLATION_LICENSE_TEXT) ??
+    (TRANSLATION_ID.toUpperCase() === "KJV" ? "Public domain (US)" : null);
+const TRANSLATION_SOURCE_URL = nullIfEmpty(process.env.BP_TRANSLATION_SOURCE_URL);
 
-// Only touch defaults if requested (prevents wiping defaults in multi-translation DBs)
-const FORCE_DEFAULT = (process.env.BP_SEED_FORCE_DEFAULT_TRANSLATION ?? "1").trim() !== "0";
+// Only touch defaults if requested.
+// Default: true for bootstrap simplicity.
+const FORCE_DEFAULT = envBool("BP_SEED_FORCE_DEFAULT_TRANSLATION", true);
 
-function log(...args: unknown[]) {
+/* -------------------------------- Utilities -------------------------------- */
+
+function log(...args: unknown[]): void {
     // eslint-disable-next-line no-console
     console.log("[db:seed]", ...args);
+}
+
+function warn(...args: unknown[]): void {
+    // eslint-disable-next-line no-console
+    console.warn("[db:seed]", ...args);
 }
 
 function fatal(...args: unknown[]): never {
@@ -7536,6 +9013,52 @@ function fatal(...args: unknown[]): never {
     console.error("[db:seed]", ...args);
     process.exit(1);
     throw new Error("unreachable");
+}
+
+function envBool(name: string, fallback = false): boolean {
+    const v = process.env[name]?.trim().toLowerCase();
+    if (!v) return fallback;
+    return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function nonEmptyOr(v: string | undefined, fallback: string): string {
+    const s = (v ?? "").trim();
+    return s || fallback;
+}
+
+function nullIfEmpty(v: string | undefined): string | null {
+    const s = (v ?? "").trim();
+    return s || null;
+}
+
+function assertSafeTranslationId(id: string): string {
+    const s = id.trim();
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(s)) {
+        throw new Error(
+            `[db:seed] invalid BP_TRANSLATION_ID '${id}'. Expected 1-64 chars matching [A-Za-z0-9._-].`,
+        );
+    }
+    return s;
+}
+
+function safeJsonStringify(value: unknown): string {
+    return JSON.stringify(value);
+}
+
+function runTx(sqlite: ReturnType<typeof openDb>["sqlite"], fn: () => Promise<void>): Promise<void> {
+    sqlite.exec("BEGIN;");
+    return fn()
+        .then(() => {
+            sqlite.exec("COMMIT;");
+        })
+        .catch((e) => {
+            try {
+                sqlite.exec("ROLLBACK;");
+            } catch {
+                // ignore rollback failure
+            }
+            throw e;
+        });
 }
 
 /* --------------------------------- Data ----------------------------------- */
@@ -7553,83 +9076,131 @@ type BookSeed = Readonly<{
 
 const PROTESTANT_66: readonly BookSeed[] = [
     // OT
-    { bookId: "GEN", ordinal: 1, testament: "OT", name: "Genesis", nameShort: "Gen", chapters: 50, osised: "Gen" },
-    { bookId: "EXO", ordinal: 2, testament: "OT", name: "Exodus", nameShort: "Exod", chapters: 40, osised: "Exod" },
-    { bookId: "LEV", ordinal: 3, testament: "OT", name: "Leviticus", nameShort: "Lev", chapters: 27, osised: "Lev" },
-    { bookId: "NUM", ordinal: 4, testament: "OT", name: "Numbers", nameShort: "Num", chapters: 36, osised: "Num" },
-    { bookId: "DEU", ordinal: 5, testament: "OT", name: "Deuteronomy", nameShort: "Deut", chapters: 34, osised: "Deut" },
-    { bookId: "JOS", ordinal: 6, testament: "OT", name: "Joshua", nameShort: "Josh", chapters: 24, osised: "Josh" },
-    { bookId: "JDG", ordinal: 7, testament: "OT", name: "Judges", nameShort: "Judg", chapters: 21, osised: "Judg" },
-    { bookId: "RUT", ordinal: 8, testament: "OT", name: "Ruth", nameShort: "Ruth", chapters: 4, osised: "Ruth" },
-    { bookId: "1SA", ordinal: 9, testament: "OT", name: "1 Samuel", nameShort: "1 Sam", chapters: 31, osised: "1Sam" },
-    { bookId: "2SA", ordinal: 10, testament: "OT", name: "2 Samuel", nameShort: "2 Sam", chapters: 24, osised: "2Sam" },
-    { bookId: "1KI", ordinal: 11, testament: "OT", name: "1 Kings", nameShort: "1 Kgs", chapters: 22, osised: "1Kgs" },
-    { bookId: "2KI", ordinal: 12, testament: "OT", name: "2 Kings", nameShort: "2 Kgs", chapters: 25, osised: "2Kgs" },
-    { bookId: "1CH", ordinal: 13, testament: "OT", name: "1 Chronicles", nameShort: "1 Chr", chapters: 29, osised: "1Chr" },
-    { bookId: "2CH", ordinal: 14, testament: "OT", name: "2 Chronicles", nameShort: "2 Chr", chapters: 36, osised: "2Chr" },
-    { bookId: "EZR", ordinal: 15, testament: "OT", name: "Ezra", nameShort: "Ezra", chapters: 10, osised: "Ezra" },
-    { bookId: "NEH", ordinal: 16, testament: "OT", name: "Nehemiah", nameShort: "Neh", chapters: 13, osised: "Neh" },
-    { bookId: "EST", ordinal: 17, testament: "OT", name: "Esther", nameShort: "Esth", chapters: 10, osised: "Esth" },
+    { bookId: "GEN", ordinal: 1, testament: "OT", name: "Genesis", nameShort: "Gen", chapters: 50, osised: "Gen", abbrs: ["Ge", "Gn"] },
+    { bookId: "EXO", ordinal: 2, testament: "OT", name: "Exodus", nameShort: "Exod", chapters: 40, osised: "Exod", abbrs: ["Ex", "Exo"] },
+    { bookId: "LEV", ordinal: 3, testament: "OT", name: "Leviticus", nameShort: "Lev", chapters: 27, osised: "Lev", abbrs: ["Le", "Lv"] },
+    { bookId: "NUM", ordinal: 4, testament: "OT", name: "Numbers", nameShort: "Num", chapters: 36, osised: "Num", abbrs: ["Nu", "Nm", "Nb"] },
+    { bookId: "DEU", ordinal: 5, testament: "OT", name: "Deuteronomy", nameShort: "Deut", chapters: 34, osised: "Deut", abbrs: ["Dt", "Deu"] },
+    { bookId: "JOS", ordinal: 6, testament: "OT", name: "Joshua", nameShort: "Josh", chapters: 24, osised: "Josh", abbrs: ["Jos"] },
+    { bookId: "JDG", ordinal: 7, testament: "OT", name: "Judges", nameShort: "Judg", chapters: 21, osised: "Judg", abbrs: ["Jdg", "Jg", "Jdgs"] },
+    { bookId: "RUT", ordinal: 8, testament: "OT", name: "Ruth", nameShort: "Ruth", chapters: 4, osised: "Ruth", abbrs: ["Ru"] },
+    { bookId: "1SA", ordinal: 9, testament: "OT", name: "1 Samuel", nameShort: "1 Sam", chapters: 31, osised: "1Sam", abbrs: ["1Sa", "1 Sam", "I Samuel"] },
+    { bookId: "2SA", ordinal: 10, testament: "OT", name: "2 Samuel", nameShort: "2 Sam", chapters: 24, osised: "2Sam", abbrs: ["2Sa", "2 Sam", "II Samuel"] },
+    { bookId: "1KI", ordinal: 11, testament: "OT", name: "1 Kings", nameShort: "1 Kgs", chapters: 22, osised: "1Kgs", abbrs: ["1Ki", "1 Kgs", "I Kings"] },
+    { bookId: "2KI", ordinal: 12, testament: "OT", name: "2 Kings", nameShort: "2 Kgs", chapters: 25, osised: "2Kgs", abbrs: ["2Ki", "2 Kgs", "II Kings"] },
+    { bookId: "1CH", ordinal: 13, testament: "OT", name: "1 Chronicles", nameShort: "1 Chr", chapters: 29, osised: "1Chr", abbrs: ["1Ch", "1 Chr", "I Chronicles"] },
+    { bookId: "2CH", ordinal: 14, testament: "OT", name: "2 Chronicles", nameShort: "2 Chr", chapters: 36, osised: "2Chr", abbrs: ["2Ch", "2 Chr", "II Chronicles"] },
+    { bookId: "EZR", ordinal: 15, testament: "OT", name: "Ezra", nameShort: "Ezra", chapters: 10, osised: "Ezra", abbrs: ["Ezr"] },
+    { bookId: "NEH", ordinal: 16, testament: "OT", name: "Nehemiah", nameShort: "Neh", chapters: 13, osised: "Neh", abbrs: ["Ne"] },
+    { bookId: "EST", ordinal: 17, testament: "OT", name: "Esther", nameShort: "Esth", chapters: 10, osised: "Esth", abbrs: ["Es"] },
     { bookId: "JOB", ordinal: 18, testament: "OT", name: "Job", nameShort: "Job", chapters: 42, osised: "Job" },
-    { bookId: "PSA", ordinal: 19, testament: "OT", name: "Psalms", nameShort: "Ps", chapters: 150, osised: "Ps" },
-    { bookId: "PRO", ordinal: 20, testament: "OT", name: "Proverbs", nameShort: "Prov", chapters: 31, osised: "Prov" },
-    { bookId: "ECC", ordinal: 21, testament: "OT", name: "Ecclesiastes", nameShort: "Eccl", chapters: 12, osised: "Eccl" },
-    { bookId: "SNG", ordinal: 22, testament: "OT", name: "Song of Solomon", nameShort: "Song", chapters: 8, osised: "Song" },
-    { bookId: "ISA", ordinal: 23, testament: "OT", name: "Isaiah", nameShort: "Isa", chapters: 66, osised: "Isa" },
-    { bookId: "JER", ordinal: 24, testament: "OT", name: "Jeremiah", nameShort: "Jer", chapters: 52, osised: "Jer" },
-    { bookId: "LAM", ordinal: 25, testament: "OT", name: "Lamentations", nameShort: "Lam", chapters: 5, osised: "Lam" },
-    { bookId: "EZK", ordinal: 26, testament: "OT", name: "Ezekiel", nameShort: "Ezek", chapters: 48, osised: "Ezek" },
-    { bookId: "DAN", ordinal: 27, testament: "OT", name: "Daniel", nameShort: "Dan", chapters: 12, osised: "Dan" },
-    { bookId: "HOS", ordinal: 28, testament: "OT", name: "Hosea", nameShort: "Hos", chapters: 14, osised: "Hos" },
-    { bookId: "JOL", ordinal: 29, testament: "OT", name: "Joel", nameShort: "Joel", chapters: 3, osised: "Joel" },
-    { bookId: "AMO", ordinal: 30, testament: "OT", name: "Amos", nameShort: "Amos", chapters: 9, osised: "Amos" },
-    { bookId: "OBA", ordinal: 31, testament: "OT", name: "Obadiah", nameShort: "Obad", chapters: 1, osised: "Obad" },
-    { bookId: "JON", ordinal: 32, testament: "OT", name: "Jonah", nameShort: "Jon", chapters: 4, osised: "Jonah" },
-    { bookId: "MIC", ordinal: 33, testament: "OT", name: "Micah", nameShort: "Mic", chapters: 7, osised: "Mic" },
-    { bookId: "NAM", ordinal: 34, testament: "OT", name: "Nahum", nameShort: "Nah", chapters: 3, osised: "Nah" },
-    { bookId: "HAB", ordinal: 35, testament: "OT", name: "Habakkuk", nameShort: "Hab", chapters: 3, osised: "Hab" },
-    { bookId: "ZEP", ordinal: 36, testament: "OT", name: "Zephaniah", nameShort: "Zeph", chapters: 3, osised: "Zeph" },
-    { bookId: "HAG", ordinal: 37, testament: "OT", name: "Haggai", nameShort: "Hag", chapters: 2, osised: "Hag" },
-    { bookId: "ZEC", ordinal: 38, testament: "OT", name: "Zechariah", nameShort: "Zech", chapters: 14, osised: "Zech" },
-    { bookId: "MAL", ordinal: 39, testament: "OT", name: "Malachi", nameShort: "Mal", chapters: 4, osised: "Mal" },
+    { bookId: "PSA", ordinal: 19, testament: "OT", name: "Psalms", nameShort: "Ps", chapters: 150, osised: "Ps", abbrs: ["Psa", "Psalm", "Pslm"] },
+    { bookId: "PRO", ordinal: 20, testament: "OT", name: "Proverbs", nameShort: "Prov", chapters: 31, osised: "Prov", abbrs: ["Pr", "Prv"] },
+    { bookId: "ECC", ordinal: 21, testament: "OT", name: "Ecclesiastes", nameShort: "Eccl", chapters: 12, osised: "Eccl", abbrs: ["Ecc", "Qoheleth"] },
+    { bookId: "SNG", ordinal: 22, testament: "OT", name: "Song of Solomon", nameShort: "Song", chapters: 8, osised: "Song", abbrs: ["So", "Canticles", "Song of Songs"] },
+    { bookId: "ISA", ordinal: 23, testament: "OT", name: "Isaiah", nameShort: "Isa", chapters: 66, osised: "Isa", abbrs: ["Is"] },
+    { bookId: "JER", ordinal: 24, testament: "OT", name: "Jeremiah", nameShort: "Jer", chapters: 52, osised: "Jer", abbrs: ["Je", "Jr"] },
+    { bookId: "LAM", ordinal: 25, testament: "OT", name: "Lamentations", nameShort: "Lam", chapters: 5, osised: "Lam", abbrs: ["La"] },
+    { bookId: "EZK", ordinal: 26, testament: "OT", name: "Ezekiel", nameShort: "Ezek", chapters: 48, osised: "Ezek", abbrs: ["Eze", "Ezk"] },
+    { bookId: "DAN", ordinal: 27, testament: "OT", name: "Daniel", nameShort: "Dan", chapters: 12, osised: "Dan", abbrs: ["Da", "Dn"] },
+    { bookId: "HOS", ordinal: 28, testament: "OT", name: "Hosea", nameShort: "Hos", chapters: 14, osised: "Hos", abbrs: ["Ho"] },
+    { bookId: "JOL", ordinal: 29, testament: "OT", name: "Joel", nameShort: "Joel", chapters: 3, osised: "Joel", abbrs: ["Jl"] },
+    { bookId: "AMO", ordinal: 30, testament: "OT", name: "Amos", nameShort: "Amos", chapters: 9, osised: "Amos", abbrs: ["Am"] },
+    { bookId: "OBA", ordinal: 31, testament: "OT", name: "Obadiah", nameShort: "Obad", chapters: 1, osised: "Obad", abbrs: ["Ob"] },
+    { bookId: "JON", ordinal: 32, testament: "OT", name: "Jonah", nameShort: "Jon", chapters: 4, osised: "Jonah", abbrs: ["Jnh"] },
+    { bookId: "MIC", ordinal: 33, testament: "OT", name: "Micah", nameShort: "Mic", chapters: 7, osised: "Mic", abbrs: ["Mc"] },
+    { bookId: "NAM", ordinal: 34, testament: "OT", name: "Nahum", nameShort: "Nah", chapters: 3, osised: "Nah", abbrs: ["Na"] },
+    { bookId: "HAB", ordinal: 35, testament: "OT", name: "Habakkuk", nameShort: "Hab", chapters: 3, osised: "Hab", abbrs: ["Hb"] },
+    { bookId: "ZEP", ordinal: 36, testament: "OT", name: "Zephaniah", nameShort: "Zeph", chapters: 3, osised: "Zeph", abbrs: ["Zep", "Zp"] },
+    { bookId: "HAG", ordinal: 37, testament: "OT", name: "Haggai", nameShort: "Hag", chapters: 2, osised: "Hag", abbrs: ["Hg"] },
+    { bookId: "ZEC", ordinal: 38, testament: "OT", name: "Zechariah", nameShort: "Zech", chapters: 14, osised: "Zech", abbrs: ["Zec", "Zc"] },
+    { bookId: "MAL", ordinal: 39, testament: "OT", name: "Malachi", nameShort: "Mal", chapters: 4, osised: "Mal", abbrs: ["Ml"] },
 
     // NT
-    { bookId: "MAT", ordinal: 40, testament: "NT", name: "Matthew", nameShort: "Matt", chapters: 28, osised: "Matt" },
-    { bookId: "MRK", ordinal: 41, testament: "NT", name: "Mark", nameShort: "Mark", chapters: 16, osised: "Mark" },
-    { bookId: "LUK", ordinal: 42, testament: "NT", name: "Luke", nameShort: "Luke", chapters: 24, osised: "Luke" },
-    { bookId: "JHN", ordinal: 43, testament: "NT", name: "John", nameShort: "John", chapters: 21, osised: "John" },
-    { bookId: "ACT", ordinal: 44, testament: "NT", name: "Acts", nameShort: "Acts", chapters: 28, osised: "Acts" },
-    { bookId: "ROM", ordinal: 45, testament: "NT", name: "Romans", nameShort: "Rom", chapters: 16, osised: "Rom" },
-    { bookId: "1CO", ordinal: 46, testament: "NT", name: "1 Corinthians", nameShort: "1 Cor", chapters: 16, osised: "1Cor" },
-    { bookId: "2CO", ordinal: 47, testament: "NT", name: "2 Corinthians", nameShort: "2 Cor", chapters: 13, osised: "2Cor" },
-    { bookId: "GAL", ordinal: 48, testament: "NT", name: "Galatians", nameShort: "Gal", chapters: 6, osised: "Gal" },
-    { bookId: "EPH", ordinal: 49, testament: "NT", name: "Ephesians", nameShort: "Eph", chapters: 6, osised: "Eph" },
-    { bookId: "PHP", ordinal: 50, testament: "NT", name: "Philippians", nameShort: "Phil", chapters: 4, osised: "Phil" },
-    { bookId: "COL", ordinal: 51, testament: "NT", name: "Colossians", nameShort: "Col", chapters: 4, osised: "Col" },
-    { bookId: "1TH", ordinal: 52, testament: "NT", name: "1 Thessalonians", nameShort: "1 Thess", chapters: 5, osised: "1Thess" },
-    { bookId: "2TH", ordinal: 53, testament: "NT", name: "2 Thessalonians", nameShort: "2 Thess", chapters: 3, osised: "2Thess" },
-    { bookId: "1TI", ordinal: 54, testament: "NT", name: "1 Timothy", nameShort: "1 Tim", chapters: 6, osised: "1Tim" },
-    { bookId: "2TI", ordinal: 55, testament: "NT", name: "2 Timothy", nameShort: "2 Tim", chapters: 4, osised: "2Tim" },
-    { bookId: "TIT", ordinal: 56, testament: "NT", name: "Titus", nameShort: "Titus", chapters: 3, osised: "Titus" },
-    { bookId: "PHM", ordinal: 57, testament: "NT", name: "Philemon", nameShort: "Phlm", chapters: 1, osised: "Phlm" },
-    { bookId: "HEB", ordinal: 58, testament: "NT", name: "Hebrews", nameShort: "Heb", chapters: 13, osised: "Heb" },
-    { bookId: "JAS", ordinal: 59, testament: "NT", name: "James", nameShort: "Jas", chapters: 5, osised: "Jas" },
-    { bookId: "1PE", ordinal: 60, testament: "NT", name: "1 Peter", nameShort: "1 Pet", chapters: 5, osised: "1Pet" },
-    { bookId: "2PE", ordinal: 61, testament: "NT", name: "2 Peter", nameShort: "2 Pet", chapters: 3, osised: "2Pet" },
-    { bookId: "1JN", ordinal: 62, testament: "NT", name: "1 John", nameShort: "1 Jn", chapters: 5, osised: "1John" },
-    { bookId: "2JN", ordinal: 63, testament: "NT", name: "2 John", nameShort: "2 Jn", chapters: 1, osised: "2John" },
-    { bookId: "3JN", ordinal: 64, testament: "NT", name: "3 John", nameShort: "3 Jn", chapters: 1, osised: "3John" },
-    { bookId: "JUD", ordinal: 65, testament: "NT", name: "Jude", nameShort: "Jude", chapters: 1, osised: "Jude" },
-    { bookId: "REV", ordinal: 66, testament: "NT", name: "Revelation", nameShort: "Rev", chapters: 22, osised: "Rev" },
+    { bookId: "MAT", ordinal: 40, testament: "NT", name: "Matthew", nameShort: "Matt", chapters: 28, osised: "Matt", abbrs: ["Mt"] },
+    { bookId: "MRK", ordinal: 41, testament: "NT", name: "Mark", nameShort: "Mark", chapters: 16, osised: "Mark", abbrs: ["Mrk", "Mk", "Mr"] },
+    { bookId: "LUK", ordinal: 42, testament: "NT", name: "Luke", nameShort: "Luke", chapters: 24, osised: "Luke", abbrs: ["Lk"] },
+    { bookId: "JHN", ordinal: 43, testament: "NT", name: "John", nameShort: "John", chapters: 21, osised: "John", abbrs: ["Jn", "Jhn"] },
+    { bookId: "ACT", ordinal: 44, testament: "NT", name: "Acts", nameShort: "Acts", chapters: 28, osised: "Acts", abbrs: ["Ac"] },
+    { bookId: "ROM", ordinal: 45, testament: "NT", name: "Romans", nameShort: "Rom", chapters: 16, osised: "Rom", abbrs: ["Ro", "Rm"] },
+    { bookId: "1CO", ordinal: 46, testament: "NT", name: "1 Corinthians", nameShort: "1 Cor", chapters: 16, osised: "1Cor", abbrs: ["1Co", "I Corinthians"] },
+    { bookId: "2CO", ordinal: 47, testament: "NT", name: "2 Corinthians", nameShort: "2 Cor", chapters: 13, osised: "2Cor", abbrs: ["2Co", "II Corinthians"] },
+    { bookId: "GAL", ordinal: 48, testament: "NT", name: "Galatians", nameShort: "Gal", chapters: 6, osised: "Gal", abbrs: ["Ga"] },
+    { bookId: "EPH", ordinal: 49, testament: "NT", name: "Ephesians", nameShort: "Eph", chapters: 6, osised: "Eph", abbrs: ["Ep"] },
+    { bookId: "PHP", ordinal: 50, testament: "NT", name: "Philippians", nameShort: "Phil", chapters: 4, osised: "Phil", abbrs: ["Php", "Pp"] },
+    { bookId: "COL", ordinal: 51, testament: "NT", name: "Colossians", nameShort: "Col", chapters: 4, osised: "Col", abbrs: ["Co"] },
+    { bookId: "1TH", ordinal: 52, testament: "NT", name: "1 Thessalonians", nameShort: "1 Thess", chapters: 5, osised: "1Thess", abbrs: ["1Th", "I Thessalonians"] },
+    { bookId: "2TH", ordinal: 53, testament: "NT", name: "2 Thessalonians", nameShort: "2 Thess", chapters: 3, osised: "2Thess", abbrs: ["2Th", "II Thessalonians"] },
+    { bookId: "1TI", ordinal: 54, testament: "NT", name: "1 Timothy", nameShort: "1 Tim", chapters: 6, osised: "1Tim", abbrs: ["1Ti", "I Timothy"] },
+    { bookId: "2TI", ordinal: 55, testament: "NT", name: "2 Timothy", nameShort: "2 Tim", chapters: 4, osised: "2Tim", abbrs: ["2Ti", "II Timothy"] },
+    { bookId: "TIT", ordinal: 56, testament: "NT", name: "Titus", nameShort: "Titus", chapters: 3, osised: "Titus", abbrs: ["Tit"] },
+    { bookId: "PHM", ordinal: 57, testament: "NT", name: "Philemon", nameShort: "Phlm", chapters: 1, osised: "Phlm", abbrs: ["Phm", "Pm"] },
+    { bookId: "HEB", ordinal: 58, testament: "NT", name: "Hebrews", nameShort: "Heb", chapters: 13, osised: "Heb", abbrs: ["He"] },
+    { bookId: "JAS", ordinal: 59, testament: "NT", name: "James", nameShort: "Jas", chapters: 5, osised: "Jas", abbrs: ["Jm"] },
+    { bookId: "1PE", ordinal: 60, testament: "NT", name: "1 Peter", nameShort: "1 Pet", chapters: 5, osised: "1Pet", abbrs: ["1Pe", "I Peter"] },
+    { bookId: "2PE", ordinal: 61, testament: "NT", name: "2 Peter", nameShort: "2 Pet", chapters: 3, osised: "2Pet", abbrs: ["2Pe", "II Peter"] },
+    { bookId: "1JN", ordinal: 62, testament: "NT", name: "1 John", nameShort: "1 Jn", chapters: 5, osised: "1John", abbrs: ["1Jn", "I John"] },
+    { bookId: "2JN", ordinal: 63, testament: "NT", name: "2 John", nameShort: "2 Jn", chapters: 1, osised: "2John", abbrs: ["2Jn", "II John"] },
+    { bookId: "3JN", ordinal: 64, testament: "NT", name: "3 John", nameShort: "3 Jn", chapters: 1, osised: "3John", abbrs: ["3Jn", "III John"] },
+    { bookId: "JUD", ordinal: 65, testament: "NT", name: "Jude", nameShort: "Jude", chapters: 1, osised: "Jude", abbrs: ["Jud"] },
+    { bookId: "REV", ordinal: 66, testament: "NT", name: "Revelation", nameShort: "Rev", chapters: 22, osised: "Rev", abbrs: ["Re", "The Revelation"] },
 ];
+
+/* ------------------------------ Seed validation ----------------------------- */
+
+function validateBookSeeds(books: readonly BookSeed[]): void {
+    if (books.length !== 66) {
+        throw new Error(`[db:seed] expected 66 books, got ${books.length}`);
+    }
+
+    const ids = new Set<string>();
+    const ords = new Set<number>();
+
+    for (const b of books) {
+        if (!/^[A-Z0-9_]{2,8}$/.test(b.bookId)) {
+            throw new Error(`[db:seed] invalid bookId '${b.bookId}'`);
+        }
+        if (ids.has(b.bookId)) {
+            throw new Error(`[db:seed] duplicate bookId '${b.bookId}'`);
+        }
+        ids.add(b.bookId);
+
+        if (!Number.isInteger(b.ordinal) || b.ordinal < 1 || b.ordinal > 66) {
+            throw new Error(`[db:seed] invalid ordinal for '${b.bookId}'`);
+        }
+        if (ords.has(b.ordinal)) {
+            throw new Error(`[db:seed] duplicate ordinal '${b.ordinal}'`);
+        }
+        ords.add(b.ordinal);
+
+        if (b.testament !== "OT" && b.testament !== "NT") {
+            throw new Error(`[db:seed] invalid testament for '${b.bookId}'`);
+        }
+        if (!b.name.trim()) {
+            throw new Error(`[db:seed] empty name for '${b.bookId}'`);
+        }
+        if (!b.nameShort.trim()) {
+            throw new Error(`[db:seed] empty nameShort for '${b.bookId}'`);
+        }
+        if (!Number.isInteger(b.chapters) || b.chapters < 1 || b.chapters > 200) {
+            throw new Error(`[db:seed] invalid chapters for '${b.bookId}'`);
+        }
+    }
+
+    for (let i = 1; i <= 66; i += 1) {
+        if (!ords.has(i)) {
+            throw new Error(`[db:seed] missing ordinal '${i}'`);
+        }
+    }
+}
 
 /* ----------------------------- Seed Operations ----------------------------- */
 
 type Db = ReturnType<typeof openDb>["db"];
 type Sqlite = ReturnType<typeof openDb>["sqlite"];
 
-async function seedBooks(db: Db) {
-    log("upserting bp_book (66)…");
+async function seedBooks(db: Db): Promise<void> {
+    log("upserting bp_book (66)...");
 
     await db
         .insert(bpBook)
@@ -7642,7 +9213,7 @@ async function seedBooks(db: Db) {
                 nameShort: b.nameShort,
                 chapters: b.chapters,
                 osised: b.osised ?? null,
-                abbrs: b.abbrs ? JSON.stringify(b.abbrs) : null,
+                abbrs: b.abbrs ? safeJsonStringify(b.abbrs) : null,
             })),
         )
         .onConflictDoUpdate({
@@ -7659,11 +9230,15 @@ async function seedBooks(db: Db) {
         });
 }
 
-async function seedTranslation(db: Db) {
-    log("upserting bp_translation…", TRANSLATION_ID);
+async function ensureSingleDefaultTranslation(db: Db, translationId: string): Promise<void> {
+    await db.update(bpTranslation).set({ isDefault: false });
+    await db.update(bpTranslation).set({ isDefault: true }).where(eq(bpTranslation.translationId, translationId));
+}
+
+async function seedTranslation(db: Db): Promise<void> {
+    log("upserting bp_translation...", TRANSLATION_ID);
 
     if (FORCE_DEFAULT) {
-        // clear any prior default(s) without destroying rows
         await db.update(bpTranslation).set({ isDefault: false });
     }
 
@@ -7673,29 +9248,25 @@ async function seedTranslation(db: Db) {
             translationId: TRANSLATION_ID,
             name: TRANSLATION_NAME,
             language: TRANSLATION_LANG,
-            derivedFrom: null,
-            // keep this permissive unless you want to lock it down to an enum in schema
+            derivedFrom: TRANSLATION_DERIVED_FROM,
             licenseKind: TRANSLATION_LICENSE_KIND as any,
             licenseText: TRANSLATION_LICENSE_TEXT,
             sourceUrl: TRANSLATION_SOURCE_URL,
             isDefault: FORCE_DEFAULT ? true : false,
-            // createdAt default
         })
         .onConflictDoUpdate({
             target: bpTranslation.translationId,
             set: {
                 name: TRANSLATION_NAME,
                 language: TRANSLATION_LANG,
-                derivedFrom: null,
+                derivedFrom: TRANSLATION_DERIVED_FROM,
                 licenseKind: TRANSLATION_LICENSE_KIND as any,
                 licenseText: TRANSLATION_LICENSE_TEXT,
                 sourceUrl: TRANSLATION_SOURCE_URL,
-                // only flip default when FORCE_DEFAULT is enabled
                 ...(FORCE_DEFAULT ? ({ isDefault: true } as const) : {}),
             },
         });
 
-    // If not forcing default, we still want *a* default if none exists at all.
     if (!FORCE_DEFAULT) {
         const anyDefault = await db
             .select({ id: bpTranslation.translationId })
@@ -7707,6 +9278,17 @@ async function seedTranslation(db: Db) {
             await db.update(bpTranslation).set({ isDefault: true }).where(eq(bpTranslation.translationId, TRANSLATION_ID));
         }
     }
+
+    const defaults = await db
+        .select({ id: bpTranslation.translationId })
+        .from(bpTranslation)
+        .where(eq(bpTranslation.isDefault, true));
+
+    if (defaults.length === 0) {
+        await ensureSingleDefaultTranslation(db, TRANSLATION_ID);
+    } else if (FORCE_DEFAULT && defaults.length !== 1) {
+        await ensureSingleDefaultTranslation(db, TRANSLATION_ID);
+    }
 }
 
 function getVerseTextCount(sqlite: Sqlite): number {
@@ -7717,37 +9299,138 @@ function getVerseTextCount(sqlite: Sqlite): number {
     return Number.isFinite(n) ? Math.trunc(n) : 0;
 }
 
+function getBookCount(sqlite: Sqlite): number {
+    const row = sqlite.prepare(`SELECT COUNT(*) AS c FROM bp_book`).get() as { c?: number } | undefined;
+    const n = row?.c ?? 0;
+    return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+
+function getTranslationRow(
+    sqlite: Sqlite,
+): {
+    translationId: string;
+    name: string | null;
+    language: string | null;
+    isDefault: number | boolean;
+} | null {
+    const row = sqlite
+        .prepare(
+            `
+            SELECT
+                translation_id AS translationId,
+                name           AS name,
+                language       AS language,
+                is_default     AS isDefault
+            FROM bp_translation
+            WHERE translation_id = ?
+            LIMIT 1
+            `,
+        )
+        .get(TRANSLATION_ID) as
+        | {
+        translationId: string;
+        name: string | null;
+        language: string | null;
+        isDefault: number | boolean;
+    }
+        | undefined;
+
+    return row ?? null;
+}
+
+function getDefaultTranslationCount(sqlite: Sqlite): number {
+    const row = sqlite
+        .prepare(`SELECT COUNT(*) AS c FROM bp_translation WHERE is_default = 1`)
+        .get() as { c?: number } | undefined;
+    const n = row?.c ?? 0;
+    return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+
+function verifySeedOutcome(sqlite: Sqlite): void {
+    const bookCount = getBookCount(sqlite);
+    if (bookCount < 66) {
+        throw new Error(`[db:seed] bp_book count too low after seeding: ${bookCount}`);
+    }
+
+    const translation = getTranslationRow(sqlite);
+    if (!translation) {
+        throw new Error(`[db:seed] seeded translation '${TRANSLATION_ID}' not found after commit`);
+    }
+
+    const defaultCount = getDefaultTranslationCount(sqlite);
+    if (defaultCount < 1) {
+        throw new Error("[db:seed] no default translation exists after seeding");
+    }
+
+    if (FORCE_DEFAULT && defaultCount !== 1) {
+        throw new Error(`[db:seed] expected exactly 1 default translation in FORCE_DEFAULT mode, got ${defaultCount}`);
+    }
+}
+
 /* ---------------------------------- Main ---------------------------------- */
 
-async function main() {
-    const { sqlite, db, dbPath, close } = openDb();
+async function main(): Promise<void> {
+    assertSafeTranslationId(TRANSLATION_ID);
+    validateBookSeeds(PROTESTANT_66);
+
+    const handle = openDb();
+    const { sqlite, db, dbPath, close, readonly } = handle;
+
+    if (readonly) {
+        fatal(
+            "seed runner opened DB in readonly mode.",
+            JSON.stringify({
+                dbPath,
+                hint: "Unset BP_DB_READONLY or set BP_DB_READONLY=0 before running db:seed.",
+            }),
+        );
+    }
+
     log("dbPath:", dbPath);
+    log(
+        "translation:",
+        JSON.stringify({
+            translationId: TRANSLATION_ID,
+            name: TRANSLATION_NAME,
+            language: TRANSLATION_LANG,
+            forceDefault: FORCE_DEFAULT,
+        }),
+    );
 
     try {
-        sqlite.exec("BEGIN;");
-        await seedBooks(db);
-        await seedTranslation(db);
-        sqlite.exec("COMMIT;");
-    } catch (e) {
-        try {
-            sqlite.exec("ROLLBACK;");
-        } catch {
-            // ignore
-        }
-        throw e;
+        await runTx(sqlite, async () => {
+            await seedBooks(db);
+            await seedTranslation(db);
+        });
     } finally {
         close();
     }
 
-    // Read-only post-check (fresh connection)
     const check = openDb();
     try {
+        verifySeedOutcome(check.sqlite);
+
         const verseTextCount = getVerseTextCount(check.sqlite);
-        log(`bp_verse_text rows for ${TRANSLATION_ID}:`, verseTextCount);
+        const translation = getTranslationRow(check.sqlite);
+        const bookCount = getBookCount(check.sqlite);
+        const defaultCount = getDefaultTranslationCount(check.sqlite);
+
+        log(
+            "post-check:",
+            JSON.stringify({
+                bpBookCount: bookCount,
+                translationId: translation?.translationId ?? null,
+                translationName: translation?.name ?? null,
+                language: translation?.language ?? null,
+                isDefault: translation ? !!translation.isDefault : null,
+                defaultTranslationCount: defaultCount,
+                verseTextCount,
+            }),
+        );
 
         if (verseTextCount === 0) {
-            log("NOTE: no verse text found for this translation_id.");
-            log("Run your KJV importer (or set BP_TRANSLATION_ID to match the imported translation_id).");
+            warn("no bp_verse_text rows found for this translation_id.");
+            warn("Run your translation importer, or set BP_TRANSLATION_ID to match the imported translation_id.");
         }
     } finally {
         check.close();
@@ -7763,7 +9446,7 @@ main().catch((err) => fatal(err));
 
 ```ts
 // apps/api/src/server.ts
-// Biblia Populi — Production API server (Bun + Hono + Drizzle + bun:sqlite)
+// Biblia.to — Production API server (Bun + Hono + Drizzle + bun:sqlite)
 //
 // Endpoints:
 //   GET   /health
@@ -7791,8 +9474,9 @@ main().catch((err) => fatal(err));
 // - /slice is designed for @tanstack/react-virtual: index = verseOrd - 1.
 // - Translation selection: ?t=KJV or ?translationId=KJV (query param wins over env/db default).
 // - Orientation-only: no commentary/doctrine storage.
+// - User annotations belong in separate user-data tables/modules, not canon tables.
 
-import { Hono, type Context } from "hono";
+import { Hono, type Context, type Next } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { compress } from "hono/compress";
@@ -7825,36 +9509,40 @@ import { bpUser, bpAuthAccount, bpSession } from "./db/authSchema";
 
 /* --------------------------------- Config --------------------------------- */
 
-const PORT = Number(process.env.PORT ?? "3000");
+const PORT = parseEnvInt(process.env.PORT, 3000, { min: 1, max: 65535 });
+const NODE_ENV = (process.env.NODE_ENV ?? "development").trim().toLowerCase();
+const IS_PROD = NODE_ENV === "production";
 
-// Public URLs (use the actual env keys you gave)
-const BP_PUBLIC_URL = (process.env.BP_PUBLIC_URL ?? `http://localhost:${PORT}`).trim().replace(/\/+$/g, "");
-const BP_WEB_ORIGIN = (process.env.BP_WEB_ORIGIN ?? process.env.BP_CORS_ORIGIN ?? "*").trim();
+// Public URLs
+const BP_PUBLIC_URL = trimTrailingSlash(process.env.BP_PUBLIC_URL ?? `http://localhost:${PORT}`);
+const BP_WEB_ORIGIN_RAW = (process.env.BP_WEB_ORIGIN ?? process.env.BP_CORS_ORIGIN ?? "").trim();
 
-// Prefer explicit env default, else fall back to DB default translation (bp_translation.is_default)
+// Explicit env default translation, else DB default.
 const ENV_TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "").trim();
 
-// CORS: allow comma-separated list; cookies require non-wildcard
-const CORS_RAW = BP_WEB_ORIGIN || "*";
-const CORS_LIST = CORS_RAW.split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+// CORS
+const CORS_LIST = splitCsv(BP_WEB_ORIGIN_RAW);
 const CORS_WILDCARD = CORS_LIST.length === 0 || CORS_LIST.includes("*");
 
 // Auth
-const AUTH_ENABLED = (process.env.BP_AUTH_ENABLED ?? "1").trim() !== "0";
-const AUTH_COOKIE = (process.env.BP_AUTH_COOKIE ?? "bp_session").trim();
-const AUTH_COOKIE_DOMAIN = (process.env.BP_AUTH_COOKIE_DOMAIN ?? "").trim() || undefined;
-const AUTH_COOKIE_PATH = (process.env.BP_AUTH_COOKIE_PATH ?? "/").trim() || "/";
-const AUTH_COOKIE_SECURE = (process.env.BP_AUTH_COOKIE_SECURE ?? "").trim()
-    ? (process.env.BP_AUTH_COOKIE_SECURE ?? "").trim() === "1"
-    : (process.env.NODE_ENV ?? "").trim().toLowerCase() === "production";
-const AUTH_SESSION_DAYS = Number(process.env.BP_AUTH_SESSION_DAYS ?? "30");
+const AUTH_ENABLED = parseEnvBool(process.env.BP_AUTH_ENABLED, true);
+const AUTH_COOKIE = nonEmptyOr(process.env.BP_AUTH_COOKIE, "bp_session");
+const AUTH_COOKIE_DOMAIN = nonEmptyOrUndefined(process.env.BP_AUTH_COOKIE_DOMAIN);
+const AUTH_COOKIE_PATH = nonEmptyOr(process.env.BP_AUTH_COOKIE_PATH, "/");
+const AUTH_COOKIE_SECURE = parseEnvBool(
+    process.env.BP_AUTH_COOKIE_SECURE,
+    IS_PROD,
+);
+const AUTH_SESSION_DAYS = parseEnvInt(process.env.BP_AUTH_SESSION_DAYS, 30, { min: 1, max: 365 });
 
-// Cookie signing (you provided BP_AUTH_COOKIE_SECRET)
+// Cookie signing
 const AUTH_COOKIE_SECRET = (process.env.BP_AUTH_COOKIE_SECRET ?? "").trim();
+const AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE = parseEnvBool(
+    process.env.BP_AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE,
+    !IS_PROD,
+);
 
-// Google OAuth (use your BP_* keys; keep legacy fallbacks)
+// Google OAuth
 const GOOGLE_CLIENT_ID = (process.env.BP_GOOGLE_CLIENT_ID ?? process.env.GOOGLE_CLIENT_ID ?? "").trim();
 const GOOGLE_CLIENT_SECRET = (process.env.BP_GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_CLIENT_SECRET ?? "").trim();
 const GOOGLE_REDIRECT_URI = (
@@ -7864,12 +9552,46 @@ const GOOGLE_REDIRECT_URI = (
 ).trim();
 const GOOGLE_SCOPES = ["openid", "email", "profile"] as const;
 
-// Where to send the user after login (your web app)
-const AUTH_AFTER_LOGIN_URL = (process.env.BP_AUTH_AFTER_LOGIN_URL ?? `${BP_WEB_ORIGIN}/reader`).trim();
-const AUTH_AFTER_LOGOUT_URL = (process.env.BP_AUTH_AFTER_LOGOUT_URL ?? `${BP_WEB_ORIGIN}/`).trim();
+// Redirects
+const AUTH_AFTER_LOGIN_URL = (
+    process.env.BP_AUTH_AFTER_LOGIN_URL ??
+    (CORS_WILDCARD ? "" : `${CORS_LIST[0]}/reader`)
+).trim();
+const AUTH_AFTER_LOGOUT_URL = (
+    process.env.BP_AUTH_AFTER_LOGOUT_URL ??
+    (CORS_WILDCARD ? "" : `${CORS_LIST[0]}/`)
+).trim();
 
-// Start the Bun server unless disabled (useful for tests)
-const LISTEN = (process.env.BP_API_LISTEN ?? "1").trim() !== "0";
+// Bun listen
+const LISTEN = parseEnvBool(process.env.BP_API_LISTEN, true);
+
+// Network timeouts
+const OAUTH_FETCH_TIMEOUT_MS = parseEnvInt(process.env.BP_OAUTH_FETCH_TIMEOUT_MS, 10_000, {
+    min: 1_000,
+    max: 60_000,
+});
+
+// Basic in-memory rate limits
+const AUTH_RATE_LIMIT_WINDOW_MS = parseEnvInt(process.env.BP_AUTH_RATE_LIMIT_WINDOW_MS, 60_000, {
+    min: 5_000,
+    max: 3600_000,
+});
+const AUTH_RATE_LIMIT_MAX = parseEnvInt(process.env.BP_AUTH_RATE_LIMIT_MAX, 30, {
+    min: 1,
+    max: 10_000,
+});
+const SEARCH_RATE_LIMIT_WINDOW_MS = parseEnvInt(process.env.BP_SEARCH_RATE_LIMIT_WINDOW_MS, 60_000, {
+    min: 5_000,
+    max: 3600_000,
+});
+const SEARCH_RATE_LIMIT_MAX = parseEnvInt(process.env.BP_SEARCH_RATE_LIMIT_MAX, 120, {
+    min: 1,
+    max: 10_000,
+});
+
+/* ------------------------------ Startup checks ----------------------------- */
+
+validateStartup();
 
 /* --------------------------------- Helpers -------------------------------- */
 
@@ -7891,28 +9613,112 @@ function toJsonStatus(n: number): JsonStatus {
     return 500;
 }
 
-function jsonOk<T>(c: Context, data: T, extraHeaders?: Record<string, string>) {
+function jsonOk<T>(c: Context, data: T, extraHeaders?: Record<string, string>, status: 200 | 201 = 200) {
     if (extraHeaders) for (const [k, v] of Object.entries(extraHeaders)) c.header(k, v);
     const body: ApiOk<T> = { ok: true, data };
-    return c.json(body);
+    return c.json(body, { status });
 }
 
-// IMPORTANT: use the init overload so Hono accepts our union status cleanly.
 function jsonErr(c: Context, status: number, code: string, message: string) {
     const body: ApiErr = { ok: false, error: { code, message } };
     return c.json(body, { status: toJsonStatus(status) });
 }
 
-function clamp(n: number, lo: number, hi: number) {
+function trimTrailingSlash(s: string): string {
+    return s.trim().replace(/\/+$/g, "");
+}
+
+function nonEmptyOr(v: string | undefined, fallback: string): string {
+    const s = (v ?? "").trim();
+    return s || fallback;
+}
+
+function nonEmptyOrUndefined(v: string | undefined): string | undefined {
+    const s = (v ?? "").trim();
+    return s || undefined;
+}
+
+function splitCsv(s: string): string[] {
+    return s
+        .split(",")
+        .map((v) => v.trim())
+        .filter(Boolean);
+}
+
+function parseEnvBool(v: string | undefined, fallback: boolean): boolean {
+    const s = (v ?? "").trim().toLowerCase();
+    if (!s) return fallback;
+    if (["1", "true", "yes", "on"].includes(s)) return true;
+    if (["0", "false", "no", "off"].includes(s)) return false;
+    return fallback;
+}
+
+function parseEnvInt(
+    v: string | undefined,
+    fallback: number,
+    bounds?: { min?: number; max?: number },
+): number {
+    const n = Number((v ?? "").trim());
+    let out = Number.isFinite(n) ? Math.trunc(n) : fallback;
+    if (bounds?.min != null && out < bounds.min) out = bounds.min;
+    if (bounds?.max != null && out > bounds.max) out = bounds.max;
+    return out;
+}
+
+function assertAbsoluteHttpUrl(name: string, value: string): void {
+    let u: URL;
+    try {
+        u = new URL(value);
+    } catch {
+        throw new Error(`[api] ${name} must be a valid absolute URL`);
+    }
+    if (u.protocol !== "http:" && u.protocol !== "https:") {
+        throw new Error(`[api] ${name} must use http or https`);
+    }
+}
+
+function validateStartup(): void {
+    assertAbsoluteHttpUrl("BP_PUBLIC_URL", BP_PUBLIC_URL);
+
+    if (AUTH_ENABLED) {
+        if (CORS_WILDCARD) {
+            throw new Error(
+                "[api] Auth is enabled but BP_WEB_ORIGIN/BP_CORS_ORIGIN resolves to wildcard/empty. Cookies require a specific origin.",
+            );
+        }
+
+        for (const origin of CORS_LIST) {
+            assertAbsoluteHttpUrl("BP_WEB_ORIGIN/BP_CORS_ORIGIN entry", origin);
+        }
+
+        assertAbsoluteHttpUrl("AUTH_AFTER_LOGIN_URL", AUTH_AFTER_LOGIN_URL);
+        assertAbsoluteHttpUrl("AUTH_AFTER_LOGOUT_URL", AUTH_AFTER_LOGOUT_URL);
+
+        if (IS_PROD && !AUTH_COOKIE_SECRET) {
+            throw new Error("[api] BP_AUTH_COOKIE_SECRET is required in production when auth is enabled.");
+        }
+
+        if (!GOOGLE_REDIRECT_URI) {
+            throw new Error("[api] GOOGLE_REDIRECT_URI resolved empty.");
+        }
+        assertAbsoluteHttpUrl("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI);
+    }
+}
+
+function clamp(n: number, lo: number, hi: number): number {
     return Math.max(lo, Math.min(hi, n));
 }
 
-function cacheNoStore(c: Context) {
+function cacheNoStore(c: Context): void {
     c.header("Cache-Control", "no-store");
 }
 
-function cachePublic(c: Context, seconds: number) {
+function cachePublic(c: Context, seconds: number): void {
     c.header("Cache-Control", `public, max-age=${seconds}`);
+}
+
+function cachePrivate(c: Context, seconds: number): void {
+    c.header("Cache-Control", `private, max-age=${seconds}`);
 }
 
 function qstr(c: Context, key: string): string | null {
@@ -7932,10 +9738,10 @@ function randId(bytes = 18): string {
     return b64url(crypto.randomBytes(bytes));
 }
 
-// Use ms timestamps for DB columns (drizzle sqlite { mode: "timestamp_ms" } => number).
 function nowMs(): number {
     return Date.now();
 }
+
 function msToDate(ms: number): Date {
     return new Date(ms);
 }
@@ -7957,12 +9763,18 @@ function cookieOpts(expiresAt?: Date): CookieOptions {
     return base;
 }
 
+function getClientIp(c: Context): string {
+    const xff = c.req.header("x-forwarded-for");
+    if (xff) {
+        const first = xff.split(",")[0]?.trim();
+        if (first) return first;
+    }
+    const xr = c.req.header("x-real-ip")?.trim();
+    if (xr) return xr;
+    return "unknown";
+}
+
 /* ------------------------------ Cookie signing ----------------------------- */
-/**
- * Prevents trivial cookie tampering; session ids are still DB-validated.
- * Format: <value>.<sig> where sig = base64url(hmacSha256(secret, value)).
- * If secret is empty, we fall back to raw cookie values (dev).
- */
 
 function hmacSig(value: string): string {
     if (!AUTH_COOKIE_SECRET) return "";
@@ -7986,25 +9798,31 @@ function packCookieValue(value: string): string {
     return `${value}.${hmacSig(value)}`;
 }
 
-function unpackCookieValue(packed: string): string | null {
-    const s = packed.trim();
-    if (!s) return null;
+type UnpackCookieResult =
+    | { ok: true; value: string }
+    | { ok: false; reason: "empty" | "bad_sig" | "legacy_disallowed" };
 
-    // dev / legacy
-    if (!AUTH_COOKIE_SECRET) return s;
+function unpackCookieValue(packed: string): UnpackCookieResult {
+    const s = packed.trim();
+    if (!s) return { ok: false, reason: "empty" };
+
+    if (!AUTH_COOKIE_SECRET) return { ok: true, value: s };
 
     const dot = s.lastIndexOf(".");
     if (dot <= 0) {
-        // allow legacy raw sid during transition; DB validation still applies
-        return s;
+        if (AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE) {
+            return { ok: true, value: s };
+        }
+        return { ok: false, reason: "legacy_disallowed" };
     }
 
     const value = s.slice(0, dot);
     const sig = s.slice(dot + 1);
     const expected = hmacSig(value);
-    if (!sig || !expected) return null;
-    if (!safeEqual(sig, expected)) return null;
-    return value;
+    if (!sig || !expected || !safeEqual(sig, expected)) {
+        return { ok: false, reason: "bad_sig" };
+    }
+    return { ok: true, value };
 }
 
 /* --------------------------------- Schemas -------------------------------- */
@@ -8029,7 +9847,7 @@ type TranslationRow = Readonly<{
     licenseKind: string | null;
     licenseText: string | null;
     sourceUrl: string | null;
-    isDefault: number; // 0/1
+    isDefault: number;
     createdAt: string | null;
 }>;
 
@@ -8093,6 +9911,11 @@ function readTranslationsRaw(): TranslationRow[] {
         .all() as TranslationRow[];
 
     return rows ?? [];
+}
+
+function invalidateTranslationsCache(): void {
+    _translationsCache = null;
+    _resolvedTranslationId = null;
 }
 
 function getTranslationsCached(): Readonly<{
@@ -8192,6 +10015,10 @@ function hasFts(): boolean {
 
 type SpineStats = Readonly<{ verseOrdMin: number; verseOrdMax: number; verseCount: number }>;
 let _spineStats: SpineStats | null = null;
+
+function invalidateSpineStats(): void {
+    _spineStats = null;
+}
 
 function getSpineStats(): SpineStats {
     if (_spineStats) return _spineStats;
@@ -8302,6 +10129,72 @@ async function fetchEntityBase(kind: "PERSON" | "PLACE", id: string) {
     return { entity: ent[0], names };
 }
 
+/* ------------------------------ Rate limiting ------------------------------ */
+
+type RateBucket = {
+    count: number;
+    resetAt: number;
+};
+
+class MemoryRateLimiter {
+    private readonly buckets = new Map<string, RateBucket>();
+
+    constructor(
+        private readonly windowMs: number,
+        private readonly maxHits: number,
+    ) {}
+
+    hit(key: string, now = Date.now()): { ok: true; remaining: number; resetAt: number } | { ok: false; retryAfterSec: number; resetAt: number } {
+        const cur = this.buckets.get(key);
+        if (!cur || now >= cur.resetAt) {
+            const resetAt = now + this.windowMs;
+            this.buckets.set(key, { count: 1, resetAt });
+            this.maybeSweep(now);
+            return { ok: true, remaining: Math.max(0, this.maxHits - 1), resetAt };
+        }
+
+        if (cur.count >= this.maxHits) {
+            return {
+                ok: false,
+                retryAfterSec: Math.max(1, Math.ceil((cur.resetAt - now) / 1000)),
+                resetAt: cur.resetAt,
+            };
+        }
+
+        cur.count += 1;
+        return { ok: true, remaining: Math.max(0, this.maxHits - cur.count), resetAt: cur.resetAt };
+    }
+
+    private maybeSweep(now: number): void {
+        if (this.buckets.size < 10_000) return;
+        for (const [k, v] of this.buckets) {
+            if (now >= v.resetAt) this.buckets.delete(k);
+        }
+    }
+}
+
+const authLimiter = new MemoryRateLimiter(AUTH_RATE_LIMIT_WINDOW_MS, AUTH_RATE_LIMIT_MAX);
+const searchLimiter = new MemoryRateLimiter(SEARCH_RATE_LIMIT_WINDOW_MS, SEARCH_RATE_LIMIT_MAX);
+
+function withRateLimit(name: "auth" | "search") {
+    const limiter = name === "auth" ? authLimiter : searchLimiter;
+
+    return async (c: Context, next: Next) => {
+        const key = `${name}:${getClientIp(c)}`;
+        const hit = limiter.hit(key);
+        if (!hit.ok) {
+            c.header("Retry-After", String(hit.retryAfterSec));
+            c.header("X-RateLimit-Limit", String(name === "auth" ? AUTH_RATE_LIMIT_MAX : SEARCH_RATE_LIMIT_MAX));
+            c.header("X-RateLimit-Reset", String(hit.resetAt));
+            return jsonErr(c, 429, "RATE_LIMITED", "Too many requests.");
+        }
+        c.header("X-RateLimit-Limit", String(name === "auth" ? AUTH_RATE_LIMIT_MAX : SEARCH_RATE_LIMIT_MAX));
+        c.header("X-RateLimit-Remaining", String(hit.remaining));
+        c.header("X-RateLimit-Reset", String(hit.resetAt));
+        return next();
+    };
+}
+
 /* ------------------------------ Auth helpers -------------------------------- */
 
 type AuthedUser = Readonly<{
@@ -8326,7 +10219,7 @@ async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null
         .select({
             id: bpSession.id,
             userId: bpSession.userId,
-            expiresAt: bpSession.expiresAt, // number (timestamp_ms)
+            expiresAt: bpSession.expiresAt,
         })
         .from(bpSession)
         .where(eq(bpSession.id, sessionId))
@@ -8336,8 +10229,11 @@ async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null
     if (!s) return null;
 
     if (Number(s.expiresAt) <= now) {
-        // best-effort cleanup
-        db.delete(bpSession).where(eq(bpSession.id, sessionId)).run();
+        try {
+            await db.delete(bpSession).where(eq(bpSession.id, sessionId));
+        } catch {
+            // ignore cleanup failure
+        }
         return null;
     }
 
@@ -8346,8 +10242,8 @@ async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null
             id: bpUser.id,
             displayName: bpUser.displayName,
             email: bpUser.email,
-            emailVerifiedAt: bpUser.emailVerifiedAt, // number | null
-            disabledAt: bpUser.disabledAt, // number | null
+            emailVerifiedAt: bpUser.emailVerifiedAt,
+            disabledAt: bpUser.disabledAt,
         })
         .from(bpUser)
         .where(eq(bpUser.id, s.userId))
@@ -8371,14 +10267,13 @@ async function createSessionForUser(c: Context, userId: string): Promise<string>
     const createdAt = nowMs();
     const expiresAt = createdAt + daysMs(AUTH_SESSION_DAYS);
 
-    // NOTE: drizzle sqlite insert typing in some versions prefers array-form.
     await db.insert(bpSession).values([
         {
             id: sid,
             createdAt,
             expiresAt,
             userId,
-            ip: c.req.header("x-forwarded-for") ?? c.req.header("x-real-ip") ?? null,
+            ip: getClientIp(c),
             ua: c.req.header("user-agent") ?? null,
         },
     ]);
@@ -8389,22 +10284,16 @@ async function createSessionForUser(c: Context, userId: string): Promise<string>
 
 async function destroySession(c: Context, sessionId: string | null): Promise<void> {
     if (sessionId) {
-        db.delete(bpSession).where(eq(bpSession.id, sessionId)).run();
+        try {
+            await db.delete(bpSession).where(eq(bpSession.id, sessionId));
+        } catch {
+            // ignore
+        }
     }
     deleteCookie(c, AUTH_COOKIE, cookieOpts());
 }
 
 /* ------------------------- Google OAuth minimal flow ------------------------ */
-/**
- * Minimal OAuth 2.0 Authorization Code + PKCE:
- * - /auth/google/start generates state + verifier, stores both in short cookies, redirects to Google
- * - /auth/google/callback validates state, exchanges code for tokens, fetches userinfo, upserts user+account, issues session cookie
- *
- * Requirements (your env keys):
- * - BP_GOOGLE_CLIENT_ID, BP_GOOGLE_CLIENT_SECRET
- * - BP_PUBLIC_URL (or BP_GOOGLE_REDIRECT_URI)
- * - BP_WEB_ORIGIN for CORS + redirects
- */
 
 const OAUTH_STATE_COOKIE = "bp_oauth_state";
 const OAUTH_VERIFIER_COOKIE = "bp_oauth_verifier";
@@ -8437,7 +10326,6 @@ function googleAuthUrl(state: string, codeChallenge: string): string {
     u.searchParams.set("code_challenge", codeChallenge);
     u.searchParams.set("code_challenge_method", "S256");
     u.searchParams.set("access_type", "offline");
-    u.searchParams.set("prompt", "consent");
     return u.toString();
 }
 
@@ -8450,6 +10338,13 @@ type GoogleTokenResponse = {
     refresh_token?: string;
 };
 
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+    return await globalThis.fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(timeoutMs),
+    });
+}
+
 async function googleExchangeCode(code: string, codeVerifier: string): Promise<GoogleTokenResponse> {
     const form = new URLSearchParams();
     form.set("client_id", GOOGLE_CLIENT_ID);
@@ -8459,11 +10354,15 @@ async function googleExchangeCode(code: string, codeVerifier: string): Promise<G
     form.set("code", code);
     form.set("code_verifier", codeVerifier);
 
-    const res = await globalThis.fetch("https://oauth2.googleapis.com/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: form.toString(),
-    });
+    const res = await fetchWithTimeout(
+        "https://oauth2.googleapis.com/token",
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: form.toString(),
+        },
+        OAUTH_FETCH_TIMEOUT_MS,
+    );
 
     if (!res.ok) {
         const text = await res.text().catch(() => "");
@@ -8481,9 +10380,13 @@ type GoogleUserInfo = {
 };
 
 async function googleFetchUserInfo(accessToken: string): Promise<GoogleUserInfo> {
-    const res = await globalThis.fetch("https://openidconnect.googleapis.com/v1/userinfo", {
-        headers: { Authorization: `Bearer ${accessToken}` },
-    });
+    const res = await fetchWithTimeout(
+        "https://openidconnect.googleapis.com/v1/userinfo",
+        {
+            headers: { Authorization: `Bearer ${accessToken}` },
+        },
+        OAUTH_FETCH_TIMEOUT_MS,
+    );
     if (!res.ok) {
         const text = await res.text().catch(() => "");
         throw new Error(`google userinfo failed: ${res.status} ${text}`);
@@ -8562,7 +10465,7 @@ async function upsertGoogleUser(
             },
         ])
         .onConflictDoUpdate({
-            target: bpAuthAccount.id,
+            target: [bpAuthAccount.provider, bpAuthAccount.providerUserId],
             set: {
                 updatedAt: now,
                 userId,
@@ -8588,6 +10491,11 @@ app.use("*", async (c, next) => {
     c.header("Vary", "Origin, Accept-Encoding");
     c.header("X-Content-Type-Options", "nosniff");
     c.header("Referrer-Policy", "no-referrer");
+    c.header("X-Frame-Options", "DENY");
+    c.header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    if (IS_PROD) {
+        c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    }
     await next();
 });
 
@@ -8604,14 +10512,15 @@ app.use(
                 if (!origin) return null;
                 return CORS_LIST.includes(origin) ? origin : null;
             },
-        allowHeaders: ["Content-Type"],
+        allowHeaders: ["Content-Type", "Authorization"],
         allowMethods: ["GET", "POST", "OPTIONS"],
         credentials: !CORS_WILDCARD,
+        maxAge: 600,
     }),
 );
 
+// Session middleware
 app.use("*", async (c, next) => {
-    // session middleware
     if (!AUTH_ENABLED) {
         c.set("user", null);
         c.set("sessionId", null);
@@ -8619,27 +10528,33 @@ app.use("*", async (c, next) => {
     }
 
     const raw = (getCookie(c, AUTH_COOKIE) ?? "").trim();
-    const sid = raw ? unpackCookieValue(raw) : null;
+    if (!raw) {
+        c.set("user", null);
+        c.set("sessionId", null);
+        return next();
+    }
 
-    if (!sid) {
+    const unpacked = unpackCookieValue(raw);
+    if (!unpacked.ok) {
+        deleteCookie(c, AUTH_COOKIE, cookieOpts());
         c.set("user", null);
         c.set("sessionId", null);
         return next();
     }
 
     try {
+        const sid = unpacked.value;
         const u = await loadUserFromSession(sid);
         c.set("user", u);
         c.set("sessionId", u ? sid : null);
 
-        // If invalid session, clear cookie
         if (!u) {
             deleteCookie(c, AUTH_COOKIE, cookieOpts());
         } else if (AUTH_COOKIE_SECRET && raw !== packCookieValue(sid)) {
-            // upgrade legacy cookie to signed
             setCookie(c, AUTH_COOKIE, packCookieValue(sid), cookieOpts());
         }
     } catch {
+        deleteCookie(c, AUTH_COOKIE, cookieOpts());
         c.set("user", null);
         c.set("sessionId", null);
     }
@@ -8674,7 +10589,7 @@ app.get("/auth/me", (c) => {
 });
 
 // Auth: start google
-app.get("/auth/google/start", (c) => {
+app.get("/auth/google/start", withRateLimit("auth"), (c) => {
     cacheNoStore(c);
 
     if (authMisconfigured()) {
@@ -8697,7 +10612,7 @@ app.get("/auth/google/start", (c) => {
 });
 
 // Auth: callback
-app.get("/auth/google/callback", async (c) => {
+app.get("/auth/google/callback", withRateLimit("auth"), async (c) => {
     cacheNoStore(c);
 
     if (authMisconfigured()) {
@@ -8719,12 +10634,14 @@ app.get("/auth/google/callback", async (c) => {
     const stateCookieRaw = (getCookie(c, OAUTH_STATE_COOKIE) ?? "").trim();
     const verifierCookieRaw = (getCookie(c, OAUTH_VERIFIER_COOKIE) ?? "").trim();
 
-    const stateCookie = stateCookieRaw ? unpackCookieValue(stateCookieRaw) : null;
-    const verifierCookie = verifierCookieRaw ? unpackCookieValue(verifierCookieRaw) : null;
+    const stateCookieRes = unpackCookieValue(stateCookieRaw);
+    const verifierCookieRes = unpackCookieValue(verifierCookieRaw);
 
-    // clear temp cookies regardless (one-shot)
     deleteCookie(c, OAUTH_STATE_COOKIE, { ...oauthTmpCookieOpts(), expires: new Date(0) });
     deleteCookie(c, OAUTH_VERIFIER_COOKIE, { ...oauthTmpCookieOpts(), expires: new Date(0) });
+
+    const stateCookie = stateCookieRes.ok ? stateCookieRes.value : null;
+    const verifierCookie = verifierCookieRes.ok ? verifierCookieRes.value : null;
 
     if (!stateCookie || stateCookie !== state || !verifierCookie) {
         return jsonErr(c, 401, "OAUTH_STATE_MISMATCH", "Invalid OAuth state.");
@@ -8734,7 +10651,9 @@ app.get("/auth/google/callback", async (c) => {
         const tokens = await googleExchangeCode(code, verifierCookie);
         const info = await googleFetchUserInfo(tokens.access_token);
 
-        if (!info.sub) return jsonErr(c, 401, "OAUTH_NO_SUB", "Provider did not return a user id.");
+        if (!info.sub) {
+            return jsonErr(c, 401, "OAUTH_NO_SUB", "Provider did not return a user id.");
+        }
 
         const { userId } = await upsertGoogleUser(info, tokens);
         await createSessionForUser(c, userId);
@@ -8748,7 +10667,7 @@ app.get("/auth/google/callback", async (c) => {
 });
 
 // Auth: logout
-app.post("/auth/logout", async (c) => {
+app.post("/auth/logout", withRateLimit("auth"), async (c) => {
     cacheNoStore(c);
     const sid = c.get("sessionId");
     await destroySession(c, sid);
@@ -8762,7 +10681,7 @@ app.get("/translations", (c) => {
     return jsonOk(c, { translations: cached.rows.map(toTranslationMeta) });
 });
 
-// Meta: selected translation + all translations + fts + spine stats
+// Meta
 app.get("/meta", async (c) => {
     cacheNoStore(c);
 
@@ -8783,13 +10702,13 @@ app.get("/meta", async (c) => {
     });
 });
 
-// Global spine stats (for virtualization / infinite scroll)
+// Spine
 app.get("/spine", (c) => {
     cachePublic(c, 30);
     return jsonOk(c, getSpineStats());
 });
 
-// Contiguous verse window keyed by global verse_ord
+// Slice
 app.get("/slice", async (c) => {
     cachePublic(c, 10);
 
@@ -8831,12 +10750,12 @@ app.get("/slice", async (c) => {
                     t.text       AS text,
                     t.updated_at AS updatedAt
                 FROM bp_verse v
-                         LEFT JOIN bp_verse_text t
-                                   ON t.verse_key = v.verse_key
-                                       AND t.translation_id = ?
+                LEFT JOIN bp_verse_text t
+                    ON t.verse_key = v.verse_key
+                    AND t.translation_id = ?
                 WHERE v.verse_ord >= ?
                 ORDER BY v.verse_ord
-                    LIMIT ?;
+                LIMIT ?;
             `,
         )
         .all(translationId, fromOrd, limit) as Array<{
@@ -8856,7 +10775,7 @@ app.get("/slice", async (c) => {
     return jsonOk(c, { translationId, fromOrd, limit, verses, done, nextFromOrd, spine });
 });
 
-// Resolve a reference to verse_ord (supports chapter-only).
+// Resolve ref to verse_ord
 app.get("/loc", async (c) => {
     cachePublic(c, 60);
 
@@ -8889,7 +10808,7 @@ app.get("/loc", async (c) => {
                     WHERE book_id = ?
                       AND chapter = ?
                       AND verse = ?
-                        LIMIT 1;
+                    LIMIT 1;
                 `,
             )
             .get(bookId, chapter, verse) as
@@ -8912,7 +10831,7 @@ app.get("/loc", async (c) => {
                 WHERE book_id = ?
                   AND chapter = ?
                 ORDER BY verse
-                    LIMIT 1;
+                LIMIT 1;
             `,
         )
         .get(bookId, chapter) as
@@ -8922,7 +10841,7 @@ app.get("/loc", async (c) => {
     return jsonOk(c, first ?? null);
 });
 
-// Books (canonical order)
+// Books
 app.get("/books", async (c) => {
     cachePublic(c, 60);
 
@@ -8943,7 +10862,7 @@ app.get("/books", async (c) => {
     return jsonOk(c, { books });
 });
 
-// Chapters meta for a book
+// Chapters
 app.get("/chapters/:bookId", async (c) => {
     cachePublic(c, 60);
 
@@ -8966,7 +10885,7 @@ app.get("/chapters/:bookId", async (c) => {
     return jsonOk(c, { bookId, chapters: rows });
 });
 
-// Chapter payload (+ orientation overlays)
+// Chapter payload
 app.get("/chapter/:bookId/:chapter", async (c) => {
     cachePublic(c, 30);
 
@@ -9111,7 +11030,7 @@ app.get("/people/:id", async (c) => {
     return jsonOk(c, { ...base, relations: { from: relFrom, to: relTo } });
 });
 
-// PLACE drawer (+ geo)
+// PLACE drawer
 app.get("/places/:id", async (c) => {
     cachePublic(c, 60);
     const id = c.req.param("id");
@@ -9137,7 +11056,7 @@ app.get("/places/:id", async (c) => {
     return jsonOk(c, { ...base, geos });
 });
 
-// EVENT drawer (+ participants)
+// EVENT drawer
 app.get("/events/:id", async (c) => {
     cachePublic(c, 60);
     const id = c.req.param("id");
@@ -9172,9 +11091,9 @@ app.get("/events/:id", async (c) => {
     return jsonOk(c, { event: ev[0], participants });
 });
 
-// Search (FTS5 preferred; fallback to LIKE)
-app.get("/search", async (c) => {
-    cachePublic(c, 10);
+// Search
+app.get("/search", withRateLimit("search"), async (c) => {
+    cachePrivate(c, 10);
 
     const qRaw = (c.req.query("q") ?? "").trim();
     const qP = SearchQuerySchema.safeParse(qRaw);
@@ -9199,12 +11118,12 @@ app.get("/search", async (c) => {
                         v.verse_ord  AS verseOrd,
                         snippet(bp_verse_text_fts, 2, '‹', '›', '…', 24) AS snippet
                     FROM bp_verse_text_fts
-                             JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
-                             JOIN bp_verse v      ON v.verse_key = t.verse_key
+                    JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
+                    JOIN bp_verse v      ON v.verse_key = t.verse_key
                     WHERE bp_verse_text_fts MATCH ?
                       AND t.translation_id = ?
                     ORDER BY bm25(bp_verse_text_fts)
-                        LIMIT ?;
+                    LIMIT ?;
                 `,
             )
             .all(q, translationId, limit) as Array<{
@@ -9255,11 +11174,11 @@ app.notFound((c) => jsonErr(c, 404, "NOT_FOUND", "Route not found."));
 /* ------------------------------ Bun entrypoint ----------------------------- */
 
 export const apiFetch = app.fetch;
+export { app };
 
 if (LISTEN) {
     const spine = getSpineStats();
     const cachedTranslations = getTranslationsCached();
-
     const server = Bun.serve({ port: PORT, fetch: apiFetch });
 
     // eslint-disable-next-line no-console
@@ -9269,24 +11188,23 @@ if (LISTEN) {
     console.log(
         `[api] translation=${ENV_TRANSLATION_ID || cachedTranslations.defaultId || "(none)"} fts=${
             hasFts() ? "on" : "off"
-        } verses=${spine.verseCount} ordMax=${spine.verseOrdMax} auth=${AUTH_ENABLED ? "on" : "off"}`,
+        } verses=${spine.verseCount} ordMax=${spine.verseOrdMax} auth=${AUTH_ENABLED ? "on" : "off"} env=${NODE_ENV}`,
     );
 
-    if (AUTH_ENABLED && CORS_WILDCARD) {
-        // eslint-disable-next-line no-console
-        console.warn(
-            "[api] WARNING: BP_WEB_ORIGIN/BP_CORS_ORIGIN is '*' while auth is enabled. Cookies require a specific origin + credentials.",
-        );
-    }
+    let shuttingDown = false;
 
     const shutdown = () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+
         try {
-            sqlite.close();
+            server.stop(true);
         } catch {
             // ignore
         }
+
         try {
-            server.stop(true);
+            sqlite.close();
         } catch {
             // ignore
         }
@@ -9296,7 +11214,16 @@ if (LISTEN) {
     process.on("SIGTERM", shutdown);
 }
 
-export { app };
+/* ------------------------------- Dev exports ------------------------------- */
+
+// Useful for tests/admin hooks if you later add them.
+export const __internal = {
+    invalidateTranslationsCache,
+    invalidateSpineStats,
+    hasFts,
+    getSpineStats,
+    getTranslationsCached,
+};
 ```
 
 ### apps/api/tsconfig.json
@@ -9476,23 +11403,32 @@ export default defineConfig([
 
 ```json
 {
-  "name": "web",
-  "private": true,
+  "name": "@biblia/web",
   "version": "0.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 4173",
+
+    "typecheck": "tsc -b --pretty false",
+    "check": "bun run typecheck && bun run build",
+
     "lint": "eslint .",
-    "preview": "vite preview"
+    "lint:fix": "eslint . --fix",
+
+    "clean": "bun x rimraf dist .vite"
   },
   "dependencies": {
+    "@biblia/annotation": "workspace:*",
     "@fontsource-variable/inter": "^5.2.8",
     "@fontsource-variable/literata": "^5.2.8",
     "@fontsource-variable/quicksand": "^5.2.10",
     "@tanstack/react-virtual": "^3.13.19",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "zustand": "^5.0.8"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
@@ -9504,9 +11440,13 @@ export default defineConfig([
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",
     "globals": "^16.5.0",
+    "rimraf": "^6.0.1",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.48.0",
     "vite": "^7.3.1"
+  },
+  "engines": {
+    "bun": ">=1.3.10"
   }
 }
 ```
@@ -12180,16 +14120,23 @@ export function useAuth(): AuthState {
 ### apps/web/src/base.css
 
 ```css
-/* apps/web/src/base.css — Biblia Populi (minimal, reading-first) */
-/*
-  Goals:
-  - Paper-soft light mode (less harsh than pure white)
-  - Ink-like dark mode
-  - Stable layout (no scrollbar jump) + calm focus
-  - Premium transitions (theme swap without jitter)
-  - Search overlays supported (--overlay, --overlay2, --activeBg)
-  - Ambient primitives for “soft particles” pages (optional)
-*/
+/* apps/web/src/base.css — Biblia.to (minimal, reading-first, premium)
+ *
+ * Goals:
+ * - Paper-soft light mode (less harsh than pure white)
+ * - Ink-like dark mode (high contrast, calm)
+ * - Stable layout (no scrollbar jump)
+ * - Premium transitions (theme swap without jitter)
+ * - Excellent focus/accessibility defaults
+ * - Scrollbars: subtle, themed, not obnoxious
+ * - Overlay primitives (search/panels/popovers)
+ * - Reader typography tokens (fixed measure; user controls font/weight/size)
+ * - Annotation-friendly primitives (selection, ink layer, highlight color tokens)
+ *
+ * Notes:
+ * - Avoid “global transitions always on”: only enable transitions during theme swap via html.bp-theme-swap
+ * - Keep tokens orientation-first. Component CSS can build on these primitives.
+ */
 
 /* =========================================================
    Root Tokens
@@ -12216,59 +14163,115 @@ export function useAuth(): AuthState {
     --reading: 720px;
 
     /* ---------------- Radii ---------------- */
-    --radius: 16px;
-    --radius-sm: 12px;
+    --radius: 18px;
+    --radius-sm: 13px;
+    --radius-xs: 10px;
+
+    /* ---------------- Borders / Hairlines ---------------- */
+    --hairlineW: 1px;
 
     /* ---------------- Text ---------------- */
     --text: 16px;
     --leading: 1.6;
+    --tracking-tight: -0.02em;
+    --tracking-normal: 0.01em;
 
     /* ---------------- Theme transition ---------------- */
     --themeDur: 320ms;
     --themeEase: cubic-bezier(0.2, 0.8, 0.2, 1);
 
+    /* ---------------- Motion primitives ---------------- */
+    --dur-1: 140ms;
+    --dur-2: 220ms;
+    --dur-3: 320ms;
+    --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+    --ease-in: cubic-bezier(0.4, 0, 1, 1);
+
     /* ---------------- Light Theme (Paper) ---------------- */
     --bg: #f6f4f0;
     --fg: #101012;
     --muted: rgba(16, 16, 18, 0.58);
+    --muted2: rgba(16, 16, 18, 0.44);
+
     --hairline: rgba(16, 16, 18, 0.11);
-    --focus: rgba(16, 16, 18, 0.14);
-    --focusRing: rgba(16, 16, 18, 0.1);
+    --hairline2: rgba(16, 16, 18, 0.075);
 
     --panel: rgba(16, 16, 18, 0.025);
+    --panel2: rgba(16, 16, 18, 0.04);
 
     --overlay: rgba(246, 244, 240, 0.9);
     --overlay2: rgba(246, 244, 240, 0.96);
     --activeBg: rgba(16, 16, 18, 0.045);
 
+    /* Brand / accents (keep subtle; UI can opt-in) */
+    --accent: rgba(170, 34, 34, 0.92); /* your red cross */
+    --accent2: rgba(170, 34, 34, 0.22);
+    --link: rgba(16, 16, 18, 0.86);
+
+    /* Selection */
     --selectionBg: rgba(16, 16, 18, 0.12);
 
+    /* Focus */
+    --focusRing: rgba(16, 16, 18, 0.12);
+    --focusShadow: 0 0 0 6px rgba(16, 16, 18, 0.08);
+
+    /* Shadows */
     --shadowSoft: 0 10px 32px rgba(0, 0, 0, 0.1);
     --shadowPop: 0 24px 90px rgba(0, 0, 0, 0.18);
+    --shadowInset: inset 0 1px 0 rgba(255, 255, 255, 0.35);
 
-    /* ---------------- Scrollbars ---------------- */
+    /* Scrollbars */
     --scrollTrack: rgba(16, 16, 18, 0.06);
     --scrollThumb: rgba(16, 16, 18, 0.18);
     --scrollThumbHover: rgba(16, 16, 18, 0.28);
 
-    /* Fallback ambient */
+    /* Ambient (optional) */
     --ambientInk: rgba(16, 16, 18, 0.06);
     --ambientInk2: rgba(16, 16, 18, 0.04);
     --ambientParticle: rgba(16, 16, 18, 0.3);
-    --focusShadow: 0 0 0 6px rgba(16, 16, 18, 0.08);
+
+    /* Annotation-friendly defaults */
+    --hl-yellow: rgba(255, 213, 74, 0.45);
+    --hl-green: rgba(72, 201, 176, 0.28);
+    --hl-blue: rgba(120, 180, 255, 0.24);
+    --ink: rgba(16, 16, 18, 0.72);
+    --ink-soft: rgba(16, 16, 18, 0.42);
 }
 
-/* Enable color-mix when supported */
+/* Prefer color-mix when supported (better theme coherence) */
 @supports (color: color-mix(in oklab, white, black)) {
     :root {
-        --ambientInk: color-mix(in oklab, var(--fg) 6%, transparent);
-        --ambientInk2: color-mix(in oklab, var(--fg) 4%, transparent);
-        --ambientParticle: color-mix(in oklab, var(--fg) 70%, transparent);
-        --focusShadow: 0 0 0 6px color-mix(in oklab, var(--focusRing) 70%, transparent);
+        --muted: color-mix(in oklab, var(--fg) 58%, transparent);
+        --muted2: color-mix(in oklab, var(--fg) 44%, transparent);
+
+        --hairline: color-mix(in oklab, var(--fg) 12%, transparent);
+        --hairline2: color-mix(in oklab, var(--fg) 8%, transparent);
+
+        --panel: color-mix(in oklab, var(--fg) 3%, transparent);
+        --panel2: color-mix(in oklab, var(--fg) 5%, transparent);
+
+        --overlay: color-mix(in oklab, var(--bg) 90%, transparent);
+        --overlay2: color-mix(in oklab, var(--bg) 96%, transparent);
+        --activeBg: color-mix(in oklab, var(--fg) 5%, transparent);
+
+        --selectionBg: color-mix(in oklab, var(--fg) 14%, transparent);
+
+        --focusRing: color-mix(in oklab, var(--fg) 13%, transparent);
+        --focusShadow: 0 0 0 6px color-mix(in oklab, var(--fg) 10%, transparent);
 
         --scrollTrack: color-mix(in oklab, var(--fg) 6%, transparent);
         --scrollThumb: color-mix(in oklab, var(--fg) 18%, transparent);
         --scrollThumbHover: color-mix(in oklab, var(--fg) 28%, transparent);
+
+        --ambientInk: color-mix(in oklab, var(--fg) 6%, transparent);
+        --ambientInk2: color-mix(in oklab, var(--fg) 4%, transparent);
+        --ambientParticle: color-mix(in oklab, var(--fg) 70%, transparent);
+
+        --hl-yellow: color-mix(in oklab, #ffd54a 52%, transparent);
+        --hl-green: color-mix(in oklab, #48c9b0 34%, transparent);
+        --hl-blue: color-mix(in oklab, #78b4ff 32%, transparent);
+        --ink: color-mix(in oklab, var(--fg) 78%, transparent);
+        --ink-soft: color-mix(in oklab, var(--fg) 46%, transparent);
     }
 }
 
@@ -12279,20 +14282,30 @@ html[data-theme="dark"] {
     --bg: #0b0b0c;
     --fg: #f4f3f1;
     --muted: rgba(244, 243, 241, 0.66);
+    --muted2: rgba(244, 243, 241, 0.5);
+
     --hairline: rgba(255, 255, 255, 0.1);
-    --focus: rgba(255, 255, 255, 0.22);
-    --focusRing: rgba(255, 255, 255, 0.13);
+    --hairline2: rgba(255, 255, 255, 0.07);
 
     --panel: rgba(255, 255, 255, 0.045);
+    --panel2: rgba(255, 255, 255, 0.065);
 
     --overlay: rgba(11, 11, 12, 0.76);
     --overlay2: rgba(11, 11, 12, 0.88);
     --activeBg: rgba(255, 255, 255, 0.065);
 
+    --accent: rgba(220, 70, 70, 0.92);
+    --accent2: rgba(220, 70, 70, 0.26);
+    --link: rgba(244, 243, 241, 0.9);
+
     --selectionBg: rgba(244, 243, 241, 0.18);
+
+    --focusRing: rgba(255, 255, 255, 0.14);
+    --focusShadow: 0 0 0 7px rgba(255, 255, 255, 0.08);
 
     --shadowSoft: 0 10px 36px rgba(0, 0, 0, 0.36);
     --shadowPop: 0 26px 110px rgba(0, 0, 0, 0.58);
+    --shadowInset: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 
     --scrollTrack: rgba(255, 255, 255, 0.08);
     --scrollThumb: rgba(255, 255, 255, 0.18);
@@ -12301,14 +14314,36 @@ html[data-theme="dark"] {
     --ambientInk: rgba(244, 243, 241, 0.07);
     --ambientInk2: rgba(244, 243, 241, 0.05);
     --ambientParticle: rgba(244, 243, 241, 0.75);
-    --focusShadow: 0 0 0 7px rgba(255, 255, 255, 0.08);
+
+    --hl-yellow: rgba(255, 213, 74, 0.26);
+    --hl-green: rgba(72, 201, 176, 0.2);
+    --hl-blue: rgba(120, 180, 255, 0.18);
+    --ink: rgba(244, 243, 241, 0.78);
+    --ink-soft: rgba(244, 243, 241, 0.46);
 }
 
 @supports (color: color-mix(in oklab, white, black)) {
     html[data-theme="dark"] {
+        --muted: color-mix(in oklab, var(--fg) 66%, transparent);
+        --muted2: color-mix(in oklab, var(--fg) 50%, transparent);
+
+        --hairline: color-mix(in oklab, var(--fg) 11%, transparent);
+        --hairline2: color-mix(in oklab, var(--fg) 8%, transparent);
+
+        --panel: color-mix(in oklab, var(--fg) 5%, transparent);
+        --panel2: color-mix(in oklab, var(--fg) 7%, transparent);
+
         --scrollTrack: color-mix(in oklab, var(--fg) 10%, transparent);
         --scrollThumb: color-mix(in oklab, var(--fg) 20%, transparent);
         --scrollThumbHover: color-mix(in oklab, var(--fg) 30%, transparent);
+
+        --selectionBg: color-mix(in oklab, var(--fg) 18%, transparent);
+
+        --hl-yellow: color-mix(in oklab, #ffd54a 30%, transparent);
+        --hl-green: color-mix(in oklab, #48c9b0 22%, transparent);
+        --hl-blue: color-mix(in oklab, #78b4ff 20%, transparent);
+        --ink: color-mix(in oklab, var(--fg) 78%, transparent);
+        --ink-soft: color-mix(in oklab, var(--fg) 46%, transparent);
     }
 }
 
@@ -12323,9 +14358,14 @@ html {
     background: var(--bg);
     color: var(--fg);
     text-size-adjust: 100%;
+    -webkit-text-size-adjust: 100%;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     color-scheme: light dark;
+
+    /* Better underline default */
+    text-underline-offset: 3px;
+    text-decoration-thickness: 1.25px;
 }
 
 body {
@@ -12348,10 +14388,17 @@ html.bp-theme-swap #root,
 html.bp-theme-swap button,
 html.bp-theme-swap input,
 html.bp-theme-swap textarea,
-html.bp-theme-swap select {
-    transition: background-color var(--themeDur) var(--themeEase), color var(--themeDur) var(--themeEase),
-    border-color var(--themeDur) var(--themeEase), outline-color var(--themeDur) var(--themeEase),
-    box-shadow var(--themeDur) var(--themeEase);
+html.bp-theme-swap select,
+html.bp-theme-swap a,
+html.bp-theme-swap [role="dialog"],
+html.bp-theme-swap [data-overlay] {
+    transition:
+            background-color var(--themeDur) var(--themeEase),
+            color var(--themeDur) var(--themeEase),
+            border-color var(--themeDur) var(--themeEase),
+            outline-color var(--themeDur) var(--themeEase),
+            box-shadow var(--themeDur) var(--themeEase),
+            fill var(--themeDur) var(--themeEase);
 }
 
 /* Reduced motion */
@@ -12385,8 +14432,8 @@ h2,
 h3,
 h4 {
     margin: 0;
-    font-weight: 600;
-    letter-spacing: -0.02em;
+    font-weight: 650;
+    letter-spacing: var(--tracking-tight);
 }
 
 p {
@@ -12394,12 +14441,14 @@ p {
 }
 
 a {
-    color: inherit;
+    color: var(--link);
     text-decoration: none;
 }
 a:hover {
     text-decoration: underline;
-    text-underline-offset: 3px;
+}
+a:active {
+    opacity: 0.92;
 }
 
 ::selection {
@@ -12425,17 +14474,18 @@ button {
 input,
 textarea,
 select {
-    border: 1px solid var(--hairline);
-    background: color-mix(in oklab, var(--panel) 70%, transparent);
+    border: var(--hairlineW) solid var(--hairline);
+    background: var(--panel);
     border-radius: 12px;
     outline: none;
+    box-shadow: var(--shadowInset);
 }
 
-@supports not (color: color-mix(in oklab, white, black)) {
+@supports (color: color-mix(in oklab, white, black)) {
     input,
     textarea,
     select {
-        background: var(--panel);
+        background: color-mix(in oklab, var(--panel) 70%, transparent);
     }
 }
 
@@ -12463,22 +14513,30 @@ button {
 
 /* =========================================================
    Scrollbars (nice but subtle)
+   - Styles are best-effort: macOS overlay scrollbars may ignore
 ========================================================= */
+:root {
+    --scrollSize: 10px;
+    --scrollRadius: 999px;
+}
+
+/* Firefox */
 * {
     scrollbar-width: thin;
     scrollbar-color: var(--scrollThumb) var(--scrollTrack);
 }
 
+/* Chromium/Safari */
 *::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+    width: var(--scrollSize);
+    height: var(--scrollSize);
 }
 *::-webkit-scrollbar-track {
     background: var(--scrollTrack);
 }
 *::-webkit-scrollbar-thumb {
     background: var(--scrollThumb);
-    border-radius: 999px;
+    border-radius: var(--scrollRadius);
     border: 2px solid transparent;
     background-clip: padding-box;
 }
@@ -12486,6 +14544,14 @@ button {
     background: var(--scrollThumbHover);
     border: 2px solid transparent;
     background-clip: padding-box;
+}
+
+/* Optional utility: hide scrollbars but keep scroll */
+.scrollbars-none {
+    scrollbar-width: none;
+}
+.scrollbars-none::-webkit-scrollbar {
+    display: none;
 }
 
 /* =========================================================
@@ -12503,22 +14569,59 @@ button {
 
 .surface {
     background: var(--panel);
-    border: 1px solid var(--hairline);
+    border: var(--hairlineW) solid var(--hairline);
     border-radius: var(--radius-sm);
+    box-shadow: var(--shadowInset);
 }
 
-/* Handy helpers */
 .hairline {
-    border: 1px solid var(--hairline);
+    border: var(--hairlineW) solid var(--hairline);
 }
 .muted {
     color: var(--muted);
+}
+.muted2 {
+    color: var(--muted2);
 }
 .shadow-soft {
     box-shadow: var(--shadowSoft);
 }
 .shadow-pop {
     box-shadow: var(--shadowPop);
+}
+
+/* =========================================================
+   Buttons (basic primitives)
+========================================================= */
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: var(--hairlineW) solid var(--hairline);
+    background: var(--panel);
+    color: var(--fg);
+    user-select: none;
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.06);
+}
+.btn:hover {
+    border-color: var(--hairline2);
+}
+.btn:active {
+    transform: translateY(0.5px);
+}
+
+/* Subtle “pill” */
+.pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border-radius: 999px;
+    border: var(--hairlineW) solid var(--hairline);
+    background: var(--panel);
 }
 
 /* =========================================================
@@ -12540,6 +14643,7 @@ button {
 
     text-rendering: optimizeLegibility;
     font-kerning: normal;
+    font-variant-ligatures: common-ligatures contextual;
     font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
 }
 
@@ -12549,15 +14653,26 @@ button {
     margin-inline: auto;
 }
 
+/* Numbers / refs in scripture */
+.scripture .vnum,
+.scripture .cnum {
+    font-family: var(--font-sans);
+    font-size: 12px;
+    letter-spacing: 0.02em;
+    color: var(--muted);
+    user-select: none;
+}
+
 /* =========================================================
    Overlay primitives (search panels, popovers)
 ========================================================= */
 .bp-overlay {
     background: var(--overlay);
-    border: 1px solid var(--hairline);
+    border: var(--hairlineW) solid var(--hairline);
     box-shadow: var(--shadowPop);
     border-radius: var(--radius);
     backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
 }
 
 .bp-overlay--solid {
@@ -12566,6 +14681,35 @@ button {
 
 .bp-active {
     background: var(--activeBg);
+}
+
+/* =========================================================
+   Annotation helpers (optional UI classes)
+========================================================= */
+
+/* highlight markup (you can render spans with this class) */
+.bp-hl {
+    background: var(--hl-yellow);
+    border-radius: 6px;
+    padding: 0 2px;
+}
+.bp-hl--green {
+    background: var(--hl-green);
+}
+.bp-hl--blue {
+    background: var(--hl-blue);
+}
+
+/* Ink layer: place over text; make sure it doesn't steal scroll */
+.bp-ink-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none; /* enable only while drawing */
+}
+
+/* When actively drawing, enable pointer events */
+.bp-ink-layer.is-drawing {
+    pointer-events: auto;
 }
 
 /* =========================================================
@@ -13124,6 +15268,19 @@ createRoot(el).render(
 
 ```tsx
 // apps/web/src/PositionPill.tsx
+// Biblia.to — Position Pill (Book / Chapter / Verse picker)
+//
+// Deep upgrades in this pass:
+// - Zero "any" casts in event unsubs; no deprecated mq signatures.
+// - Bulletproof outside-click handling (no scrollbar mis-close; supports touch/pen).
+// - Keyboard UX: arrows to move between columns; Enter commits; Esc closes; Home/End jump.
+// - Accessibility: proper listbox/option semantics + roving tabindex + aria-activedescendant.
+// - Focus restore to pill on close; remembers last focused column.
+// - Robust async chapters loading with AbortController + per-book cache + stale guard.
+// - Safer positioning: auto reflow on resize/scroll/visualViewport; clamps within viewport.
+// - Fixes tiny bugs: removed stray imports; removed unused pending flags; consistent phases.
+// - Keeps monochrome-only visuals (no hue). Popover CSS injection uses only theme vars.
+
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { apiGetChapters, type BookRow, type ChaptersPayload } from "./api";
@@ -13131,7 +15288,13 @@ import { apiGetChapters, type BookRow, type ChaptersPayload } from "./api";
 type Props = {
   styles: Record<string, React.CSSProperties>;
   books: BookRow[] | null;
-  current: { label: string; ord: number; bookId: string | null; chapter: number | null; verse: number | null };
+  current: {
+    label: string;
+    ord: number;
+    bookId: string | null;
+    chapter: number | null;
+    verse: number | null;
+  };
   onJump: (bookId: string, chapter: number, verse: number | null) => void;
 };
 
@@ -13145,18 +15308,24 @@ const POPOVER_MAX_H = S(330);
 const POPOVER_MARGIN = 14;
 const LIST_PAD = S(10);
 
-// Pill stability: fixed width (no jitter) + tighter
+// Pill stability: fixed width (no jitter)
 const PILL_W_CLOSED = S(216);
 const PILL_W_OPEN = S(226);
 const NUM_COL_W = S(62);
 const PILL_PAD_X = S(9);
 const PILL_GAP = S(6);
 
-// Micro delay to prevent accidental close on scrollbar clicks
+// Micro delay to prevent accidental close on scrollbars/drags outside
 const CLOSE_DELAY_MS = 110;
+
+// phase timings
+const OPEN_MS = 150;
+const CLOSE_MS = 145;
 
 type WheelOption = { key: string; label: string; value: number };
 type PopPos = Readonly<{ left: number; top: number; height: number; width: number }>;
+
+type Col = "book" | "chapter" | "verse";
 
 function pressedStyle(styles: Record<string, React.CSSProperties>): React.CSSProperties | null {
   return (styles as any).btnPressed ?? (styles as any).buttonPressed ?? null;
@@ -13198,7 +15367,7 @@ function subscribeMediaQuery(query: string, onChange: (matches: boolean) => void
   if (typeof window === "undefined" || !window.matchMedia) return () => {};
   const mq = window.matchMedia(query);
 
-  const handler = () => onChange(mq.matches);
+  const handler = () => onChange(!!mq.matches);
   handler();
 
   if (mq.addEventListener) {
@@ -13239,7 +15408,7 @@ function injectPopoverCssOnce(): void {
   const el = document.createElement("style");
   el.setAttribute(k, "1");
 
-  // ZERO red: only neutral vars / grayscale mixes.
+  // ZERO hue: only neutral vars / grayscale mixes
   el.textContent = `
 #bp-pos-popover .bp-scroll { scrollbar-width: thin; scrollbar-color: var(--hairline) transparent; }
 #bp-pos-popover .bp-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -13263,6 +15432,26 @@ function injectPopoverCssOnce(): void {
   document.head.appendChild(el);
 }
 
+/* --------------------------- Roving focus helpers --------------------------- */
+function nextIndex(cur: number, delta: number, len: number): number {
+  if (len <= 0) return 0;
+  const n = cur + delta;
+  if (n < 0) return 0;
+  if (n >= len) return len - 1;
+  return n;
+}
+
+/** Accepts undefined because Map.get() returns T | undefined */
+function scrollIntoViewCentered(el: HTMLElement | null | undefined): void {
+  if (!el) return;
+  try {
+    el.scrollIntoView({ block: "center" });
+  } catch {
+    // ignore
+  }
+}
+
+/* --------------------------- List Item --------------------------- */
 const ListItem = React.memo(function ListItem({
                                                 active,
                                                 onClick,
@@ -13271,6 +15460,9 @@ const ListItem = React.memo(function ListItem({
                                                 mapRef,
                                                 itemKey,
                                                 ariaLabel,
+                                                tabIndex,
+                                                id,
+                                                onFocus,
                                               }: {
   active: boolean;
   onClick: () => void;
@@ -13279,6 +15471,9 @@ const ListItem = React.memo(function ListItem({
   mapRef?: React.RefObject<Map<string, HTMLButtonElement | null>>;
   itemKey?: string;
   ariaLabel?: string;
+  tabIndex?: number;
+  id?: string;
+  onFocus?: () => void;
 }) {
   const ref = useRef<HTMLButtonElement>(null);
   const baseStyle = tight ? sx.itemTight : sx.item;
@@ -13293,6 +15488,7 @@ const ListItem = React.memo(function ListItem({
 
   return (
       <button
+          id={id}
           type="button"
           className="bp-row"
           ref={ref}
@@ -13302,9 +15498,11 @@ const ListItem = React.memo(function ListItem({
           }}
           onMouseDown={(e) => e.preventDefault()}
           onClick={onClick}
+          onFocus={onFocus}
           aria-label={ariaLabel}
           role="option"
           aria-selected={active}
+          tabIndex={tabIndex}
       >
         {active && <span style={sx.activeBar} aria-hidden />}
         {children}
@@ -13316,18 +15514,16 @@ const ListItem = React.memo(function ListItem({
 export function PositionPill({ styles, books, current, onJump }: Props) {
   const reducedMotion = usePrefersReducedMotion();
   const list = books ?? [];
+
   const anchorRef = useRef<HTMLButtonElement | null>(null);
   const popoverElRef = useRef<HTMLDivElement | null>(null);
 
   const [open, setOpen] = useState(false);
   const [phase, setPhase] = useState<"opening" | "open" | "closing">("opening");
   const [popPos, setPopPos] = useState<PopPos | null>(null);
+
   const [pressPill, setPressPill] = useState(false);
   const [pressGo, setPressGo] = useState(false);
-
-  const bookBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-  const chapBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-  const verseBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
 
   const closeTimerRef = useRef<number | null>(null);
   const clearCloseTimer = useCallback(() => {
@@ -13336,6 +15532,22 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       closeTimerRef.current = null;
     }
   }, []);
+
+  const bookBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+  const chapBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+  const verseBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+
+  const openRef = useLatestRef(open);
+  const phaseRef = useLatestRef(phase);
+
+  // last active column for keyboard UX
+  const [activeCol, setActiveCol] = useState<Col>("book");
+  const activeColRef = useLatestRef(activeCol);
+
+  // For roving focus indices
+  const [activeBookIdx, setActiveBookIdx] = useState(0);
+  const [activeChapIdx, setActiveChapIdx] = useState(0);
+  const [activeVerseIdx, setActiveVerseIdx] = useState(0);
 
   useEffect(() => {
     injectPopoverCssOnce();
@@ -13359,10 +15571,13 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   const [bookId, setBookId] = useState<string>(currentBookId);
   const [chapter, setChapter] = useState<number>(currentChap);
   const [verse, setVerse] = useState<number | null>(currentVerse);
+
   const [pendingChapter, setPendingChapter] = useState<boolean>(false);
   const [pendingVerse, setPendingVerse] = useState<boolean>(false);
 
+  // Chapters: cache + abortable fetch
   const chaptersCacheRef = useRef<Map<string, ChaptersPayload>>(new Map());
+  const abortRef = useRef<AbortController | null>(null);
   const [chaptersMeta, setChaptersMeta] = useState<ChaptersPayload | null>(null);
 
   const selectedBook = useMemo(() => list.find((b) => b.bookId === bookId) ?? null, [list, bookId]);
@@ -13370,32 +15585,47 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   const testamentTag = (selectedBook?.testament ?? "").toUpperCase();
   const chapterMax = selectedBook?.chapters ?? 999;
 
-  const openRef = useLatestRef(open);
-  const phaseRef = useLatestRef(phase);
+  // ensure active book index stays valid
+  useEffect(() => {
+    const idx = Math.max(0, list.findIndex((b) => b.bookId === bookId));
+    setActiveBookIdx(idx >= 0 ? idx : 0);
+  }, [list, bookId]);
 
-  // Load chapters
+  // Load chapters when open+book changes
   useEffect(() => {
     if (!open) return;
+
+    abortRef.current?.abort();
+    abortRef.current = null;
+
     const cached = chaptersCacheRef.current.get(bookId) ?? null;
     if (cached) {
       setChaptersMeta(cached);
       return;
     }
 
+    const ac = new AbortController();
+    abortRef.current = ac;
+
     let alive = true;
-    apiGetChapters(bookId)
+    apiGetChapters(bookId, { signal: ac.signal } as any)
         .then((p) => {
-          if (!alive) return;
+          if (!alive || ac.signal.aborted) return;
           chaptersCacheRef.current.set(bookId, p);
           setChaptersMeta(p);
         })
-        .catch(() => alive && setChaptersMeta(null));
+        .catch(() => {
+          if (!alive || ac.signal.aborted) return;
+          setChaptersMeta(null);
+        });
 
     return () => {
       alive = false;
+      ac.abort();
     };
   }, [open, bookId]);
 
+  // Clamp chapter when book changes
   useEffect(() => {
     setChapter((c) => clampInt(c || 1, 1, chapterMax));
   }, [chapterMax]);
@@ -13411,20 +15641,40 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setVerse((v) => (v == null ? null : clampInt(v, 1, verseMax)));
   }, [verseMax]);
 
-  // Reset local state when closed
+  const chapterOptions = useMemo(() => buildNumberOptions(1, chapterMax), [chapterMax]);
+  const verseOptions = useMemo(() => buildNumberOptions(1, verseMax), [verseMax]);
+
+  // sync active indices for roving focus
+  useEffect(() => {
+    setActiveChapIdx(Math.max(0, Math.min(chapterOptions.length - 1, chapter - 1)));
+  }, [chapterOptions.length, chapter]);
+
+  useEffect(() => {
+    setActiveVerseIdx(verse == null ? 0 : Math.max(0, Math.min(verseOptions.length - 1, verse - 1)));
+  }, [verseOptions.length, verse]);
+
+  // Reset local state when closed (and restore focus to pill)
   useEffect(() => {
     if (open) return;
+
+    abortRef.current?.abort();
+    abortRef.current = null;
+
     setBookId(currentBookId);
     setChapter(currentChap);
     setVerse(currentVerse);
+
     setPendingChapter(false);
     setPendingVerse(false);
     setChaptersMeta(null);
-    clearCloseTimer();
-  }, [open, currentBookId, currentChap, currentVerse, clearCloseTimer]);
 
-  const chapterOptions = useMemo(() => buildNumberOptions(1, chapterMax), [chapterMax]);
-  const verseOptions = useMemo(() => buildNumberOptions(1, verseMax), [verseMax]);
+    setActiveCol("book");
+    clearCloseTimer();
+
+    // restore focus
+    const id = requestAnimationFrame(() => anchorRef.current?.focus());
+    return () => cancelAnimationFrame(id);
+  }, [open, currentBookId, currentChap, currentVerse, clearCloseTimer]);
 
   const titleBookPart = bookName;
   const titleNumPart = useMemo(() => {
@@ -13453,6 +15703,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setPendingVerse(true);
     setChapter(1);
     setVerse(null);
+    setActiveCol("chapter");
   }, []);
 
   const onPickChapter = useCallback((nextChapter: number) => {
@@ -13460,6 +15711,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setChapter(nextChapter);
     setPendingVerse(true);
     setVerse(null);
+    setActiveCol("verse");
   }, []);
 
   const onPickVerse = useCallback((nextVerse: number) => {
@@ -13478,7 +15730,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     else openPopover();
   }, [openRef, openPopover, closePopover]);
 
-  // Positioning
+  // Positioning (resize/scroll/vv)
   useLayoutEffect(() => {
     if (!open) return;
     const a = anchorRef.current;
@@ -13503,10 +15755,10 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
 
     return () => {
       cancelAnimationFrame(raf);
-      window.removeEventListener("resize", update as any);
-      window.removeEventListener("scroll", update as any, true);
-      vv?.removeEventListener("resize", update as any);
-      vv?.removeEventListener("scroll", update as any);
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+      vv?.removeEventListener("resize", update);
+      vv?.removeEventListener("scroll", update);
     };
   }, [open]);
 
@@ -13518,7 +15770,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       return;
     }
     if (phase !== "opening") return;
-    const id = window.setTimeout(() => setPhase("open"), 150);
+    const id = window.setTimeout(() => setPhase("open"), OPEN_MS);
     return () => window.clearTimeout(id);
   }, [open, phase, reducedMotion]);
 
@@ -13528,19 +15780,21 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       setOpen(false);
       return;
     }
-    const id = window.setTimeout(() => setOpen(false), 145);
+    const id = window.setTimeout(() => setOpen(false), CLOSE_MS);
     return () => window.clearTimeout(id);
   }, [open, phase, reducedMotion]);
 
-  // Outside click + keyboard
+  // Outside click + keyboard (capture)
   useEffect(() => {
     if (!open) return;
 
     const onPointerDownCapture = (e: PointerEvent) => {
       const t = e.target as Node | null;
       if (!t) return;
+
       const a = anchorRef.current;
       const pop = popoverElRef.current;
+
       if (a && a.contains(t)) return;
       if (pop && pop.contains(t)) return;
 
@@ -13554,12 +15808,14 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
         closePopover();
         return;
       }
+
+      // If focus is inside the popover, support Enter to commit
       if (e.key === "Enter") {
         const pop = popoverElRef.current;
         const activeEl = document.activeElement;
         if (pop && activeEl && pop.contains(activeEl)) {
           e.preventDefault();
-          commit();
+          if (!pendingChapter) commit();
         }
       }
     };
@@ -13568,20 +15824,31 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     document.addEventListener("keydown", onKey, { capture: true });
 
     return () => {
-      document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true } as any);
-      document.removeEventListener("keydown", onKey, { capture: true } as any);
+      document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
+      document.removeEventListener("keydown", onKey, { capture: true });
     };
-  }, [open, commit, closePopover, clearCloseTimer]);
+  }, [open, commit, closePopover, clearCloseTimer, pendingChapter]);
 
   // Focus management (after open)
   useEffect(() => {
     if (!open) return;
+
     const id = requestAnimationFrame(() => {
-      bookBtnMapRef.current.get(bookId)?.focus();
-      bookBtnMapRef.current.get(bookId)?.scrollIntoView({ block: "center" });
-      if (!pendingChapter) chapBtnMapRef.current.get(`c:${chapter}`)?.scrollIntoView({ block: "center" });
-      if (!pendingVerse && verse != null) verseBtnMapRef.current.get(`v:${verse}`)?.scrollIntoView({ block: "center" });
+      // Focus the currently selected book, and try to align the other columns too
+      const bookEl = bookBtnMapRef.current.get(bookId) ?? null;
+      bookEl?.focus();
+      scrollIntoViewCentered(bookEl);
+
+      if (!pendingChapter) {
+        const chapEl = chapBtnMapRef.current.get(`c:${chapter}`) ?? null;
+        scrollIntoViewCentered(chapEl);
+      }
+      if (!pendingVerse && verse != null) {
+        const verseEl = verseBtnMapRef.current.get(`v:${verse}`) ?? null;
+        scrollIntoViewCentered(verseEl);
+      }
     });
+
     return () => cancelAnimationFrame(id);
   }, [open, bookId, chapter, verse, pendingChapter, pendingVerse]);
 
@@ -13612,13 +15879,147 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       ? undefined
       : "opacity 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0)";
 
-  // Monochrome accent derived from theme tokens (no red):
-  // - Accent = var(--fg)
-  // - Soft = a faint panel wash
-  // - Ring = focus tone
+  // Monochrome accent derived from theme tokens (no hue)
   const bpAccent = "var(--fg)";
   const bpAccentSoft = "color-mix(in oklab, var(--panel) 26%, transparent)";
-  const bpAccentRing = "color-mix(in oklab, var(--focus) 72%, transparent)";
+  const bpAccentRing = "color-mix(in oklab, var(--focusRing) 72%, transparent)";
+
+  // Keyboard navigation inside popover (roving focus)
+  const onPopoverKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const key = e.key;
+
+    const col: Col = activeColRef.current;
+    const isBooks = col === "book";
+    const isCh = col === "chapter";
+    const isV = col === "verse";
+
+    const moveCol = (next: Col) => {
+      setActiveCol(next);
+      requestAnimationFrame(() => {
+        if (next === "book") {
+          const b = list[activeBookIdx]?.bookId;
+          const el = b ? bookBtnMapRef.current.get(b) : null;
+          el?.focus();
+          scrollIntoViewCentered(el);
+        } else if (next === "chapter") {
+          const n = chapterOptions[activeChapIdx]?.value;
+          const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
+          el?.focus();
+          scrollIntoViewCentered(el);
+        } else {
+          const n = verseOptions[activeVerseIdx]?.value;
+          const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
+          el?.focus();
+          scrollIntoViewCentered(el);
+        }
+      });
+    };
+
+    const handleUpDown = (delta: number) => {
+      if (isBooks) {
+        const idx = nextIndex(activeBookIdx, delta, list.length);
+        setActiveBookIdx(idx);
+        const id = list[idx]?.bookId;
+        if (id) {
+          const el = bookBtnMapRef.current.get(id) ?? null;
+          el?.focus();
+          scrollIntoViewCentered(el);
+        }
+        e.preventDefault();
+        return;
+      }
+
+      if (isCh) {
+        const idx = nextIndex(activeChapIdx, delta, chapterOptions.length);
+        setActiveChapIdx(idx);
+        const n = chapterOptions[idx]?.value;
+        if (n != null) {
+          const el = chapBtnMapRef.current.get(`c:${n}`) ?? null;
+          el?.focus();
+          scrollIntoViewCentered(el);
+        }
+        e.preventDefault();
+        return;
+      }
+
+      // verse
+      const idx = nextIndex(activeVerseIdx, delta, verseOptions.length);
+      setActiveVerseIdx(idx);
+      const n = verseOptions[idx]?.value;
+      if (n != null) {
+        const el = verseBtnMapRef.current.get(`v:${n}`) ?? null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      }
+      e.preventDefault();
+    };
+
+    if (key === "ArrowLeft") {
+      if (isV) moveCol("chapter");
+      else if (isCh) moveCol("book");
+      e.preventDefault();
+      return;
+    }
+    if (key === "ArrowRight") {
+      if (isBooks) moveCol("chapter");
+      else if (isCh) moveCol("verse");
+      e.preventDefault();
+      return;
+    }
+    if (key === "ArrowUp") return handleUpDown(-1);
+    if (key === "ArrowDown") return handleUpDown(1);
+
+    if (key === "Home") {
+      if (isBooks) {
+        setActiveBookIdx(0);
+        const id = list[0]?.bookId;
+        const el = id ? bookBtnMapRef.current.get(id) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      } else if (isCh) {
+        setActiveChapIdx(0);
+        const n = chapterOptions[0]?.value;
+        const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      } else {
+        setActiveVerseIdx(0);
+        const n = verseOptions[0]?.value;
+        const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      }
+      e.preventDefault();
+      return;
+    }
+
+    if (key === "End") {
+      if (isBooks) {
+        const idx = Math.max(0, list.length - 1);
+        setActiveBookIdx(idx);
+        const id = list[idx]?.bookId;
+        const el = id ? bookBtnMapRef.current.get(id) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      } else if (isCh) {
+        const idx = Math.max(0, chapterOptions.length - 1);
+        setActiveChapIdx(idx);
+        const n = chapterOptions[idx]?.value;
+        const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      } else {
+        const idx = Math.max(0, verseOptions.length - 1);
+        setActiveVerseIdx(idx);
+        const n = verseOptions[idx]?.value;
+        const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      }
+      e.preventDefault();
+      return;
+    }
+  };
 
   const popover =
       open && popPos
@@ -13641,6 +16042,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                   role="dialog"
                   aria-label="Jump"
                   aria-modal="false"
+                  onKeyDown={onPopoverKeyDown}
               >
                 <div style={sx.topRow}>
                   <div
@@ -13676,8 +16078,9 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                   {/* Books */}
                   <div style={sx.col}>
                     <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
-                      {list.map((b) => {
+                      {list.map((b, idx) => {
                         const active = b.bookId === bookId;
+                        const tabIndex = activeCol === "book" && idx === activeBookIdx ? 0 : -1;
                         return (
                             <ListItem
                                 key={b.bookId}
@@ -13686,6 +16089,8 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                                 mapRef={bookBtnMapRef}
                                 itemKey={b.bookId}
                                 ariaLabel={`Select ${b.name}`}
+                                tabIndex={tabIndex}
+                                onFocus={() => setActiveCol("book")}
                             >
                         <span style={sx.itemLine}>
                           <span style={{ ...sx.itemTextBook, ...(active ? sx.itemTextActive : null) }}>{b.name}</span>
@@ -13699,9 +16104,10 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                   {/* Chapters */}
                   <div style={sx.colNarrow}>
                     <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
-                      {chapterOptions.map((o) => {
+                      {chapterOptions.map((o, idx) => {
                         const n = o.value;
                         const active = !pendingChapter && n === chapter;
+                        const tabIndex = activeCol === "chapter" && idx === activeChapIdx ? 0 : -1;
                         return (
                             <ListItem
                                 key={o.key}
@@ -13711,6 +16117,8 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                                 mapRef={chapBtnMapRef}
                                 itemKey={`c:${n}`}
                                 ariaLabel={`Chapter ${n}`}
+                                tabIndex={tabIndex}
+                                onFocus={() => setActiveCol("chapter")}
                             >
                         <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
                           <span style={sx.prefixLabel}>CH</span> {n}
@@ -13727,9 +16135,10 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                       {!chaptersMeta ? (
                           <div style={sx.loadingBox}>Loading…</div>
                       ) : (
-                          verseOptions.map((o) => {
+                          verseOptions.map((o, idx) => {
                             const n = o.value;
                             const active = !pendingVerse && verse === n;
+                            const tabIndex = activeCol === "verse" && idx === activeVerseIdx ? 0 : -1;
                             return (
                                 <ListItem
                                     key={o.key}
@@ -13739,6 +16148,8 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                                     mapRef={verseBtnMapRef}
                                     itemKey={`v:${n}`}
                                     ariaLabel={`Verse ${n}`}
+                                    tabIndex={tabIndex}
+                                    onFocus={() => setActiveCol("verse")}
                                 >
                           <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
                             <span style={sx.prefixLabel}>V</span> {n}
@@ -13817,7 +16228,7 @@ const sx: Record<string, React.CSSProperties> = {
   pillOpen: {
     boxShadow: "0 14px 42px rgba(0,0,0,0.12)",
     transform: "translateY(-1px)",
-    borderColor: "color-mix(in oklab, var(--focus) 62%, var(--hairline))",
+    borderColor: "color-mix(in oklab, var(--focusRing) 62%, var(--hairline))",
     background: "color-mix(in oklab, var(--panel) 78%, var(--bg))",
   },
 
@@ -13867,6 +16278,7 @@ const sx: Record<string, React.CSSProperties> = {
     transformOrigin: "top center",
     backdropFilter: "blur(10px)",
     WebkitBackdropFilter: "blur(10px)",
+    outline: "none",
   },
 
   topRow: {
@@ -13995,7 +16407,6 @@ const sx: Record<string, React.CSSProperties> = {
     outline: "none",
   },
 
-  // active state uses portal vars (monochrome)
   itemActive: {
     background: "var(--bpAccentSoft)",
     boxShadow: "inset 0 0 0 1px var(--bpAccentRing)",
@@ -14389,25 +16800,60 @@ import React, { useMemo } from "react";
 import type { BookRow } from "../api";
 
 /**
- * Title Page (simple + virtualizer-safe)
- * - No <pre>, no box-drawing unicode, no long unbroken lines
- * - Predictable sizing + wrapping
- * - Won't destabilize scroll measurement in TanStack Virtual
+ * Biblia.to — Book Title Page (premium + virtualizer-safe)
+ *
+ * Design goals:
+ * - Predictable height + wrapping (TanStack Virtual friendly)
+ * - No huge shadows/filters that explode paint cost
+ * - Uses your actual font tokens (base.css): --font-serif / --font-sans
+ * - Clean, “luxury card” with subtle ink + hairlines
+ *
+ * Notes:
+ * - All text is short and wraps; no long unbroken runs.
+ * - Uses color-mix tokens already present elsewhere in your app.
  */
 
 function formatTestament(t: unknown): string {
-    const v = String(t ?? "").toUpperCase();
-    if (v === "NT") return "THE NEW TESTAMENT";
-    if (v === "OT") return "THE OLD TESTAMENT";
+    const v = String(t ?? "").trim().toUpperCase();
+    if (v === "NT" || v === "NEW" || v.includes("NEW")) return "THE NEW TESTAMENT";
+    if (v === "OT" || v === "OLD" || v.includes("OLD")) return "THE OLD TESTAMENT";
     return "HOLY SCRIPTURE";
 }
 
-function getBookTitleParts(book: BookRow | null, bookId: string) {
-    const raw = (book?.name ?? bookId).toUpperCase().trim();
+function normalizeBookName(book: BookRow | null, bookId: string): string {
+    const raw = (book?.name ?? bookId).toString().trim();
+    return raw || bookId;
+}
+
+function upperWords(s: string): string {
+    return s
+        .trim()
+        .replace(/\s+/g, " ")
+        .toUpperCase();
+}
+
+function getBookTitleParts(book: BookRow | null, bookId: string): { prefix: string; main: string; subtitle?: string } {
+    const raw = upperWords(normalizeBookName(book, bookId));
 
     if (raw === "PSALMS") return { prefix: "", main: "PSALMS" };
-    if (["MATTHEW", "MARK", "LUKE", "JOHN"].includes(raw)) return { prefix: "THE GOSPEL ACCORDING TO", main: raw };
-    if (raw === "REVELATION") return { prefix: "THE REVELATION OF", main: "JOHN" };
+    if (raw === "PROVERBS") return { prefix: "THE BOOK OF", main: "PROVERBS" };
+
+    if (["MATTHEW", "MARK", "LUKE", "JOHN"].includes(raw)) {
+        return { prefix: "THE GOSPEL ACCORDING TO", main: raw };
+    }
+
+    if (raw === "ACTS" || raw === "ACTS OF THE APOSTLES") {
+        return { prefix: "", main: "ACTS", subtitle: "OF THE APOSTLES" };
+    }
+
+    if (raw === "REVELATION" || raw === "THE REVELATION") {
+        return { prefix: "THE REVELATION OF", main: "JOHN" };
+    }
+
+    // Epistles styling (optional flourish)
+    if (raw.startsWith("1 ") || raw.startsWith("2 ") || raw.startsWith("3 ")) {
+        return { prefix: "THE EPISTLE OF", main: raw };
+    }
 
     return { prefix: "THE BOOK OF", main: raw };
 }
@@ -14415,20 +16861,34 @@ function getBookTitleParts(book: BookRow | null, bookId: string) {
 export const BookTitlePage = React.memo(function BookTitlePage(props: { book: BookRow | null; bookId: string }) {
     const { book, bookId } = props;
 
-    const testament = useMemo(() => formatTestament(book?.testament), [book?.testament]);
-    const { prefix, main } = useMemo(() => getBookTitleParts(book, bookId), [book, bookId]);
+    const displayName = useMemo(() => normalizeBookName(book, bookId), [book, bookId]);
+    const testament = useMemo(() => formatTestament((book as any)?.testament), [book]);
+    const { prefix, main, subtitle } = useMemo(() => getBookTitleParts(book, bookId), [book, bookId]);
 
     return (
-        <section style={s.wrap} aria-label={`Book: ${book?.name ?? bookId}`}>
+        <section style={s.wrap} aria-label={`Book: ${displayName}`}>
             <div style={s.card}>
-                <div style={s.plate} role="presentation" aria-hidden="true" />
+                {/* Top hairline */}
+                <div style={s.hairlineTop} aria-hidden="true" />
+
+                {/* Kicker */}
                 <div style={s.kicker}>{testament}</div>
+
+                {/* Title */}
                 <div style={s.titleBlock}>
                     {prefix ? <div style={s.prefix}>{prefix}</div> : null}
+
                     <h1 style={s.main}>{main}</h1>
-                    <div style={s.rule} />
+
+                    {subtitle ? <div style={s.subtitle}>{subtitle}</div> : null}
+
+                    <div style={s.rule} aria-hidden="true" />
+
                     <div style={s.motto}>VERBUM DOMINI MANET IN AETERNUM</div>
                 </div>
+
+                {/* Bottom hairline */}
+                <div style={s.hairlineBot} aria-hidden="true" />
             </div>
         </section>
     );
@@ -14441,34 +16901,42 @@ const s: Record<string, React.CSSProperties> = {
         justifyContent: "center",
         background: "transparent",
     },
+
     card: {
         width: "100%",
         maxWidth: 760,
-        borderRadius: 18,
-        padding: "22px 18px",
+        borderRadius: 20,
+        padding: "18px 16px",
         background: "color-mix(in oklab, var(--card) 92%, var(--bg) 8%)",
         border: "1px solid color-mix(in oklab, var(--border) 78%, transparent)",
-        boxShadow: "0 16px 44px color-mix(in oklab, black 14%, transparent), inset 0 1px 0 rgba(255,255,255,0.18)",
+        boxShadow: "0 16px 44px color-mix(in oklab, black 14%, transparent), inset 0 1px 0 rgba(255,255,255,0.16)",
         overflow: "hidden",
+        contain: "paint",
     },
 
-    // tiny embossed “plate line” — stable, cheap to render
-    plate: {
+    hairlineTop: {
         height: 1,
-        background: "linear-gradient(to right, transparent, color-mix(in oklab, var(--border) 75%, transparent), transparent)",
-        marginBottom: 14,
-        opacity: 0.9,
+        background:
+            "linear-gradient(to right, transparent, color-mix(in oklab, var(--border) 78%, transparent), transparent)",
+        opacity: 0.95,
+        marginBottom: 12,
+    },
+    hairlineBot: {
+        height: 1,
+        background:
+            "linear-gradient(to right, transparent, color-mix(in oklab, var(--border) 72%, transparent), transparent)",
+        opacity: 0.75,
+        marginTop: 14,
     },
 
     kicker: {
-        fontFamily:
-            "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji'",
+        fontFamily: "var(--font-sans)",
         fontSize: 12,
         letterSpacing: "0.22em",
         textTransform: "uppercase",
         color: "color-mix(in oklab, var(--fg) 70%, var(--muted) 30%)",
         textAlign: "center",
-        marginBottom: 14,
+        marginBottom: 12,
         userSelect: "none",
     },
 
@@ -14477,12 +16945,11 @@ const s: Record<string, React.CSSProperties> = {
         flexDirection: "column",
         alignItems: "center",
         gap: 8,
-        padding: "6px 0 2px",
+        padding: "4px 0 2px",
     },
 
     prefix: {
-        fontFamily:
-            "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji'",
+        fontFamily: "var(--font-sans)",
         fontSize: 12.5,
         letterSpacing: "0.18em",
         textTransform: "uppercase",
@@ -14491,21 +16958,38 @@ const s: Record<string, React.CSSProperties> = {
         userSelect: "none",
         maxWidth: 560,
         lineHeight: 1.25,
+        padding: "0 6px",
     },
 
     main: {
         margin: 0,
-        fontFamily:
-            "ui-serif, Georgia, Cambria, 'Times New Roman', Times, serif",
-        fontWeight: 700,
+        fontFamily: "var(--font-serif)",
+        fontWeight: 760,
         fontSize: 34,
-        letterSpacing: "0.04em",
+        letterSpacing: "0.05em",
         textTransform: "uppercase",
         textAlign: "center",
         color: "color-mix(in oklab, var(--fg) 92%, var(--muted) 8%)",
-        lineHeight: 1.05,
+        lineHeight: 1.06,
         userSelect: "none",
-        maxWidth: 640,
+        maxWidth: 660,
+        padding: "0 6px",
+        overflowWrap: "anywhere",
+        textWrap: "balance",
+    },
+
+    subtitle: {
+        fontFamily: "var(--font-serif)",
+        fontSize: 16,
+        fontWeight: 620,
+        letterSpacing: "0.14em",
+        textTransform: "uppercase",
+        color: "color-mix(in oklab, var(--fg) 78%, var(--muted) 22%)",
+        textAlign: "center",
+        userSelect: "none",
+        maxWidth: 660,
+        lineHeight: 1.12,
+        padding: "0 8px",
         overflowWrap: "anywhere",
     },
 
@@ -14519,8 +17003,7 @@ const s: Record<string, React.CSSProperties> = {
 
     motto: {
         marginTop: 8,
-        fontFamily:
-            "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji'",
+        fontFamily: "var(--font-sans)",
         fontSize: 11.5,
         letterSpacing: "0.16em",
         textTransform: "uppercase",
@@ -14529,6 +17012,7 @@ const s: Record<string, React.CSSProperties> = {
         userSelect: "none",
         maxWidth: 620,
         lineHeight: 1.25,
+        padding: "0 8px",
     },
 };
 ```
@@ -15666,20 +18150,20 @@ import {
 } from "./typography";
 
 /**
- * Biblia Populi — Reader Typography Control (fixed + safe)
+ * Biblia.to — Reader Typography Control (elite + bulletproof)
  *
- * Contract:
- * - Fixed width (not user-adjustable)
- * - Fixed leading (not user-adjustable)
- * - User can change: Enable + Font + Size + Weight
+ * Contract (your request):
+ * - Width locked (measurePx fixed to DEFAULT)
+ * - Leading locked (leading fixed to DEFAULT)
+ * - User controls: Enable + Font + Size + Weight
  *
- * Upgrades / Fixes:
- * - No "toggle open" desync: close() always returns focus to trigger.
- * - Click-outside uses composedPath() when available (portals/shadows safe).
- * - Left/Right cycles fonts ONLY when panel is open and focus is not on a slider.
- * - Robust cleanup for listeners (no `as any` hacks).
- * - Reduced-motion respected; keyframes injected once.
- * - Keyboard affordances: Escape closes, Home/End jump slider ends.
+ * Upgrades:
+ * - No click-outside "as any" hacks. Uses a clean capture listener + composedPath() when available.
+ * - Focus correctness: open -> focus panel; close -> restore focus to trigger.
+ * - Keyboard: Escape closes; Left/Right cycles fonts when panel open and no range focused; Home/End snaps range.
+ * - A11y: aria-controls, aria-expanded, role="dialog", label wiring.
+ * - Reduced motion respected; animation injected once per app (and not removed).
+ * - Prevents legacy stored values from reintroducing measure/leading drift.
  */
 
 type FontOpt = ReturnType<typeof fontOptions>[number] & {
@@ -15687,7 +18171,10 @@ type FontOpt = ReturnType<typeof fontOptions>[number] & {
     family?: string;
 };
 
+type RangeId = "sizePx" | "weight";
+
 function clampNum(n: number, lo: number, hi: number): number {
+    if (!Number.isFinite(n)) return lo;
     return Math.max(lo, Math.min(hi, n));
 }
 
@@ -15698,7 +18185,7 @@ function usePrefersReducedMotion(): boolean {
         const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
         const onChange = () => setReduced(mq.matches);
         onChange();
-        // Safari < 14 uses addListener/removeListener
+        // Safari legacy
         if (mq.addEventListener) mq.addEventListener("change", onChange);
         else mq.addListener(onChange);
         return () => {
@@ -15717,46 +18204,47 @@ function nextOf<T>(arr: readonly T[], current: T, dir: 1 | -1): T {
 
 function fontFamilyForOpt(f: FontOpt): string {
     const fam = (f.cssFamily ?? f.family ?? String(f.id)).trim();
-    if (
-        fam.includes(",") ||
-        fam.startsWith("var(") ||
-        fam.startsWith("ui-") ||
-        fam.includes("system-ui")
-    ) {
-        return fam;
-    }
+    if (!fam) return "var(--font-serif)";
+    if (fam.includes(",") || fam.startsWith("var(") || fam.startsWith("ui-") || fam.includes("system-ui")) return fam;
     return `"${fam}", ui-serif, Georgia, Cambria, "Times New Roman", serif`;
 }
 
 function useInjectOnceStyle(cssText: string, attr: string): void {
     useEffect(() => {
         if (typeof document === "undefined") return;
-
-        const existing = document.querySelector(`style[${attr}]`);
-        if (existing) return;
+        const sel = `style[${attr}="1"]`;
+        if (document.querySelector(sel)) return;
 
         const el = document.createElement("style");
         el.setAttribute(attr, "1");
         el.textContent = cssText;
         document.head.appendChild(el);
-
-        return () => {
-            el.remove();
-        };
     }, [cssText, attr]);
 }
 
 function IconAa() {
-    return <span style={{ fontWeight: 820, letterSpacing: "-0.06em" }}>Aa</span>;
+    return <span style={{ fontWeight: 860, letterSpacing: "-0.06em" }}>Aa</span>;
 }
 function IconX() {
     return <span style={{ fontSize: 14, lineHeight: 1 }}>✕</span>;
 }
 
-function pathContains(path: EventTarget[] | undefined, node: Node | null): boolean {
-    if (!path || !node) return false;
-    return path.some((t) => t === node);
+function isRangeInput(el: Element | null): el is HTMLInputElement {
+    return !!el && el.tagName === "INPUT" && (el as HTMLInputElement).type === "range";
 }
+
+function eventComposedPath(e: Event): EventTarget[] | null {
+    const anyE = e as unknown as { composedPath?: () => EventTarget[] };
+    return typeof anyE.composedPath === "function" ? anyE.composedPath() : null;
+}
+
+function pathContainsNode(path: EventTarget[] | null, node: Node | null): boolean {
+    if (!path || !node) return false;
+    for (const t of path) if (t === node) return true;
+    return false;
+}
+
+const PANEL_ID = "bp-typo-panel";
 
 export function ReaderTypographyControl() {
     const stored = useMemo(() => loadReaderTypography(), []);
@@ -15769,6 +18257,9 @@ export function ReaderTypographyControl() {
     const rootRef = useRef<HTMLDivElement | null>(null);
     const triggerRef = useRef<HTMLButtonElement | null>(null);
     const panelRef = useRef<HTMLDivElement | null>(null);
+
+    // Track whether a slider currently has focus (so Left/Right doesn't steal arrows)
+    const [activeRange, setActiveRange] = useState<RangeId | null>(null);
 
     const limits = useMemo(() => typographyLimits(), []);
     const fonts = useMemo(() => fontOptions() as FontOpt[], []);
@@ -15783,8 +18274,26 @@ export function ReaderTypographyControl() {
         "data-bp-typo-pop",
     );
 
+    const ids = useMemo(() => (fonts.map((f) => f.id) as TypographyFont[]), [fonts]);
+
+    const fontIndex = useMemo(() => {
+        if (!fonts.length) return 0;
+        const idx = fonts.findIndex((f) => f.id === t.font);
+        return idx >= 0 ? idx : 0;
+    }, [fonts, t.font]);
+
+    const curFont = useMemo(() => (fonts.length ? fonts[fontIndex]! : null), [fonts, fontIndex]);
+
+    const summary = useMemo(() => {
+        const size = `${Math.round(t.sizePx)}px`;
+        const weight = `${Math.round(t.weight)}`;
+        const font = curFont?.label ?? String(t.font);
+        return `${font} · ${size} · ${weight}`;
+    }, [t.sizePx, t.weight, t.font, curFont]);
+
     const closePanel = useCallback(() => {
         setOpen(false);
+        setActiveRange(null);
         queueMicrotask(() => triggerRef.current?.focus());
     }, []);
 
@@ -15804,64 +18313,84 @@ export function ReaderTypographyControl() {
         setEnabled(false);
         setT(DEFAULT_TYPOGRAPHY);
         setOpen(false);
+        setActiveRange(null);
         queueMicrotask(() => triggerRef.current?.focus());
     }, []);
 
-    // Live apply + save
+    // Lock contract fields always (measurePx + leading)
     useEffect(() => {
+        setT((prev) =>
+            updateTypography(prev, {
+                measurePx: DEFAULT_TYPOGRAPHY.measurePx,
+                leading: DEFAULT_TYPOGRAPHY.leading,
+            }),
+        );
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // Live apply + save (and enforce locked fields even if storage is dirty)
+    useEffect(() => {
+        const locked = updateTypography(t, {
+            measurePx: DEFAULT_TYPOGRAPHY.measurePx,
+            leading: DEFAULT_TYPOGRAPHY.leading,
+        });
+
         if (!enabled) {
             applyReaderTypography(null);
             clearReaderTypography();
             return;
         }
-        applyReaderTypography(t);
-        saveReaderTypography(t);
+
+        // Apply locked snapshot (prevents drift if someone patched t elsewhere)
+        applyReaderTypography(locked);
+        saveReaderTypography(locked);
+
+        // Keep state coherent if we had to clamp/lock
+        if (locked !== t) setT(locked);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [enabled, t]);
 
-    // Click-outside (capture). Uses composedPath when available.
+    // Open -> focus panel (so Escape works immediately)
+    useEffect(() => {
+        if (!open) return;
+        queueMicrotask(() => panelRef.current?.focus());
+    }, [open]);
+
+    // Click-outside (capture) — portals/shadow safe via composedPath when available.
     useEffect(() => {
         if (!open) return;
 
-        const onPointerDown = (e: PointerEvent) => {
+        const onPointerDownCapture = (e: PointerEvent) => {
             const root = rootRef.current;
             if (!root) return;
 
             const target = e.target as Node | null;
-            const path = (e as any).composedPath?.() as EventTarget[] | undefined;
+            const path = eventComposedPath(e);
 
-            const inside =
-                (target && root.contains(target)) || pathContains(path, root);
-
+            const inside = (target && root.contains(target)) || pathContainsNode(path, root);
             if (!inside) closePanel();
         };
 
-        document.addEventListener("pointerdown", onPointerDown, { capture: true });
-        return () => {
-            document.removeEventListener("pointerdown", onPointerDown, { capture: true } as any);
-        };
+        document.addEventListener("pointerdown", onPointerDownCapture, { capture: true });
+        return () => document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
     }, [open, closePanel]);
 
-    // Keyboard: Escape closes; Left/Right cycles font unless a slider is focused.
+    // Keyboard
     useEffect(() => {
         if (!open) return;
 
-        const onKey = (e: KeyboardEvent) => {
+        const onKeyCapture = (e: KeyboardEvent) => {
             if (e.key === "Escape") {
                 e.preventDefault();
                 closePanel();
                 return;
             }
+
             if (e.metaKey || e.ctrlKey || e.altKey) return;
-            if (fonts.length === 0) return;
 
-            const ae = document.activeElement as HTMLElement | null;
-            const isRange =
-                ae?.tagName === "INPUT" &&
-                (ae as HTMLInputElement).type === "range";
-
-            // If a slider is focused, allow arrow keys to adjust it.
-            if (isRange) {
-                // Add Home/End to jump ends (nice touch).
+            // If a slider is focused, allow arrows to adjust it; add Home/End for snap.
+            const ae = document.activeElement as Element | null;
+            if (isRangeInput(ae)) {
                 if (e.key === "Home" || e.key === "End") {
                     const input = ae as HTMLInputElement;
                     const min = Number(input.min);
@@ -15874,76 +18403,30 @@ export function ReaderTypographyControl() {
                 return;
             }
 
+            // Font cycling (only when enabled, panel open, and no range focused)
+            if (!enabled) return;
+            if (!ids.length) return;
+
             if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
-                if (!enabled) return;
-
-                const ids = fonts.map((f) => f.id) as TypographyFont[];
                 const dir: 1 | -1 = e.key === "ArrowRight" ? 1 : -1;
-
                 setPatch({ font: nextOf(ids, t.font, dir) });
                 e.preventDefault();
             }
         };
 
-        window.addEventListener("keydown", onKey, { capture: true });
-        return () => {
-            window.removeEventListener("keydown", onKey, { capture: true } as any);
-        };
-    }, [open, closePanel, enabled, fonts, setPatch, t.font]);
+        window.addEventListener("keydown", onKeyCapture, { capture: true });
+        return () => window.removeEventListener("keydown", onKeyCapture, { capture: true });
+    }, [open, closePanel, enabled, ids, setPatch, t.font]);
 
-    // When opening, focus panel (so Escape works even if user doesn't click inside)
-    useEffect(() => {
-        if (!open) return;
-        queueMicrotask(() => panelRef.current?.focus());
-    }, [open]);
-
-    const onToggleOpen = useCallback(() => {
-        setOpen((v) => !v);
-    }, []);
-
-    const ids = useMemo(
-        () =>
-            fonts.length
-                ? (fonts.map((f) => f.id) as TypographyFont[])
-                : ([] as TypographyFont[]),
-        [fonts],
-    );
-
-    const fontIndex = useMemo(() => {
-        if (fonts.length === 0) return 0;
-        const idx = fonts.findIndex((f) => f.id === t.font);
-        return idx >= 0 ? idx : 0;
-    }, [fonts, t.font]);
-
-    const curFont = useMemo(() => (fonts.length ? fonts[fontIndex]! : null), [fonts, fontIndex]);
+    const onToggleOpen = useCallback(() => setOpen((v) => !v), []);
 
     const hopFont = useCallback(
         (dir: -1 | 1) => {
-            if (!enabled || ids.length === 0) return;
+            if (!enabled || !ids.length) return;
             setPatch({ font: nextOf(ids, t.font, dir) });
         },
         [enabled, ids, setPatch, t.font],
     );
-
-    const summary = useMemo(() => {
-        const size = `${Math.round(t.sizePx)}px`;
-        const weight = `${Math.round(t.weight)}`;
-        const font = curFont?.label ?? String(t.font);
-        return `${font} · ${size} · ${weight}`;
-    }, [t.sizePx, t.weight, t.font, curFont]);
-
-    // Fixed: width + leading are locked to defaults (contract)
-    useEffect(() => {
-        // If the stored value has old fields changed, force them back on mount.
-        // (Does not toggle enabled; just normalizes the state.)
-        setT((prev) =>
-            updateTypography(prev, {
-                measurePx: DEFAULT_TYPOGRAPHY.measurePx,
-                leading: DEFAULT_TYPOGRAPHY.leading,
-            }),
-        );
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
 
     const sliderStyle = enabled ? sx.range : { ...sx.range, ...sx.rangeDisabled };
 
@@ -15960,17 +18443,19 @@ export function ReaderTypographyControl() {
                 onClick={onToggleOpen}
                 aria-haspopup="dialog"
                 aria-expanded={open}
+                aria-controls={PANEL_ID}
                 aria-label="Typography settings"
                 title={`Typography (${summary})`}
             >
-        <span style={sx.triggerGlyph}>
-          <IconAa />
-        </span>
+                <span style={sx.triggerGlyph}>
+                    <IconAa />
+                </span>
                 <span style={{ ...sx.dot, ...(enabled ? sx.dotOn : sx.dotOff) }} aria-hidden />
             </button>
 
             {open && (
                 <div
+                    id={PANEL_ID}
                     ref={panelRef}
                     style={{
                         ...sx.panel,
@@ -16017,7 +18502,7 @@ export function ReaderTypographyControl() {
                         </div>
                     </div>
 
-                    {/* Tiny one-line summary */}
+                    {/* Summary */}
                     <div style={sx.sub} title={summary}>
                         {summary}
                     </div>
@@ -16059,9 +18544,7 @@ export function ReaderTypographyControl() {
                                     title={curFont ? `${curFont.label} (${fontIndex + 1}/${fonts.length})` : "Font"}
                                 >
                                     <span style={sx.fontName}>{curFont?.label ?? "—"}</span>
-                                    <span style={sx.fontCount}>
-                    {fonts.length ? `${fontIndex + 1}/${fonts.length}` : ""}
-                  </span>
+                                    <span style={sx.fontCount}>{fonts.length ? `${fontIndex + 1}/${fonts.length}` : ""}</span>
                                 </button>
 
                                 <button
@@ -16094,8 +18577,11 @@ export function ReaderTypographyControl() {
                                         sizePx: Math.round(clampNum(Number(e.target.value), 12, limits.sizePx.hi)),
                                     })
                                 }
+                                onFocus={() => setActiveRange("sizePx")}
+                                onBlur={() => setActiveRange((v) => (v === "sizePx" ? null : v))}
                                 style={sliderStyle}
                                 disabled={!enabled}
+                                aria-label="Scripture font size"
                             />
                         </div>
 
@@ -16116,8 +18602,11 @@ export function ReaderTypographyControl() {
                                         weight: Math.round(clampNum(Number(e.target.value), 200, limits.weight.hi)),
                                     })
                                 }
+                                onFocus={() => setActiveRange("weight")}
+                                onBlur={() => setActiveRange((v) => (v === "weight" ? null : v))}
                                 style={sliderStyle}
                                 disabled={!enabled}
+                                aria-label="Scripture font weight"
                             />
                         </div>
                     </div>
@@ -16172,7 +18661,7 @@ const sx: Record<string, React.CSSProperties> = {
         background: "color-mix(in oklab, var(--panel) 86%, transparent)",
     },
     triggerDisabled: { opacity: 0.92 },
-    triggerGlyph: { fontSize: 13.5, fontWeight: 820, letterSpacing: "-0.05em" },
+    triggerGlyph: { fontSize: 13.5, fontWeight: 860, letterSpacing: "-0.05em" },
 
     dot: {
         position: "absolute",
@@ -16241,8 +18730,7 @@ const sx: Record<string, React.CSSProperties> = {
         alignItems: "center",
         justifyContent: "center",
         cursor: "pointer",
-        transition:
-            "transform 140ms cubic-bezier(0.23, 1, 0.32, 1), background 140ms ease, border-color 140ms ease",
+        transition: "transform 140ms cubic-bezier(0.23, 1, 0.32, 1), background 140ms ease, border-color 140ms ease",
         WebkitTapHighlightColor: "transparent",
         userSelect: "none",
     },
@@ -16408,17 +18896,26 @@ const sx: Record<string, React.CSSProperties> = {
 
 ```tsx
 // apps/web/src/reader/ReaderViewport.tsx
-// Biblia Populi — Reader Viewport (TanStack Virtual + smart chunked prefetching)
+// Biblia.to — Reader Viewport (TanStack Virtual + smart chunked prefetching)
 //
 // Freeze killers (why it was locking up):
 // • The scroll container MUST remain sx.scroll (position:absolute; inset:0). Do NOT override to position:relative.
 //   Overriding causes massive layout (millions of px) + virtualizer instability.
 //
-// Upgrades / bulletproofing:
+// Full upgrades in this pass:
 // • Real request cancellation via AbortController (abort on spine-change + unmount).
+// • De-duped chunk requests (same chunk never fetched twice concurrently).
 // • Stable prefetch deps (first/last index; not virtualItems identity).
-// • Measuring is allowed again when dataTick bumps (skeleton -> real text) but limited to once/element/tick.
+// • Measuring allowed again when dataTick bumps (skeleton -> real text) but limited to once/element/tick.
+// • Scroll/position tracking uses rAF throttle + passive listeners to reduce layout pressure.
 // • Book-gate will NOT trigger at verseOrdMin (no “gate at Genesis 1:1”).
+// • Memory pressure guard: hard cap on chunks + evict farthest-first from current chunk.
+// • Safer “ready” semantics: onReady fires once per spine-run when initial chunk queued.
+// • jumpToOrd queues if scrollEl not ready.
+//
+// Fix for TS2322:
+// TanStack Virtual expects behavior?: "auto" | "smooth" (its own type) — not DOM ScrollBehavior.
+// We define a local ScrollMode union and use it everywhere.
 
 import React, {
     forwardRef,
@@ -16442,18 +18939,23 @@ const PREFETCH_CHUNKS_AHEAD = 2;
 const PREFETCH_CHUNKS_BEHIND = 1;
 
 const MAX_CHUNKS_IN_MEMORY = 10;
+
+// Keep estimate modest; measured sizes will correct after load.
 const EST_ROW_PX = 56;
+
+type ScrollMode = "auto" | "smooth";
 
 function chunkStart(ord: number): number {
     return Math.floor((ord - 1) / CHUNK) * CHUNK + 1;
 }
+
 function clamp(n: number, lo: number, hi: number): number {
     return Math.max(lo, Math.min(hi, n));
 }
 
 /* ------------------------------ Public API ------------------------------ */
 export type ReaderViewportHandle = {
-    jumpToOrd: (ord: number, behavior?: "auto" | "smooth") => void;
+    jumpToOrd: (ord: number, behavior?: ScrollMode) => void;
     getCurrentOrd: () => number;
 };
 
@@ -16468,7 +18970,7 @@ type Props = {
 };
 
 /* --------------------------- Internal types ---------------------------- */
-type PendingJump = { ord: number; behavior: "auto" | "smooth" };
+type PendingJump = { ord: number; behavior: ScrollMode };
 type BookGateState = { ord: number; bookId: string };
 
 /* ----------------------------- Book Gate UI ---------------------------- */
@@ -16495,6 +18997,7 @@ function BookGate(props: { book: BookRow | null; bookId: string; onContinue: () 
                 padding: 18,
                 background: "color-mix(in oklab, var(--bg) 72%, rgba(0,0,0,0.55))",
                 backdropFilter: "blur(10px)",
+                WebkitBackdropFilter: "blur(10px)",
             }}
             onKeyDown={(e) => {
                 const block = new Set([" ", "PageDown", "PageUp", "ArrowDown", "ArrowUp", "Home", "End"]);
@@ -16582,21 +19085,18 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     // All heavy data lives in a ref (prevents massive re-renders)
     const chunkRef = useRef<ChunkState>(createChunkState());
-    const [dataTick, setDataTick] = useState(0); // triggers virtualizer refresh (and re-measure pass)
+    const [dataTick, setDataTick] = useState(0);
 
-    // Measure thrash breaker:
-    // - we allow measuring again when dataTick changes (skeleton -> real text)
-    // - but never more than once per element per tick
+    // Measure thrash breaker: measure at most once per element per tick
     const measuredAtRef = useRef<WeakMap<Element, number>>(new WeakMap());
 
     const bumpTick = useCallback(() => setDataTick((t) => t + 1), []);
 
-    // spine sanity: derive count from range (trust ord bounds more than verseCount)
+    // spine sanity: derive count from ord bounds
     const derivedCount = useMemo(() => {
         const min = spine.verseOrdMin;
         const max = spine.verseOrdMax;
-        const c = max >= min ? max - min + 1 : 0;
-        return c;
+        return max >= min ? max - min + 1 : 0;
     }, [spine.verseOrdMin, spine.verseOrdMax]);
 
     const count = useMemo(() => {
@@ -16606,7 +19106,10 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         return c;
     }, [spine.verseCount, derivedCount]);
 
-    const initialOrd = useMemo(() => clamp(1, spine.verseOrdMin, spine.verseOrdMax), [spine.verseOrdMin, spine.verseOrdMax]);
+    const initialOrd = useMemo(
+        () => clamp(spine.verseOrdMin, spine.verseOrdMin, spine.verseOrdMax),
+        [spine.verseOrdMin, spine.verseOrdMax],
+    );
 
     const [posOrd, setPosOrd] = useState<number>(initialOrd);
     const posOrdRef = useRef<number>(initialOrd);
@@ -16617,7 +19120,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
     // Invalidate in-flight requests when spine changes
     const runIdRef = useRef(0);
 
-    // Real cancellation (prevents late commits + reduces network spam)
+    // Real cancellation
     const inFlightRef = useRef<Map<number, AbortController>>(new Map());
     const abortAllInFlight = useCallback(() => {
         for (const c of inFlightRef.current.values()) c.abort();
@@ -16662,27 +19165,28 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                 const victim = list.splice(farIdx, 1)[0]!;
                 state.loadedChunks.delete(victim);
 
-                // Remove all verses within victim chunk
                 const startOrd = victim;
-                const end = Math.min(victim + CHUNK - 1, spine.verseOrdMax);
-                for (let ord = startOrd; ord <= end; ord++) state.verseMap.delete(ord);
+                const endOrd = Math.min(victim + CHUNK - 1, spine.verseOrdMax);
+                for (let ord = startOrd; ord <= endOrd; ord++) state.verseMap.delete(ord);
             }
         },
         [spine.verseOrdMin, spine.verseOrdMax],
     );
 
-    /* ------------------------- Load chunk ------------------------- */
+    /* ------------------------- Load chunk (dedup + cancel) ------------------------- */
     const ensureChunk = useCallback(
         async (startOrd: number, keepOrd?: number): Promise<void> => {
             const s = clamp(startOrd, spine.verseOrdMin, spine.verseOrdMax);
             const chunk = chunkStart(s);
 
             const state = chunkRef.current;
-            if (state.loadedChunks.has(chunk) || state.loadingChunks.has(chunk)) return;
+            if (state.loadedChunks.has(chunk)) return;
+            if (state.loadingChunks.has(chunk)) return;
 
             const myRunId = runIdRef.current;
 
             state.loadingChunks.add(chunk);
+
             const ctrl = new AbortController();
             inFlightRef.current.set(chunk, ctrl);
 
@@ -16712,12 +19216,11 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     /* ------------------------- Reset on spine change ------------------------- */
     useEffect(() => {
-        // New run: abort in-flight requests and invalidate late results
         abortAllInFlight();
         runIdRef.current++;
 
         chunkRef.current = createChunkState();
-        measuredAtRef.current = new WeakMap(); // reset measured cache per run
+        measuredAtRef.current = new WeakMap();
 
         setPosOrd(initialOrd);
         posOrdRef.current = initialOrd;
@@ -16730,12 +19233,10 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         pendingJumpRef.current = null;
         readyOnceRef.current = false;
 
-        // Kick initial chunk
         void ensureChunk(chunkStart(initialOrd), initialOrd);
         bumpTick();
     }, [initialOrd, ensureChunk, bumpTick, abortAllInFlight]);
 
-    // Abort any in-flight fetches on unmount
     useEffect(() => {
         return () => abortAllInFlight();
     }, [abortAllInFlight]);
@@ -16761,7 +19262,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
     /* ------------------------- Public jump API ------------------------- */
     const jumpToOrd = useCallback(
-        (ord: number, behavior: "auto" | "smooth" = "auto") => {
+        (ord: number, behavior: ScrollMode = "auto") => {
             const targetOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
             const idx = targetOrd - spine.verseOrdMin;
 
@@ -16815,28 +19316,18 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         const start = chunkStart(firstOrd);
         const end = chunkStart(lastOrd);
 
-        // current viewport
         for (let c = start; c <= end; c += CHUNK) void ensureChunk(c, firstOrd);
 
-        // ahead
         for (let k = 1; k <= PREFETCH_CHUNKS_AHEAD; k++) {
             const ahead = end + k * CHUNK;
             if (ahead <= spine.verseOrdMax) void ensureChunk(ahead, lastOrd);
         }
 
-        // behind
         for (let k = 1; k <= PREFETCH_CHUNKS_BEHIND; k++) {
             const behind = start - k * CHUNK;
             if (behind >= spine.verseOrdMin) void ensureChunk(behind, firstOrd);
         }
-    }, [
-        firstIndex,
-        lastIndex,
-        ensureChunk,
-        spine.verseOrdMin,
-        spine.verseOrdMax,
-        virtualItems.length,
-    ]);
+    }, [firstIndex, lastIndex, ensureChunk, spine.verseOrdMin, spine.verseOrdMax, virtualItems.length]);
 
     /* ------------------------- Gate scroll lock ------------------------- */
     useEffect(() => {
@@ -16863,13 +19354,15 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         };
     }, [scrollEl, gate]);
 
-    /* ------------------------- Track top verse (layout) ------------------------- */
-    useLayoutEffect(() => {
+    /* ------------------------- Track top verse (throttled) ------------------------- */
+    const rafScrollRef = useRef<number>(0);
+
+    const computeAndSetTopOrd = useCallback(() => {
+        rafScrollRef.current = 0;
         if (!scrollEl || !virtualItems.length || gateRef.current) return;
 
         const st = scrollEl.scrollTop;
 
-        // virtualItems are sorted by start.
         let topItem = virtualItems[0]!;
         for (let i = 0; i < virtualItems.length; i++) {
             const it = virtualItems[i]!;
@@ -16880,14 +19373,37 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         }
 
         const ord = spine.verseOrdMin + topItem.index;
-
         if (posOrdRef.current !== ord) {
             posOrdRef.current = ord;
             setPosOrd(ord);
         }
 
         void ensureChunk(chunkStart(ord), ord);
-    }, [scrollEl, virtualItems.length, firstIndex, lastIndex, ensureChunk, spine.verseOrdMin]);
+    }, [ensureChunk, scrollEl, spine.verseOrdMin, virtualItems]);
+
+    useLayoutEffect(() => {
+        if (!scrollEl || !virtualItems.length || gateRef.current) return;
+        computeAndSetTopOrd();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [scrollEl, virtualItems.length, firstIndex, lastIndex]);
+
+    useEffect(() => {
+        if (!scrollEl) return;
+
+        const onScroll = () => {
+            if (rafScrollRef.current) return;
+            rafScrollRef.current = window.requestAnimationFrame(computeAndSetTopOrd);
+        };
+
+        scrollEl.addEventListener("scroll", onScroll, { passive: true });
+        return () => {
+            scrollEl.removeEventListener("scroll", onScroll);
+            if (rafScrollRef.current) {
+                cancelAnimationFrame(rafScrollRef.current);
+                rafScrollRef.current = 0;
+            }
+        };
+    }, [scrollEl, computeAndSetTopOrd]);
 
     /* ------------------------- Emit position ------------------------- */
     const lastSentRef = useRef<{ ord: number; hasVerse: boolean }>({ ord: -1, hasVerse: false });
@@ -16899,7 +19415,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
         const next = { ord: effectiveOrd, hasVerse: !!verse };
         const prev = lastSentRef.current;
-
         if (prev.ord === next.ord && prev.hasVerse === next.hasVerse) return;
 
         lastSentRef.current = next;
@@ -16909,6 +19424,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
     /* ------------------------- Book-boundary gate detection ------------------------- */
     useEffect(() => {
         if (!scrollEl || gateRef.current) return;
+
         if (gateCooldownRef.current > 0) {
             gateCooldownRef.current--;
             return;
@@ -16918,8 +19434,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         const cur = chunkRef.current.verseMap.get(ord) ?? null;
         if (!cur) return;
 
-        // Gate only when we *enter* a new book from the previous verse.
-        // (Never gate at the very first verse of the canon.)
         if (ord === spine.verseOrdMin) return;
         const prev = chunkRef.current.verseMap.get(ord - 1) ?? null;
         if (!prev) return;
@@ -16955,8 +19469,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
         [bookById],
     );
 
-    // Stable measurement ref (critical for TanStack Virtual stability)
-    // Measure at most once per element per dataTick (skeleton -> real text).
     const measureRowEl = useCallback(
         (el: HTMLDivElement | null) => {
             if (!el) return;
@@ -17349,10 +19861,22 @@ export const sx: Record<string, CSSProperties> = {
 import type { BookRow } from "../api";
 
 /**
- * Reader types (web)
- * - Keep these minimal + transport-friendly (what the UI actually needs).
- * - Everything here is safe to JSON round-trip.
+ * Reader types (web) — Biblia.to
+ *
+ * Design goals:
+ * - JSON-safe, transport-friendly (server -> client -> localStorage -> server)
+ * - Canon anchored (verseKey + verseOrd are the immutable scripture anchors)
+ * - Token-ready selection + annotation (stable across font size/measure/line wrapping)
+ * - Overlay-ready (highlights, notes, drawings, bookmarks) with deterministic anchoring
+ *
+ * IMPORTANT PRINCIPLE:
+ * - Layout is ephemeral. Anchors must be semantic (ord/keys + token/char ranges).
+ * - Any pixel geometry is treated as a *view projection* and can be recomputed.
  */
+
+/* =============================================================================
+   Core Reader Data (transport)
+============================================================================= */
 
 /** Global spine bounds (by canonical verse_ord). */
 export type SpineStats = Readonly<{
@@ -17368,15 +19892,98 @@ export type VerseRef = Readonly<{
     verse?: number | null;
 }>;
 
-/** A verse row returned by /slice (what the reader virtual list renders). */
+/**
+ * A translation identity (optional but extremely useful once you have multiple translations).
+ * Keep it stringly-typed (slug) for transport simplicity.
+ */
+export type TranslationRef = Readonly<{
+    /** e.g. "kjv", "esv", "niv", "lxx", etc */
+    translationId: string;
+    /** Optional: human label cached client-side */
+    label?: string | null;
+}>;
+
+/** Token kind for reader interactions (kept stable for DOM + selection logic). */
+export type SliceTokenKind =
+    | "WORD"
+    | "PUNCT"
+    | "SPACE"
+    | "LINEBREAK"
+    | "MARKER"
+    | "NUMBER"
+    | "SYMBOL";
+
+/**
+ * Tokenization config identity.
+ * If you ever change tokenization rules, bump tokenizerId to preserve stable selection replay.
+ */
+export type TokenizerRef = Readonly<{
+    /** e.g. "tok_v1_en", "tok_v1_grc", "tok_v1_he" */
+    tokenizerId: string;
+    /** Optional: version/debug info */
+    version?: string | null;
+}>;
+
+/**
+ * A token inside a verse (optional feature).
+ * tokenIndex is local within the verse, 0..N-1, stable for (verseKey, translationId, tokenizerId).
+ *
+ * Offsets:
+ * - charStart/charEnd are offsets into `text` string (if provided)
+ * - Convention: [start, end) half-open
+ */
+export type SliceVerseToken = Readonly<{
+    tokenIndex: number;
+
+    /** surface string (can include spaces/punct depending on your tokenizer policy) */
+    token: string;
+
+    /** optional normalized form for matching/search/highlight rules */
+    tokenNorm?: string | null;
+
+    tokenKind?: SliceTokenKind | null;
+
+    /** offsets into verse text string */
+    charStart?: number | null;
+    charEnd?: number | null;
+
+    /**
+     * Optional: "sub-identity" for special tokens (e.g., footnote markers, speaker tags)
+     * Keep opaque; renderer may interpret specific schemes.
+     */
+    tokenTag?: string | null;
+}>;
+
+/**
+ * A verse row returned by /slice (what the reader virtual list renders).
+ *
+ * Notes:
+ * - verseKey + verseOrd are the canonical anchors.
+ * - text can be null (missing overlay / redaction / not loaded).
+ * - tokens are optional (backend might gate tokenization behind a flag).
+ */
 export type SliceVerse = Readonly<{
     verseKey: string; // stable scripture identity key for the canon
     verseOrd: number; // global ordinal (bp_verse.verse_ord)
+
     bookId: string;
     chapter: number;
     verse: number;
-    text: string | null; // translation overlay text (or null if missing)
-    updatedAt: string | null; // ISO timestamp string (or null)
+
+    /** translation overlay text (or null if missing) */
+    text: string | null;
+
+    /** optional translation identity for this row */
+    translation?: TranslationRef | null;
+
+    /** optional tokenization identity for this row */
+    tokenizer?: TokenizerRef | null;
+
+    /** Optional tokenization for selection/highlight/annotation */
+    tokens?: ReadonlyArray<SliceVerseToken> | null;
+
+    /** ISO timestamp string (or null) */
+    updatedAt: string | null;
 }>;
 
 /** Current reader position (used for sticky header + nav state). */
@@ -17397,6 +20004,417 @@ export type ReaderCurrentPos = Readonly<{
 
 /** Minimal “jump” intent used by controls. */
 export type ReaderJump = VerseRef;
+
+/* =============================================================================
+   Anchoring + Selection (token-first, char fallback)
+============================================================================= */
+
+/**
+ * A stable anchor inside scripture.
+ *
+ * Choose a policy:
+ * - For partial selections: prefer token ranges (stable under reflow).
+ * - If tokens are unavailable: use char offsets as a fallback.
+ *
+ * Invariants:
+ * - Always include verseOrd + verseKey.
+ * - tokenStart/tokenEnd and charStart/charEnd are optional, but at least one method should exist
+ *   for partial anchors. Whole-verse anchors may omit ranges entirely.
+ */
+export type ReaderAnchor = Readonly<{
+    verseOrd: number;
+    verseKey: string;
+
+    /** Optional: tie anchor to translation/tokenizer identity for deterministic replay */
+    translationId?: string | null;
+    tokenizerId?: string | null;
+
+    /** Preferred: token offsets within verse tokens */
+    tokenStart?: number | null;
+    tokenEnd?: number | null; // exclusive
+
+    /** Fallback: char offsets within verse text */
+    charStart?: number | null;
+    charEnd?: number | null; // exclusive
+}>;
+
+/**
+ * A selection spanning scripture. Can span verses.
+ *
+ * Normalization rules (recommended):
+ * - start must be <= end by (verseOrd, tokenStart/charStart).
+ * - end is exclusive when using tokenEnd/charEnd (easy concatenation).
+ */
+export type ReaderRange = Readonly<{
+    start: ReaderAnchor;
+    end: ReaderAnchor;
+
+    /** Optional: reason / origin (mouse selection, keyboard, programmatic, search result) */
+    origin?: ReaderSelectionOrigin | null;
+}>;
+
+export type ReaderSelectionOrigin =
+    | "MOUSE_DRAG"
+    | "KEYBOARD"
+    | "TOUCH"
+    | "PROGRAM"
+    | "SEARCH"
+    | "SHARE_LINK";
+
+/**
+ * Convenience for “selected exactly these tokens”.
+ * Useful for fast rendering of highlights without re-splitting.
+ */
+export type ReaderTokenSpan = Readonly<{
+    verseOrd: number;
+    verseKey: string;
+    tokenStart: number;
+    tokenEnd: number; // exclusive
+}>;
+
+/* =============================================================================
+   Annotation System (orientation-only; no doctrine/commentary in canon)
+============================================================================= */
+
+/**
+ * Annotation kinds your reader UI can support.
+ * Keep this small; add variants as your UX grows.
+ */
+export type ReaderAnnotationKind =
+    | "HIGHLIGHT"
+    | "UNDERLINE"
+    | "NOTE"
+    | "BOOKMARK"
+    | "LINK"
+    | "DRAWING";
+
+/**
+ * Annotation visibility / scoping.
+ * - PRIVATE: only the user
+ * - SHARED: share link / group
+ * - PUBLIC: (if you ever do this) visible broadly
+ */
+export type ReaderVisibility = "PRIVATE" | "SHARED" | "PUBLIC";
+
+/**
+ * A stable identifier for local-first objects.
+ * Use ULID if you want time-sortable ids; keep type as string for transport.
+ */
+export type ReaderId = string;
+
+/**
+ * A palette entry for monochrome (or “ink”) styling.
+ * Keep it as tokens so you can skin via CSS variables.
+ */
+export type ReaderInk =
+    | "INK_0"
+    | "INK_1"
+    | "INK_2"
+    | "INK_3"
+    | "INK_4"
+    | "INK_5";
+
+/** Highlight style variants. */
+export type ReaderHighlightStyle = "SOLID" | "SOFT" | "UNDERLINE" | "OUTLINE";
+
+/**
+ * Rich text payload for notes.
+ * Keep it simple now; you can expand later (Markdown, ProseMirror JSON, etc).
+ */
+export type ReaderNoteBody =
+    | Readonly<{ format: "PLAINTEXT"; text: string }>
+    | Readonly<{ format: "MARKDOWN"; md: string }>;
+
+/**
+ * Base shape for any annotation.
+ * - Anchors to a ReaderRange (or a single anchor for bookmarks)
+ * - Carries metadata for sync + conflict resolution
+ */
+export type ReaderAnnotationBase = Readonly<{
+    id: ReaderId;
+    kind: ReaderAnnotationKind;
+
+    /** anchor into canon */
+    range: ReaderRange;
+
+    /** optional: if set, means "this annotation applies to whole verse(s) regardless of range offsets" */
+    scope?: "RANGE" | "WHOLE_VERSE" | null;
+
+    /** styling */
+    ink?: ReaderInk | null;
+
+    /** visibility */
+    visibility?: ReaderVisibility | null;
+
+    /** tags for organizing (user-defined) */
+    tags?: ReadonlyArray<string> | null;
+
+    /** timestamps (ISO) */
+    createdAt: string;
+    updatedAt: string;
+
+    /** soft delete */
+    deletedAt?: string | null;
+
+    /** sync metadata (optional) */
+    rev?: number | null; // monotonic revision for conflict resolution
+    deviceId?: string | null;
+}>;
+
+/** Highlight annotation */
+export type ReaderHighlight = ReaderAnnotationBase &
+    Readonly<{
+        kind: "HIGHLIGHT";
+        style?: ReaderHighlightStyle | null;
+        /** intensity 0..1 (UI decides actual effect) */
+        strength?: number | null;
+    }>;
+
+/** Underline annotation */
+export type ReaderUnderline = ReaderAnnotationBase &
+    Readonly<{
+        kind: "UNDERLINE";
+        style?: "SINGLE" | "DOUBLE" | null;
+    }>;
+
+/** Note annotation (anchored to a range; UI can show pin/marker) */
+export type ReaderNote = ReaderAnnotationBase &
+    Readonly<{
+        kind: "NOTE";
+        title?: string | null;
+        body: ReaderNoteBody;
+        /** optional: collapsed/expanded in UI */
+        uiState?: Readonly<{ collapsed?: boolean | null }> | null;
+    }>;
+
+/** Bookmark annotation (often whole verse/chapter) */
+export type ReaderBookmark = ReaderAnnotationBase &
+    Readonly<{
+        kind: "BOOKMARK";
+        label?: string | null;
+    }>;
+
+/** Link annotation (connects a range to some target) */
+export type ReaderLink = ReaderAnnotationBase &
+    Readonly<{
+        kind: "LINK";
+        target: ReaderLinkTarget;
+        label?: string | null;
+    }>;
+
+export type ReaderLinkTarget =
+    | Readonly<{ type: "VERSE_REF"; ref: VerseRef }>
+    | Readonly<{ type: "RANGE"; range: ReaderRange }>
+    | Readonly<{ type: "URL"; url: string }>
+    | Readonly<{ type: "SEARCH"; query: string }>;
+
+/**
+ * Drawing annotation (freehand marks).
+ * IMPORTANT: DO NOT anchor drawings to pixel coords alone.
+ * Anchor to scripture range + store strokes in *normalized local coordinates* relative to a layout box.
+ */
+export type ReaderDrawing = ReaderAnnotationBase &
+    Readonly<{
+        kind: "DRAWING";
+
+        /** strokes in a normalized coordinate space */
+        drawing: ReaderDrawingPayload;
+
+        /** optional: indicates which projection box the normalized coords refer to */
+        projection?: ReaderDrawingProjection | null;
+    }>;
+
+/**
+ * Projection defines the coordinate space for drawing.
+ * - "VERSE_BLOCK": normalize within each verse block
+ * - "RANGE_BLOCK": normalize within a single selection rectangle spanning multiple verses (less ideal)
+ * - "PAGE_VIEW": normalize within viewport snapshot (least stable; avoid unless necessary)
+ */
+export type ReaderDrawingProjection = "VERSE_BLOCK" | "RANGE_BLOCK" | "PAGE_VIEW";
+
+/**
+ * Drawing payload: vector strokes.
+ * All coordinates are normalized [0..1] unless specified.
+ */
+export type ReaderDrawingPayload = Readonly<{
+    version: 1;
+
+    /** which ink style */
+    ink?: ReaderInk | null;
+
+    /** stroke width normalized (UI scales based on font size / measure) */
+    width?: number | null; // e.g. 0.004
+
+    /** list of strokes */
+    strokes: ReadonlyArray<ReaderStroke>;
+}>;
+
+export type ReaderStroke = Readonly<{
+    /** stable id for incremental editing */
+    strokeId: ReaderId;
+
+    /** points in normalized space */
+    points: ReadonlyArray<ReaderPoint>;
+
+    /** optional per-stroke overrides */
+    ink?: ReaderInk | null;
+    width?: number | null;
+
+    /** smoothing hint (UI only) */
+    smooth?: boolean | null;
+}>;
+
+export type ReaderPoint = Readonly<{
+    x: number; // 0..1
+    y: number; // 0..1
+    /** optional pressure (pen) 0..1 */
+    p?: number | null;
+    /** optional timestamp delta in ms for replay */
+    t?: number | null;
+}>;
+
+/**
+ * Union of all supported annotations.
+ * (Keep this as the single payload type for sync and local storage.)
+ */
+export type ReaderAnnotation = ReaderHighlight | ReaderUnderline | ReaderNote | ReaderBookmark | ReaderLink | ReaderDrawing;
+
+/* =============================================================================
+   UI Geometry Projections (ephemeral, recomputable)
+============================================================================= */
+
+/**
+ * A DOM-targeted selector for a verse in the viewport.
+ * Useful when you need to map anchors -> DOM nodes.
+ */
+export type VerseDomKey = Readonly<{
+    verseOrd: number;
+    /** recommended: id like `ord-${verseOrd}` in your VerseRow wrapper */
+    elementId: string;
+}>;
+
+/**
+ * A projected rectangle in viewport coordinates (pixels).
+ * This is NOT stable across layout changes; only use for rendering overlays in current view.
+ */
+export type ViewportRect = Readonly<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+}>;
+
+/**
+ * A computed overlay quad(s) for a range highlight in the *current* viewport.
+ * Store these only as cache; regenerate on scroll/resize/typography changes.
+ */
+export type RangeOverlayProjection = Readonly<{
+    range: ReaderRange;
+    rects: ReadonlyArray<ViewportRect>;
+    /** computed at time */
+    computedAt: string;
+    /** optional: signature of typography settings used for this projection */
+    typographySig?: string | null;
+}>;
+
+/* =============================================================================
+   Copy / Export / Share
+============================================================================= */
+
+/**
+ * A normalized export block for sharing/copy.
+ * Use this to power “Copy with refs”, “Export selection”, etc.
+ */
+export type ReaderExportBlock = Readonly<{
+    range: ReaderRange;
+
+    /** Plain text suitable for clipboard */
+    text: string;
+
+    /** Optional: richer payload for share formats */
+    lines?: ReadonlyArray<ReaderExportLine> | null;
+
+    /** Reference string (e.g. "John 3:16–18") */
+    refLabel?: string | null;
+
+    /** Optional: translation used */
+    translationId?: string | null;
+}>;
+
+export type ReaderExportLine = Readonly<{
+    verseKey: string;
+    verseOrd: number;
+    bookId: string;
+    chapter: number;
+    verse: number;
+    text: string;
+}>;
+
+/* =============================================================================
+   Reader Preferences (localStorage-safe)
+============================================================================= */
+
+export type ReaderTypographyPrefs = Readonly<{
+    enabled: boolean;
+    font: string; // css family token
+    sizePx: number;
+    weight: number;
+    leading: number;
+    measurePx: number;
+}>;
+
+export type ReaderPrefs = Readonly<{
+    typography: ReaderTypographyPrefs;
+
+    /** Whether tokens are requested/used (if backend supports). */
+    tokenization?: Readonly<{
+        enabled: boolean;
+        tokenizerId?: string | null;
+    }> | null;
+
+    /** Annotation defaults */
+    annotation?: Readonly<{
+        ink?: ReaderInk | null;
+        highlightStyle?: ReaderHighlightStyle | null;
+        visibility?: ReaderVisibility | null;
+    }> | null;
+}>;
+
+/* =============================================================================
+   Sync Shapes (optional; local-first friendly)
+============================================================================= */
+
+/**
+ * A batch payload to sync annotations.
+ * Client can send "sinceRev" and receive deltas.
+ */
+export type ReaderAnnotationSyncRequest = Readonly<{
+    sinceRev?: number | null;
+    deviceId?: string | null;
+    /** changed locally */
+    upserts?: ReadonlyArray<ReaderAnnotation> | null;
+    /** ids deleted locally */
+    deletes?: ReadonlyArray<ReaderId> | null;
+}>;
+
+export type ReaderAnnotationSyncResponse = Readonly<{
+    /** latest server revision after applying request */
+    rev: number;
+    /** server-authoritative upserts */
+    upserts: ReadonlyArray<ReaderAnnotation>;
+    /** server-authoritative deletions */
+    deletes: ReadonlyArray<ReaderId>;
+}>;
+
+/* =============================================================================
+   Small utility types
+============================================================================= */
+
+/** Useful for APIs that return a slice of verses. */
+export type SlicePayload = Readonly<{
+    verses: ReadonlyArray<SliceVerse>;
+    spine: SpineStats;
+}>;
 ```
 
 ### apps/web/src/reader/typography.ts
@@ -17405,25 +20423,46 @@ export type ReaderJump = VerseRef;
 // apps/web/src/reader/typography.ts
 //
 // Reader typography + layout tuning (scripture + measure)
-// - Robust storage (handles legacy keys + bad/malformed values)
-// - Deterministic normalization (always clamps to sane ranges)
-// - Single source of truth for CSS var application
+//
+// Principles:
+// - Persist stable IDs, not CSS strings.
+// - Resolve IDs -> actual font-family strings via FONT_PRESETS (which can point at CSS vars).
+// - Normalize/clamp deterministically (safe JSON round-trip).
+// - One authoritative apply() that sets CSS vars on <html>.
+// - Optional font-load readiness helpers (for stable measurement / virtualizer calm).
 //
 // CSS vars expected (defined in base.css):
-// --bpScriptureFont
-// --bpScriptureSize
-// --bpScriptureLeading
-// --bpScriptureWeight
-// --bpReaderMeasure
+// --bpScriptureFont         (font-family value)
+// --bpScriptureSize         (px)
+// --bpScriptureLeading      (number)
+// --bpScriptureWeight       (number)
+// --bpReaderMeasure         (px)
 
-export type TypographyFont = "serif" | "sans" | "rounded" | "book" | "human";
+export type TypographyFont =
+    | "serif"
+    | "sans"
+    | "rounded"
+    | "book"
+    | "human"
+    // reserved slots for future (hosted/uploaded/custom):
+    | "custom_1"
+    | "custom_2";
 
 export type ReaderTypography = Readonly<{
-    font: TypographyFont; // Scripture text only
+    /** Stable id, resolved to actual font-family via FONT_PRESETS. */
+    font: TypographyFont;
+
+    /** Scripture text size in px (clamped). */
     sizePx: number; // 12..30
-    weight: number; // 200..650 (integer)
+
+    /** font-weight (integer). */
+    weight: number; // 200..650
+
+    /** line-height multiplier. */
     leading: number; // 0.95..2.1
-    measurePx: number; // 240..980
+
+    /** max line length (measure) in px. */
+    measurePx: number; // 535..980
 }>;
 
 export const DEFAULT_TYPOGRAPHY: ReaderTypography = Object.freeze({
@@ -17434,15 +20473,21 @@ export const DEFAULT_TYPOGRAPHY: ReaderTypography = Object.freeze({
     measurePx: 840,
 });
 
-// Current storage key
+// Storage key
 const STORAGE_KEY_V2 = "bp_reader_typography_v2";
 
 // Legacy keys (kept for migration)
 const STORAGE_KEY_V1 = "bp_reader_typography_v1";
 const LEGACY_KEYS = Object.freeze(["bp_reader_typography", "bp_typography"]);
 
+// Optional: future envelope (we still accept raw v2 objects for backward compat)
+type TypographyEnvelopeV1 = Readonly<{
+    v: 1;
+    t: ReaderTypography;
+}>;
+
 // ──────────────────────────────────────────────────────────────
-// Limits — synced with UI (sizePx now floors at 12px)
+// Limits — keep UI + normalization synced
 // ──────────────────────────────────────────────────────────────
 const LIMITS = Object.freeze({
     sizePx: { lo: 12, hi: 30, step: 1 },
@@ -17451,21 +20496,23 @@ const LIMITS = Object.freeze({
     measurePx: { lo: 535, hi: 980, step: 1 },
 });
 
+/**
+ * Font presets.
+ * - `css` must be a valid font-family value.
+ * - For app fonts, point at CSS vars (base.css controls actual stacks/loaded fonts).
+ * - For system fallbacks, provide explicit stacks.
+ */
 export const FONT_PRESETS: Readonly<Record<TypographyFont, { label: string; css: string }>> = Object.freeze({
-    // These should resolve via CSS variables in base.css
     serif: { label: "Literata", css: "var(--font-serif)" },
     sans: { label: "Inter", css: "var(--font-sans)" },
     rounded: { label: "Quicksand", css: "var(--font-rounded)" },
 
-    // Always-available system-ish stacks
-    book: {
-        label: "Book",
-        css: 'ui-serif, Charter, "Iowan Old Style", Georgia, "Times New Roman", Times, serif',
-    },
-    human: {
-        label: "Human",
-        css: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", sans-serif',
-    },
+    book: { label: "Book", css: 'ui-serif, Charter, "Iowan Old Style", Georgia, "Times New Roman", Times, serif' },
+    human: { label: "Human", css: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", sans-serif' },
+
+    // Future: if you add CSS vars like --font-custom-1, --font-custom-2 in base.css:
+    custom_1: { label: "Custom 1", css: "var(--font-custom-1, var(--font-serif))" },
+    custom_2: { label: "Custom 2", css: "var(--font-custom-2, var(--font-serif))" },
 });
 
 // ──────────────────────────────────────────────────────────────
@@ -17537,11 +20584,23 @@ function safeLocalStorageRemove(key: string): void {
     }
 }
 
+function isTypographyFont(x: string): x is TypographyFont {
+    return (
+        x === "serif" ||
+        x === "sans" ||
+        x === "rounded" ||
+        x === "book" ||
+        x === "human" ||
+        x === "custom_1" ||
+        x === "custom_2"
+    );
+}
+
 function normalizeFont(raw: unknown): TypographyFont {
     const s = (toString(raw) ?? "").trim().toLowerCase();
 
     // Direct ids
-    if (s === "serif" || s === "sans" || s === "rounded" || s === "book" || s === "human") return s as TypographyFont;
+    if (isTypographyFont(s)) return s;
 
     // Common synonyms (old saves / human inputs)
     if (s.includes("literata")) return "serif";
@@ -17574,33 +20633,61 @@ function normalizeTypography(t: Partial<ReaderTypography> | null | undefined): R
     });
 }
 
+function unwrapTypographyPayload(parsed: unknown): ReaderTypography | null {
+    if (!parsed || typeof parsed !== "object") return null;
+
+    // Envelope form: { v: 1, t: {...} }
+    const anyObj = parsed as Record<string, unknown>;
+    if (anyObj.v === 1 && anyObj.t && typeof anyObj.t === "object") {
+        return normalizeTypography(anyObj.t as Partial<ReaderTypography>);
+    }
+
+    // Raw form: { font, sizePx, ... } (your current v2/v1)
+    return normalizeTypography(anyObj as Partial<ReaderTypography>);
+}
+
+/**
+ * A stable signature for projections/caches.
+ * Use this to know when to recompute highlight rects, drawing projections, etc.
+ */
+export function typographySignature(t: ReaderTypography): string {
+    // Keep it short and stable (order matters).
+    return `f=${t.font}|s=${t.sizePx}|w=${t.weight}|l=${t.leading}|m=${t.measurePx}`;
+}
+
 // ──────────────────────────────────────────────────────────────
 // Public API
 // ──────────────────────────────────────────────────────────────
 
-/** Public helper for UI (e.g. titles, tooltips) */
+export function typographyLimits() {
+    return LIMITS;
+}
+
+/** UI helper */
 export function getFontLabel(font: TypographyFont): string {
     return FONT_PRESETS[font]?.label ?? font;
 }
 
-/** Public helper for UI previews / tooltips (actual CSS font-family string) */
+/** Actual CSS `font-family` string */
 export function getFontCssFamily(font: TypographyFont): string {
     return FONT_PRESETS[font]?.css ?? "var(--font-serif)";
 }
 
-/** Try v2 → v1 → legacy keys */
+/**
+ * Try v2 → v1 → legacy keys, normalize, and migrate to v2.
+ */
 export function loadReaderTypography(): ReaderTypography | null {
     const rawV2 = safeLocalStorageGet(STORAGE_KEY_V2);
     if (rawV2) {
         const parsed = safeJsonParse(rawV2);
-        const t = parsed ? normalizeTypography(parsed as Partial<ReaderTypography>) : null;
+        const t = unwrapTypographyPayload(parsed);
         if (t) return t;
     }
 
     const rawV1 = safeLocalStorageGet(STORAGE_KEY_V1);
     if (rawV1) {
         const parsed = safeJsonParse(rawV1);
-        const t = parsed ? normalizeTypography(parsed as Partial<ReaderTypography>) : null;
+        const t = unwrapTypographyPayload(parsed);
         if (t) {
             saveReaderTypography(t);
             safeLocalStorageRemove(STORAGE_KEY_V1);
@@ -17612,7 +20699,7 @@ export function loadReaderTypography(): ReaderTypography | null {
         const raw = safeLocalStorageGet(k);
         if (!raw) continue;
         const parsed = safeJsonParse(raw);
-        const t = parsed ? normalizeTypography(parsed as Partial<ReaderTypography>) : null;
+        const t = unwrapTypographyPayload(parsed);
         if (t) {
             saveReaderTypography(t);
             safeLocalStorageRemove(k);
@@ -17624,7 +20711,12 @@ export function loadReaderTypography(): ReaderTypography | null {
 }
 
 export function saveReaderTypography(t: ReaderTypography): void {
+    // Keep raw shape for maximum backward compatibility (simple, readable).
     safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(t));
+
+    // If you ever want to switch to envelope, you can do:
+    // const env: TypographyEnvelopeV1 = { v: 1, t };
+    // safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(env));
 }
 
 export function clearReaderTypography(): void {
@@ -17633,7 +20725,7 @@ export function clearReaderTypography(): void {
 
 /**
  * Apply CSS vars to <html>.
- * NOTE: --bpScriptureFont is a font-family *value* (string), not a token name.
+ * NOTE: --bpScriptureFont is a *font-family value* (string), not an id.
  */
 export function applyReaderTypography(t: ReaderTypography | null): void {
     if (typeof document === "undefined") return;
@@ -17663,9 +20755,12 @@ export function applyReaderTypographyFromStorage(): ReaderTypography | null {
     return t;
 }
 
+export function updateTypography(base: ReaderTypography, patch: Partial<ReaderTypography>): ReaderTypography {
+    return normalizeTypography({ ...base, ...patch });
+}
+
 /**
- * UI options.
- * IMPORTANT: cssFamily is what makes previews actually render different fonts.
+ * UI options (previews can use cssFamily to render different fonts in the picker).
  */
 export function fontOptions(): Array<{ id: TypographyFont; label: string; cssFamily: string }> {
     return (Object.keys(FONT_PRESETS) as TypographyFont[]).map((k) => ({
@@ -17675,12 +20770,24 @@ export function fontOptions(): Array<{ id: TypographyFont; label: string; cssFam
     }));
 }
 
-export function typographyLimits() {
-    return LIMITS;
-}
+/**
+ * Optional: Wait for fonts to be ready after applying.
+ * Useful if you notice measurement jitter with virtualizer when switching fonts.
+ */
+export async function waitForFontsIfSupported(timeoutMs = 600): Promise<void> {
+    if (typeof document === "undefined") return;
+    const fonts: FontFaceSet | undefined = (document as any).fonts;
+    if (!fonts || typeof fonts.ready?.then !== "function") return;
 
-export function updateTypography(base: ReaderTypography, patch: Partial<ReaderTypography>): ReaderTypography {
-    return normalizeTypography({ ...base, ...patch });
+    // race with timeout so we never hang
+    await Promise.race([
+        fonts.ready.then(() => undefined),
+        new Promise<void>((resolve) => {
+            const id = window.setTimeout(() => resolve(), timeoutMs);
+            // best-effort cleanup is handled by resolve path
+            void id;
+        }),
+    ]);
 }
 ```
 
@@ -17688,7 +20795,7 @@ export function updateTypography(base: ReaderTypography, patch: Partial<ReaderTy
 
 ```tsx
 // apps/web/src/reader/VerseRow.tsx
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import type { BookRow } from "../api";
 import type { SliceVerse } from "./types";
 import { sx } from "./sx";
@@ -17699,15 +20806,31 @@ type Props = {
     book: BookRow | null;
 };
 
+/**
+ * Biblia.to — VerseRow (token-ready + selection/annotation-friendly)
+ *
+ * Upgrades:
+ * - Stable IDs + data-* for verse + (optional) token anchors
+ * - Pointer hover/focus are “non-thrashy” and ignore touch hover
+ * - Keyboard: Enter/Space can toggle an "active" state hook via data attribute (non-breaking)
+ * - Safer aria: verse is a region-like article with described-by text node
+ * - Optional token rendering (if row.tokens exists) with char offsets when available
+ *
+ * NOTE:
+ * - This component does NOT implement selection/highlight yet; it only emits stable DOM anchors
+ *   that your future selection engine can target deterministically.
+ */
 export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
     const isBookStart = row.chapter === 1 && row.verse === 1;
     const isChapterStart = row.verse === 1;
 
-    // Keep these local, but make them hard to “thrash”:
-    // - only set true if not already true
-    // - only set false if not already false
     const [hovered, setHovered] = useState(false);
     const [focused, setFocused] = useState(false);
+
+    // Optional “active” state (future: click to open annotation menu, etc.)
+    const [active, setActive] = useState(false);
+
+    const rootRef = useRef<HTMLDivElement | null>(null);
 
     // Hover is a mouse/pen affordance; avoid “sticky hover” on touch.
     const onEnter = useCallback((e: React.PointerEvent) => {
@@ -17720,7 +20843,21 @@ export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
     }, []);
 
     const onFocus = useCallback(() => setFocused((v) => (v ? v : true)), []);
-    const onBlur = useCallback(() => setFocused((v) => (v ? false : v)), []);
+    const onBlur = useCallback(() => {
+        setFocused((v) => (v ? false : v));
+        setActive(false);
+    }, []);
+
+    const onKeyDown = useCallback((e: React.KeyboardEvent) => {
+        // Keep this conservative; do not swallow arrows/page keys that scrolling might depend on.
+        if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setActive((v) => !v);
+        }
+        if (e.key === "Escape") {
+            setActive(false);
+        }
+    }, []);
 
     const bookLabel = (book?.name ?? row.bookId).toString();
     const ariaLabel = useMemo(() => `${bookLabel} ${row.chapter}:${row.verse}`, [bookLabel, row.chapter, row.verse]);
@@ -17731,17 +20868,53 @@ export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
         const base = sx.verseRow;
         const h = hovered ? sx.verseRowHover : undefined;
         const f = focused ? sx.verseRowFocus : undefined;
-        return { ...base, ...(h ?? {}), ...(f ?? {}) };
-    }, [hovered, focused]);
+        // Active is optional; if you have a style token, it’ll apply; otherwise no-op.
+        const a = active ? (sx as any).verseRowActive : undefined;
+        return { ...base, ...(h ?? {}), ...(f ?? {}), ...(a ?? {}) };
+    }, [hovered, focused, active]);
+
+    // Token-ready render:
+    // - If tokens are present, each token becomes a stable span with data-token-index.
+    // - If tokens are absent, render the plain text exactly as before.
+    const tokens = row.tokens ?? null;
+
+    const verseBody = useMemo(() => {
+        if (!tokens || tokens.length === 0) {
+            return row.text ?? "";
+        }
+
+        // Render tokens as spans so selection/highlight can snap to token boundaries.
+        return (
+            <>
+                {tokens.map((t) => {
+                    const key = `${row.verseOrd}:${t.tokenIndex}`;
+                    return (
+                        <span
+                            key={key}
+                            data-token-index={t.tokenIndex}
+                            data-token-kind={t.tokenKind ?? undefined}
+                            data-char-start={t.charStart ?? undefined}
+                            data-char-end={t.charEnd ?? undefined}
+                        >
+                            {t.token}
+                        </span>
+                    );
+                })}
+            </>
+        );
+    }, [tokens, row.text, row.verseOrd]);
 
     return (
         <div
             id={`ord-${row.verseOrd}`}
+            ref={rootRef}
             data-ord={row.verseOrd}
             data-verse-key={row.verseKey}
             data-book={row.bookId}
             data-chapter={row.chapter}
             data-verse={row.verse}
+            data-has-tokens={tokens && tokens.length > 0 ? "1" : "0"}
+            data-active={active ? "1" : "0"}
             style={{ padding: 0 }}
         >
             {isBookStart ? <BookTitlePage book={book} bookId={row.bookId} /> : null}
@@ -17767,13 +20940,29 @@ export const VerseRow = React.memo(function VerseRow({ row, book }: Props) {
                 onPointerLeave={onLeave}
                 onFocus={onFocus}
                 onBlur={onBlur}
+                onKeyDown={onKeyDown}
+                onPointerDown={(e) => {
+                    // Prevent touch from triggering odd focus/selection behavior.
+                    // Mouse should keep default text selection.
+                    if (e.pointerType !== "mouse") e.preventDefault();
+                }}
+                onClick={() => {
+                    // Mouse click can mark active without breaking selection; keep it light.
+                    setActive(true);
+                }}
             >
                 <div style={sx.verseNum} aria-hidden="true">
                     {row.verse}
                 </div>
 
-                <div id={verseTextId} className="scripture" style={sx.verseText}>
-                    {row.text ?? ""}
+                <div
+                    id={verseTextId}
+                    className="scripture"
+                    style={sx.verseText}
+                    data-verse-ord={row.verseOrd}
+                    data-verse-key={row.verseKey}
+                >
+                    {verseBody}
                 </div>
             </div>
         </div>
@@ -18436,17 +21625,23 @@ const sx: Record<string, React.CSSProperties> = {
 
 ```tsx
 // apps/web/src/theme.tsx
-// Biblia Populi — Theme system (PURE BLACK & WHITE ONLY — ZERO red anywhere)
-// Accent, selection, ring, soft colors all converted to monochrome neutral grays.
-// Toggle remains crisp black/white. Cross-tab + system sync upgraded.
+// Biblia.to — Theme system (MONOCHROME ONLY — ZERO hue accents)
 //
-// Upgrades in this pass:
-// - Removes deprecated React/TS surfaces (no React.MutableRefObject, no mq.addListener/removeListener)
-// - Removes unused @ts-expect-error needs by not using them at all
-// - Fixes explicit-choice logic so system theme only applies until user picks
-// - Tightens types: ThemeCtx.setMode is a stable function (Mode | updater), not raw Dispatch
-// - No “red” anywhere (only neutral monochrome/sepia-ish neutrals; no hue accents)
-// - Safer reduced-motion tracking (live subscription, not one-time memo)
+// Guarantees:
+// - No “accent color” (no red, no blue, no green). Strict neutral grayscale only.
+// - System theme follows OS UNTIL user explicitly chooses.
+// - Cross-tab sync via storage event.
+// - No deprecated mq.addListener/removeListener usage.
+// - Stable API surface (setMode supports value or updater).
+// - Reduced-motion tracked live.
+// - meta[name="theme-color"] updated.
+// - CSS vars applied to :root; optional selection style injected.
+//
+// Notes:
+// - This file intentionally does NOT “own” all base.css tokens. It sets a core subset
+//   (bg/fg/panel/hairline/muted/overlays/rings/shadows/scrollbars/toggle).
+// - base.css can define additional derived tokens using color-mix when available.
+
 import React, {
     createContext,
     useCallback,
@@ -18459,7 +21654,7 @@ import React, {
 
 export type Mode = "light" | "dark";
 
-// CSSProperties doesn’t include custom CSS vars; we extend it.
+// CSSProperties doesn’t include custom CSS vars; extend it safely.
 export type CssVarStyle = React.CSSProperties & Record<string, string | number>;
 
 type ThemeConfig = Readonly<{
@@ -18472,7 +21667,10 @@ type ThemeCtx = Readonly<{
     mode: Mode;
     isDark: boolean;
     vars: CssVarStyle;
+    reducedMotion: boolean;
+    hasExplicitChoice: boolean;
     setMode: (next: Mode | ((prev: Mode) => Mode)) => void;
+    clearChoice: () => void; // revert to system + removes storage
     toggle: () => void;
 }>;
 
@@ -18519,24 +21717,19 @@ function getSystemMode(): Mode {
 }
 
 /* ----------------------------- media subscriptions ----------------------------- */
-function subscribeMediaQuery(
-    query: string,
-    onChange: (matches: boolean) => void,
-): () => void {
+function subscribeMediaQuery(query: string, onChange: (matches: boolean) => void): () => void {
     if (typeof window === "undefined" || !window.matchMedia) return () => {};
     const mq = window.matchMedia(query);
 
-    const handler = () => onChange(mq.matches);
-    // initial
+    const handler = () => onChange(!!mq.matches);
     handler();
 
-    // Modern path
     if (mq.addEventListener) {
         mq.addEventListener("change", handler);
         return () => mq.removeEventListener("change", handler);
     }
 
-    // Legacy fallback (typed any to avoid deprecated TS signature warnings)
+    // legacy fallback (avoid TS deprecated signatures by using any)
     const anyMq = mq as any;
     if (typeof anyMq.addListener === "function") {
         anyMq.addListener(handler);
@@ -18549,11 +21742,15 @@ function subscribeMediaQuery(
 }
 
 function subscribePrefersReducedMotion(onChange: (reduced: boolean) => void): () => void {
-    return subscribeMediaQuery("(prefers-reduced-motion: reduce)", (m) => onChange(!!m));
+    return subscribeMediaQuery("(prefers-reduced-motion: reduce)", onChange);
 }
 
 function subscribePrefersDark(onChange: (isDark: boolean) => void): () => void {
-    return subscribeMediaQuery("(prefers-color-scheme: dark)", (m) => onChange(!!m));
+    return subscribeMediaQuery("(prefers-color-scheme: dark)", onChange);
+}
+
+function subscribeForcedColors(onChange: (forced: boolean) => void): () => void {
+    return subscribeMediaQuery("(forced-colors: active)", onChange);
 }
 
 /* --------------------------------- meta theme color -------------------------------- */
@@ -18565,51 +21762,45 @@ function setMetaThemeColor(hex: string): void {
 
 /* --------------------------------- theme vars -------------------------------- */
 /**
- * 100% monochrome (neutral). No red. No colored accent.
- * These are intentionally “neutral-warm” whites/blacks; still monochrome (no saturated hue).
+ * Strict monochrome only. No hue.
+ * Light is paper-ish neutral. Dark is ink-like neutral.
  */
 export function getThemeVars(mode: Mode): CssVarStyle {
     if (mode === "dark") {
         return {
             ["--bg" as any]: "#0b0b0c",
+            ["--fg" as any]: "#f4f3f1",
+            ["--muted" as any]: "rgba(244,243,241,0.64)",
+            ["--muted2" as any]: "rgba(244,243,241,0.50)",
+
+            ["--hairline" as any]: "rgba(255,255,255,0.10)",
+            ["--hairline2" as any]: "rgba(255,255,255,0.07)",
+
             ["--panel" as any]: "rgba(255,255,255,0.045)",
             ["--panel2" as any]: "rgba(255,255,255,0.065)",
-            ["--fg" as any]: "#f4f3f1",
-            ["--muted" as any]: "rgba(244,243,241,0.62)",
-            ["--hairline" as any]: "rgba(255,255,255,0.10)",
 
-            ["--shadow" as any]: "0 18px 60px rgba(0,0,0,0.45)",
-            ["--shadowSoft" as any]: "0 10px 34px rgba(0,0,0,0.34)",
-            ["--glow" as any]:
-                "0 0 0 1px rgba(255,255,255,0.06), 0 14px 38px rgba(0,0,0,0.42)",
+            ["--overlay" as any]: "rgba(12,12,13,0.76)",
+            ["--overlay2" as any]: "rgba(12,12,13,0.88)",
 
-            // Focus & rings: neutral grayscale
-            ["--focus" as any]: "rgba(255,255,255,0.22)",
-            ["--focusRing" as any]: "rgba(255,255,255,0.12)",
+            ["--activeBg" as any]: "rgba(255,255,255,0.065)",
+            ["--selection" as any]: "rgba(244,243,241,0.20)",
 
-            // Overlays
-            ["--overlay" as any]: "rgba(20,20,22,0.78)",
-            ["--overlay2" as any]: "rgba(20,20,22,0.62)",
-
-            // Interaction surfaces
-            ["--activeBg" as any]: "rgba(255,255,255,0.06)",
-            ["--selection" as any]: "rgba(244,243,241,0.28)",
-            ["--kbd" as any]: "rgba(255,255,255,0.06)",
-
-            // Radii
-            ["--radius" as any]: "14px",
-            ["--radiusLg" as any]: "18px",
-
-            // “Accent” is monochrome (same family)
-            ["--accent" as any]: "#f4f3f1",
-            ["--accentSoft" as any]: "rgba(244,243,241,0.22)",
+            // Focus/rings (neutral)
+            ["--focusRing" as any]: "rgba(255,255,255,0.14)",
             ["--ring" as any]: "rgba(255,255,255,0.18)",
+            ["--focusShadow" as any]: "0 0 0 7px rgba(255,255,255,0.08)",
 
-            // Glass
-            ["--glass" as any]: "rgba(16,16,18,0.78)",
-            ["--glass2" as any]: "rgba(16,16,18,0.62)",
+            // Shadows
+            ["--shadowSoft" as any]: "0 10px 36px rgba(0,0,0,0.36)",
+            ["--shadowPop" as any]: "0 26px 110px rgba(0,0,0,0.58)",
+            ["--shadowInset" as any]: "inset 0 1px 0 rgba(255,255,255,0.06)",
 
-            // Toggle — pure monochrome
+            // Scrollbars
+            ["--scrollTrack" as any]: "rgba(255,255,255,0.08)",
+            ["--scrollThumb" as any]: "rgba(255,255,255,0.18)",
+            ["--scrollThumbHover" as any]: "rgba(255,255,255,0.28)",
+
+            // Toggle (monochrome)
             ["--toggleTrack" as any]: "rgba(255,255,255,0.06)",
             ["--toggleTrackOn" as any]: "rgba(255,255,255,0.28)",
             ["--toggleInset" as any]: "inset 0 0 0 1px rgba(255,255,255,0.10)",
@@ -18622,41 +21813,38 @@ export function getThemeVars(mode: Mode): CssVarStyle {
 
     return {
         ["--bg" as any]: "#f6f2ea",
+        ["--fg" as any]: "#15110e",
+        ["--muted" as any]: "rgba(21,17,14,0.58)",
+        ["--muted2" as any]: "rgba(21,17,14,0.44)",
+
+        ["--hairline" as any]: "rgba(21,17,14,0.09)",
+        ["--hairline2" as any]: "rgba(21,17,14,0.065)",
+
         ["--panel" as any]: "rgba(20,14,10,0.028)",
         ["--panel2" as any]: "rgba(20,14,10,0.045)",
-        ["--fg" as any]: "#15110e",
-        ["--muted" as any]: "rgba(21,17,14,0.56)",
-        ["--hairline" as any]: "rgba(21,17,14,0.09)",
-
-        ["--shadow" as any]: "0 18px 60px rgba(18,12,10,0.10)",
-        ["--shadowSoft" as any]: "0 10px 34px rgba(18,12,10,0.075)",
-        ["--glow" as any]:
-            "0 0 0 1px rgba(21,17,14,0.06), 0 14px 38px rgba(18,12,10,0.10)",
-
-        ["--focus" as any]: "rgba(21,17,14,0.14)",
-        ["--focusRing" as any]: "rgba(21,17,14,0.08)",
 
         ["--overlay" as any]: "rgba(246,242,234,0.86)",
-        ["--overlay2" as any]: "rgba(246,242,234,0.72)",
+        ["--overlay2" as any]: "rgba(246,242,234,0.94)",
 
         ["--activeBg" as any]: "rgba(21,17,14,0.045)",
-        ["--selection" as any]: "rgba(21,17,14,0.20)",
-        ["--kbd" as any]: "rgba(21,17,14,0.045)",
+        ["--selection" as any]: "rgba(21,17,14,0.14)",
 
-        ["--radius" as any]: "14px",
-        ["--radiusLg" as any]: "18px",
+        ["--focusRing" as any]: "rgba(21,17,14,0.10)",
+        ["--ring" as any]: "rgba(0,0,0,0.16)",
+        ["--focusShadow" as any]: "0 0 0 6px rgba(21,17,14,0.08)",
 
-        ["--accent" as any]: "#15110e",
-        ["--accentSoft" as any]: "rgba(21,17,14,0.16)",
-        ["--ring" as any]: "rgba(0,0,0,0.18)",
+        ["--shadowSoft" as any]: "0 10px 34px rgba(18,12,10,0.075)",
+        ["--shadowPop" as any]: "0 24px 90px rgba(18,12,10,0.14)",
+        ["--shadowInset" as any]: "inset 0 1px 0 rgba(255,255,255,0.38)",
 
-        ["--glass" as any]: "rgba(246,242,234,0.92)",
-        ["--glass2" as any]: "rgba(246,242,234,0.78)",
+        ["--scrollTrack" as any]: "rgba(21,17,14,0.06)",
+        ["--scrollThumb" as any]: "rgba(21,17,14,0.18)",
+        ["--scrollThumbHover" as any]: "rgba(21,17,14,0.28)",
 
         ["--toggleTrack" as any]: "rgba(21,17,14,0.045)",
-        ["--toggleTrackOn" as any]: "rgba(0,0,0,0.28)",
+        ["--toggleTrackOn" as any]: "rgba(0,0,0,0.22)",
         ["--toggleInset" as any]: "inset 0 0 0 1px rgba(21,17,14,0.08)",
-        ["--toggleInsetOn" as any]: "inset 0 0 0 1px rgba(0,0,0,0.45)",
+        ["--toggleInsetOn" as any]: "inset 0 0 0 1px rgba(0,0,0,0.40)",
         ["--toggleKnob" as any]: "rgba(255,255,255,0.92)",
         ["--toggleKnobShadow" as any]:
             "0 10px 22px rgba(18,12,10,0.14), 0 0 0 1px rgba(21,17,14,0.08)",
@@ -18684,15 +21872,18 @@ function installSelectionColor(vars: CssVarStyle): void {
         el.id = id;
         document.head.appendChild(el);
     }
-    el.textContent = `::selection { background: ${sel}; } ::-moz-selection { background: ${sel}; }`;
+    el.textContent = `::selection{background:${sel};}::-moz-selection{background:${sel};}`;
 }
 
-/* -------------------------- Smart system + cross-tab sync -------------------------- */
-/**
- * • Cross-tab sync (storage event)
- * • System preference only while user has NOT made an explicit choice
- * • Uses addEventListener (no deprecated TS signatures)
- */
+function setRootAttrs(mode: Mode, reducedMotion: boolean, forcedColors: boolean): void {
+    if (typeof document === "undefined") return;
+    const root = document.documentElement;
+    root.setAttribute("data-theme", mode);
+    root.setAttribute("data-reduced-motion", reducedMotion ? "1" : "0");
+    root.setAttribute("data-forced-colors", forcedColors ? "1" : "0");
+}
+
+/* -------------------------- system + cross-tab sync -------------------------- */
 function setupThemeSync(
     storageKey: string,
     setModeInternal: React.Dispatch<React.SetStateAction<Mode>>,
@@ -18702,24 +21893,23 @@ function setupThemeSync(
 
     const onStorage = (e: StorageEvent) => {
         if (e.key !== storageKey) return;
-        const v = e.newValue;
 
+        const v = e.newValue;
         if (v === "light" || v === "dark") {
-            (hasExplicitRef as any).current = true;
+            hasExplicitRef.current = true;
             setModeInternal(v);
             return;
         }
 
-        // key removed → revert to system
-        (hasExplicitRef as any).current = false;
+        // key removed -> revert to system
+        hasExplicitRef.current = false;
         setModeInternal(getSystemMode());
     };
 
     window.addEventListener("storage", onStorage);
 
     const disposeSystem = subscribePrefersDark(() => {
-        // follow system only if user has not explicitly chosen
-        if ((hasExplicitRef as any).current) return;
+        if (hasExplicitRef.current) return; // user choice wins
         setModeInternal(getSystemMode());
     });
 
@@ -18738,14 +21928,20 @@ export function ThemeProvider(props: {
 }) {
     const config: ThemeConfig = useMemo(
         () => ({
-            storageKey: props.storageKey ?? "bp_theme_v2",
+            storageKey: props.storageKey ?? "bp_theme_v3",
             metaThemeColorLight: props.metaThemeColorLight ?? "#f6f2ea",
             metaThemeColorDark: props.metaThemeColorDark ?? "#0b0b0c",
         }),
         [props.storageKey, props.metaThemeColorLight, props.metaThemeColorDark],
     );
 
-    // User explicitly chose if storage already has a value.
+    const [reducedMotion, setReducedMotion] = useState(false);
+    const [forcedColors, setForcedColors] = useState(false);
+
+    useEffect(() => subscribePrefersReducedMotion(setReducedMotion), []);
+    useEffect(() => subscribeForcedColors(setForcedColors), []);
+
+    // If there is stored value at boot, that's an explicit choice.
     const hasExplicitRef = useRef<boolean>(!!readStoredMode(config.storageKey));
 
     const [modeInternal, setModeInternal] = useState<Mode>(() => {
@@ -18753,60 +21949,64 @@ export function ThemeProvider(props: {
         return saved ?? getSystemMode();
     });
 
-    const [reducedMotion, setReducedMotion] = useState(false);
-
-    useEffect(() => {
-        return subscribePrefersReducedMotion((reduced) => setReducedMotion(reduced));
-    }, []);
-
     const vars = useMemo(() => getThemeVars(modeInternal), [modeInternal]);
 
-    // Wrapped setter that marks the choice as explicit + persists.
-    const setMode = useCallback((next: Mode | ((prev: Mode) => Mode)) => {
-        hasExplicitRef.current = true;
+    const setMode = useCallback(
+        (next: Mode | ((prev: Mode) => Mode)) => {
+            hasExplicitRef.current = true;
+            setModeInternal((prev) => {
+                const resolved = typeof next === "function" ? (next as (p: Mode) => Mode)(prev) : next;
+                safeSet(config.storageKey, resolved);
+                return resolved;
+            });
+        },
+        [config.storageKey],
+    );
 
-        setModeInternal((prev) => {
-            const resolved = typeof next === "function" ? (next as (p: Mode) => Mode)(prev) : next;
-            safeSet(config.storageKey, resolved);
-            return resolved;
-        });
+    const clearChoice = useCallback(() => {
+        hasExplicitRef.current = false;
+        safeRemove(config.storageKey);
+        setModeInternal(getSystemMode());
     }, [config.storageKey]);
 
     const toggle = useCallback(() => {
         setMode((m) => (m === "dark" ? "light" : "dark"));
     }, [setMode]);
 
-    // Apply document attributes + css vars
+    // Apply document attrs + vars (single effect, deterministic ordering)
     useEffect(() => {
-        if (typeof document === "undefined") return;
-
-        document.documentElement.setAttribute("data-theme", modeInternal);
-        document.documentElement.setAttribute("data-reduced-motion", reducedMotion ? "1" : "0");
-
+        setRootAttrs(modeInternal, reducedMotion, forcedColors);
         setMetaThemeColor(modeInternal === "dark" ? config.metaThemeColorDark : config.metaThemeColorLight);
         applyCssVars(vars);
         installSelectionColor(vars);
-    }, [modeInternal, vars, reducedMotion, config.metaThemeColorDark, config.metaThemeColorLight]);
+    }, [
+        modeInternal,
+        vars,
+        reducedMotion,
+        forcedColors,
+        config.metaThemeColorDark,
+        config.metaThemeColorLight,
+    ]);
 
     // Cross-tab + system sync
-    useEffect(() => {
-        return setupThemeSync(config.storageKey, setModeInternal, hasExplicitRef);
-    }, [config.storageKey]);
+    useEffect(() => setupThemeSync(config.storageKey, setModeInternal, hasExplicitRef), [config.storageKey]);
 
-    // Old key migration
+    // Old key migrations (keep tight + safe)
     useEffect(() => {
-        const oldKey = "bp_theme";
-        if (config.storageKey === oldKey) return;
+        const candidates = ["bp_theme", "bp_theme_v2"];
+        const cur = readStoredMode(config.storageKey);
+        if (cur) return;
 
-        const old = safeGet(oldKey);
-        if (old === "light" || old === "dark") {
-            const cur = safeGet(config.storageKey);
-            if (!cur) {
+        for (const k of candidates) {
+            if (k === config.storageKey) continue;
+            const old = readStoredMode(k);
+            if (old) {
                 safeSet(config.storageKey, old);
+                safeRemove(k);
                 hasExplicitRef.current = true;
                 setModeInternal(old);
+                break;
             }
-            safeRemove(oldKey);
         }
     }, [config.storageKey]);
 
@@ -18815,10 +22015,13 @@ export function ThemeProvider(props: {
             mode: modeInternal,
             isDark: modeInternal === "dark",
             vars,
+            reducedMotion,
+            hasExplicitChoice: hasExplicitRef.current,
             setMode,
+            clearChoice,
             toggle,
         }),
-        [modeInternal, vars, setMode, toggle],
+        [modeInternal, vars, reducedMotion, setMode, clearChoice, toggle],
     );
 
     return <ThemeContext.Provider value={value}>{props.children}</ThemeContext.Provider>;
@@ -18830,26 +22033,22 @@ export function useTheme(): ThemeCtx {
     return ctx;
 }
 
-/** Root wrapper that injects CSS vars + smooth transition */
+/** Root wrapper that injects CSS vars + smooth transition (optional) */
 export function ThemeShell(props: { children: React.ReactNode; style?: React.CSSProperties }) {
-    const { vars } = useTheme();
-    const reduce =
-        typeof document !== "undefined"
-            ? document.documentElement.getAttribute("data-reduced-motion") === "1"
-            : false;
+    const { vars, reducedMotion } = useTheme();
 
     const shellStyle = useMemo(
         () => ({
             minHeight: "100vh",
             background: "var(--bg)",
             color: "var(--fg)",
-            transition: reduce
+            transition: reducedMotion
                 ? undefined
                 : "background-color 320ms ease, color 320ms ease, border-color 320ms ease, box-shadow 320ms ease",
             ...vars,
             ...(props.style ?? {}),
         }),
-        [vars, props.style, reduce],
+        [vars, props.style, reducedMotion],
     );
 
     return <div style={shellStyle}>{props.children}</div>;
@@ -18887,9 +22086,9 @@ export function ThemeToggleSwitch(props: {
     const size = props.size ?? "md";
 
     const { W, H, PAD } = dims(size);
-    const BORDER = 1; // 1px border on track
+    const BORDER = 1;
     const KNOB = H - 2 * PAD - 2 * BORDER;
-    const TRAVEL = W - H; // Equivalent to (W - 2*PAD - 2*BORDER) - KNOB
+    const TRAVEL = W - H;
 
     const [press, setPress] = useState(false);
     const [hover, setHover] = useState(false);
@@ -18930,8 +22129,7 @@ export function ThemeToggleSwitch(props: {
         background: "var(--toggleKnob)",
         boxShadow: "var(--toggleKnobShadow)",
         transform: `translateX(${isOn ? TRAVEL : 0}px) ${press ? "scale(0.98)" : "scale(1)"}`,
-        backgroundImage:
-            "linear-gradient(180deg, rgba(255,255,255,0.98), rgba(255,255,255,0.88))",
+        backgroundImage: "linear-gradient(180deg, rgba(255,255,255,0.98), rgba(255,255,255,0.88))",
     };
 
     const onKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
@@ -18992,7 +22190,8 @@ const defaults: { track: React.CSSProperties; knob: React.CSSProperties } = {
         display: "inline-flex",
         alignItems: "center",
         justifyContent: "flex-start",
-        transition: "transform 140ms ease, opacity 140ms ease, background 180ms ease, box-shadow 180ms ease",
+        transition:
+            "transform 140ms ease, opacity 140ms ease, background 180ms ease, box-shadow 180ms ease",
         userSelect: "none",
         WebkitTapHighlightColor: "transparent",
     },
@@ -19079,17 +22278,17 @@ export default defineConfig({
 
 ### biblia.to-code-export.md
 
-> TRUNCATED: file was 663045 bytes; showing first 48000 chars
+> TRUNCATED: file was 826107 bytes; showing first 48000 chars
 
 ```md
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-05T21:59:45.706Z
+Generated: 2026-03-06T21:43:51.300Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
-Total files: 53
-Total raw bytes (all included files): 18488066
+Total files: 58
+Total raw bytes (all included files): 1741841
 Truncated/skipped files: 1
-Export time: 73ms
+Export time: 20ms
 
 ## Notes
 
@@ -19113,6 +22312,8 @@ Export time: 73ms
 │   │   │   ├── auth/
 │   │   │   ├── reader/
 │   │   │   │   ├── prefs/
+├── packages/
+│   ├── annotation/
 ├── scripts/
 ```
 
@@ -20887,7 +24088,6 @@ export default {
           "type": "text",
           "primaryKey": false,
           "notNull": true,
-          "autoincrement": false,
 ```
 
 ### export-repo.ts
@@ -21223,25 +24423,55 @@ main();
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "dev": "bun scripts/dev.ts",
-    "dev:api": "bun run --filter @bp/api dev",
-    "dev:web": "bun run --filter @bp/web dev",
-    "db:bootstrap": "bun run --filter @bp/api db:bootstrap",
-    "db:migrate": "bun run --filter @bp/api db:migrate",
-    "db:seed": "bun run --filter @bp/api db:seed",
-    "db:verify": "bun run --filter @bp/api db:verify",
-    "import:osis": "bun run --filter @bp/api import:osis",
-    "drizzle:generate": "bun run --filter @bp/api drizzle:generate",
-    "drizzle:studio": "bun run --filter @bp/api drizzle:studio",
-    "build": "bun run build:api && bun run build:web",
-    "build:api": "bun run --filter @bp/api build",
-    "build:web": "bun run --filter @bp/web build",
-    "preview": "bun run --filter @bp/web preview",
-    "typecheck": "bun run typecheck:api && bun run typecheck:web",
-    "typecheck:api": "bun run --filter @bp/api typecheck",
-    "typecheck:web": "bun run --filter @bp/web typecheck"
+    "dev:api": "bun run --filter @biblia/api dev",
+    "dev:web": "bun run --filter @biblia/web dev",
+    "dev:no-db": "BP_DEV_SKIP_DB=1 bun scripts/dev.ts",
+    "dev:verify": "BP_DEV_VERIFY_DB=1 bun scripts/dev.ts",
+    "dev:api-only": "BP_DEV_NO_WEB=1 bun scripts/dev.ts",
+    "dev:web-only": "BP_DEV_NO_API=1 bun scripts/dev.ts",
+    "dev:import": "bun scripts/dev.ts",
+
+    "clean": "bun scripts/clean.ts",
+    "clean:dry": "bun scripts/clean.ts --dry-run",
+    "clean:all": "bun scripts/clean.ts --aggressive",
+    "clean:all:env": "bun scripts/clean.ts --aggressive --include-dot-env",
+
+    "db:bootstrap": "bun run --filter @biblia/api db:bootstrap",
+    "db:migrate": "bun run --filter @biblia/api db:migrate",
+    "db:seed": "bun run --filter @biblia/api db:seed",
+    "db:verify": "bun run --filter @biblia/api db:verify",
+
+    "import:osis": "bun run --filter @biblia/api import:osis",
+
+    "drizzle:generate": "bun run --filter @biblia/api drizzle:generate",
+    "drizzle:studio": "bun run --filter @biblia/api drizzle:studio",
+
+    "build": "bun run build:annotation && bun run build:api && bun run build:web",
+    "build:annotation": "bun run --filter @biblia/annotation build",
+    "build:api": "bun run --filter @biblia/api build",
+    "build:web": "bun run --filter @biblia/web build",
+
+    "preview": "bun run --filter @biblia/web preview",
+
+    "prod": "bun scripts/prod.ts",
+    "prod:api-only": "BP_PROD_NO_WEB=1 bun scripts/prod.ts",
+    "prod:web-only": "BP_PROD_NO_API=1 bun scripts/prod.ts",
+    "prod:skip-build": "BP_PROD_SKIP_BUILD=1 bun scripts/prod.ts",
+    "prod:verify-db": "BP_PROD_VERIFY_DB=1 bun scripts/prod.ts",
+
+    "typecheck": "bun run typecheck:annotation && bun run typecheck:api && bun run typecheck:web",
+    "typecheck:annotation": "bun run --filter @biblia/annotation typecheck",
+    "typecheck:api": "bun run --filter @biblia/api typecheck",
+    "typecheck:web": "bun run --filter @biblia/web typecheck",
+
+    "check": "bun run typecheck && bun run build",
+    "reinstall": "bun run clean:all && bun install"
   },
   "dependencies": {
     "lucide-react": "^0.576.0"
@@ -21249,7 +24479,841 @@ main();
   "devDependencies": {
     "@types/node": "^25.3.2",
     "bun-types": "^1.3.10"
+  },
+  "engines": {
+    "bun": ">=1.3.10"
   }
+}
+```
+
+### packages/annotation/package.json
+
+```json
+{
+  "name": "@biblia/annotation",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./commands/types": {
+      "types": "./dist/commands/types.d.ts",
+      "import": "./dist/commands/types.js",
+      "default": "./dist/commands/types.js"
+    },
+    "./events/types": {
+      "types": "./dist/events/types.d.ts",
+      "import": "./dist/events/types.js",
+      "default": "./dist/events/types.js"
+    },
+    "./model/types": {
+      "types": "./dist/model/types.d.ts",
+      "import": "./dist/model/types.js",
+      "default": "./dist/model/types.js"
+    },
+    "./model/guards": {
+      "types": "./dist/model/guards.d.ts",
+      "import": "./dist/model/guards.js",
+      "default": "./dist/model/guards.js"
+    },
+    "./model/ids": {
+      "types": "./dist/model/ids.d.ts",
+      "import": "./dist/model/ids.js",
+      "default": "./dist/model/ids.js"
+    },
+    "./anchor/normalize": {
+      "types": "./dist/anchor/normalize.d.ts",
+      "import": "./dist/anchor/normalize.js",
+      "default": "./dist/anchor/normalize.js"
+    },
+    "./engine/createAnnotationEngine": {
+      "types": "./dist/engine/createAnnotationEngine.d.ts",
+      "import": "./dist/engine/createAnnotationEngine.js",
+      "default": "./dist/engine/createAnnotationEngine.js"
+    },
+    "./ink/ink": {
+      "types": "./dist/ink/ink.d.ts",
+      "import": "./dist/ink/ink.js",
+      "default": "./dist/ink/ink.js"
+    },
+    "./layout/geometry": {
+      "types": "./dist/layout/geometry.d.ts",
+      "import": "./dist/layout/geometry.js",
+      "default": "./dist/layout/geometry.js"
+    },
+    "./ops/reducer": {
+      "types": "./dist/ops/reducer.d.ts",
+      "import": "./dist/ops/reducer.js",
+      "default": "./dist/ops/reducer.js"
+    },
+    "./reanchor/reanchor": {
+      "types": "./dist/reanchor/reanchor.d.ts",
+      "import": "./dist/reanchor/reanchor.js",
+      "default": "./dist/reanchor/reanchor.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "bun run typecheck",
+    "clean": "bun x rimraf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "rimraf": "^6.0.1"
+  }
+}
+```
+
+### packages/annotation/src/model/anchor.ts
+
+```ts
+// packages/annotation/src/model/anchor.ts
+
+export type Brand<T, B extends string> = T & { readonly __brand: B };
+
+export type VerseKey = Brand<string, "VerseKey">;
+export type TranslationId = Brand<string, "TranslationId">;
+
+export type AnnotationAnchor = Readonly<{
+    /**
+     * Stable canon identity.
+     * Must always exist.
+     */
+    verseOrd: number;
+    verseKey: VerseKey;
+
+    /**
+     * Optional semantic context.
+     * Useful for deterministic replay across translation/tokenizer changes.
+     */
+    translationId?: TranslationId | null;
+    tokenizerId?: string | null;
+
+    /**
+     * Preferred partial-anchor method.
+     * Half-open [start, end) semantics.
+     */
+    tokenStart?: number | null;
+    tokenEnd?: number | null;
+
+    /**
+     * Fallback partial-anchor method when tokens are unavailable.
+     * Half-open [start, end) semantics.
+     */
+    charStart?: number | null;
+    charEnd?: number | null;
+}>;
+
+export type AnnotationRange = Readonly<{
+    start: AnnotationAnchor;
+    end: AnnotationAnchor;
+}>;
+
+export type AnnotationScope = "RANGE" | "WHOLE_VERSE";
+
+export function hasTokenOffsets(anchor: AnnotationAnchor): boolean {
+    return Number.isInteger(anchor.tokenStart) && Number.isInteger(anchor.tokenEnd);
+}
+
+export function hasCharOffsets(anchor: AnnotationAnchor): boolean {
+    return Number.isInteger(anchor.charStart) && Number.isInteger(anchor.charEnd);
+}
+
+export function compareAnchors(a: AnnotationAnchor, b: AnnotationAnchor): number {
+    if (a.verseOrd !== b.verseOrd) return a.verseOrd - b.verseOrd;
+
+    const aPos = firstDefinedNumber(a.tokenStart, a.charStart, 0);
+    const bPos = firstDefinedNumber(b.tokenStart, b.charStart, 0);
+
+    return aPos - bPos;
+}
+
+export function normalizeRange(range: AnnotationRange): AnnotationRange {
+    return compareAnchors(range.start, range.end) <= 0
+        ? range
+        : { start: range.end, end: range.start };
+}
+
+export function validateAnchor(anchor: AnnotationAnchor): void {
+    if (!Number.isInteger(anchor.verseOrd) || anchor.verseOrd <= 0) {
+        throw new Error("anchor.verseOrd must be a positive integer");
+    }
+
+    if (!anchor.verseKey || typeof anchor.verseKey !== "string") {
+        throw new Error("anchor.verseKey must be present");
+    }
+
+    const hasTokens = hasTokenOffsets(anchor);
+    const hasChars = hasCharOffsets(anchor);
+
+    if (hasTokens) {
+        if ((anchor.tokenStart as number) < 0 || (anchor.tokenEnd as number) < (anchor.tokenStart as number)) {
+            throw new Error("anchor token range is invalid");
+        }
+    }
+
+    if (hasChars) {
+        if ((anchor.charStart as number) < 0 || (anchor.charEnd as number) < (anchor.charStart as number)) {
+            throw new Error("anchor char range is invalid");
+        }
+    }
+
+    if (
+        anchor.tokenStart != null ||
+        anchor.tokenEnd != null ||
+        anchor.charStart != null ||
+        anchor.charEnd != null
+    ) {
+        const completeTokenPair = anchor.tokenStart != null && anchor.tokenEnd != null;
+        const completeCharPair = anchor.charStart != null && anchor.charEnd != null;
+
+        if (!completeTokenPair && !completeCharPair) {
+            throw new Error("partial anchor must provide tokenStart/tokenEnd or charStart/charEnd");
+        }
+    }
+}
+
+export function validateRange(range: AnnotationRange): void {
+    validateAnchor(range.start);
+    validateAnchor(range.end);
+
+    if (compareAnchors(range.start, range.end) > 0) {
+        throw new Error("range start must be <= range end");
+    }
+}
+
+function firstDefinedNumber(...values: Array<number | null | undefined>): number {
+    for (const value of values) {
+        if (typeof value === "number" && Number.isFinite(value)) return value;
+    }
+    return 0;
+}
+```
+
+### packages/annotation/src/model/ids.ts
+
+```ts
+// packages/annotation/src/model/ids.ts
+// Biblia.to — annotation ids + hashing
+//
+// Goals:
+// - strict branded string ids for annotation-domain objects
+// - lexicographically sortable, time-prefixed ids
+// - monotonic generation within the same millisecond
+// - runtime-safe validation helpers
+// - deterministic text normalization + hashing
+// - zero external dependencies
+//
+// Compatibility:
+// - preserves defaultMakeId(prefix?: string): string
+// - preserves defaultHashText(input: string): string
+// - preserves defaultHashNullableText(input): string | null
+// - preserves normalizeName(s: string): string
+//
+// Notes:
+// - IDs are not secrets and are not auth tokens.
+// - Hashes here are for stable fingerprints / change detection, not security.
+// - This file is safe for Bun / Node / browser runtimes and does not rely on DOM lib typings.
+
+export type Brand<T, B extends string> = T & { readonly __brand: B };
+
+/* ============================================================================
+   Branded ID types
+============================================================================ */
+
+export type AnnotationId = Brand<string, "AnnotationId">;
+export type CollectionId = Brand<string, "CollectionId">;
+export type LabelId = Brand<string, "LabelId">;
+export type PaletteId = Brand<string, "PaletteId">;
+export type ShareId = Brand<string, "ShareId">;
+export type EventId = Brand<string, "EventId">;
+export type StrokeId = Brand<string, "StrokeId">;
+export type AttachmentId = Brand<string, "AttachmentId">;
+
+export type UserId = Brand<string, "UserId">;
+export type DeviceId = Brand<string, "DeviceId">;
+
+export type VerseKey = Brand<string, "VerseKey">;
+export type TranslationId = Brand<string, "TranslationId">;
+export type BlockId = Brand<string, "BlockId">;
+export type ContainerKey = Brand<string, "ContainerKey">;
+
+export type SelectionHash = Brand<string, "SelectionHash">;
+
+/* ============================================================================
+   Prefix registry
+============================================================================ */
+
+export const ID_PREFIX = {
+    annotation: "ann",
+    collection: "col",
+    label: "lab",
+    palette: "pal",
+    share: "shr",
+    event: "evt",
+    stroke: "stk",
+    attachment: "att",
+} as const;
+
+export type KnownIdPrefix = (typeof ID_PREFIX)[keyof typeof ID_PREFIX];
+
+/* ============================================================================
+   Public name normalization
+============================================================================ */
+
+/**
+ * Normalize a user-visible name for comparison / indexing.
+ *
+ * Behavior:
+ * - unicode normalizes with NFKC
+ * - trims ends
+ * - collapses internal whitespace
+ * - lowercases
+ */
+export function normalizeName(s: string): string {
+    if (typeof s !== "string") {
+        throw new Error("[ids] normalizeName requires a string");
+    }
+
+    return s
+        .normalize("NFKC")
+        .trim()
+        .replace(/\s+/g, " ")
+        .toLowerCase();
+}
+
+/* ============================================================================
+   Public ID creation API
+============================================================================ */
+
+/**
+ * Backward-compatible generic id maker.
+ *
+ * Format:
+ *   <prefix>_<26-char-monotonic-body>
+ *
+ * Example:
+ *   ann_01JNCFSY8PG0A0FQ5FD7X7X9FH
+ */
+export function defaultMakeId(prefix = "ann"): string {
+    return makeId(prefix);
+}
+
+export function makeId(prefix = "ann", nowMs = Date.now()): string {
+    const safePrefix = normalizePrefix(prefix);
+    const body = makeMonotonicBody(nowMs);
+    return `${safePrefix}_${body}`;
+}
+
+export function createAnnotationId(nowMs?: number): AnnotationId {
+    return makeKnownId(ID_PREFIX.annotation, nowMs) as AnnotationId;
+}
+
+export function createCollectionId(nowMs?: number): CollectionId {
+    return makeKnownId(ID_PREFIX.collection, nowMs) as CollectionId;
+}
+
+export function createLabelId(nowMs?: number): LabelId {
+    return makeKnownId(ID_PREFIX.label, nowMs) as LabelId;
+}
+
+export function createPaletteId(nowMs?: number): PaletteId {
+    return makeKnownId(ID_PREFIX.palette, nowMs) as PaletteId;
+}
+
+export function createShareId(nowMs?: number): ShareId {
+    return makeKnownId(ID_PREFIX.share, nowMs) as ShareId;
+}
+
+export function createEventId(nowMs?: number): EventId {
+    return makeKnownId(ID_PREFIX.event, nowMs) as EventId;
+}
+
+export function createStrokeId(nowMs?: number): StrokeId {
+    return makeKnownId(ID_PREFIX.stroke, nowMs) as StrokeId;
+}
+
+export function createAttachmentId(nowMs?: number): AttachmentId {
+    return makeKnownId(ID_PREFIX.attachment, nowMs) as AttachmentId;
+}
+
+/* ============================================================================
+   Public ID validation / coercion
+============================================================================ */
+
+export function isAnnotationId(value: unknown): value is AnnotationId {
+    return isPrefixedId(value, ID_PREFIX.annotation);
+}
+
+export function isCollectionId(value: unknown): value is CollectionId {
+    return isPrefixedId(value, ID_PREFIX.collection);
+}
+
+export function isLabelId(value: unknown): value is LabelId {
+    return isPrefixedId(value, ID_PREFIX.label);
+}
+
+export function isPaletteId(value: unknown): value is PaletteId {
+    return isPrefixedId(value, ID_PREFIX.palette);
+}
+
+export function isShareId(value: unknown): value is ShareId {
+    return isPrefixedId(value, ID_PREFIX.share);
+}
+
+export function isEventId(value: unknown): value is EventId {
+    return isPrefixedId(value, ID_PREFIX.event);
+}
+
+export function isStrokeId(value: unknown): value is StrokeId {
+    return isPrefixedId(value, ID_PREFIX.stroke);
+}
+
+export function isAttachmentId(value: unknown): value is AttachmentId {
+    return isPrefixedId(value, ID_PREFIX.attachment);
+}
+
+export function toAnnotationId(value: string): AnnotationId {
+    assertPrefixedId(value, ID_PREFIX.annotation, "AnnotationId");
+    return value as AnnotationId;
+}
+
+export function toCollectionId(value: string): CollectionId {
+    assertPrefixedId(value, ID_PREFIX.collection, "CollectionId");
+    return value as CollectionId;
+}
+
+export function toLabelId(value: string): LabelId {
+    assertPrefixedId(value, ID_PREFIX.label, "LabelId");
+    return value as LabelId;
+}
+
+export function toPaletteId(value: string): PaletteId {
+    assertPrefixedId(value, ID_PREFIX.palette, "PaletteId");
+    return value as PaletteId;
+}
+
+export function toShareId(value: string): ShareId {
+    assertPrefixedId(value, ID_PREFIX.share, "ShareId");
+    return value as ShareId;
+}
+
+export function toEventId(value: string): EventId {
+    assertPrefixedId(value, ID_PREFIX.event, "EventId");
+    return value as EventId;
+}
+
+export function toStrokeId(value: string): StrokeId {
+    assertPrefixedId(value, ID_PREFIX.stroke, "StrokeId");
+    return value as StrokeId;
+}
+
+export function toAttachmentId(value: string): AttachmentId {
+    assertPrefixedId(value, ID_PREFIX.attachment, "AttachmentId");
+    return value as AttachmentId;
+}
+
+export function assertAnnotationId(value: unknown): asserts value is AnnotationId {
+    assertPrefixedId(value, ID_PREFIX.annotation, "AnnotationId");
+}
+
+export function assertCollectionId(value: unknown): asserts value is CollectionId {
+    assertPrefixedId(value, ID_PREFIX.collection, "CollectionId");
+}
+
+export function assertLabelId(value: unknown): asserts value is LabelId {
+    assertPrefixedId(value, ID_PREFIX.label, "LabelId");
+}
+
+export function assertPaletteId(value: unknown): asserts value is PaletteId {
+    assertPrefixedId(value, ID_PREFIX.palette, "PaletteId");
+}
+
+export function assertShareId(value: unknown): asserts value is ShareId {
+    assertPrefixedId(value, ID_PREFIX.share, "ShareId");
+}
+
+export function assertEventId(value: unknown): asserts value is EventId {
+    assertPrefixedId(value, ID_PREFIX.event, "EventId");
+}
+
+export function assertStrokeId(value: unknown): asserts value is StrokeId {
+    assertPrefixedId(value, ID_PREFIX.stroke, "StrokeId");
+}
+
+export function assertAttachmentId(value: unknown): asserts value is AttachmentId {
+    assertPrefixedId(value, ID_PREFIX.attachment, "AttachmentId");
+}
+
+export function isPrefixedId(value: unknown, prefix: string): value is string {
+    if (typeof value !== "string") return false;
+    if (!SAFE_PREFIX_RE.test(prefix)) return false;
+    if (!value.startsWith(`${prefix}_`)) return false;
+
+    const body = value.slice(prefix.length + 1);
+    return ID_BODY_RE.test(body);
+}
+
+export function assertPrefixedId(
+    value: unknown,
+    prefix: string,
+    label = "id",
+): asserts value is string {
+    if (!isPrefixedId(value, prefix)) {
+        throw new Error(`[ids] invalid ${label}: expected "${prefix}_<26-char-body>"`);
+    }
+}
+
+export function extractIdPrefix(value: string): string | null {
+    const idx = value.indexOf("_");
+    if (idx <= 0) return null;
+
+    const prefix = value.slice(0, idx);
+    return SAFE_PREFIX_RE.test(prefix) ? prefix : null;
+}
+
+export function splitId(value: string): Readonly<{ prefix: string; body: string }> | null {
+    const idx = value.indexOf("_");
+    if (idx <= 0) return null;
+
+    const prefix = value.slice(0, idx);
+    const body = value.slice(idx + 1);
+
+    if (!SAFE_PREFIX_RE.test(prefix)) return null;
+    if (!ID_BODY_RE.test(body)) return null;
+
+    return { prefix, body };
+}
+
+/* ============================================================================
+   Public hashing API
+============================================================================ */
+
+/**
+ * Deterministic 64-bit FNV-1a over UTF-8 bytes.
+ *
+ * Output format:
+ *   fnv1a64_<16 hex chars>
+ *
+ * Good for:
+ * - selection fingerprints
+ * - re-anchor comparison
+ * - change detection
+ * - cache keys
+ *
+ * Not suitable for:
+ * - passwords
+ * - secrets
+ * - adversarial collision resistance
+ */
+export function defaultHashText(input: string): string {
+    if (typeof input !== "string") {
+        throw new Error("[ids] defaultHashText requires a string");
+    }
+
+    const bytes = utf8Encode(input);
+    let hash = FNV64_OFFSET_BASIS;
+    for (let i = 0; i < bytes.length; i += 1) {
+        hash ^= BigInt(bytes[i] ?? 0);
+        hash = BigInt.asUintN(64, hash * FNV64_PRIME);
+    }
+
+    return `fnv1a64_${hash.toString(16).padStart(16, "0")}`;
+}
+
+/**
+ * Convenience helper for optional text.
+ * Returns null for nullish / blank values, otherwise hashed text.
+ */
+export function defaultHashNullableText(input: string | null | undefined): string | null {
+    if (!isNonEmptyString(input)) return null;
+    return defaultHashText(input);
+}
+
+export function toSelectionHash(value: string): SelectionHash {
+    if (!isSelectionHash(value)) {
+        throw new Error("[ids] invalid SelectionHash");
+    }
+    return value as SelectionHash;
+}
+
+export function isSelectionHash(value: unknown): value is SelectionHash {
+    return typeof value === "string" && /^fnv1a64_[0-9a-f]{16}$/u.test(value);
+}
+
+export function assertSelectionHash(value: unknown): asserts value is SelectionHash {
+    if (!isSelectionHash(value)) {
+        throw new Error("[ids] invalid SelectionHash");
+    }
+}
+
+/* ============================================================================
+   Internal constants
+============================================================================ */
+
+const SAFE_PREFIX_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/u;
+const ID_BODY_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/u;
+
+const CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const TIME_PART_LEN = 10;
+const RANDOM_PART_LEN = 16;
+
+const FNV64_OFFSET_BASIS = 0xcbf29ce484222325n;
+const FNV64_PRIME = 0x100000001b3n;
+
+/* ============================================================================
+   Internal monotonic ID state
+============================================================================ */
+
+let lastTimestampMs = -1;
+let lastRandomDigits: number[] | null = null;
+
+/* ============================================================================
+   Internal helpers
+============================================================================ */
+
+function isNonEmptyString(value: unknown): value is string {
+    return typeof value === "string" && value.trim().length > 0;
+}
+
+function normalizePrefix(prefix: string): string {
+    const normalized = String(prefix)
+        .normalize("NFKC")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "_")
+        .replace(/[^a-z0-9_-]/g, "_")
+        .replace(/_+/g, "_")
+        .replace(/^_+|_+$/g, "");
+
+    if (normalized.length === 0) return "id";
+    return normalized.slice(0, 24);
+}
+
+function makeKnownId(prefix: KnownIdPrefix, nowMs = Date.now()): string {
+    return `${prefix}_${makeMonotonicBody(nowMs)}`;
+}
+
+function makeMonotonicBody(nowMs: number): string {
+    assertValidTimestamp(nowMs);
+
+    const timePart = encodeTime48(nowMs);
+    const randomDigits = nextRandomDigits(nowMs);
+    const randomPart = encodeDigits(randomDigits);
+
+    return `${timePart}${randomPart}`;
+}
+
+function nextRandomDigits(nowMs: number): number[] {
+    if (nowMs === lastTimestampMs && lastRandomDigits !== null) {
+        const next = lastRandomDigits.slice();
+        incrementBase32Digits(next);
+        lastRandomDigits = next;
+        return next;
+    }
+
+    const next = randomBase32Digits(RANDOM_PART_LEN);
+    lastTimestampMs = nowMs;
+    lastRandomDigits = next;
+    return next;
+}
+
+function incrementBase32Digits(digits: number[]): void {
+    for (let i = digits.length - 1; i >= 0; i -= 1) {
+        const digit = digits[i] ?? 0;
+        if (digit < 31) {
+            digits[i] = digit + 1;
+            return;
+        }
+        digits[i] = 0;
+    }
+
+    throw new Error("[ids] monotonic id overflow within the same millisecond");
+}
+
+function randomBase32Digits(length: number): number[] {
+    const out = new Array<number>(length);
+    const bytes = getRandomBytes(length);
+
+    for (let i = 0; i < length; i += 1) {
+        out[i] = (bytes[i] ?? 0) & 31;
+    }
+
+    return out;
+}
+
+function encodeTime48(nowMs: number): string {
+    let value = Math.trunc(nowMs);
+    let out = "";
+
+    for (let i = 0; i < TIME_PART_LEN; i += 1) {
+        out = alphabetChar(value % 32) + out;
+        value = Math.floor(value / 32);
+    }
+
+    return out;
+}
+
+function encodeDigits(digits: readonly number[]): string {
+    let out = "";
+    for (let i = 0; i < digits.length; i += 1) {
+        out += alphabetChar(digits[i] ?? 0);
+    }
+    return out;
+}
+
+function alphabetChar(index: number): string {
+    if (!Number.isInteger(index) || index < 0 || index >= 32) {
+        throw new Error("[ids] invalid base32 alphabet index");
+    }
+
+    const char = CROCKFORD32.charAt(index);
+    if (!char) {
+        throw new Error("[ids] base32 alphabet lookup failed");
+    }
+
+    return char;
+}
+
+function assertValidTimestamp(value: number): void {
+    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+        throw new Error("[ids] timestamp must be a non-negative integer millisecond value");
+    }
+
+    // 48-bit ULID-compatible time ceiling.
+    if (value > 281_474_976_710_655) {
+        throw new Error("[ids] timestamp exceeds 48-bit time range");
+    }
+}
+
+function getRandomBytes(length: number): Uint8Array {
+    const g = globalThis as {
+        crypto?: {
+            getRandomValues?: (array: Uint8Array) => Uint8Array;
+        };
+    };
+
+    const cryptoLike = g.crypto;
+    if (cryptoLike && typeof cryptoLike.getRandomValues === "function") {
+        return cryptoLike.getRandomValues(new Uint8Array(length));
+    }
+
+    // Fallback only for unusual runtimes without crypto.
+    // Fine for local uniqueness; crypto-backed runtimes are preferred.
+    const out = new Uint8Array(length);
+    for (let i = 0; i < length; i += 1) {
+        out[i] = Math.floor(Math.random() * 256);
+    }
+    return out;
+}
+
+/**
+ * UTF-8 encoder with no dependency on DOM typings.
+ */
+function utf8Encode(input: string): Uint8Array {
+    const bytes: number[] = [];
+
+    for (let i = 0; i < input.length; i += 1) {
+        let codePoint = input.charCodeAt(i);
+
+        // surrogate pair
+        if (codePoint >= 0xd800 && codePoint <= 0xdbff && i + 1 < input.length) {
+            const next = input.charCodeAt(i + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) {
+                codePoint = 0x10000 + ((codePoint - 0xd800) << 10) + (next - 0xdc00);
+                i += 1;
+            }
+        }
+
+        if (codePoint <= 0x7f) {
+            bytes.push(codePoint);
+            continue;
+        }
+
+        if (codePoint <= 0x7ff) {
+            bytes.push(
+                0xc0 | (codePoint >> 6),
+                0x80 | (codePoint & 0x3f),
+            );
+            continue;
+        }
+
+        if (codePoint <= 0xffff) {
+            bytes.push(
+                0xe0 | (codePoint >> 12),
+                0x80 | ((codePoint >> 6) & 0x3f),
+                0x80 | (codePoint & 0x3f),
+            );
+            continue;
+        }
+
+        bytes.push(
+            0xf0 | (codePoint >> 18),
+            0x80 | ((codePoint >> 12) & 0x3f),
+            0x80 | ((codePoint >> 6) & 0x3f),
+            0x80 | (codePoint & 0x3f),
+        );
+    }
+
+    return Uint8Array.from(bytes);
+}
+```
+
+### packages/annotation/tsconfig.json
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    "strict": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noFallthroughCasesInSwitch": true,
+
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/.tsbuildinfo",
+
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "useDefineForClassFields": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "skipLibCheck": true,
+    "noEmitOnError": true
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude": [
+    "dist",
+    "node_modules",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.spec.ts",
+    "**/*.spec.tsx"
+  ]
 }
 ```
 
@@ -21284,53 +25348,392 @@ I believe God’s Word does not belong to gatekeepers — it is given for the wo
 ---
 ```
 
+### scripts/clean.ts
+
+```ts
+// scripts/clean.ts
+// Biblia.to — root clean script (Bun-first, cross-platform, hardened)
+//
+// Run from repo root:
+//   bun scripts/clean.ts
+//   bun run clean
+//
+// Features:
+// - Cross-platform recursive deletion (no rm -rf)
+// - Cleans common build/cache outputs across root/apps/packages
+// - Safe root guard (won't run outside expected repo shape)
+// - Optional aggressive mode for lockfiles/install state
+// - Optional dry-run mode
+//
+// Flags:
+//   --dry-run                  Print what would be removed
+//   --aggressive               Also remove node_modules and lockfiles
+//   --include-dot-env          Also remove common local env files
+//
+// Examples:
+//   bun scripts/clean.ts
+//   bun scripts/clean.ts --dry-run
+//   bun scripts/clean.ts --aggressive
+//   bun scripts/clean.ts --aggressive --include-dot-env
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as process from "node:process";
+
+const ROOT = process.cwd();
+
+type Options = {
+    dryRun: boolean;
+    aggressive: boolean;
+    includeDotEnv: boolean;
+};
+
+function nowStamp(): string {
+    const d = new Date();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    return `${hh}:${mm}:${ss}`;
+}
+
+function log(...args: unknown[]): void {
+    console.log(`[clean ${nowStamp()}]`, ...args);
+}
+
+function errlog(...args: unknown[]): void {
+    console.error(`[clean ${nowStamp()}]`, ...args);
+}
+
+function hasFlag(flag: string): boolean {
+    return process.argv.slice(2).includes(flag);
+}
+
+function exists(p: string): boolean {
+    try {
+        return fs.existsSync(p);
+    } catch {
+        return false;
+    }
+}
+
+function isDirectory(p: string): boolean {
+    try {
+        return fs.statSync(p).isDirectory();
+    } catch {
+        return false;
+    }
+}
+
+function readDirNames(p: string): string[] {
+    try {
+        return fs.readdirSync(p, { withFileTypes: true }).map((d) => d.name);
+    } catch {
+        return [];
+    }
+}
+
+function normalizeAbs(p: string): string {
+    return path.normalize(path.resolve(ROOT, p));
+}
+
+function pathWithinRoot(absPath: string): boolean {
+    const rel = path.relative(ROOT, absPath);
+    return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function assertRepoRoot(): void {
+    const appsDir = path.join(ROOT, "apps");
+    const packagesDir = path.join(ROOT, "packages");
+    const pkgJson = path.join(ROOT, "package.json");
+
+    if (!exists(pkgJson) || !isDirectory(appsDir) || !isDirectory(packagesDir)) {
+        throw new Error(
+            `repo root shape not detected at ${ROOT}. Expected package.json, apps/, and packages/. Run from repo root.`,
+        );
+    }
+}
+
+async function rmPath(absPath: string, dryRun: boolean): Promise<boolean> {
+    if (!pathWithinRoot(absPath)) {
+        throw new Error(`refusing to delete outside repo root: ${absPath}`);
+    }
+
+    if (!exists(absPath)) return false;
+
+    const rel = path.relative(ROOT, absPath) || ".";
+
+    if (dryRun) {
+        log(`[dry-run] remove ${rel}`);
+        return true;
+    }
+
+    await fs.promises.rm(absPath, {
+        recursive: true,
+        force: true,
+        maxRetries: 2,
+        retryDelay: 80,
+    });
+
+    log(`removed ${rel}`);
+    return true;
+}
+
+function gatherWorkspaceDirs(baseDir: string): string[] {
+    const absBase = path.join(ROOT, baseDir);
+    if (!isDirectory(absBase)) return [];
+
+    return readDirNames(absBase)
+        .map((name) => path.join(absBase, name))
+        .filter((p) => isDirectory(p));
+}
+
+function uniqueSorted(paths: string[]): string[] {
+    return [...new Set(paths.map((p) => normalizeAbs(p)))].sort((a, b) => a.localeCompare(b));
+}
+
+function buildDeletionPlan(opts: Options): string[] {
+    const targets: string[] = [];
+
+    const rootTargets = [
+        ".turbo",
+        ".cache",
+        ".eslintcache",
+        "coverage",
+        "dist",
+        "build",
+        "tmp",
+        "temp",
+        ".DS_Store",
+    ];
+
+    for (const rel of rootTargets) {
+        targets.push(path.join(ROOT, rel));
+    }
+
+    const workspaceDirs = [
+        ...gatherWorkspaceDirs("apps"),
+        ...gatherWorkspaceDirs("packages"),
+    ];
+
+    const perWorkspaceTargets = [
+        "dist",
+        "build",
+        ".vite",
+        ".turbo",
+        ".cache",
+        "coverage",
+        ".svelte-kit",
+        ".next",
+        ".nuxt",
+        ".output",
+        "storybook-static",
+        ".rpt2_cache",
+        ".tsbuildinfo",
+    ];
+
+    for (const ws of workspaceDirs) {
+        for (const rel of perWorkspaceTargets) {
+            targets.push(path.join(ws, rel));
+        }
+    }
+
+    if (opts.aggressive) {
+        targets.push(path.join(ROOT, "node_modules"));
+
+        for (const ws of workspaceDirs) {
+            targets.push(path.join(ws, "node_modules"));
+        }
+
+        targets.push(path.join(ROOT, "bun.lock"));
+        targets.push(path.join(ROOT, "bun.lockb"));
+        targets.push(path.join(ROOT, "package-lock.json"));
+        targets.push(path.join(ROOT, "pnpm-lock.yaml"));
+        targets.push(path.join(ROOT, "yarn.lock"));
+    }
+
+    if (opts.includeDotEnv) {
+        const envFiles = [
+            ".env",
+            ".env.local",
+            ".env.development.local",
+            ".env.production.local",
+            ".env.test.local",
+        ];
+
+        for (const rel of envFiles) {
+            targets.push(path.join(ROOT, rel));
+        }
+
+        for (const ws of workspaceDirs) {
+            for (const rel of envFiles) {
+                targets.push(path.join(ws, rel));
+            }
+        }
+    }
+
+    return uniqueSorted(targets);
+}
+
+async function main(): Promise<void> {
+    const opts: Options = {
+        dryRun: hasFlag("--dry-run"),
+        aggressive: hasFlag("--aggressive"),
+        includeDotEnv: hasFlag("--include-dot-env"),
+    };
+
+    assertRepoRoot();
+
+    log("=== Biblia.to Clean ===");
+    log("ROOT:", ROOT);
+    log("dryRun:", opts.dryRun);
+    log("aggressive:", opts.aggressive);
+    log("includeDotEnv:", opts.includeDotEnv);
+
+    const plan = buildDeletionPlan(opts);
+
+    let removed = 0;
+    let skipped = 0;
+    let hadErrors = false;
+
+    for (const absPath of plan) {
+        try {
+            const didRemove = await rmPath(absPath, opts.dryRun);
+            if (didRemove) removed += 1;
+            else skipped += 1;
+        } catch (e) {
+            hadErrors = true;
+            errlog(`failed to remove ${path.relative(ROOT, absPath) || "."}:`, e);
+        }
+    }
+
+    log(`done. removed=${removed} skipped=${skipped}`);
+
+    if (hadErrors) {
+        process.exit(1);
+    }
+}
+
+void main().catch((e) => {
+    errlog("fatal:", e);
+    process.exit(1);
+});
+```
+
 ### scripts/dev.ts
 
 ```ts
 // scripts/dev.ts
-// Biblia Populi — root dev runner (Bun-first)
+// Biblia.to — root dev runner (Bun-first, production-grade)
 // Run from repo root:
 //   bun run dev
 //
 // Starts:
-// - apps/api (bun --watch src/server.ts via package script "dev")
-// - apps/web (vite via package script "dev")
+// - apps/api (bun run dev)
+// - apps/web (bun run dev)
 //
-// Extras:
-// - Ensures API DB is bootstrapped (migrate + seed) unless BP_DEV_SKIP_DB=1
-// - Optionally runs OSIS import if BP_DEV_IMPORT_OSIS points to a file
-// - Optional: verify DB after bootstrap/import if apps/api has db:verify script
-// - Clean shutdown on Ctrl+C / SIGTERM
+// Features:
+// - Bun-only process management (no child_process)
+// - DB bootstrap (db:bootstrap or migrate+seed) unless BP_DEV_SKIP_DB=1
+// - Optional OSIS import via BP_DEV_IMPORT_OSIS=/abs/or/relative/path.xml
+// - Optional DB verify via BP_DEV_VERIFY_DB=1
+// - Optional API health wait before starting web
+// - Prefixed child stdout/stderr logs
+// - Graceful shutdown with escalation
+// - Better repo/package/script sanity checks
+// - Optional per-service disable switches
+//
+// Env knobs:
+//   BP_DEV_SKIP_DB=1
+//   BP_DEV_VERIFY_DB=1
+//   BP_DEV_IMPORT_OSIS=./resources/kjv.xml
+//   BP_DEV_IMPORT_SET_DEFAULT=1
+//
+//   BP_DEV_NO_API=1
+//   BP_DEV_NO_WEB=1
+//
+//   BP_DEV_API_SCRIPT=dev
+//   BP_DEV_WEB_SCRIPT=dev
+//
+//   BP_DEV_VITE_API_BASE=http://localhost:3000
+//
+//   BP_DEV_WAIT_FOR_API=1                (default: 1)
+//   BP_DEV_API_HEALTH_URL=http://localhost:3000/health
+//   BP_DEV_API_HEALTH_TIMEOUT_MS=45000
+//   BP_DEV_API_HEALTH_INTERVAL_MS=350
+//
+//   BP_DEV_SHUTDOWN_GRACE_MS=2500
 //
 // Notes:
-// - Uses Bun.spawn only (no Node child_process).
-// - Uses Bun.which to locate bun if needed.
-// - Better logs, env toggles, and stronger shutdown behavior.
+// - Run from repo root.
+// - Assumes apps/api and apps/web are Bun projects with package.json scripts.
+// - If one long-running child exits, the runner shuts the other down.
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as process from "node:process";
-import * as fs from "node:fs";
 
 type BunSubprocess = ReturnType<typeof Bun.spawn>;
-type Proc = { name: string; proc: BunSubprocess };
+
+type ServiceName = "api" | "web";
+
+type Proc = {
+    name: ServiceName;
+    proc: BunSubprocess;
+    stdoutDone: Promise<void>;
+    stderrDone: Promise<void>;
+};
+
+type PackageJson = {
+    name?: string;
+    scripts?: Record<string, string>;
+};
 
 const ROOT = process.cwd();
 const API_CWD = path.join(ROOT, "apps", "api");
 const WEB_CWD = path.join(ROOT, "apps", "web");
 
+const DEV_NAME = "Biblia.to Dev";
+
 const procs: Proc[] = [];
 let shuttingDown = false;
+let shutdownRequestedBy: string | null = null;
+let finalized = false;
 
-/* --------------------------------- helpers -------------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                   helpers                                  */
+/* -------------------------------------------------------------------------- */
 
 function envStr(name: string, fallback = ""): string {
-    const v = (process.env[name] ?? "").trim();
-    return v || fallback;
+    const v = process.env[name];
+    if (typeof v !== "string") return fallback;
+    const s = v.trim();
+    return s || fallback;
 }
 
-function envBool(name: string): boolean {
-    const v = (process.env[name] ?? "").trim().toLowerCase();
-    return v === "1" || v === "true" || v === "yes" || v === "on";
+function envInt(name: string, fallback: number): number {
+    const raw = envStr(name, "");
+    if (!raw) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
+function envBool(name: string, fallback = false): boolean {
+    const raw = envStr(name, "");
+    if (!raw) return fallback;
+    switch (raw.toLowerCase()) {
+        case "1":
+        case "true":
+        case "yes":
+        case "on":
+            return true;
+        case "0":
+        case "false":
+        case "no":
+        case "off":
+            return false;
+        default:
+            return fallback;
+    }
 }
 
 function nowStamp(): string {
@@ -21341,114 +25744,31 @@ function nowStamp(): string {
     return `${hh}:${mm}:${ss}`;
 }
 
-function log(...args: unknown[]) {
-    // eslint-disable-next-line no-console
+function log(...args: unknown[]): void {
     console.log(`[dev ${nowStamp()}]`, ...args);
 }
 
-function warn(...args: unknown[]) {
-    // eslint-disable-next-line no-console
+function warn(...args: unknown[]): void {
     console.warn(`[dev ${nowStamp()}]`, ...args);
 }
 
-function errlog(...args: unknown[]) {
-    // eslint-disable-next-line no-console
+function errlog(...args: unknown[]): void {
     console.error(`[dev ${nowStamp()}]`, ...args);
 }
 
+function serviceLog(name: ServiceName, stream: "stdout" | "stderr", line: string): void {
+    const prefix = `[${name}:${stream}]`;
+    if (stream === "stderr") {
+        console.error(prefix, line);
+    } else {
+        console.log(prefix, line);
+    }
+}
+
 function bunBin(): string {
-    // Usually bun is the current execPath, but if not, resolve via PATH.
-    const ep = (process.execPath ?? "").toLowerCase();
-    if (ep.includes("bun")) return process.execPath;
+    const execPath = String(process.execPath ?? "");
+    if (execPath.toLowerCase().includes("bun")) return execPath;
     return Bun.which("bun") ?? "bun";
-}
-
-async function runOnce(name: string, cwd: string, cmd: string[], extraEnv?: Record<string, string>): Promise<void> {
-    log(`> (${name}) ${cmd.join(" ")}`);
-
-    const p = Bun.spawn({
-        cmd,
-        cwd,
-        stdout: "inherit",
-        stderr: "inherit",
-        env: { ...process.env, ...(extraEnv ?? {}) },
-    });
-
-    const code = await p.exited;
-    if (code !== 0) throw new Error(`${name} failed (exit ${code})`);
-}
-
-function runLong(name: string, cwd: string, cmd: string[], extraEnv?: Record<string, string>): Proc {
-    log(`+ (${name}) ${cmd.join(" ")}`);
-
-    const p = Bun.spawn({
-        cmd,
-        cwd,
-        stdout: "inherit",
-        stderr: "inherit",
-        env: { ...process.env, ...(extraEnv ?? {}) },
-    });
-
-    // If any long-running process exits unexpectedly, shut everything down.
-    p.exited.then((code) => {
-        if (shuttingDown) return;
-        errlog(`${name} exited (exit ${code})`);
-        shutdown(code === 0 ? 0 : 1);
-    });
-
-    return { name, proc: p };
-}
-
-function shutdown(exitCode = 0): void {
-    if (shuttingDown) return;
-    shuttingDown = true;
-
-    // Try graceful first
-    for (const p of procs) {
-        try {
-            p.proc.kill("SIGTERM");
-        } catch {
-            // ignore
-        }
-    }
-
-    // Then hard-kill if still around
-    setTimeout(() => {
-        for (const p of procs) {
-            try {
-                p.proc.kill("SIGKILL");
-            } catch {
-                // ignore
-            }
-        }
-        process.exit(exitCode);
-    }, 300);
-}
-
-process.on("SIGINT", () => shutdown(0));
-process.on("SIGTERM", () => shutdown(0));
-process.on("uncaughtException", (e) => {
-    errlog("uncaughtException:", e);
-    shutdown(1);
-});
-process.on("unhandledRejection", (e) => {
-    errlog("unhandledRejection:", e);
-    shutdown(1);
-});
-
-function readJsonFile<T>(filePath: string): T | null {
-    try {
-        const txt = fs.readFileSync(filePath, "utf8");
-        return JSON.parse(txt) as T;
-    } catch {
-        return null;
-    }
-}
-
-function apiHasScript(scriptName: string): boolean {
-    const pjPath = path.join(API_CWD, "package.json");
-    const json = readJsonFile<{ scripts?: Record<string, string> }>(pjPath);
-    return Boolean(json?.scripts && Object.prototype.hasOwnProperty.call(json.scripts, scriptName));
 }
 
 function fileExists(p: string): boolean {
@@ -21459,79 +25779,930 @@ function fileExists(p: string): boolean {
     }
 }
 
-/* -------------------------------- bootstrap -------------------------------- */
-
-async function bootstrapDb(bunPath: string): Promise<void> {
-    if (envBool("BP_DEV_SKIP_DB")) {
-        log("BP_DEV_SKIP_DB=1 -> skipping db bootstrap");
-        return;
+function dirExists(p: string): boolean {
+    try {
+        return fs.existsSync(p) && fs.statSync(p).isDirectory();
+    } catch {
+        return false;
     }
+}
 
-    // Prefer db:bootstrap if present; otherwise migrate+seed.
-    if (apiHasScript("db:bootstrap")) {
-        await runOnce("api:db:bootstrap", API_CWD, [bunPath, "run", "db:bootstrap"]);
-    } else {
-        warn("apps/api has no db:bootstrap script; falling back to db:migrate + db:seed");
-        if (apiHasScript("db:migrate")) await runOnce("api:db:migrate", API_CWD, [bunPath, "run", "db:migrate"]);
-        if (apiHasScript("db:seed")) await runOnce("api:db:seed", API_CWD, [bunPath, "run", "db:seed"]);
+function normalizeAbs(p: string): string {
+    return path.isAbsolute(p) ? path.normalize(p) : path.resolve(ROOT, p);
+}
+
+function readJsonFile<T>(filePath: string): T | null {
+    try {
+        return JSON.parse(fs.readFileSync(filePath, "utf8")) as T;
+    } catch {
+        return null;
     }
+}
 
-    // Optional OSIS import
-    const osisPath = envStr("BP_DEV_IMPORT_OSIS", "");
-    if (osisPath) {
-        if (!fileExists(osisPath)) {
-            warn("BP_DEV_IMPORT_OSIS was set but file does not exist:", osisPath);
-        } else if (apiHasScript("import:osis")) {
-            // Prefer script; if it expects a path argument, pass it.
-            await runOnce("api:import:osis", API_CWD, [bunPath, "run", "import:osis", osisPath], {
-                // Optional knobs:
-                // BP_IMPORT_SET_DEFAULT: "1",
-            });
+function readPackageJson(pkgDir: string): PackageJson {
+    const pkgPath = path.join(pkgDir, "package.json");
+    const pkg = readJsonFile<PackageJson>(pkgPath);
+    if (!pkg) {
+        throw new Error(`invalid or missing package.json at ${pkgPath}`);
+    }
+    return pkg;
+}
+
+function hasScript(pkgDir: string, scriptName: string): boolean {
+    const pkg = readPackageJson(pkgDir);
+    return Boolean(pkg.scripts && Object.prototype.hasOwnProperty.call(pkg.scripts, scriptName));
+}
+
+function assertRepoShape(): void {
+    if (!dirExists(API_CWD)) {
+        throw new Error(`apps/api not found at ${API_CWD} (run from repo root)`);
+    }
+    if (!dirExists(WEB_CWD)) {
+        throw new Error(`apps/web not found at ${WEB_CWD} (run from repo root)`);
+    }
+    if (!fileExists(path.join(API_CWD, "package.json"))) {
+        throw new Error(`missing package.json in ${API_CWD}`);
+    }
+    if (!fileExists(path.join(WEB_CWD, "package.json"))) {
+        throw new Error(`missing package.json in ${WEB_CWD}`);
+    }
+}
+
+function assertScript(pkgDir: string, scriptName: string, label: string): void {
+    if (!hasScript(pkgDir, scriptName)) {
+        throw new Error(`${label} script "${scriptName}" not found in ${path.join(pkgDir, "package.json")}`);
+    }
+}
+
+function resolveOsisPath(raw: string): string {
+    return normalizeAbs(raw);
+}
+
+async function pumpStream(
+    name: ServiceName,
+    streamName: "stdout" | "stderr",
+    stream: ReadableStream<Uint8Array> | null | undefined,
+): Promise<void> {
+    if (!stream) return;
+
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let carry = "";
+
+    try {
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+
+            carry += decoder.decode(value, { stream: true });
+
+            for (;;) {
+                const nl = carry.indexOf("\n");
+                if (nl < 0) break;
+
+                let line = carry.slice(0, nl);
+                carry = carry.slice(nl + 1);
+
+                if (line.endsWith("\r")) line = line.slice(0, -1);
+                if (line.length > 0) serviceLog(name, streamName, line);
+            }
+        }
+
+        carry += decoder.decode();
+        const finalLine = carry.replace(/\r$/, "");
+        if (finalLine.length > 0) serviceLog(name, streamName, finalLine);
+    } catch (e) {
+        if (!shuttingDown) {
+            errlog(`${name} ${streamName} pump failed:`, e);
+        }
+    } finally {
+        try {
+            reader.releaseLock();
+        } catch {
+            // ignore
+        }
+    }
+}
+
+async function runOnce(
+    name: string,
+    cwd: string,
+    cmd: string[],
+    extraEnv?: Record<string, string>,
+): Promise<void> {
+    log(`> (${name}) ${cmd.join(" ")}`);
+
+    const p = Bun.spawn({
+        cmd,
+        cwd,
+        env: { ...process.env, ...(extraEnv ?? {}) },
+        stdout: "inherit",
+        stderr: "inherit",
+    });
+
+    const code = await p.exited;
+    if (code !== 0) {
+        throw new Error(`${name} failed (exit ${code})`);
+    }
+}
+
+function runLong(
+    name: ServiceName,
+    cwd: string,
+    cmd: string[],
+    extraEnv?: Record<string, string>,
+): Proc {
+    log(`+ (${name}) ${cmd.join(" ")}`);
+
+    const proc = Bun.spawn({
+        cmd,
+        cwd,
+        env: { ...process.env, ...(extraEnv ?? {}) },
+        stdout: "pipe",
+        stderr: "pipe",
+    });
+
+    const stdoutDone = pumpStream(name, "stdout", proc.stdout);
+    const stderrDone = pumpStream(name, "stderr", proc.stderr);
+
+    proc.exited.then((code) => {
+        if (shuttingDown) return;
+
+        const exitCode = typeof code === "number" ? code : 1;
+        if (exitCode === 0) {
+            errlog(`${name} exited unexpectedly with code 0`);
         } else {
-            warn("apps/api has no import:osis script; skipping import");
+            errlog(`${name} exited with code ${exitCode}`);
+        }
+
+        void shutdown(exitCode === 0 ? 1 : exitCode, `${name} exited`);
+    });
+
+    return { name, proc, stdoutDone, stderrDone };
+}
+
+async function waitMs(ms: number): Promise<void> {
+    await Bun.sleep(ms);
+}
+
+async function shutdown(exitCode = 0, reason = "shutdown"): Promise<never> {
+    if (finalized) {
+        process.exit(exitCode);
+    }
+
+    if (shuttingDown) {
+        if (!shutdownRequestedBy) shutdownRequestedBy = reason;
+        return new Promise<never>(() => {
+            /* never resolves */
+        });
+    }
+
+    shuttingDown = true;
+    shutdownRequestedBy = reason;
+
+    const graceMs = Math.max(100, envInt("BP_DEV_SHUTDOWN_GRACE_MS", 2500));
+    log(`shutting down (${reason})...`);
+
+    for (const p of procs) {
+        try {
+            p.proc.kill("SIGTERM");
+        } catch {
+            // ignore
         }
     }
 
-    // Optional verify
-    if (envBool("BP_DEV_VERIFY_DB") && apiHasScript("db:verify")) {
+    const waitAll = Promise.allSettled(
+        procs.map(async (p) => {
+            try {
+                await Promise.race([
+                    p.proc.exited,
+                    waitMs(graceMs),
+                ]);
+            } catch {
+                // ignore
+            }
+        }),
+    );
+
+    await waitAll;
+
+    for (const p of procs) {
+        try {
+            p.proc.kill("SIGKILL");
+        } catch {
+            // ignore
+        }
+    }
+
+    await Promise.allSettled(
+        procs.flatMap((p) => [p.stdoutDone, p.stderrDone]),
+    );
+
+    finalized = true;
+    process.exit(exitCode);
+}
+
+async function waitForApiHealth(): Promise<void> {
+    const enabled = envBool("BP_DEV_WAIT_FOR_API", true);
+    if (!enabled) {
+        log("BP_DEV_WAIT_FOR_API=0 -> skipping API health wait");
+        return;
+    }
+
+    const url = envStr("BP_DEV_API_HEALTH_URL", "http://localhost:3000/health");
+    const timeoutMs = Math.max(1000, envInt("BP_DEV_API_HEALTH_TIMEOUT_MS", 45_000));
+    const intervalMs = Math.max(100, envInt("BP_DEV_API_HEALTH_INTERVAL_MS", 350));
+
+    log(`waiting for API health: ${url}`);
+
+    const start = Date.now();
+    let lastErr: unknown = null;
+
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const res = await fetch(url, {
+                method: "GET",
+                headers: { accept: "application/json,text/plain,*/*" },
+            });
+
+            if (res.ok) {
+                log(`API healthy (${res.status})`);
+                return;
+            }
+
+            lastErr = new Error(`health returned ${res.status}`);
+        } catch (e) {
+            lastErr = e;
+        }
+
+        await waitMs(intervalMs);
+    }
+
+    throw new Error(`API health check timed out after ${timeoutMs}ms (${String(lastErr ?? "unknown error")})`);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                 bootstrap                                   */
+/* -------------------------------------------------------------------------- */
+
+async function bootstrapDb(bunPath: string): Promise<void> {
+    if (envBool("BP_DEV_SKIP_DB")) {
+        log("BP_DEV_SKIP_DB=1 -> skipping DB bootstrap");
+        return;
+    }
+
+    if (hasScript(API_CWD, "db:bootstrap")) {
+        await runOnce("api:db:bootstrap", API_CWD, [bunPath, "run", "db:bootstrap"]);
+    } else {
+        warn(`apps/api has no "db:bootstrap"; falling back to db:migrate + db:seed`);
+
+        if (hasScript(API_CWD, "db:migrate")) {
+            await runOnce("api:db:migrate", API_CWD, [bunPath, "run", "db:migrate"]);
+        } else {
+            warn(`apps/api missing "db:migrate"`);
+        }
+
+        if (hasScript(API_CWD, "db:seed")) {
+            await runOnce("api:db:seed", API_CWD, [bunPath, "run", "db:seed"]);
+        } else {
+            warn(`apps/api missing "db:seed"`);
+        }
+    }
+
+    const osisRaw = envStr("BP_DEV_IMPORT_OSIS", "");
+    if (osisRaw) {
+        const osisPath = resolveOsisPath(osisRaw);
+
+        if (!fileExists(osisPath)) {
+            warn(`BP_DEV_IMPORT_OSIS set but file does not exist: ${osisPath}`);
+        } else if (hasScript(API_CWD, "import:osis")) {
+            const extraEnv: Record<string, string> = {};
+
+            if (envBool("BP_DEV_IMPORT_SET_DEFAULT")) {
+                extraEnv.BP_IMPORT_SET_DEFAULT = "1";
+            }
+
+            await runOnce("api:import:osis", API_CWD, [bunPath, "run", "import:osis", osisPath], extraEnv);
+        } else {
+            warn(`apps/api has no "import:osis" script; skipping OSIS import`);
+        }
+    }
+
+    if (envBool("BP_DEV_VERIFY_DB") && hasScript(API_CWD, "db:verify")) {
         await runOnce("api:db:verify", API_CWD, [bunPath, "run", "db:verify"]);
     }
 }
 
-/* ---------------------------------- main ---------------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                    main                                     */
+/* -------------------------------------------------------------------------- */
 
 async function main(): Promise<void> {
     const bunPath = bunBin();
 
-    log("=== Biblia Populi Dev ===");
+    const noApi = envBool("BP_DEV_NO_API");
+    const noWeb = envBool("BP_DEV_NO_WEB");
+
+    const apiScript = envStr("BP_DEV_API_SCRIPT", "dev");
+    const webScript = envStr("BP_DEV_WEB_SCRIPT", "dev");
+
+    log(`=== ${DEV_NAME} ===`);
     log("ROOT:", ROOT);
     log("API :", API_CWD);
     log("WEB :", WEB_CWD);
     log("BUN :", bunPath);
 
-    // Basic sanity (helps when run from wrong folder)
-    if (!fileExists(path.join(API_CWD, "package.json"))) {
-        throw new Error(`apps/api not found at ${API_CWD} (run from repo root)`);
-    }
-    if (!fileExists(path.join(WEB_CWD, "package.json"))) {
-        throw new Error(`apps/web not found at ${WEB_CWD} (run from repo root)`);
+    assertRepoShape();
+
+    if (!noApi) assertScript(API_CWD, apiScript, "apps/api");
+    if (!noWeb) assertScript(WEB_CWD, webScript, "apps/web");
+
+    if (noApi && noWeb) {
+        throw new Error("both BP_DEV_NO_API=1 and BP_DEV_NO_WEB=1 were set; nothing to run");
     }
 
-    await bootstrapDb(bunPath);
+    if (!noApi) {
+        await bootstrapDb(bunPath);
+    } else {
+        log("BP_DEV_NO_API=1 -> skipping API bootstrap and API process start");
+    }
 
-    // Optional env overrides for web dev server (handy for remote api)
     const viteApiBase = envStr("BP_DEV_VITE_API_BASE", "");
     const webEnv = viteApiBase ? { VITE_API_BASE: viteApiBase } : undefined;
 
-    procs.push(runLong("api", API_CWD, [bunPath, "run", "dev"]));
-    procs.push(runLong("web", WEB_CWD, [bunPath, "run", "dev"], webEnv));
+    if (!noApi) {
+        procs.push(runLong("api", API_CWD, [bunPath, "run", apiScript]));
+    }
 
-    log("running. Ctrl+C to stop.");
+    if (!noApi && !noWeb) {
+        await waitForApiHealth();
+    }
+
+    if (!noWeb) {
+        procs.push(runLong("web", WEB_CWD, [bunPath, "run", webScript], webEnv));
+    } else {
+        log("BP_DEV_NO_WEB=1 -> skipping web process start");
+    }
+
+    log("running. Press Ctrl+C to stop.");
 }
 
-main().catch((e) => {
+/* -------------------------------------------------------------------------- */
+/*                              process lifecycle                              */
+/* -------------------------------------------------------------------------- */
+
+process.on("SIGINT", () => {
+    void shutdown(0, "SIGINT");
+});
+
+process.on("SIGTERM", () => {
+    void shutdown(0, "SIGTERM");
+});
+
+process.on("uncaughtException", (e) => {
+    errlog("uncaughtException:", e);
+    void shutdown(1, "uncaughtException");
+});
+
+process.on("unhandledRejection", (e) => {
+    errlog("unhandledRejection:", e);
+    void shutdown(1, "unhandledRejection");
+});
+
+void main().catch((e) => {
     errlog("fatal:", e);
-    shutdown(1);
+    void shutdown(1, "startup failure");
+});
+```
+
+### scripts/prod.ts
+
+```ts
+// scripts/prod.ts
+// Biblia.to — root production runner (Bun-first, hardened)
+//
+// Run from repo root:
+//   bun scripts/prod.ts
+//   bun run prod
+//
+// Purpose:
+// - Optional root preflight
+// - Optional API DB bootstrap / verify
+// - Build web/api if requested
+// - Start API and/or preview web in "production-ish" local mode
+// - Graceful shutdown with escalation
+// - Prefixed child logs
+//
+// This is for local/staging/prod-like orchestration from the monorepo root.
+// It is not a replacement for Docker/systemd/k8s, but it's excellent for
+// single-machine deployment and validation.
+//
+// Env / flags:
+//
+// Service control:
+//   BP_PROD_NO_API=1
+//   BP_PROD_NO_WEB=1
+//
+// Scripts:
+//   BP_PROD_API_START_SCRIPT=start        default: start
+//   BP_PROD_WEB_START_SCRIPT=preview      default: preview
+//   BP_PROD_BUILD_API_SCRIPT=build        default: build
+//   BP_PROD_BUILD_WEB_SCRIPT=build        default: build
+//
+// Build / bootstrap:
+//   BP_PROD_SKIP_BUILD=1
+//   BP_PROD_SKIP_DB=1
+//   BP_PROD_VERIFY_DB=1
+//
+// API health:
+//   BP_PROD_WAIT_FOR_API=1                default: 1
+//   BP_PROD_API_HEALTH_URL=http://localhost:3000/health
+//   BP_PROD_API_HEALTH_TIMEOUT_MS=45000
+//   BP_PROD_API_HEALTH_INTERVAL_MS=500
+//
+// Web preview env passthrough:
+//   BP_PROD_VITE_API_BASE=http://localhost:3000
+//
+// Shutdown:
+//   BP_PROD_SHUTDOWN_GRACE_MS=4000
+//
+// Examples:
+//   bun scripts/prod.ts
+//   BP_PROD_VERIFY_DB=1 bun scripts/prod.ts
+//   BP_PROD_NO_WEB=1 bun scripts/prod.ts
+//   BP_PROD_SKIP_BUILD=1 bun scripts/prod.ts
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as process from "node:process";
+
+type BunSubprocess = ReturnType<typeof Bun.spawn>;
+type ServiceName = "api" | "web";
+
+type Proc = {
+    name: ServiceName;
+    proc: BunSubprocess;
+    stdoutDone: Promise<void>;
+    stderrDone: Promise<void>;
+};
+
+type PackageJson = {
+    name?: string;
+    scripts?: Record<string, string>;
+};
+
+const ROOT = process.cwd();
+const API_CWD = path.join(ROOT, "apps", "api");
+const WEB_CWD = path.join(ROOT, "apps", "web");
+
+const procs: Proc[] = [];
+let shuttingDown = false;
+let finalized = false;
+
+/* -------------------------------------------------------------------------- */
+/*                                   helpers                                  */
+/* -------------------------------------------------------------------------- */
+
+function nowStamp(): string {
+    const d = new Date();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    return `${hh}:${mm}:${ss}`;
+}
+
+function log(...args: unknown[]): void {
+    console.log(`[prod ${nowStamp()}]`, ...args);
+}
+
+function warn(...args: unknown[]): void {
+    console.warn(`[prod ${nowStamp()}]`, ...args);
+}
+
+function errlog(...args: unknown[]): void {
+    console.error(`[prod ${nowStamp()}]`, ...args);
+}
+
+function envStr(name: string, fallback = ""): string {
+    const v = process.env[name];
+    if (typeof v !== "string") return fallback;
+    const s = v.trim();
+    return s || fallback;
+}
+
+function envInt(name: string, fallback: number): number {
+    const raw = envStr(name, "");
+    if (!raw) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
+function envBool(name: string, fallback = false): boolean {
+    const raw = envStr(name, "");
+    if (!raw) return fallback;
+    switch (raw.toLowerCase()) {
+        case "1":
+        case "true":
+        case "yes":
+        case "on":
+            return true;
+        case "0":
+        case "false":
+        case "no":
+        case "off":
+            return false;
+        default:
+            return fallback;
+    }
+}
+
+function exists(p: string): boolean {
+    try {
+        return fs.existsSync(p);
+    } catch {
+        return false;
+    }
+}
+
+function isDirectory(p: string): boolean {
+    try {
+        return fs.statSync(p).isDirectory();
+    } catch {
+        return false;
+    }
+}
+
+function bunBin(): string {
+    const execPath = String(process.execPath ?? "");
+    if (execPath.toLowerCase().includes("bun")) return execPath;
+    return Bun.which("bun") ?? "bun";
+}
+
+function readJsonFile<T>(filePath: string): T | null {
+    try {
+        return JSON.parse(fs.readFileSync(filePath, "utf8")) as T;
+    } catch {
+        return null;
+    }
+}
+
+function readPackageJson(pkgDir: string): PackageJson {
+    const pkgPath = path.join(pkgDir, "package.json");
+    const pkg = readJsonFile<PackageJson>(pkgPath);
+    if (!pkg) throw new Error(`invalid or missing package.json at ${pkgPath}`);
+    return pkg;
+}
+
+function hasScript(pkgDir: string, scriptName: string): boolean {
+    const pkg = readPackageJson(pkgDir);
+    return Boolean(pkg.scripts && Object.prototype.hasOwnProperty.call(pkg.scripts, scriptName));
+}
+
+function assertRepoShape(): void {
+    if (!exists(path.join(ROOT, "package.json"))) {
+        throw new Error(`missing package.json at ${ROOT}`);
+    }
+    if (!isDirectory(API_CWD)) {
+        throw new Error(`apps/api not found at ${API_CWD}`);
+    }
+    if (!isDirectory(WEB_CWD)) {
+        throw new Error(`apps/web not found at ${WEB_CWD}`);
+    }
+}
+
+function assertScript(pkgDir: string, scriptName: string, label: string): void {
+    if (!hasScript(pkgDir, scriptName)) {
+        throw new Error(`${label} script "${scriptName}" not found in ${path.join(pkgDir, "package.json")}`);
+    }
+}
+
+async function waitMs(ms: number): Promise<void> {
+    await Bun.sleep(ms);
+}
+
+function serviceLog(name: ServiceName, stream: "stdout" | "stderr", line: string): void {
+    const prefix = `[${name}:${stream}]`;
+    if (stream === "stderr") console.error(prefix, line);
+    else console.log(prefix, line);
+}
+
+async function pumpStream(
+    name: ServiceName,
+    streamName: "stdout" | "stderr",
+    stream: ReadableStream<Uint8Array> | null | undefined,
+): Promise<void> {
+    if (!stream) return;
+
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let carry = "";
+
+    try {
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+
+            carry += decoder.decode(value, { stream: true });
+
+            for (;;) {
+                const nl = carry.indexOf("\n");
+                if (nl < 0) break;
+
+                let line = carry.slice(0, nl);
+                carry = carry.slice(nl + 1);
+
+                if (line.endsWith("\r")) line = line.slice(0, -1);
+                if (line.length > 0) serviceLog(name, streamName, line);
+            }
+        }
+
+        carry += decoder.decode();
+        const finalLine = carry.replace(/\r$/, "");
+        if (finalLine.length > 0) serviceLog(name, streamName, finalLine);
+    } catch (e) {
+        if (!shuttingDown) errlog(`${name} ${streamName} pump failed:`, e);
+    } finally {
+        try {
+            reader.releaseLock();
+        } catch {
+            // ignore
+        }
+    }
+}
+
+async function runOnce(
+    name: string,
+    cwd: string,
+    cmd: string[],
+    extraEnv?: Record<string, string>,
+): Promise<void> {
+    log(`> (${name}) ${cmd.join(" ")}`);
+
+    const p = Bun.spawn({
+        cmd,
+        cwd,
+        env: { ...process.env, ...(extraEnv ?? {}) },
+        stdout: "inherit",
+        stderr: "inherit",
+    });
+
+    const code = await p.exited;
+    if (code !== 0) {
+        throw new Error(`${name} failed (exit ${code})`);
+    }
+}
+
+function runLong(
+    name: ServiceName,
+    cwd: string,
+    cmd: string[],
+    extraEnv?: Record<string, string>,
+): Proc {
+    log(`+ (${name}) ${cmd.join(" ")}`);
+
+    const proc = Bun.spawn({
+        cmd,
+        cwd,
+        env: { ...process.env, ...(extraEnv ?? {}) },
+        stdout: "pipe",
+        stderr: "pipe",
+    });
+
+    const stdoutDone = pumpStream(name, "stdout", proc.stdout);
+    const stderrDone = pumpStream(name, "stderr", proc.stderr);
+
+    proc.exited.then((code) => {
+        if (shuttingDown) return;
+        const exitCode = typeof code === "number" ? code : 1;
+        errlog(`${name} exited with code ${exitCode}`);
+        void shutdown(exitCode === 0 ? 1 : exitCode, `${name} exited`);
+    });
+
+    return { name, proc, stdoutDone, stderrDone };
+}
+
+async function shutdown(exitCode = 0, reason = "shutdown"): Promise<never> {
+    if (finalized) process.exit(exitCode);
+
+    if (shuttingDown) {
+        return new Promise<never>(() => {
+            /* never resolves */
+        });
+    }
+
+    shuttingDown = true;
+
+    const graceMs = Math.max(100, envInt("BP_PROD_SHUTDOWN_GRACE_MS", 4000));
+    log(`shutting down (${reason})...`);
+
+    for (const p of procs) {
+        try {
+            p.proc.kill("SIGTERM");
+        } catch {
+            // ignore
+        }
+    }
+
+    await Promise.allSettled(
+        procs.map(async (p) => {
+            try {
+                await Promise.race([p.proc.exited, waitMs(graceMs)]);
+            } catch {
+                // ignore
+            }
+        }),
+    );
+
+    for (const p of procs) {
+        try {
+            p.proc.kill("SIGKILL");
+        } catch {
+            // ignore
+        }
+    }
+
+    await Promise.allSettled(
+        procs.flatMap((p) => [p.stdoutDone, p.stderrDone]),
+    );
+
+    finalized = true;
+    process.exit(exitCode);
+}
+
+async function waitForApiHealth(): Promise<void> {
+    const enabled = envBool("BP_PROD_WAIT_FOR_API", true);
+    if (!enabled) {
+        log("BP_PROD_WAIT_FOR_API=0 -> skipping API health wait");
+        return;
+    }
+
+    const url = envStr("BP_PROD_API_HEALTH_URL", "http://localhost:3000/health");
+    const timeoutMs = Math.max(1000, envInt("BP_PROD_API_HEALTH_TIMEOUT_MS", 45_000));
+    const intervalMs = Math.max(100, envInt("BP_PROD_API_HEALTH_INTERVAL_MS", 500));
+
+    log(`waiting for API health: ${url}`);
+
+    const start = Date.now();
+    let lastErr: unknown = null;
+
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const res = await fetch(url, {
+                method: "GET",
+                headers: { accept: "application/json,text/plain,*/*" },
+            });
+
+            if (res.ok) {
+                log(`API healthy (${res.status})`);
+                return;
+            }
+
+            lastErr = new Error(`health returned ${res.status}`);
+        } catch (e) {
+            lastErr = e;
+        }
+
+        await waitMs(intervalMs);
+    }
+
+    throw new Error(`API health check timed out after ${timeoutMs}ms (${String(lastErr ?? "unknown error")})`);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                prod workflow                               */
+/* -------------------------------------------------------------------------- */
+
+async function bootstrapDb(bunPath: string): Promise<void> {
+    if (envBool("BP_PROD_SKIP_DB")) {
+        log("BP_PROD_SKIP_DB=1 -> skipping DB bootstrap");
+        return;
+    }
+
+    if (hasScript(API_CWD, "db:bootstrap")) {
+        await runOnce("api:db:bootstrap", API_CWD, [bunPath, "run", "db:bootstrap"]);
+    } else {
+        warn(`apps/api has no "db:bootstrap"; falling back to db:migrate + db:seed`);
+
+        if (hasScript(API_CWD, "db:migrate")) {
+            await runOnce("api:db:migrate", API_CWD, [bunPath, "run", "db:migrate"]);
+        }
+        if (hasScript(API_CWD, "db:seed")) {
+            await runOnce("api:db:seed", API_CWD, [bunPath, "run", "db:seed"]);
+        }
+    }
+
+    if (envBool("BP_PROD_VERIFY_DB") && hasScript(API_CWD, "db:verify")) {
+        await runOnce("api:db:verify", API_CWD, [bunPath, "run", "db:verify"]);
+    }
+}
+
+async function buildIfNeeded(
+    bunPath: string,
+    noApi: boolean,
+    noWeb: boolean,
+    apiBuildScript: string,
+    webBuildScript: string,
+): Promise<void> {
+    if (envBool("BP_PROD_SKIP_BUILD")) {
+        log("BP_PROD_SKIP_BUILD=1 -> skipping builds");
+        return;
+    }
+
+    if (!noApi) {
+        assertScript(API_CWD, apiBuildScript, "apps/api");
+        await runOnce("api:build", API_CWD, [bunPath, "run", apiBuildScript]);
+    }
+
+    if (!noWeb) {
+        assertScript(WEB_CWD, webBuildScript, "apps/web");
+        await runOnce("web:build", WEB_CWD, [bunPath, "run", webBuildScript]);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                    main                                    */
+/* -------------------------------------------------------------------------- */
+
+async function main(): Promise<void> {
+    const bunPath = bunBin();
+
+    const noApi = envBool("BP_PROD_NO_API");
+    const noWeb = envBool("BP_PROD_NO_WEB");
+
+    const apiStartScript = envStr("BP_PROD_API_START_SCRIPT", "start");
+    const webStartScript = envStr("BP_PROD_WEB_START_SCRIPT", "preview");
+    const apiBuildScript = envStr("BP_PROD_BUILD_API_SCRIPT", "build");
+    const webBuildScript = envStr("BP_PROD_BUILD_WEB_SCRIPT", "build");
+
+    log("=== Biblia.to Prod ===");
+    log("ROOT:", ROOT);
+    log("API :", API_CWD);
+    log("WEB :", WEB_CWD);
+    log("BUN :", bunPath);
+
+    assertRepoShape();
+
+    if (noApi && noWeb) {
+        throw new Error("both BP_PROD_NO_API=1 and BP_PROD_NO_WEB=1 were set; nothing to run");
+    }
+
+    if (!noApi) {
+        assertScript(API_CWD, apiStartScript, "apps/api");
+    }
+    if (!noWeb) {
+        assertScript(WEB_CWD, webStartScript, "apps/web");
+    }
+
+    if (!noApi) {
+        await bootstrapDb(bunPath);
+    } else {
+        log("BP_PROD_NO_API=1 -> skipping DB bootstrap");
+    }
+
+    await buildIfNeeded(bunPath, noApi, noWeb, apiBuildScript, webBuildScript);
+
+    if (!noApi) {
+        procs.push(runLong("api", API_CWD, [bunPath, "run", apiStartScript]));
+    }
+
+    if (!noApi && !noWeb) {
+        await waitForApiHealth();
+    }
+
+    if (!noWeb) {
+        const viteApiBase = envStr("BP_PROD_VITE_API_BASE", "");
+        const webEnv = viteApiBase ? { VITE_API_BASE: viteApiBase } : undefined;
+        procs.push(runLong("web", WEB_CWD, [bunPath, "run", webStartScript], webEnv));
+    }
+
+    log("running. Press Ctrl+C to stop.");
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              process lifecycle                              */
+/* -------------------------------------------------------------------------- */
+
+process.on("SIGINT", () => {
+    void shutdown(0, "SIGINT");
+});
+
+process.on("SIGTERM", () => {
+    void shutdown(0, "SIGTERM");
+});
+
+process.on("uncaughtException", (e) => {
+    errlog("uncaughtException:", e);
+    void shutdown(1, "uncaughtException");
+});
+
+process.on("unhandledRejection", (e) => {
+    errlog("unhandledRejection:", e);
+    void shutdown(1, "unhandledRejection");
+});
+
+void main().catch((e) => {
+    errlog("fatal:", e);
+    void shutdown(1, "startup failure");
 });
 ```
 

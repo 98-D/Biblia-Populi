@@ -1,27 +1,23 @@
 // apps/api/src/db/annotationSchema.ts
 // Biblia.to — Reader Annotations schema (user data; NOT canon)
 //
-// Deep upgrade goals (virtualized-reader + future-proof):
-// - Virtualization-safe anchors: verse-ord ranges + optional token spans + optional token char offsets
-// - Supports: highlights, notes, drawings/ink, bookmarks, tags, attachments, history, sharing exports
-// - Sync-friendly: per-row rev + updatedAtMs + tombstones + idempotency keys + conflict-safe writes
-// - Fast querying: by user, by updatedAt, by verseOrd range overlap, by kind
-// - Durable styling: palette-based + explicit per-annotation style JSON
-// - Ink scaling: normalized coords, bbox, stroke chunks, compression-ready
-// - Audit/undo: event log optional (append-only), and snapshot helpers
+// Hardened goals:
+// - Virtualization-safe anchors: verse-ord truth + optional token spans + optional char offsets
+// - Durable user data that survives canon/token rebuilds
+// - Stronger invariants between related fields
+// - Sync-friendly writes: rev, tombstones, idempotency, device/client metadata
+// - Better relational structure for collections + sharing
+// - Ink storage supports both inline and chunked payloads
 //
-// Anchoring model (truth):
-// - Structural truth: startVerseOrd/endVerseOrd ALWAYS (range overlap queryable)
-// - Exact selection: (startVerseKey/endVerseKey + token indices + char offsets) optional and used for precision
-// - Never store viewport pixels as truth.
-//
-// Notes:
+// Important:
 // - This module references bpUser from authSchema.
-// - It intentionally does NOT reference canon tables with foreign keys (bp_verse, bp_token, etc.)
-//   because those are "canon-ish" and may be rebuilt; annotations should survive rebuilds.
-//   We keep verseKey/translationId fields as plain TEXT with indexes.
+// - It intentionally does NOT FK to canon tables (bp_verse, bp_token, etc.).
+//   Annotation durability matters more than rebuild-coupled referential integrity.
 //
-// SQLite/Drizzle: timestamps are INTEGER ms epoch.
+// SQLite / Drizzle:
+// - All timestamps are INTEGER ms epoch.
+// - JSON payloads are stored as TEXT.
+// - Do not treat viewport pixels as truth.
 
 import {
     sqliteTable,
@@ -32,9 +28,16 @@ import {
     uniqueIndex,
     primaryKey,
     check,
+    foreignKey,
 } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 import { bpUser } from "./authSchema";
+
+/* --------------------------------- Helpers --------------------------------- */
+
+const lenGt0 = (col: unknown) => sql`length(${col as any}) > 0`;
+const lenGe = (col: unknown, n: number) => sql`length(${col as any}) >= ${n}`;
+const jsonNonEmptyArrayish = (col: unknown) => sql`length(trim(${col as any})) >= 2`;
 
 /* ---------------------------------- Enums ---------------------------------- */
 
@@ -47,9 +50,9 @@ export const AnnotationKind = {
 export type AnnotationKind = (typeof AnnotationKind)[keyof typeof AnnotationKind];
 
 export const AnchorKind = {
-    RANGE: "RANGE", // verse-ord range (required)
-    TOKEN_SPAN: "TOKEN_SPAN", // optional token indices/offsets for exactness
-    LOCATION: "LOCATION", // optional: exact single-verse "pin" (still has ord range; 1 verse)
+    RANGE: "RANGE",
+    TOKEN_SPAN: "TOKEN_SPAN",
+    LOCATION: "LOCATION",
 } as const;
 export type AnchorKind = (typeof AnchorKind)[keyof typeof AnchorKind];
 
@@ -73,11 +76,6 @@ export const PrivacyLevel = {
 } as const;
 export type PrivacyLevel = (typeof PrivacyLevel)[keyof typeof PrivacyLevel];
 
-/**
- * Palette is optional but recommended:
- * - gives consistent colors across devices
- * - allows user to rename/manage swatches
- */
 export const PaletteKind = {
     HIGHLIGHT: "HIGHLIGHT",
     INK: "INK",
@@ -85,66 +83,132 @@ export const PaletteKind = {
 } as const;
 export type PaletteKind = (typeof PaletteKind)[keyof typeof PaletteKind];
 
-/**
- * A minimal stable uuid-ish check for ids (don’t enforce strict uuid).
- * SQLite regex checks are annoying; keep checks simple.
- */
-const lenGt0 = (col: unknown) => sql`length(${col as any}) > 0`;
+export const AnnotationShareScope = {
+    ANNOTATIONS: "ANNOTATIONS",
+    COLLECTION: "COLLECTION",
+} as const;
+export type AnnotationShareScope = (typeof AnnotationShareScope)[keyof typeof AnnotationShareScope];
+
+export const InkStorageMode = {
+    INLINE: "INLINE",
+    CHUNKED: "CHUNKED",
+} as const;
+export type InkStorageMode = (typeof InkStorageMode)[keyof typeof InkStorageMode];
+
+export const AnnotationEventKind = {
+    CREATE: "CREATE",
+    UPDATE: "UPDATE",
+    DELETE: "DELETE",
+    RESTORE: "RESTORE",
+    ADD_STROKE: "ADD_STROKE",
+    DEL_STROKE: "DEL_STROKE",
+    ADD_LABEL: "ADD_LABEL",
+    DEL_LABEL: "DEL_LABEL",
+    MOVE_COLLECTION: "MOVE_COLLECTION",
+} as const;
+export type AnnotationEventKind = (typeof AnnotationEventKind)[keyof typeof AnnotationEventKind];
+
+/* -------------------------- Collections / Notebooks ------------------------- */
+
+export const bpAnnotationCollection = sqliteTable(
+    "bp_annotation_collection",
+    {
+        collectionId: text("collection_id").primaryKey(), // uuid/cuid/ulid
+        userId: text("user_id")
+            .notNull()
+            .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        name: text("name").notNull(),
+        nameNorm: text("name_norm").notNull(),
+
+        description: text("description"),
+        color: text("color"),
+        icon: text("icon"),
+
+        sortOrdinal: integer("sort_ordinal"),
+        createdAt: integer("created_at").notNull(),
+        updatedAt: integer("updated_at").notNull(),
+        deletedAt: integer("deleted_at"),
+    },
+    (t) => ({
+        userIdx: index("bp_annotation_collection_user_idx").on(t.userId, t.updatedAt),
+        userSortIdx: index("bp_annotation_collection_user_sort_idx").on(t.userId, t.sortOrdinal, t.updatedAt),
+        nameUq: uniqueIndex("bp_annotation_collection_name_uq").on(t.userId, t.nameNorm),
+
+        idCheck: check("bp_annotation_collection_id_check", lenGt0(t.collectionId)),
+        nameCheck: check("bp_annotation_collection_name_check", lenGt0(t.name)),
+        nameNormCheck: check("bp_annotation_collection_name_norm_check", lenGt0(t.nameNorm)),
+        sortCheck: check(
+            "bp_annotation_collection_sort_check",
+            sql`${t.sortOrdinal} is null or ${t.sortOrdinal} >= 0`,
+        ),
+        chronologyCheck: check(
+            "bp_annotation_collection_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_collection_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
+        ),
+    }),
+);
 
 /* ----------------------------- Core Annotation ------------------------------ */
 
-/**
- * bp_annotation
- * The user-owned “thing”: highlight/note/ink/bookmark/etc.
- * Spans/strokes/labels/attachments hang off this id.
- */
 export const bpAnnotation = sqliteTable(
     "bp_annotation",
     {
-        annotationId: text("annotation_id").primaryKey(), // uuid/cuid/ksuid (app-generated)
+        annotationId: text("annotation_id").primaryKey(), // uuid/cuid/ksuid/ulid
         userId: text("user_id")
             .notNull()
             .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
 
         kind: text("kind").notNull(), // AnnotationKind
 
-        // Optimistic sync revision (monotonic per annotation).
-        // Any write increments rev.
+        // Optimistic concurrency / sync revision.
         rev: integer("rev").notNull().default(1),
 
-        // Idempotency key (optional): lets clients retry safely.
-        // Typical: "deviceId:ulid" or request hash.
+        // Idempotent write support.
         idempotencyKey: text("idempotency_key"),
 
-        createdAt: integer("created_at").notNull(), // ms epoch
-        updatedAt: integer("updated_at").notNull(), // ms epoch
-        deletedAt: integer("deleted_at"), // ms epoch (nullable; soft delete/tombstone)
+        // Device / client metadata for debugging + sync reconciliation.
+        createdDeviceId: text("created_device_id"),
+        updatedDeviceId: text("updated_device_id"),
+        clientCreatedAt: integer("client_created_at"),
+        clientUpdatedAt: integer("client_updated_at"),
 
-        // Optional “foldering” / grouping
-        collectionId: text("collection_id"), // optional (user-defined notebooks, etc.)
-        title: text("title"), // optional label
+        createdAt: integer("created_at").notNull(),
+        updatedAt: integer("updated_at").notNull(),
+        deletedAt: integer("deleted_at"),
 
-        // Optional visual styling
-        color: text("color"), // e.g. "#FFD54A"
-        opacity: real("opacity"), // 0..1
+        collectionId: text("collection_id").references(() => bpAnnotationCollection.collectionId, {
+            onDelete: "set null",
+            onUpdate: "cascade",
+        }),
 
-        // Prefer paletteId when set; keeps palette stable even if color changes.
+        title: text("title"),
+
+        // Visual style.
+        color: text("color"),
+        opacity: real("opacity"),
         paletteId: text("palette_id"),
-
-        // JSON blob: underline, squiggle, badge shape, note pin style, etc.
         styleJson: text("style_json"),
 
-        // Content payload for NOTE / BOOKMARK
+        // NOTE / BOOKMARK payload
         noteText: text("note_text"),
-        noteFormat: text("note_format"), // "plain" | "md"
-        noteHtml: text("note_html"), // optional pre-rendered for fast UI (cache; can be regenerated)
+        noteFormat: text("note_format"),
+        noteHtml: text("note_html"), // cached / derived render surface
 
-        // Search helpers
-        textSearch: text("text_search"), // optional normalized text concat for quick LIKE searches
+        // Derived, denormalized search surface for quick LIKE/FTS pipelines.
+        textSearch: text("text_search"),
+
+        // Optional user sort override / pin order inside a collection or view.
+        sortOrdinal: integer("sort_ordinal"),
     },
     (t) => ({
         userIdx: index("bp_annotation_user_idx").on(t.userId, t.updatedAt),
         userKindIdx: index("bp_annotation_user_kind_idx").on(t.userId, t.kind, t.updatedAt),
+        userCollectionIdx: index("bp_annotation_user_collection_idx").on(t.userId, t.collectionId, t.updatedAt),
         updatedIdx: index("bp_annotation_updated_idx").on(t.updatedAt),
         deletedIdx: index("bp_annotation_deleted_idx").on(t.deletedAt),
         idemUq: uniqueIndex("bp_annotation_idem_uq").on(t.userId, t.idempotencyKey),
@@ -164,29 +228,36 @@ export const bpAnnotation = sqliteTable(
             "bp_annotation_note_format_check",
             sql`${t.noteFormat} is null or ${t.noteFormat} in ('plain','md')`,
         ),
+        sortCheck: check(
+            "bp_annotation_sort_check",
+            sql`${t.sortOrdinal} is null or ${t.sortOrdinal} >= 0`,
+        ),
+        chronologyCheck: check(
+            "bp_annotation_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        clientChronologyCheck: check(
+            "bp_annotation_client_chronology_check",
+            sql`${t.clientCreatedAt} is null or ${t.clientUpdatedAt} is null or ${t.clientUpdatedAt} >= ${t.clientCreatedAt}`,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
+        ),
+        notePayloadCheck: check(
+            "bp_annotation_note_payload_check",
+            sql`
+                ${t.kind} != 'NOTE'
+                or ${t.noteText} is not null
+                or ${t.noteHtml} is not null
+                or ${t.title} is not null
+            `,
+        ),
     }),
 );
 
 /* ------------------------------ Span Anchors -------------------------------- */
 
-/**
- * bp_annotation_span
- * A single annotation can target one or more spans (most are exactly 1).
- *
- * Structural truth:
- * - startVerseOrd/endVerseOrd are REQUIRED.
- *
- * Exactness options:
- * - translationId can be set to "bind" the selection to a translation.
- * - start/end token indices (token_index) are recommended for partial-verse selection.
- * - start/end char offsets (within bp_verse_text.text) are optional and help sanity checks.
- *
- * Cross-verse token spans:
- * - startTokenIndex applies to startVerseKey (or start verse of the range)
- * - endTokenIndex applies to endVerseKey (or end verse of the range)
- *
- * If you don’t have tokenization yet, leave token indices null and rely on verse range.
- */
 export const bpAnnotationSpan = sqliteTable(
     "bp_annotation_span",
     {
@@ -194,38 +265,35 @@ export const bpAnnotationSpan = sqliteTable(
             .notNull()
             .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        spanOrdinal: integer("span_ordinal").notNull(), // 1..N ordering of spans
+        spanOrdinal: integer("span_ordinal").notNull(), // 1..N
 
         anchorKind: text("anchor_kind").notNull().default("RANGE"),
 
-        // If set, annotation is tied to a translation (good for exact token indices).
-        // If null, UI can apply it across translations, but token anchors may be ignored.
+        // Null means translation-agnostic structural anchor.
+        // Set for token-precise, translation-specific anchoring.
         translationId: text("translation_id"),
 
-        // Structural anchor (required)
+        // Structural truth.
         startVerseOrd: integer("start_verse_ord").notNull(),
         endVerseOrd: integer("end_verse_ord").notNull(),
 
-        // Convenience/debug/export (optional)
+        // Convenience / export / debugging snapshots.
         startVerseKey: text("start_verse_key"),
         endVerseKey: text("end_verse_key"),
 
-        // Optional token anchoring (recommended for partial highlights)
+        // Optional exact token anchoring.
         startTokenIndex: integer("start_token_index"),
         endTokenIndex: integer("end_token_index"),
 
-        // Optional char offsets for extra exactness checks.
-        // Interpret as offsets into verse text for startVerseKey/endVerseKey.
+        // Optional char offsets inside start/end verse text.
         startCharOffset: integer("start_char_offset"),
         endCharOffset: integer("end_char_offset"),
 
-        // Optional exactness helpers (never used as identity)
-        selectedText: text("selected_text"), // snapshot
-        selectedTextHash: text("selected_text_hash"), // hash of snapshot
-        selectionVersion: integer("selection_version"), // bump if selection encoding changes
+        selectedText: text("selected_text"),
+        selectedTextHash: text("selected_text_hash"),
+        selectionVersion: integer("selection_version"),
 
-        // Optional “pin” within the range for note/bookmark placement (0..1).
-        // This is NOT viewport positioning: it’s a logical hint within the range.
+        // Logical pin inside local span space [0..1]; never viewport pixels.
         pinX: real("pin_x"),
         pinY: real("pin_y"),
     },
@@ -236,6 +304,7 @@ export const bpAnnotationSpan = sqliteTable(
         ordIdx: index("bp_annotation_span_ord_idx").on(t.startVerseOrd, t.endVerseOrd),
         transIdx: index("bp_annotation_span_trans_idx").on(t.translationId, t.startVerseOrd, t.endVerseOrd),
         startKeyIdx: index("bp_annotation_span_start_key_idx").on(t.translationId, t.startVerseKey),
+        endKeyIdx: index("bp_annotation_span_end_key_idx").on(t.translationId, t.endVerseKey),
 
         anchorKindCheck: check(
             "bp_annotation_span_anchor_kind_check",
@@ -244,7 +313,6 @@ export const bpAnnotationSpan = sqliteTable(
         spanOrdCheck: check("bp_annotation_span_ordinal_check", sql`${t.spanOrdinal} >= 1`),
         spanCheck: check("bp_annotation_span_check", sql`${t.startVerseOrd} <= ${t.endVerseOrd}`),
 
-        // token span sanity (if provided)
         tokStartCheck: check(
             "bp_annotation_span_tok_start_check",
             sql`${t.startTokenIndex} is null or ${t.startTokenIndex} >= 0`,
@@ -254,7 +322,6 @@ export const bpAnnotationSpan = sqliteTable(
             sql`${t.endTokenIndex} is null or ${t.endTokenIndex} >= 0`,
         ),
 
-        // char offset sanity (if provided)
         charStartCheck: check(
             "bp_annotation_span_char_start_check",
             sql`${t.startCharOffset} is null or ${t.startCharOffset} >= 0`,
@@ -264,7 +331,52 @@ export const bpAnnotationSpan = sqliteTable(
             sql`${t.endCharOffset} is null or ${t.endCharOffset} >= 0`,
         ),
 
-        // pin sanity
+        tokenPairCheck: check(
+            "bp_annotation_span_token_pair_check",
+            sql`(${t.startTokenIndex} is null) = (${t.endTokenIndex} is null)`,
+        ),
+        charPairCheck: check(
+            "bp_annotation_span_char_pair_check",
+            sql`(${t.startCharOffset} is null) = (${t.endCharOffset} is null)`,
+        ),
+
+        tokenSpanRequiresTranslationCheck: check(
+            "bp_annotation_span_token_requires_translation_check",
+            sql`${t.anchorKind} != 'TOKEN_SPAN' or ${t.translationId} is not null`,
+        ),
+        tokenSpanRequiresTokensCheck: check(
+            "bp_annotation_span_token_requires_tokens_check",
+            sql`${t.anchorKind} != 'TOKEN_SPAN' or (${t.startTokenIndex} is not null and ${t.endTokenIndex} is not null)`,
+        ),
+        locationSingleVerseCheck: check(
+            "bp_annotation_span_location_single_verse_check",
+            sql`${t.anchorKind} != 'LOCATION' or ${t.startVerseOrd} = ${t.endVerseOrd}`,
+        ),
+
+        sameVerseTokenOrderCheck: check(
+            "bp_annotation_span_same_verse_token_order_check",
+            sql`
+                ${t.startTokenIndex} is null
+                or ${t.endTokenIndex} is null
+                or ${t.startVerseOrd} != ${t.endVerseOrd}
+                or ${t.startTokenIndex} <= ${t.endTokenIndex}
+            `,
+        ),
+        sameVerseCharOrderCheck: check(
+            "bp_annotation_span_same_verse_char_order_check",
+            sql`
+                ${t.startCharOffset} is null
+                or ${t.endCharOffset} is null
+                or ${t.startVerseOrd} != ${t.endVerseOrd}
+                or ${t.startCharOffset} <= ${t.endCharOffset}
+            `,
+        ),
+
+        selectionVersionCheck: check(
+            "bp_annotation_span_selection_version_check",
+            sql`${t.selectionVersion} is null or ${t.selectionVersion} >= 1`,
+        ),
+
         pinXCheck: check(
             "bp_annotation_span_pin_x_check",
             sql`${t.pinX} is null or (${t.pinX} >= 0 and ${t.pinX} <= 1)`,
@@ -276,52 +388,45 @@ export const bpAnnotationSpan = sqliteTable(
     }),
 );
 
-/**
- * Optional computed bbox per span in “layout-neutral” normalized coordinates.
- * - For highlight spans, bbox can represent union of token rects normalized by verse block.
- * - For ink spans, bbox can represent ink strokes union for rendering acceleration.
- *
- * Keep separate so you can regenerate without touching the core span row.
- */
 export const bpAnnotationSpanBBox = sqliteTable(
     "bp_annotation_span_bbox",
     {
-        annotationId: text("annotation_id")
-            .notNull()
-            .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
-
+        annotationId: text("annotation_id").notNull(),
         spanOrdinal: integer("span_ordinal").notNull(),
 
-        // Normalized bounding box in [0..1] coords within the local span canvas.
         minX: real("min_x").notNull(),
         minY: real("min_y").notNull(),
         maxX: real("max_x").notNull(),
         maxY: real("max_y").notNull(),
 
-        updatedAt: integer("updated_at").notNull(), // ms epoch
+        updatedAt: integer("updated_at").notNull(),
     },
     (t) => ({
         pk: primaryKey({ columns: [t.annotationId, t.spanOrdinal] }),
+        spanFk: foreignKey({
+            columns: [t.annotationId, t.spanOrdinal],
+            foreignColumns: [bpAnnotationSpan.annotationId, bpAnnotationSpan.spanOrdinal],
+            name: "bp_annotation_span_bbox_span_fk",
+        }).onDelete("cascade").onUpdate("cascade"),
         idx: index("bp_annotation_span_bbox_idx").on(t.annotationId, t.spanOrdinal),
+
         minXCheck: check("bp_annotation_span_bbox_min_x_check", sql`${t.minX} >= 0 and ${t.minX} <= 1`),
         minYCheck: check("bp_annotation_span_bbox_min_y_check", sql`${t.minY} >= 0 and ${t.minY} <= 1`),
         maxXCheck: check("bp_annotation_span_bbox_max_x_check", sql`${t.maxX} >= 0 and ${t.maxX} <= 1`),
         maxYCheck: check("bp_annotation_span_bbox_max_y_check", sql`${t.maxY} >= 0 and ${t.maxY} <= 1`),
-        spanCheck: check("bp_annotation_span_bbox_span_check", sql`${t.minX} <= ${t.maxX} and ${t.minY} <= ${t.maxY}`),
+        spanCheck: check(
+            "bp_annotation_span_bbox_span_check",
+            sql`${t.minX} <= ${t.maxX} and ${t.minY} <= ${t.maxY}`,
+        ),
     }),
 );
 
 /* ------------------------------ Labels / Tags ------------------------------- */
 
-/**
- * bp_annotation_label
- * User-defined labels/tags (not canon, not interpretation; just organization).
- * These are like “topics” a user uses privately.
- */
 export const bpAnnotationLabel = sqliteTable(
     "bp_annotation_label",
     {
-        labelId: text("label_id").primaryKey(), // uuid/cuid
+        labelId: text("label_id").primaryKey(),
         userId: text("user_id")
             .notNull()
             .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
@@ -339,20 +444,26 @@ export const bpAnnotationLabel = sqliteTable(
         normUq: uniqueIndex("bp_annotation_label_norm_uq").on(t.userId, t.nameNorm),
 
         idCheck: check("bp_annotation_label_id_check", lenGt0(t.labelId)),
-        nameCheck: check("bp_annotation_label_name_check", sql`length(${t.name}) > 0`),
-        nameNormCheck: check("bp_annotation_label_name_norm_check", sql`length(${t.nameNorm}) > 0`),
+        nameCheck: check("bp_annotation_label_name_check", lenGt0(t.name)),
+        nameNormCheck: check("bp_annotation_label_name_norm_check", lenGt0(t.nameNorm)),
+        chronologyCheck: check(
+            "bp_annotation_label_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_label_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
+        ),
     }),
 );
 
-/**
- * Join table: annotation <-> label (many-to-many)
- */
 export const bpAnnotationLabelLink = sqliteTable(
     "bp_annotation_label_link",
     {
         annotationId: text("annotation_id")
             .notNull()
             .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
+
         labelId: text("label_id")
             .notNull()
             .references(() => bpAnnotationLabel.labelId, { onDelete: "cascade", onUpdate: "cascade" }),
@@ -366,19 +477,21 @@ export const bpAnnotationLabelLink = sqliteTable(
     }),
 );
 
-/* ------------------------------- Palette ----------------------------------- */
+/* -------------------------------- Palette ---------------------------------- */
 
 export const bpAnnotationPalette = sqliteTable(
     "bp_annotation_palette",
     {
-        paletteId: text("palette_id").primaryKey(), // uuid/cuid
+        paletteId: text("palette_id").primaryKey(),
         userId: text("user_id")
             .notNull()
             .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        kind: text("kind").notNull(), // PaletteKind
+        kind: text("kind").notNull(),
         name: text("name").notNull(),
-        color: text("color").notNull(), // #RRGGBB
+        nameNorm: text("name_norm").notNull(),
+
+        color: text("color").notNull(),
         opacity: real("opacity"),
 
         createdAt: integer("created_at").notNull(),
@@ -387,100 +500,134 @@ export const bpAnnotationPalette = sqliteTable(
     },
     (t) => ({
         userIdx: index("bp_annotation_palette_user_idx").on(t.userId, t.kind, t.updatedAt),
-        nameUq: uniqueIndex("bp_annotation_palette_name_uq").on(t.userId, t.kind, t.name),
+        nameUq: uniqueIndex("bp_annotation_palette_name_uq").on(t.userId, t.kind, t.nameNorm),
+
         kindCheck: check("bp_annotation_palette_kind_check", sql`${t.kind} in ('HIGHLIGHT','INK','TAG')`),
-        nameCheck: check("bp_annotation_palette_name_check", sql`length(${t.name}) > 0`),
-        colorCheck: check("bp_annotation_palette_color_check", sql`length(${t.color}) >= 4`),
+        idCheck: check("bp_annotation_palette_id_check", lenGt0(t.paletteId)),
+        nameCheck: check("bp_annotation_palette_name_check", lenGt0(t.name)),
+        nameNormCheck: check("bp_annotation_palette_name_norm_check", lenGt0(t.nameNorm)),
+        colorCheck: check("bp_annotation_palette_color_check", lenGe(t.color, 4)),
         opacityCheck: check(
             "bp_annotation_palette_opacity_check",
             sql`${t.opacity} is null or (${t.opacity} >= 0 and ${t.opacity} <= 1)`,
+        ),
+        chronologyCheck: check(
+            "bp_annotation_palette_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_palette_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
         ),
     }),
 );
 
 /* ----------------------------------- Ink ----------------------------------- */
 
-/**
- * bp_annotation_ink_stroke
- * One INK annotation can have many strokes.
- *
- * Points:
- * - x/y are normalized [0..1] within the local span canvas
- * - optional: t = ms offset since stroke start
- * - optional: p = pressure [0..1]
- * - optional: v = velocity (computed)
- *
- * Storage:
- * - pointsJson: JSON array of points (simple, portable)
- * - Optional chunking table below for very large strokes (mobile pencil use).
- */
 export const bpAnnotationInkStroke = sqliteTable(
     "bp_annotation_ink_stroke",
     {
-        strokeId: text("stroke_id").primaryKey(), // uuid/cuid
+        strokeId: text("stroke_id").primaryKey(),
         annotationId: text("annotation_id")
             .notNull()
             .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        ordinal: integer("ordinal").notNull(), // 1..N within annotation
-        tool: text("tool").notNull().default("PEN"), // InkTool
+        ordinal: integer("ordinal").notNull(),
+        tool: text("tool").notNull().default("PEN"),
 
-        paletteId: text("palette_id"), // prefer palette
+        storageMode: text("storage_mode").notNull().default("INLINE"),
+
+        paletteId: text("palette_id"),
         color: text("color"),
         opacity: real("opacity"),
 
-        // Width expressed in normalized units; UI maps to px relative to span bbox.
+        // Width in normalized local-span units.
         width: real("width"),
 
-        // Optional stroke smoothing/brush config (JSON)
         brushJson: text("brush_json"),
 
-        // Bounding box in normalized coords for fast culling
         minX: real("min_x"),
         minY: real("min_y"),
         maxX: real("max_x"),
         maxY: real("max_y"),
 
-        // Total points count (for quick sanity)
         pointCount: integer("point_count"),
 
-        // Full points payload
-        pointsJson: text("points_json").notNull(),
+        // INLINE mode: full payload here.
+        // CHUNKED mode: null here; use chunk rows.
+        pointsJson: text("points_json"),
 
-        createdAt: integer("created_at").notNull(), // ms epoch
-        deletedAt: integer("deleted_at"), // optional tombstone for per-stroke erase ops
+        createdAt: integer("created_at").notNull(),
+        deletedAt: integer("deleted_at"),
     },
     (t) => ({
         annIdx: index("bp_annotation_ink_ann_idx").on(t.annotationId),
         ordUq: uniqueIndex("bp_annotation_ink_ord_uq").on(t.annotationId, t.ordinal),
         deletedIdx: index("bp_annotation_ink_deleted_idx").on(t.annotationId, t.deletedAt),
 
-        toolCheck: check("bp_annotation_ink_tool_check", sql`${t.tool} in ('PEN','HIGHLIGHTER','ERASER')`),
+        storageModeCheck: check(
+            "bp_annotation_ink_storage_mode_check",
+            sql`${t.storageMode} in ('INLINE','CHUNKED')`,
+        ),
+        toolCheck: check(
+            "bp_annotation_ink_tool_check",
+            sql`${t.tool} in ('PEN','HIGHLIGHTER','ERASER')`,
+        ),
         ordCheck: check("bp_annotation_ink_ord_check", sql`${t.ordinal} >= 1`),
         opacityCheck: check(
             "bp_annotation_ink_opacity_check",
             sql`${t.opacity} is null or (${t.opacity} >= 0 and ${t.opacity} <= 1)`,
         ),
-        widthCheck: check("bp_annotation_ink_width_check", sql`${t.width} is null or ${t.width} >= 0`),
+        widthCheck: check(
+            "bp_annotation_ink_width_check",
+            sql`${t.width} is null or ${t.width} >= 0`,
+        ),
         pointCountCheck: check(
             "bp_annotation_ink_point_count_check",
             sql`${t.pointCount} is null or ${t.pointCount} >= 0`,
         ),
-        bboxMinXCheck: check("bp_annotation_ink_min_x_check", sql`${t.minX} is null or (${t.minX} >= 0 and ${t.minX} <= 1)`),
-        bboxMinYCheck: check("bp_annotation_ink_min_y_check", sql`${t.minY} is null or (${t.minY} >= 0 and ${t.minY} <= 1)`),
-        bboxMaxXCheck: check("bp_annotation_ink_max_x_check", sql`${t.maxX} is null or (${t.maxX} >= 0 and ${t.maxX} <= 1)`),
-        bboxMaxYCheck: check("bp_annotation_ink_max_y_check", sql`${t.maxY} is null or (${t.maxY} >= 0 and ${t.maxY} <= 1)`),
+        bboxMinXCheck: check(
+            "bp_annotation_ink_min_x_check",
+            sql`${t.minX} is null or (${t.minX} >= 0 and ${t.minX} <= 1)`,
+        ),
+        bboxMinYCheck: check(
+            "bp_annotation_ink_min_y_check",
+            sql`${t.minY} is null or (${t.minY} >= 0 and ${t.minY} <= 1)`,
+        ),
+        bboxMaxXCheck: check(
+            "bp_annotation_ink_max_x_check",
+            sql`${t.maxX} is null or (${t.maxX} >= 0 and ${t.maxX} <= 1)`,
+        ),
+        bboxMaxYCheck: check(
+            "bp_annotation_ink_max_y_check",
+            sql`${t.maxY} is null or (${t.maxY} >= 0 and ${t.maxY} <= 1)`,
+        ),
+        bboxOrderCheck: check(
+            "bp_annotation_ink_bbox_order_check",
+            sql`
+                (
+                    ${t.minX} is null and ${t.minY} is null and ${t.maxX} is null and ${t.maxY} is null
+                ) or (
+                    ${t.minX} is not null and ${t.minY} is not null and ${t.maxX} is not null and ${t.maxY} is not null
+                    and ${t.minX} <= ${t.maxX}
+                    and ${t.minY} <= ${t.maxY}
+                )
+            `,
+        ),
+        storagePayloadCheck: check(
+            "bp_annotation_ink_storage_payload_check",
+            sql`
+                (${t.storageMode} = 'INLINE' and ${t.pointsJson} is not null)
+                or (${t.storageMode} = 'CHUNKED' and ${t.pointsJson} is null)
+            `,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_ink_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
+        ),
     }),
 );
 
-/**
- * Optional chunk table for very large strokes.
- * If used:
- * - bp_annotation_ink_stroke.pointsJson may be NULL (but Drizzle would need schema change),
- *   or you store a small preview and put full data in chunks.
- *
- * Keeping it as optional “append” storage. Use only if you hit perf limits.
- */
 export const bpAnnotationInkStrokeChunk = sqliteTable(
     "bp_annotation_ink_stroke_chunk",
     {
@@ -488,7 +635,7 @@ export const bpAnnotationInkStrokeChunk = sqliteTable(
             .notNull()
             .references(() => bpAnnotationInkStroke.strokeId, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        chunkIndex: integer("chunk_index").notNull(), // 0..N
+        chunkIndex: integer("chunk_index").notNull(),
         pointsJson: text("points_json").notNull(),
 
         createdAt: integer("created_at").notNull(),
@@ -497,15 +644,12 @@ export const bpAnnotationInkStrokeChunk = sqliteTable(
         pk: primaryKey({ columns: [t.strokeId, t.chunkIndex] }),
         idx: index("bp_annotation_ink_stroke_chunk_idx").on(t.strokeId),
         chunkCheck: check("bp_annotation_ink_stroke_chunk_check", sql`${t.chunkIndex} >= 0`),
+        pointsCheck: check("bp_annotation_ink_stroke_chunk_points_check", lenGt0(t.pointsJson)),
     }),
 );
 
 /* ------------------------------ Attachments -------------------------------- */
 
-/**
- * Attachments let notes include images, audio, PDFs, etc (future).
- * We store metadata and a storage key; actual blob storage can be local disk, S3, etc.
- */
 export const bpAnnotationAttachment = sqliteTable(
     "bp_annotation_attachment",
     {
@@ -514,10 +658,10 @@ export const bpAnnotationAttachment = sqliteTable(
             .notNull()
             .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
 
-        kind: text("kind").notNull(), // "image" | "audio" | "file" | ...
+        kind: text("kind").notNull(), // image | audio | file | ...
         mime: text("mime"),
         byteSize: integer("byte_size"),
-        storageKey: text("storage_key").notNull(), // e.g. "user/<id>/att/<id>"
+        storageKey: text("storage_key").notNull(),
         originalName: text("original_name"),
         sha256: text("sha256"),
 
@@ -528,33 +672,42 @@ export const bpAnnotationAttachment = sqliteTable(
         annIdx: index("bp_annotation_attachment_ann_idx").on(t.annotationId),
         kindIdx: index("bp_annotation_attachment_kind_idx").on(t.kind),
         storageIdx: uniqueIndex("bp_annotation_attachment_storage_uq").on(t.storageKey),
-        kindCheck: check("bp_annotation_attachment_kind_check", sql`length(${t.kind}) > 0`),
+
+        attachmentIdCheck: check("bp_annotation_attachment_id_check", lenGt0(t.attachmentId)),
+        kindCheck: check("bp_annotation_attachment_kind_check", lenGt0(t.kind)),
         storageCheck: check("bp_annotation_attachment_storage_check", lenGt0(t.storageKey)),
-        sizeCheck: check("bp_annotation_attachment_size_check", sql`${t.byteSize} is null or ${t.byteSize} >= 0`),
+        sizeCheck: check(
+            "bp_annotation_attachment_size_check",
+            sql`${t.byteSize} is null or ${t.byteSize} >= 0`,
+        ),
+        deletedChronologyCheck: check(
+            "bp_annotation_attachment_deleted_chronology_check",
+            sql`${t.deletedAt} is null or ${t.deletedAt} >= ${t.createdAt}`,
+        ),
     }),
 );
 
 /* ------------------------------ Share / Export ------------------------------ */
 
-/**
- * Optional “share” surface:
- * - share selected annotations via link
- * - or export packs
- *
- * Keep privacy defaults PRIVATE.
- */
 export const bpAnnotationShare = sqliteTable(
     "bp_annotation_share",
     {
-        shareId: text("share_id").primaryKey(), // uuid/cuid
+        shareId: text("share_id").primaryKey(),
         userId: text("user_id")
             .notNull()
             .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
 
         privacy: text("privacy").notNull().default("PRIVATE"),
+        scope: text("scope").notNull().default("ANNOTATIONS"),
 
-        // A share pack is a list of annotation IDs (JSON array) + optional metadata.
-        annotationIdsJson: text("annotation_ids_json").notNull(),
+        // Optional stable slug / token for public or shared-link retrieval.
+        shareSlug: text("share_slug"),
+
+        // For collection-scoped shares.
+        collectionId: text("collection_id").references(() => bpAnnotationCollection.collectionId, {
+            onDelete: "set null",
+            onUpdate: "cascade",
+        }),
 
         title: text("title"),
         note: text("note"),
@@ -565,66 +718,98 @@ export const bpAnnotationShare = sqliteTable(
     },
     (t) => ({
         userIdx: index("bp_annotation_share_user_idx").on(t.userId, t.updatedAt),
+        shareSlugUq: uniqueIndex("bp_annotation_share_slug_uq").on(t.shareSlug),
+
         privacyCheck: check(
             "bp_annotation_share_privacy_check",
             sql`${t.privacy} in ('PRIVATE','SHARED_LINK','PUBLIC')`,
         ),
-        idsCheck: check("bp_annotation_share_ids_check", sql`length(${t.annotationIdsJson}) > 1`),
+        scopeCheck: check(
+            "bp_annotation_share_scope_check",
+            sql`${t.scope} in ('ANNOTATIONS','COLLECTION')`,
+        ),
+        chronologyCheck: check(
+            "bp_annotation_share_chronology_check",
+            sql`${t.updatedAt} >= ${t.createdAt}`,
+        ),
+        revokedChronologyCheck: check(
+            "bp_annotation_share_revoked_chronology_check",
+            sql`${t.revokedAt} is null or ${t.revokedAt} >= ${t.createdAt}`,
+        ),
+        collectionScopeCheck: check(
+            "bp_annotation_share_collection_scope_check",
+            sql`${t.scope} != 'COLLECTION' or ${t.collectionId} is not null`,
+        ),
     }),
 );
 
-/* ------------------------------ Event Log ----------------------------------- */
+export const bpAnnotationShareItem = sqliteTable(
+    "bp_annotation_share_item",
+    {
+        shareId: text("share_id")
+            .notNull()
+            .references(() => bpAnnotationShare.shareId, { onDelete: "cascade", onUpdate: "cascade" }),
 
-/**
- * Append-only event log (optional but extremely valuable):
- * - enables undo/redo
- * - enables audit/debugging
- * - enables replication if you ever move off SQLite
- *
- * You can keep this table even if you don’t use it initially.
- */
-export const AnnotationEventKind = {
-    CREATE: "CREATE",
-    UPDATE: "UPDATE",
-    DELETE: "DELETE",
-    RESTORE: "RESTORE",
-    ADD_STROKE: "ADD_STROKE",
-    DEL_STROKE: "DEL_STROKE",
-    ADD_LABEL: "ADD_LABEL",
-    DEL_LABEL: "DEL_LABEL",
-} as const;
-export type AnnotationEventKind = (typeof AnnotationEventKind)[keyof typeof AnnotationEventKind];
+        annotationId: text("annotation_id")
+            .notNull()
+            .references(() => bpAnnotation.annotationId, { onDelete: "cascade", onUpdate: "cascade" }),
+
+        ordinal: integer("ordinal").notNull(),
+        createdAt: integer("created_at").notNull(),
+    },
+    (t) => ({
+        pk: primaryKey({ columns: [t.shareId, t.annotationId] }),
+        shareOrdUq: uniqueIndex("bp_annotation_share_item_ord_uq").on(t.shareId, t.ordinal),
+        annIdx: index("bp_annotation_share_item_ann_idx").on(t.annotationId),
+        ordCheck: check("bp_annotation_share_item_ord_check", sql`${t.ordinal} >= 1`),
+    }),
+);
+
+/* ------------------------------- Event Log --------------------------------- */
 
 export const bpAnnotationEvent = sqliteTable(
     "bp_annotation_event",
     {
-        eventId: text("event_id").primaryKey(), // uuid/cuid
+        eventId: text("event_id").primaryKey(),
         userId: text("user_id")
             .notNull()
             .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
 
         annotationId: text("annotation_id"),
-        kind: text("kind").notNull(), // AnnotationEventKind
-        at: integer("at").notNull(), // ms epoch
+        annotationRev: integer("annotation_rev"),
+        kind: text("kind").notNull(),
+        at: integer("at").notNull(),
 
-        // Optional linking for detailed events
+        // Client / sync metadata
+        clientAt: integer("client_at"),
+        deviceId: text("device_id"),
+        idempotencyKey: text("idempotency_key"),
+
+        // Optional detailed links
         strokeId: text("stroke_id"),
         labelId: text("label_id"),
+        collectionId: text("collection_id"),
 
-        // JSON payload: before/after deltas, client meta, etc.
         payloadJson: text("payload_json"),
     },
     (t) => ({
         userIdx: index("bp_annotation_event_user_idx").on(t.userId, t.at),
         annIdx: index("bp_annotation_event_ann_idx").on(t.annotationId, t.at),
         kindIdx: index("bp_annotation_event_kind_idx").on(t.kind, t.at),
+        annRevIdx: index("bp_annotation_event_ann_rev_idx").on(t.annotationId, t.annotationRev),
+
         kindCheck: check(
             "bp_annotation_event_kind_check",
             sql`${t.kind} in (
                 'CREATE','UPDATE','DELETE','RESTORE',
                 'ADD_STROKE','DEL_STROKE',
-                'ADD_LABEL','DEL_LABEL'
+                'ADD_LABEL','DEL_LABEL',
+                'MOVE_COLLECTION'
             )`,
+        ),
+        revCheck: check(
+            "bp_annotation_event_rev_check",
+            sql`${t.annotationRev} is null or ${t.annotationRev} >= 1`,
         ),
     }),
 );
@@ -632,6 +817,8 @@ export const bpAnnotationEvent = sqliteTable(
 /* ---------------------------- Export convenience ---------------------------- */
 
 export const annotationSchema = {
+    bpAnnotationCollection,
+
     bpAnnotation,
     bpAnnotationSpan,
     bpAnnotationSpanBBox,
@@ -647,6 +834,7 @@ export const annotationSchema = {
     bpAnnotationAttachment,
 
     bpAnnotationShare,
+    bpAnnotationShareItem,
 
     bpAnnotationEvent,
 } as const;

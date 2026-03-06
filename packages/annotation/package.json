@@ -1,0 +1,85 @@
+{
+  "name": "@biblia/annotation",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./commands/types": {
+      "types": "./dist/commands/types.d.ts",
+      "import": "./dist/commands/types.js",
+      "default": "./dist/commands/types.js"
+    },
+    "./events/types": {
+      "types": "./dist/events/types.d.ts",
+      "import": "./dist/events/types.js",
+      "default": "./dist/events/types.js"
+    },
+    "./model/types": {
+      "types": "./dist/model/types.d.ts",
+      "import": "./dist/model/types.js",
+      "default": "./dist/model/types.js"
+    },
+    "./model/guards": {
+      "types": "./dist/model/guards.d.ts",
+      "import": "./dist/model/guards.js",
+      "default": "./dist/model/guards.js"
+    },
+    "./model/ids": {
+      "types": "./dist/model/ids.d.ts",
+      "import": "./dist/model/ids.js",
+      "default": "./dist/model/ids.js"
+    },
+    "./anchor/normalize": {
+      "types": "./dist/anchor/normalize.d.ts",
+      "import": "./dist/anchor/normalize.js",
+      "default": "./dist/anchor/normalize.js"
+    },
+    "./engine/createAnnotationEngine": {
+      "types": "./dist/engine/createAnnotationEngine.d.ts",
+      "import": "./dist/engine/createAnnotationEngine.js",
+      "default": "./dist/engine/createAnnotationEngine.js"
+    },
+    "./ink/ink": {
+      "types": "./dist/ink/ink.d.ts",
+      "import": "./dist/ink/ink.js",
+      "default": "./dist/ink/ink.js"
+    },
+    "./layout/geometry": {
+      "types": "./dist/layout/geometry.d.ts",
+      "import": "./dist/layout/geometry.js",
+      "default": "./dist/layout/geometry.js"
+    },
+    "./ops/reducer": {
+      "types": "./dist/ops/reducer.d.ts",
+      "import": "./dist/ops/reducer.js",
+      "default": "./dist/ops/reducer.js"
+    },
+    "./reanchor/reanchor": {
+      "types": "./dist/reanchor/reanchor.d.ts",
+      "import": "./dist/reanchor/reanchor.js",
+      "default": "./dist/reanchor/reanchor.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "bun run typecheck",
+    "clean": "bun x rimraf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "rimraf": "^6.0.1"
+  }
+}

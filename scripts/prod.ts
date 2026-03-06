@@ -1,55 +1,62 @@
-// scripts/dev.ts
-// Biblia.to — root dev runner (Bun-first, production-grade)
+// scripts/prod.ts
+// Biblia.to — root production runner (Bun-first, hardened)
+//
 // Run from repo root:
-//   bun run dev
+//   bun scripts/prod.ts
+//   bun run prod
 //
-// Starts:
-// - apps/api (bun run dev)
-// - apps/web (bun run dev)
-//
-// Features:
-// - Bun-only process management (no child_process)
-// - DB bootstrap (db:bootstrap or migrate+seed) unless BP_DEV_SKIP_DB=1
-// - Optional OSIS import via BP_DEV_IMPORT_OSIS=/abs/or/relative/path.xml
-// - Optional DB verify via BP_DEV_VERIFY_DB=1
-// - Optional API health wait before starting web
-// - Prefixed child stdout/stderr logs
+// Purpose:
+// - Optional root preflight
+// - Optional API DB bootstrap / verify
+// - Build web/api if requested
+// - Start API and/or preview web in "production-ish" local mode
 // - Graceful shutdown with escalation
-// - Better repo/package/script sanity checks
-// - Optional per-service disable switches
+// - Prefixed child logs
 //
-// Env knobs:
-//   BP_DEV_SKIP_DB=1
-//   BP_DEV_VERIFY_DB=1
-//   BP_DEV_IMPORT_OSIS=./resources/kjv.xml
-//   BP_DEV_IMPORT_SET_DEFAULT=1
+// This is for local/staging/prod-like orchestration from the monorepo root.
+// It is not a replacement for Docker/systemd/k8s, but it's excellent for
+// single-machine deployment and validation.
 //
-//   BP_DEV_NO_API=1
-//   BP_DEV_NO_WEB=1
+// Env / flags:
 //
-//   BP_DEV_API_SCRIPT=dev
-//   BP_DEV_WEB_SCRIPT=dev
+// Service control:
+//   BP_PROD_NO_API=1
+//   BP_PROD_NO_WEB=1
 //
-//   BP_DEV_VITE_API_BASE=http://localhost:3000
+// Scripts:
+//   BP_PROD_API_START_SCRIPT=start        default: start
+//   BP_PROD_WEB_START_SCRIPT=preview      default: preview
+//   BP_PROD_BUILD_API_SCRIPT=build        default: build
+//   BP_PROD_BUILD_WEB_SCRIPT=build        default: build
 //
-//   BP_DEV_WAIT_FOR_API=1                (default: 1)
-//   BP_DEV_API_HEALTH_URL=http://localhost:3000/health
-//   BP_DEV_API_HEALTH_TIMEOUT_MS=45000
-//   BP_DEV_API_HEALTH_INTERVAL_MS=350
+// Build / bootstrap:
+//   BP_PROD_SKIP_BUILD=1
+//   BP_PROD_SKIP_DB=1
+//   BP_PROD_VERIFY_DB=1
 //
-//   BP_DEV_SHUTDOWN_GRACE_MS=2500
+// API health:
+//   BP_PROD_WAIT_FOR_API=1                default: 1
+//   BP_PROD_API_HEALTH_URL=http://localhost:3000/health
+//   BP_PROD_API_HEALTH_TIMEOUT_MS=45000
+//   BP_PROD_API_HEALTH_INTERVAL_MS=500
 //
-// Notes:
-// - Run from repo root.
-// - Assumes apps/api and apps/web are Bun projects with package.json scripts.
-// - If one long-running child exits, the runner shuts the other down.
+// Web preview env passthrough:
+//   BP_PROD_VITE_API_BASE=http://localhost:3000
+//
+// Shutdown:
+//   BP_PROD_SHUTDOWN_GRACE_MS=4000
+//
+// Examples:
+//   bun scripts/prod.ts
+//   BP_PROD_VERIFY_DB=1 bun scripts/prod.ts
+//   BP_PROD_NO_WEB=1 bun scripts/prod.ts
+//   BP_PROD_SKIP_BUILD=1 bun scripts/prod.ts
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as process from "node:process";
 
 type BunSubprocess = ReturnType<typeof Bun.spawn>;
-
 type ServiceName = "api" | "web";
 
 type Proc = {
@@ -68,16 +75,33 @@ const ROOT = process.cwd();
 const API_CWD = path.join(ROOT, "apps", "api");
 const WEB_CWD = path.join(ROOT, "apps", "web");
 
-const DEV_NAME = "Biblia.to Dev";
-
 const procs: Proc[] = [];
 let shuttingDown = false;
-let shutdownRequestedBy: string | null = null;
 let finalized = false;
 
 /* -------------------------------------------------------------------------- */
 /*                                   helpers                                  */
 /* -------------------------------------------------------------------------- */
+
+function nowStamp(): string {
+    const d = new Date();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    return `${hh}:${mm}:${ss}`;
+}
+
+function log(...args: unknown[]): void {
+    console.log(`[prod ${nowStamp()}]`, ...args);
+}
+
+function warn(...args: unknown[]): void {
+    console.warn(`[prod ${nowStamp()}]`, ...args);
+}
+
+function errlog(...args: unknown[]): void {
+    console.error(`[prod ${nowStamp()}]`, ...args);
+}
 
 function envStr(name: string, fallback = ""): string {
     const v = process.env[name];
@@ -112,42 +136,7 @@ function envBool(name: string, fallback = false): boolean {
     }
 }
 
-function nowStamp(): string {
-    const d = new Date();
-    const hh = String(d.getHours()).padStart(2, "0");
-    const mm = String(d.getMinutes()).padStart(2, "0");
-    const ss = String(d.getSeconds()).padStart(2, "0");
-    return `${hh}:${mm}:${ss}`;
-}
-
-function log(...args: unknown[]): void {
-    console.log(`[dev ${nowStamp()}]`, ...args);
-}
-
-function warn(...args: unknown[]): void {
-    console.warn(`[dev ${nowStamp()}]`, ...args);
-}
-
-function errlog(...args: unknown[]): void {
-    console.error(`[dev ${nowStamp()}]`, ...args);
-}
-
-function serviceLog(name: ServiceName, stream: "stdout" | "stderr", line: string): void {
-    const prefix = `[${name}:${stream}]`;
-    if (stream === "stderr") {
-        console.error(prefix, line);
-    } else {
-        console.log(prefix, line);
-    }
-}
-
-function bunBin(): string {
-    const execPath = String(process.execPath ?? "");
-    if (execPath.toLowerCase().includes("bun")) return execPath;
-    return Bun.which("bun") ?? "bun";
-}
-
-function fileExists(p: string): boolean {
+function exists(p: string): boolean {
     try {
         return fs.existsSync(p);
     } catch {
@@ -155,16 +144,18 @@ function fileExists(p: string): boolean {
     }
 }
 
-function dirExists(p: string): boolean {
+function isDirectory(p: string): boolean {
     try {
-        return fs.existsSync(p) && fs.statSync(p).isDirectory();
+        return fs.statSync(p).isDirectory();
     } catch {
         return false;
     }
 }
 
-function normalizeAbs(p: string): string {
-    return path.isAbsolute(p) ? path.normalize(p) : path.resolve(ROOT, p);
+function bunBin(): string {
+    const execPath = String(process.execPath ?? "");
+    if (execPath.toLowerCase().includes("bun")) return execPath;
+    return Bun.which("bun") ?? "bun";
 }
 
 function readJsonFile<T>(filePath: string): T | null {
@@ -178,9 +169,7 @@ function readJsonFile<T>(filePath: string): T | null {
 function readPackageJson(pkgDir: string): PackageJson {
     const pkgPath = path.join(pkgDir, "package.json");
     const pkg = readJsonFile<PackageJson>(pkgPath);
-    if (!pkg) {
-        throw new Error(`invalid or missing package.json at ${pkgPath}`);
-    }
+    if (!pkg) throw new Error(`invalid or missing package.json at ${pkgPath}`);
     return pkg;
 }
 
@@ -190,17 +179,14 @@ function hasScript(pkgDir: string, scriptName: string): boolean {
 }
 
 function assertRepoShape(): void {
-    if (!dirExists(API_CWD)) {
-        throw new Error(`apps/api not found at ${API_CWD} (run from repo root)`);
+    if (!exists(path.join(ROOT, "package.json"))) {
+        throw new Error(`missing package.json at ${ROOT}`);
     }
-    if (!dirExists(WEB_CWD)) {
-        throw new Error(`apps/web not found at ${WEB_CWD} (run from repo root)`);
+    if (!isDirectory(API_CWD)) {
+        throw new Error(`apps/api not found at ${API_CWD}`);
     }
-    if (!fileExists(path.join(API_CWD, "package.json"))) {
-        throw new Error(`missing package.json in ${API_CWD}`);
-    }
-    if (!fileExists(path.join(WEB_CWD, "package.json"))) {
-        throw new Error(`missing package.json in ${WEB_CWD}`);
+    if (!isDirectory(WEB_CWD)) {
+        throw new Error(`apps/web not found at ${WEB_CWD}`);
     }
 }
 
@@ -210,8 +196,14 @@ function assertScript(pkgDir: string, scriptName: string, label: string): void {
     }
 }
 
-function resolveOsisPath(raw: string): string {
-    return normalizeAbs(raw);
+async function waitMs(ms: number): Promise<void> {
+    await Bun.sleep(ms);
+}
+
+function serviceLog(name: ServiceName, stream: "stdout" | "stderr", line: string): void {
+    const prefix = `[${name}:${stream}]`;
+    if (stream === "stderr") console.error(prefix, line);
+    else console.log(prefix, line);
 }
 
 async function pumpStream(
@@ -248,9 +240,7 @@ async function pumpStream(
         const finalLine = carry.replace(/\r$/, "");
         if (finalLine.length > 0) serviceLog(name, streamName, finalLine);
     } catch (e) {
-        if (!shuttingDown) {
-            errlog(`${name} ${streamName} pump failed:`, e);
-        }
+        if (!shuttingDown) errlog(`${name} ${streamName} pump failed:`, e);
     } finally {
         try {
             reader.releaseLock();
@@ -303,40 +293,26 @@ function runLong(
 
     proc.exited.then((code) => {
         if (shuttingDown) return;
-
         const exitCode = typeof code === "number" ? code : 1;
-        if (exitCode === 0) {
-            errlog(`${name} exited unexpectedly with code 0`);
-        } else {
-            errlog(`${name} exited with code ${exitCode}`);
-        }
-
+        errlog(`${name} exited with code ${exitCode}`);
         void shutdown(exitCode === 0 ? 1 : exitCode, `${name} exited`);
     });
 
     return { name, proc, stdoutDone, stderrDone };
 }
 
-async function waitMs(ms: number): Promise<void> {
-    await Bun.sleep(ms);
-}
-
 async function shutdown(exitCode = 0, reason = "shutdown"): Promise<never> {
-    if (finalized) {
-        process.exit(exitCode);
-    }
+    if (finalized) process.exit(exitCode);
 
     if (shuttingDown) {
-        if (!shutdownRequestedBy) shutdownRequestedBy = reason;
         return new Promise<never>(() => {
             /* never resolves */
         });
     }
 
     shuttingDown = true;
-    shutdownRequestedBy = reason;
 
-    const graceMs = Math.max(100, envInt("BP_DEV_SHUTDOWN_GRACE_MS", 2500));
+    const graceMs = Math.max(100, envInt("BP_PROD_SHUTDOWN_GRACE_MS", 4000));
     log(`shutting down (${reason})...`);
 
     for (const p of procs) {
@@ -347,20 +323,15 @@ async function shutdown(exitCode = 0, reason = "shutdown"): Promise<never> {
         }
     }
 
-    const waitAll = Promise.allSettled(
+    await Promise.allSettled(
         procs.map(async (p) => {
             try {
-                await Promise.race([
-                    p.proc.exited,
-                    waitMs(graceMs),
-                ]);
+                await Promise.race([p.proc.exited, waitMs(graceMs)]);
             } catch {
                 // ignore
             }
         }),
     );
-
-    await waitAll;
 
     for (const p of procs) {
         try {
@@ -379,15 +350,15 @@ async function shutdown(exitCode = 0, reason = "shutdown"): Promise<never> {
 }
 
 async function waitForApiHealth(): Promise<void> {
-    const enabled = envBool("BP_DEV_WAIT_FOR_API", true);
+    const enabled = envBool("BP_PROD_WAIT_FOR_API", true);
     if (!enabled) {
-        log("BP_DEV_WAIT_FOR_API=0 -> skipping API health wait");
+        log("BP_PROD_WAIT_FOR_API=0 -> skipping API health wait");
         return;
     }
 
-    const url = envStr("BP_DEV_API_HEALTH_URL", "http://localhost:3000/health");
-    const timeoutMs = Math.max(1000, envInt("BP_DEV_API_HEALTH_TIMEOUT_MS", 45_000));
-    const intervalMs = Math.max(100, envInt("BP_DEV_API_HEALTH_INTERVAL_MS", 350));
+    const url = envStr("BP_PROD_API_HEALTH_URL", "http://localhost:3000/health");
+    const timeoutMs = Math.max(1000, envInt("BP_PROD_API_HEALTH_TIMEOUT_MS", 45_000));
+    const intervalMs = Math.max(100, envInt("BP_PROD_API_HEALTH_INTERVAL_MS", 500));
 
     log(`waiting for API health: ${url}`);
 
@@ -418,12 +389,12 @@ async function waitForApiHealth(): Promise<void> {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                 bootstrap                                   */
+/*                                prod workflow                               */
 /* -------------------------------------------------------------------------- */
 
 async function bootstrapDb(bunPath: string): Promise<void> {
-    if (envBool("BP_DEV_SKIP_DB")) {
-        log("BP_DEV_SKIP_DB=1 -> skipping DB bootstrap");
+    if (envBool("BP_PROD_SKIP_DB")) {
+        log("BP_PROD_SKIP_DB=1 -> skipping DB bootstrap");
         return;
     }
 
@@ -434,55 +405,56 @@ async function bootstrapDb(bunPath: string): Promise<void> {
 
         if (hasScript(API_CWD, "db:migrate")) {
             await runOnce("api:db:migrate", API_CWD, [bunPath, "run", "db:migrate"]);
-        } else {
-            warn(`apps/api missing "db:migrate"`);
         }
-
         if (hasScript(API_CWD, "db:seed")) {
             await runOnce("api:db:seed", API_CWD, [bunPath, "run", "db:seed"]);
-        } else {
-            warn(`apps/api missing "db:seed"`);
         }
     }
 
-    const osisRaw = envStr("BP_DEV_IMPORT_OSIS", "");
-    if (osisRaw) {
-        const osisPath = resolveOsisPath(osisRaw);
-
-        if (!fileExists(osisPath)) {
-            warn(`BP_DEV_IMPORT_OSIS set but file does not exist: ${osisPath}`);
-        } else if (hasScript(API_CWD, "import:osis")) {
-            const extraEnv: Record<string, string> = {};
-
-            if (envBool("BP_DEV_IMPORT_SET_DEFAULT")) {
-                extraEnv.BP_IMPORT_SET_DEFAULT = "1";
-            }
-
-            await runOnce("api:import:osis", API_CWD, [bunPath, "run", "import:osis", osisPath], extraEnv);
-        } else {
-            warn(`apps/api has no "import:osis" script; skipping OSIS import`);
-        }
-    }
-
-    if (envBool("BP_DEV_VERIFY_DB") && hasScript(API_CWD, "db:verify")) {
+    if (envBool("BP_PROD_VERIFY_DB") && hasScript(API_CWD, "db:verify")) {
         await runOnce("api:db:verify", API_CWD, [bunPath, "run", "db:verify"]);
     }
 }
 
+async function buildIfNeeded(
+    bunPath: string,
+    noApi: boolean,
+    noWeb: boolean,
+    apiBuildScript: string,
+    webBuildScript: string,
+): Promise<void> {
+    if (envBool("BP_PROD_SKIP_BUILD")) {
+        log("BP_PROD_SKIP_BUILD=1 -> skipping builds");
+        return;
+    }
+
+    if (!noApi) {
+        assertScript(API_CWD, apiBuildScript, "apps/api");
+        await runOnce("api:build", API_CWD, [bunPath, "run", apiBuildScript]);
+    }
+
+    if (!noWeb) {
+        assertScript(WEB_CWD, webBuildScript, "apps/web");
+        await runOnce("web:build", WEB_CWD, [bunPath, "run", webBuildScript]);
+    }
+}
+
 /* -------------------------------------------------------------------------- */
-/*                                    main                                     */
+/*                                    main                                    */
 /* -------------------------------------------------------------------------- */
 
 async function main(): Promise<void> {
     const bunPath = bunBin();
 
-    const noApi = envBool("BP_DEV_NO_API");
-    const noWeb = envBool("BP_DEV_NO_WEB");
+    const noApi = envBool("BP_PROD_NO_API");
+    const noWeb = envBool("BP_PROD_NO_WEB");
 
-    const apiScript = envStr("BP_DEV_API_SCRIPT", "dev");
-    const webScript = envStr("BP_DEV_WEB_SCRIPT", "dev");
+    const apiStartScript = envStr("BP_PROD_API_START_SCRIPT", "start");
+    const webStartScript = envStr("BP_PROD_WEB_START_SCRIPT", "preview");
+    const apiBuildScript = envStr("BP_PROD_BUILD_API_SCRIPT", "build");
+    const webBuildScript = envStr("BP_PROD_BUILD_WEB_SCRIPT", "build");
 
-    log(`=== ${DEV_NAME} ===`);
+    log("=== Biblia.to Prod ===");
     log("ROOT:", ROOT);
     log("API :", API_CWD);
     log("WEB :", WEB_CWD);
@@ -490,24 +462,27 @@ async function main(): Promise<void> {
 
     assertRepoShape();
 
-    if (!noApi) assertScript(API_CWD, apiScript, "apps/api");
-    if (!noWeb) assertScript(WEB_CWD, webScript, "apps/web");
-
     if (noApi && noWeb) {
-        throw new Error("both BP_DEV_NO_API=1 and BP_DEV_NO_WEB=1 were set; nothing to run");
+        throw new Error("both BP_PROD_NO_API=1 and BP_PROD_NO_WEB=1 were set; nothing to run");
+    }
+
+    if (!noApi) {
+        assertScript(API_CWD, apiStartScript, "apps/api");
+    }
+    if (!noWeb) {
+        assertScript(WEB_CWD, webStartScript, "apps/web");
     }
 
     if (!noApi) {
         await bootstrapDb(bunPath);
     } else {
-        log("BP_DEV_NO_API=1 -> skipping API bootstrap and API process start");
+        log("BP_PROD_NO_API=1 -> skipping DB bootstrap");
     }
 
-    const viteApiBase = envStr("BP_DEV_VITE_API_BASE", "");
-    const webEnv = viteApiBase ? { VITE_API_BASE: viteApiBase } : undefined;
+    await buildIfNeeded(bunPath, noApi, noWeb, apiBuildScript, webBuildScript);
 
     if (!noApi) {
-        procs.push(runLong("api", API_CWD, [bunPath, "run", apiScript]));
+        procs.push(runLong("api", API_CWD, [bunPath, "run", apiStartScript]));
     }
 
     if (!noApi && !noWeb) {
@@ -515,9 +490,9 @@ async function main(): Promise<void> {
     }
 
     if (!noWeb) {
-        procs.push(runLong("web", WEB_CWD, [bunPath, "run", webScript], webEnv));
-    } else {
-        log("BP_DEV_NO_WEB=1 -> skipping web process start");
+        const viteApiBase = envStr("BP_PROD_VITE_API_BASE", "");
+        const webEnv = viteApiBase ? { VITE_API_BASE: viteApiBase } : undefined;
+        procs.push(runLong("web", WEB_CWD, [bunPath, "run", webStartScript], webEnv));
     }
 
     log("running. Press Ctrl+C to stop.");

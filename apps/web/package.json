@@ -1,21 +1,30 @@
 {
-  "name": "web",
-  "private": true,
+  "name": "@biblia/web",
   "version": "0.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 4173",
+
+    "typecheck": "tsc -b --pretty false",
+    "check": "bun run typecheck && bun run build",
+
     "lint": "eslint .",
-    "preview": "vite preview"
+    "lint:fix": "eslint . --fix",
+
+    "clean": "bun x rimraf dist .vite"
   },
   "dependencies": {
+    "@biblia/annotation": "workspace:*",
     "@fontsource-variable/inter": "^5.2.8",
     "@fontsource-variable/literata": "^5.2.8",
     "@fontsource-variable/quicksand": "^5.2.10",
     "@tanstack/react-virtual": "^3.13.19",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "zustand": "^5.0.8"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
@@ -27,8 +36,12 @@
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",
     "globals": "^16.5.0",
+    "rimraf": "^6.0.1",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.48.0",
     "vite": "^7.3.1"
+  },
+  "engines": {
+    "bun": ">=1.3.10"
   }
 }
