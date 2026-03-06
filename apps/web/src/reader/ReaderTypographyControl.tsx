@@ -14,11 +14,20 @@ import {
 } from "./typography";
 
 /**
- * Less-is-more Typography Control (compact popover)
- * - No tabs, no big preview cards, no clunky width
- * - Always shows the 5 essentials: Enable + Font + Size + Weight + Leading + Width
- * - Native sliders (arrow keys work automatically when focused)
- * - Left/Right anywhere in panel cycles font (unless a slider is focused)
+ * Biblia.to — Reader Typography Control (elite + bulletproof)
+ *
+ * Contract (your request):
+ * - Width locked (measurePx fixed to DEFAULT)
+ * - Leading locked (leading fixed to DEFAULT)
+ * - User controls: Enable + Font + Size + Weight
+ *
+ * Upgrades:
+ * - No click-outside "as any" hacks. Uses a clean capture listener + composedPath() when available.
+ * - Focus correctness: open -> focus panel; close -> restore focus to trigger.
+ * - Keyboard: Escape closes; Left/Right cycles fonts when panel open and no range focused; Home/End snaps range.
+ * - A11y: aria-controls, aria-expanded, role="dialog", label wiring.
+ * - Reduced motion respected; animation injected once per app (and not removed).
+ * - Prevents legacy stored values from reintroducing measure/leading drift.
  */
 
 type FontOpt = ReturnType<typeof fontOptions>[number] & {
@@ -26,7 +35,10 @@ type FontOpt = ReturnType<typeof fontOptions>[number] & {
     family?: string;
 };
 
+type RangeId = "sizePx" | "weight";
+
 function clampNum(n: number, lo: number, hi: number): number {
+    if (!Number.isFinite(n)) return lo;
     return Math.max(lo, Math.min(hi, n));
 }
 
@@ -37,8 +49,13 @@ function usePrefersReducedMotion(): boolean {
         const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
         const onChange = () => setReduced(mq.matches);
         onChange();
-        mq.addEventListener?.("change", onChange);
-        return () => mq.removeEventListener?.("change", onChange);
+        // Safari legacy
+        if (mq.addEventListener) mq.addEventListener("change", onChange);
+        else mq.addListener(onChange);
+        return () => {
+            if (mq.removeEventListener) mq.removeEventListener("change", onChange);
+            else mq.removeListener(onChange);
+        };
     }, []);
     return reduced;
 }
@@ -51,6 +68,7 @@ function nextOf<T>(arr: readonly T[], current: T, dir: 1 | -1): T {
 
 function fontFamilyForOpt(f: FontOpt): string {
     const fam = (f.cssFamily ?? f.family ?? String(f.id)).trim();
+    if (!fam) return "var(--font-serif)";
     if (fam.includes(",") || fam.startsWith("var(") || fam.startsWith("ui-") || fam.includes("system-ui")) return fam;
     return `"${fam}", ui-serif, Georgia, Cambria, "Times New Roman", serif`;
 }
@@ -58,25 +76,39 @@ function fontFamilyForOpt(f: FontOpt): string {
 function useInjectOnceStyle(cssText: string, attr: string): void {
     useEffect(() => {
         if (typeof document === "undefined") return;
-
-        const existing = document.querySelector(`style[${attr}]`);
-        if (existing) return;
+        const sel = `style[${attr}="1"]`;
+        if (document.querySelector(sel)) return;
 
         const el = document.createElement("style");
         el.setAttribute(attr, "1");
         el.textContent = cssText;
         document.head.appendChild(el);
-
-        return () => el.remove();
     }, [cssText, attr]);
 }
 
 function IconAa() {
-    return <span style={{ fontWeight: 820, letterSpacing: "-0.06em" }}>Aa</span>;
+    return <span style={{ fontWeight: 860, letterSpacing: "-0.06em" }}>Aa</span>;
 }
 function IconX() {
     return <span style={{ fontSize: 14, lineHeight: 1 }}>✕</span>;
 }
+
+function isRangeInput(el: Element | null): el is HTMLInputElement {
+    return !!el && el.tagName === "INPUT" && (el as HTMLInputElement).type === "range";
+}
+
+function eventComposedPath(e: Event): EventTarget[] | null {
+    const anyE = e as unknown as { composedPath?: () => EventTarget[] };
+    return typeof anyE.composedPath === "function" ? anyE.composedPath() : null;
+}
+
+function pathContainsNode(path: EventTarget[] | null, node: Node | null): boolean {
+    if (!path || !node) return false;
+    for (const t of path) if (t === node) return true;
+    return false;
+}
+
+const PANEL_ID = "bp-typo-panel";
 
 export function ReaderTypographyControl() {
     const stored = useMemo(() => loadReaderTypography(), []);
@@ -89,6 +121,9 @@ export function ReaderTypographyControl() {
     const rootRef = useRef<HTMLDivElement | null>(null);
     const triggerRef = useRef<HTMLButtonElement | null>(null);
     const panelRef = useRef<HTMLDivElement | null>(null);
+
+    // Track whether a slider currently has focus (so Left/Right doesn't steal arrows)
+    const [activeRange, setActiveRange] = useState<RangeId | null>(null);
 
     const limits = useMemo(() => typographyLimits(), []);
     const fonts = useMemo(() => fontOptions() as FontOpt[], []);
@@ -103,9 +138,32 @@ export function ReaderTypographyControl() {
         "data-bp-typo-pop",
     );
 
+    const ids = useMemo(() => (fonts.map((f) => f.id) as TypographyFont[]), [fonts]);
+
+    const fontIndex = useMemo(() => {
+        if (!fonts.length) return 0;
+        const idx = fonts.findIndex((f) => f.id === t.font);
+        return idx >= 0 ? idx : 0;
+    }, [fonts, t.font]);
+
+    const curFont = useMemo(() => (fonts.length ? fonts[fontIndex]! : null), [fonts, fontIndex]);
+
+    const summary = useMemo(() => {
+        const size = `${Math.round(t.sizePx)}px`;
+        const weight = `${Math.round(t.weight)}`;
+        const font = curFont?.label ?? String(t.font);
+        return `${font} · ${size} · ${weight}`;
+    }, [t.sizePx, t.weight, t.font, curFont]);
+
+    const closePanel = useCallback(() => {
+        setOpen(false);
+        setActiveRange(null);
+        queueMicrotask(() => triggerRef.current?.focus());
+    }, []);
+
     const ensureEnabled = useCallback(() => {
-        if (!enabled) setEnabled(true);
-    }, [enabled]);
+        setEnabled((prev) => (prev ? prev : true));
+    }, []);
 
     const setPatch = useCallback(
         (patch: Partial<ReaderTypography>) => {
@@ -115,109 +173,125 @@ export function ReaderTypographyControl() {
         [ensureEnabled],
     );
 
-    const closePanel = useCallback(() => {
-        setOpen(false);
-        queueMicrotask(() => triggerRef.current?.focus());
-    }, []);
-
     const resetToDefaults = useCallback(() => {
         setEnabled(false);
         setT(DEFAULT_TYPOGRAPHY);
         setOpen(false);
+        setActiveRange(null);
         queueMicrotask(() => triggerRef.current?.focus());
     }, []);
 
-    // Live apply + save
+    // Lock contract fields always (measurePx + leading)
     useEffect(() => {
+        setT((prev) =>
+            updateTypography(prev, {
+                measurePx: DEFAULT_TYPOGRAPHY.measurePx,
+                leading: DEFAULT_TYPOGRAPHY.leading,
+            }),
+        );
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // Live apply + save (and enforce locked fields even if storage is dirty)
+    useEffect(() => {
+        const locked = updateTypography(t, {
+            measurePx: DEFAULT_TYPOGRAPHY.measurePx,
+            leading: DEFAULT_TYPOGRAPHY.leading,
+        });
+
         if (!enabled) {
             applyReaderTypography(null);
             clearReaderTypography();
             return;
         }
-        applyReaderTypography(t);
-        saveReaderTypography(t);
+
+        // Apply locked snapshot (prevents drift if someone patched t elsewhere)
+        applyReaderTypography(locked);
+        saveReaderTypography(locked);
+
+        // Keep state coherent if we had to clamp/lock
+        if (locked !== t) setT(locked);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [enabled, t]);
 
-    // Click-outside
+    // Open -> focus panel (so Escape works immediately)
+    useEffect(() => {
+        if (!open) return;
+        queueMicrotask(() => panelRef.current?.focus());
+    }, [open]);
+
+    // Click-outside (capture) — portals/shadow safe via composedPath when available.
     useEffect(() => {
         if (!open) return;
 
-        const onPointerDown = (e: PointerEvent) => {
+        const onPointerDownCapture = (e: PointerEvent) => {
             const root = rootRef.current;
             if (!root) return;
-            if (!root.contains(e.target as Node)) closePanel();
+
+            const target = e.target as Node | null;
+            const path = eventComposedPath(e);
+
+            const inside = (target && root.contains(target)) || pathContainsNode(path, root);
+            if (!inside) closePanel();
         };
 
-        document.addEventListener("pointerdown", onPointerDown, { capture: true });
-        return () => document.removeEventListener("pointerdown", onPointerDown, { capture: true } as any);
+        document.addEventListener("pointerdown", onPointerDownCapture, { capture: true });
+        return () => document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
     }, [open, closePanel]);
 
-    // Keyboard: Escape closes; Left/Right cycles font unless a slider is focused.
+    // Keyboard
     useEffect(() => {
         if (!open) return;
 
-        const onKey = (e: KeyboardEvent) => {
+        const onKeyCapture = (e: KeyboardEvent) => {
             if (e.key === "Escape") {
                 e.preventDefault();
                 closePanel();
                 return;
             }
-            if (e.metaKey || e.ctrlKey || e.altKey) return;
-            if (fonts.length === 0) return;
 
-            const ae = document.activeElement as HTMLElement | null;
-            const isRange = ae?.tagName === "INPUT" && (ae as HTMLInputElement).type === "range";
-            if (isRange) return;
+            if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+            // If a slider is focused, allow arrows to adjust it; add Home/End for snap.
+            const ae = document.activeElement as Element | null;
+            if (isRangeInput(ae)) {
+                if (e.key === "Home" || e.key === "End") {
+                    const input = ae as HTMLInputElement;
+                    const min = Number(input.min);
+                    const max = Number(input.max);
+                    input.value = String(e.key === "Home" ? min : max);
+                    input.dispatchEvent(new Event("input", { bubbles: true }));
+                    input.dispatchEvent(new Event("change", { bubbles: true }));
+                    e.preventDefault();
+                }
+                return;
+            }
+
+            // Font cycling (only when enabled, panel open, and no range focused)
+            if (!enabled) return;
+            if (!ids.length) return;
 
             if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
-                if (!enabled) return;
-                const ids = fonts.map((f) => f.id) as TypographyFont[];
                 const dir: 1 | -1 = e.key === "ArrowRight" ? 1 : -1;
                 setPatch({ font: nextOf(ids, t.font, dir) });
                 e.preventDefault();
             }
         };
 
-        window.addEventListener("keydown", onKey, { capture: true });
-        return () => window.removeEventListener("keydown", onKey, { capture: true } as any);
-    }, [open, closePanel, enabled, fonts, setPatch, t.font]);
-
-    // When opening, focus panel
-    useEffect(() => {
-        if (!open) return;
-        queueMicrotask(() => panelRef.current?.focus());
-    }, [open]);
+        window.addEventListener("keydown", onKeyCapture, { capture: true });
+        return () => window.removeEventListener("keydown", onKeyCapture, { capture: true });
+    }, [open, closePanel, enabled, ids, setPatch, t.font]);
 
     const onToggleOpen = useCallback(() => setOpen((v) => !v), []);
 
-    const ids = useMemo(() => (fonts.length ? (fonts.map((f) => f.id) as TypographyFont[]) : ([] as TypographyFont[])), [fonts]);
-
-    const fontIndex = useMemo(() => {
-        if (fonts.length === 0) return 0;
-        const idx = fonts.findIndex((f) => f.id === t.font);
-        return idx >= 0 ? idx : 0;
-    }, [fonts, t.font]);
-
-    const curFont = useMemo(() => (fonts.length ? fonts[fontIndex]! : null), [fonts, fontIndex]);
-
     const hopFont = useCallback(
         (dir: -1 | 1) => {
-            if (!enabled || ids.length === 0) return;
+            if (!enabled || !ids.length) return;
             setPatch({ font: nextOf(ids, t.font, dir) });
         },
         [enabled, ids, setPatch, t.font],
     );
 
-    const summary = useMemo(() => {
-        const size = `${Math.round(t.sizePx)}px`;
-        const weight = `${Math.round(t.weight)}`;
-        const leading = t.leading.toFixed(2);
-        const width = `${Math.round(t.measurePx)}px`;
-        return `${t.font} · ${size} · ${weight} · ${leading} · ${width}`;
-    }, [t]);
-
-    // Slider specs (inline)
-    const leadingStep = useMemo(() => (limits.leading.digits !== undefined ? Math.pow(10, -limits.leading.digits) : 0.01), [limits]);
     const sliderStyle = enabled ? sx.range : { ...sx.range, ...sx.rangeDisabled };
 
     return (
@@ -233,6 +307,7 @@ export function ReaderTypographyControl() {
                 onClick={onToggleOpen}
                 aria-haspopup="dialog"
                 aria-expanded={open}
+                aria-controls={PANEL_ID}
                 aria-label="Typography settings"
                 title={`Typography (${summary})`}
             >
@@ -244,6 +319,7 @@ export function ReaderTypographyControl() {
 
             {open && (
                 <div
+                    id={PANEL_ID}
                     ref={panelRef}
                     style={{
                         ...sx.panel,
@@ -290,7 +366,7 @@ export function ReaderTypographyControl() {
                         </div>
                     </div>
 
-                    {/* Tiny one-line summary (optional, but tight) */}
+                    {/* Summary */}
                     <div style={sx.sub} title={summary}>
                         {summary}
                     </div>
@@ -332,9 +408,7 @@ export function ReaderTypographyControl() {
                                     title={curFont ? `${curFont.label} (${fontIndex + 1}/${fonts.length})` : "Font"}
                                 >
                                     <span style={sx.fontName}>{curFont?.label ?? "—"}</span>
-                                    <span style={sx.fontCount}>
-                                        {fonts.length ? `${fontIndex + 1}/${fonts.length}` : ""}
-                                    </span>
+                                    <span style={sx.fontCount}>{fonts.length ? `${fontIndex + 1}/${fonts.length}` : ""}</span>
                                 </button>
 
                                 <button
@@ -362,9 +436,16 @@ export function ReaderTypographyControl() {
                                 max={limits.sizePx.hi}
                                 step={limits.sizePx.step}
                                 value={t.sizePx}
-                                onChange={(e) => setPatch({ sizePx: Math.round(clampNum(Number(e.target.value), 12, limits.sizePx.hi)) })}
+                                onChange={(e) =>
+                                    setPatch({
+                                        sizePx: Math.round(clampNum(Number(e.target.value), 12, limits.sizePx.hi)),
+                                    })
+                                }
+                                onFocus={() => setActiveRange("sizePx")}
+                                onBlur={() => setActiveRange((v) => (v === "sizePx" ? null : v))}
                                 style={sliderStyle}
                                 disabled={!enabled}
+                                aria-label="Scripture font size"
                             />
                         </div>
 
@@ -380,47 +461,16 @@ export function ReaderTypographyControl() {
                                 max={limits.weight.hi}
                                 step={limits.weight.step}
                                 value={t.weight}
-                                onChange={(e) => setPatch({ weight: Math.round(clampNum(Number(e.target.value), 200, limits.weight.hi)) })}
-                                style={sliderStyle}
-                                disabled={!enabled}
-                            />
-                        </div>
-
-                        {/* Leading */}
-                        <div style={sx.block}>
-                            <div style={sx.blockTop}>
-                                <span style={sx.blockLabel}>Leading</span>
-                                <span style={sx.blockValue}>{t.leading.toFixed(2)}</span>
-                            </div>
-                            <input
-                                type="range"
-                                min={0.95}
-                                max={limits.leading.hi}
-                                step={leadingStep}
-                                value={t.leading}
-                                onChange={(e) => setPatch({ leading: Number(clampNum(Number(e.target.value), 0.95, limits.leading.hi).toFixed(2)) })}
-                                style={sliderStyle}
-                                disabled={!enabled}
-                            />
-                        </div>
-
-                        {/* Width */}
-                        <div style={sx.block}>
-                            <div style={sx.blockTop}>
-                                <span style={sx.blockLabel}>Width</span>
-                                <span style={sx.blockValue}>{Math.round(t.measurePx)}px</span>
-                            </div>
-                            <input
-                                type="range"
-                                min={240}
-                                max={limits.measurePx.hi}
-                                step={limits.measurePx.step}
-                                value={t.measurePx}
                                 onChange={(e) =>
-                                    setPatch({ measurePx: Math.round(clampNum(Number(e.target.value), 240, limits.measurePx.hi)) })
+                                    setPatch({
+                                        weight: Math.round(clampNum(Number(e.target.value), 200, limits.weight.hi)),
+                                    })
                                 }
+                                onFocus={() => setActiveRange("weight")}
+                                onBlur={() => setActiveRange((v) => (v === "weight" ? null : v))}
                                 style={sliderStyle}
                                 disabled={!enabled}
+                                aria-label="Scripture font weight"
                             />
                         </div>
                     </div>
@@ -430,7 +480,12 @@ export function ReaderTypographyControl() {
                         <button type="button" style={sx.doneBtn} onClick={closePanel}>
                             Done
                         </button>
-                        <button type="button" style={sx.resetBtn} onClick={resetToDefaults} title="Reset and turn off overrides">
+                        <button
+                            type="button"
+                            style={sx.resetBtn}
+                            onClick={resetToDefaults}
+                            title="Reset and turn off overrides"
+                        >
                             Reset
                         </button>
                     </div>
@@ -470,7 +525,7 @@ const sx: Record<string, React.CSSProperties> = {
         background: "color-mix(in oklab, var(--panel) 86%, transparent)",
     },
     triggerDisabled: { opacity: 0.92 },
-    triggerGlyph: { fontSize: 13.5, fontWeight: 820, letterSpacing: "-0.05em" },
+    triggerGlyph: { fontSize: 13.5, fontWeight: 860, letterSpacing: "-0.05em" },
 
     dot: {
         position: "absolute",
@@ -508,7 +563,13 @@ const sx: Record<string, React.CSSProperties> = {
     },
     panelNoMotion: { animation: "none" },
 
-    header: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "1px 1px 0" },
+    header: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 8,
+        padding: "1px 1px 0",
+    },
     hTitle: { fontSize: 12.6, fontWeight: 860, letterSpacing: "-0.02em" },
     hRight: { display: "flex", alignItems: "center", gap: 6, flexShrink: 0 },
 
@@ -640,7 +701,14 @@ const sx: Record<string, React.CSSProperties> = {
         WebkitTapHighlightColor: "transparent",
     },
     fontPillDisabled: { cursor: "not-allowed", opacity: 0.65 },
-    fontName: { fontSize: 11.4, fontWeight: 820, letterSpacing: "-0.01em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+    fontName: {
+        fontSize: 11.4,
+        fontWeight: 820,
+        letterSpacing: "-0.01em",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+    },
     fontCount: { fontSize: 10.6, color: "var(--muted)", fontVariantNumeric: "tabular-nums", flexShrink: 0 },
 
     block: { display: "flex", flexDirection: "column", gap: 6 },

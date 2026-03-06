@@ -1,5 +1,5 @@
 // apps/api/src/db/authSchema.ts
-// Biblia Populi — Auth/Identity schema (DB-backed sessions + OAuth accounts)
+// Biblia.to — Auth/Identity schema (DB-backed sessions + OAuth accounts)
 //
 // Intent:
 // - Minimal + durable identity core
@@ -51,7 +51,9 @@ export const bpAuthAccount = sqliteTable(
         createdAt: integer("created_at").notNull(), // ms epoch
         updatedAt: integer("updated_at").notNull(), // ms epoch
 
-        userId: text("user_id").notNull(),
+        userId: text("user_id")
+            .notNull()
+            .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
 
         provider: text("provider").notNull(), // "google"
         providerUserId: text("provider_user_id").notNull(), // Google "sub"
@@ -80,7 +82,9 @@ export const bpSession = sqliteTable(
         createdAt: integer("created_at").notNull(), // ms epoch
         expiresAt: integer("expires_at").notNull(), // ms epoch
 
-        userId: text("user_id").notNull(),
+        userId: text("user_id")
+            .notNull()
+            .references(() => bpUser.id, { onDelete: "cascade", onUpdate: "cascade" }),
 
         // Optional hardening / audit
         ip: text("ip"),

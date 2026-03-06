@@ -5,10 +5,21 @@ import { Reader } from "./Reader";
 import { Search, type ReaderLocation } from "./Search";
 import { ThemeProvider, ThemeShell, ThemeTogglePill, useTheme } from "./theme";
 
+import { AuthProvider, useAuth } from "./auth/useAuth";
+import { ReaderPrefsProvider } from "./reader/prefs/ReaderPrefsProvider";
+
 type Page = "home" | "learn" | "reader";
 
-const LS_LAST_PAGE = "bp_nav_last_page_v1";
-const LS_LAST_LOC = "bp_nav_last_loc_v1";
+/**
+ * Rebrand: Biblia Populi -> Biblia.to
+ * We migrate localStorage keys so existing users keep their last page / location.
+ */
+const LS_LAST_PAGE = "bt_nav_last_page_v1";
+const LS_LAST_LOC = "bt_nav_last_loc_v1";
+
+// legacy keys (read-only migration)
+const LS_LAST_PAGE_LEGACY = "bp_nav_last_page_v1";
+const LS_LAST_LOC_LEGACY = "bp_nav_last_loc_v1";
 
 /* ---------------- Small helpers (safe localStorage) ---------------- */
 function safeGet(key: string): string | null {
@@ -34,12 +45,7 @@ function isPage(v: unknown): v is Page {
 }
 
 function toInt(v: unknown): number | null {
-    const n =
-        typeof v === "number"
-            ? v
-            : typeof v === "string" && v.trim() !== ""
-                ? Number(v)
-                : NaN;
+    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
     return Number.isFinite(n) ? Math.trunc(n) : null;
 }
 
@@ -152,10 +158,15 @@ function formatHash(page: Page, loc: ReaderLocation | null): string {
 }
 
 /* ---------------- App ---------------- */
+
 export default function App() {
     return (
         <ThemeProvider>
-            <AppInner />
+            <AuthProvider>
+                <ReaderPrefsProvider>
+                    <AppInner />
+                </ReaderPrefsProvider>
+            </AuthProvider>
         </ThemeProvider>
     );
 }
@@ -166,14 +177,16 @@ function AppInner() {
     const initialNav = useMemo(() => {
         const url = typeof window === "undefined" ? {} : readUrlIntent();
 
-        const savedPageRaw = safeGet(LS_LAST_PAGE);
+        // Prefer new keys; fall back to legacy keys for migration.
+        const savedPageRaw = safeGet(LS_LAST_PAGE) ?? safeGet(LS_LAST_PAGE_LEGACY);
         const savedPage: Page | null = isPage(savedPageRaw) ? savedPageRaw : null;
 
-        const savedLoc = parseLoc(safeGet(LS_LAST_LOC));
+        const savedLoc =
+            parseLoc(safeGet(LS_LAST_LOC)) ??
+            parseLoc(safeGet(LS_LAST_LOC_LEGACY));
 
         // Default to HOME unless URL explicitly asked for reader.
         const page: Page = (url.page as Page | undefined) ?? (savedPage && savedPage !== "reader" ? savedPage : "home");
-
         const loc: ReaderLocation | null = url.loc ?? savedLoc;
 
         return { page, loc };
@@ -185,7 +198,7 @@ function AppInner() {
     // Whether *we* are currently writing to the URL (so popstate/hashchange doesn't bounce back)
     const writingUrl = useRef(false);
 
-    // Keep last page + loc
+    // Keep last page + loc (new keys)
     useEffect(() => {
         safeSet(LS_LAST_PAGE, page);
     }, [page]);
@@ -195,6 +208,15 @@ function AppInner() {
         if (enc) safeSet(LS_LAST_LOC, enc);
         else safeDel(LS_LAST_LOC);
     }, [readerLoc]);
+
+    // One-time cleanup: once we've written new keys, legacy keys are no longer needed.
+    useEffect(() => {
+        // Only remove if new keys exist (avoid nuking in private mode edge cases).
+        const hasNew = safeGet(LS_LAST_PAGE) != null || safeGet(LS_LAST_LOC) != null;
+        if (!hasNew) return;
+        safeDel(LS_LAST_PAGE_LEGACY);
+        safeDel(LS_LAST_LOC_LEGACY);
+    }, []);
 
     // Keep URL in sync
     useEffect(() => {
@@ -222,8 +244,6 @@ function AppInner() {
             const intent = readUrlIntent();
 
             if (intent.page) setPage(intent.page);
-
-            // Only set reader loc when URL provides one explicitly.
             if (intent.loc) setReaderLoc(intent.loc);
         };
 
@@ -278,11 +298,16 @@ function AppInner() {
         [goHome, goLearn, mode, toggle, startReading, navigateTo],
     );
 
+    // No more account pill in the corner; sign-in lives on Home and account menu lives in ReaderHeader.
+    const showCornerTheme = page !== "reader"; // reader already has a theme switch in the header
+
     return (
         <ThemeShell style={styles.page}>
-            <div style={styles.cornerControls} aria-label="App controls">
-                <ThemeTogglePill mode={mode} onToggle={toggle} />
-            </div>
+            {showCornerTheme ? (
+                <div style={styles.cornerControls} aria-label="Theme">
+                    <ThemeTogglePill mode={mode} onToggle={toggle} />
+                </div>
+            ) : null}
 
             <div style={styles.stage}>{renderPage(page, page === "reader" ? readerLoc : null)}</div>
         </ThemeShell>
@@ -293,6 +318,7 @@ function AppInner() {
 
 function Home(props: { onLearnMore: () => void; onStartReading: () => void; onNavigate: (loc: ReaderLocation) => void }) {
     const { onLearnMore, onStartReading, onNavigate } = props;
+    const { user, signInWithGoogle } = useAuth();
 
     return (
         <main style={styles.centerStage} aria-label="Landing">
@@ -301,7 +327,7 @@ function Home(props: { onLearnMore: () => void; onStartReading: () => void; onNa
                     <img src="/cross.png" alt="" style={styles.crossImg} draggable={false} decoding="async" loading="eager" />
                 </div>
 
-                <h1 style={styles.h1}>Biblia Populi</h1>
+                <h1 style={styles.h1}>Biblia.to</h1>
                 <p style={styles.lede}>
                     A public, open-access KJV Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen.
                 </p>
@@ -319,6 +345,27 @@ function Home(props: { onLearnMore: () => void; onStartReading: () => void; onNa
                     <button type="button" onClick={onStartReading} style={styles.primaryBtnButton} aria-label="Start reading">
                         Start reading
                     </button>
+                </div>
+
+                {/* Home is the only place we need a sign-in CTA. */}
+                <div style={styles.authRow} aria-label="Account">
+                    {!user ? (
+                        <>
+                            <button
+                                type="button"
+                                onClick={() => signInWithGoogle({ returnTo: window.location.href })}
+                                style={styles.authBtn}
+                            >
+                                Continue with Google
+                            </button>
+                            <div style={styles.authHint}>Optional. Use one account across devices.</div>
+                        </>
+                    ) : (
+                        <>
+                            <div style={styles.authHintStrong}>Signed in.</div>
+                            <div style={styles.authHint}>Open the Reader to manage account (sign out, refresh).</div>
+                        </>
+                    )}
                 </div>
 
                 <button type="button" onClick={onLearnMore} style={styles.learnMoreBtn}>
@@ -473,6 +520,49 @@ export const styles: Record<string, React.CSSProperties> = {
         border: "none",
         cursor: "pointer",
         WebkitTapHighlightColor: "transparent",
+    },
+
+    /* ---------- Auth CTA (home only) ---------- */
+    authRow: {
+        marginTop: 14,
+        display: "grid",
+        placeItems: "center",
+        gap: 8,
+    },
+
+    authBtn: {
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "10px 14px",
+        borderRadius: 12,
+        border: "1px solid var(--hairline)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 92%, white), color-mix(in oklab, var(--panel) 98%, transparent))",
+        color: "var(--fg)",
+        fontSize: 12.8,
+        fontWeight: 720,
+        letterSpacing: "-0.01em",
+        boxShadow: "0 10px 26px rgba(0,0,0,0.06)",
+        cursor: "pointer",
+        WebkitTapHighlightColor: "transparent",
+    },
+
+    authHint: {
+        fontSize: 12.2,
+        color: "var(--muted)",
+        lineHeight: 1.6,
+        maxWidth: 520,
+        marginInline: "auto",
+    },
+
+    authHintStrong: {
+        fontSize: 12.2,
+        color: "var(--fg)",
+        opacity: 0.92,
+        fontWeight: 760,
+        letterSpacing: "0.02em",
+        textTransform: "uppercase",
     },
 
     learnMoreBtn: {

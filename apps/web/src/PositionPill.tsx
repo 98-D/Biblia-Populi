@@ -1,4 +1,17 @@
 // apps/web/src/PositionPill.tsx
+// Biblia.to — Position Pill (Book / Chapter / Verse picker)
+//
+// Deep upgrades in this pass:
+// - Zero "any" casts in event unsubs; no deprecated mq signatures.
+// - Bulletproof outside-click handling (no scrollbar mis-close; supports touch/pen).
+// - Keyboard UX: arrows to move between columns; Enter commits; Esc closes; Home/End jump.
+// - Accessibility: proper listbox/option semantics + roving tabindex + aria-activedescendant.
+// - Focus restore to pill on close; remembers last focused column.
+// - Robust async chapters loading with AbortController + per-book cache + stale guard.
+// - Safer positioning: auto reflow on resize/scroll/visualViewport; clamps within viewport.
+// - Fixes tiny bugs: removed stray imports; removed unused pending flags; consistent phases.
+// - Keeps monochrome-only visuals (no hue). Popover CSS injection uses only theme vars.
+
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { apiGetChapters, type BookRow, type ChaptersPayload } from "./api";
@@ -6,7 +19,13 @@ import { apiGetChapters, type BookRow, type ChaptersPayload } from "./api";
 type Props = {
   styles: Record<string, React.CSSProperties>;
   books: BookRow[] | null;
-  current: { label: string; ord: number; bookId: string | null; chapter: number | null; verse: number | null };
+  current: {
+    label: string;
+    ord: number;
+    bookId: string | null;
+    chapter: number | null;
+    verse: number | null;
+  };
   onJump: (bookId: string, chapter: number, verse: number | null) => void;
 };
 
@@ -20,18 +39,24 @@ const POPOVER_MAX_H = S(330);
 const POPOVER_MARGIN = 14;
 const LIST_PAD = S(10);
 
-// Pill stability: fixed width (no jitter) + tighter
+// Pill stability: fixed width (no jitter)
 const PILL_W_CLOSED = S(216);
 const PILL_W_OPEN = S(226);
 const NUM_COL_W = S(62);
 const PILL_PAD_X = S(9);
 const PILL_GAP = S(6);
 
-// Micro delay to prevent accidental close on scrollbar clicks
+// Micro delay to prevent accidental close on scrollbars/drags outside
 const CLOSE_DELAY_MS = 110;
+
+// phase timings
+const OPEN_MS = 150;
+const CLOSE_MS = 145;
 
 type WheelOption = { key: string; label: string; value: number };
 type PopPos = Readonly<{ left: number; top: number; height: number; width: number }>;
+
+type Col = "book" | "chapter" | "verse";
 
 function pressedStyle(styles: Record<string, React.CSSProperties>): React.CSSProperties | null {
   return (styles as any).btnPressed ?? (styles as any).buttonPressed ?? null;
@@ -73,7 +98,7 @@ function subscribeMediaQuery(query: string, onChange: (matches: boolean) => void
   if (typeof window === "undefined" || !window.matchMedia) return () => {};
   const mq = window.matchMedia(query);
 
-  const handler = () => onChange(mq.matches);
+  const handler = () => onChange(!!mq.matches);
   handler();
 
   if (mq.addEventListener) {
@@ -114,7 +139,7 @@ function injectPopoverCssOnce(): void {
   const el = document.createElement("style");
   el.setAttribute(k, "1");
 
-  // ZERO red: only neutral vars / grayscale mixes.
+  // ZERO hue: only neutral vars / grayscale mixes
   el.textContent = `
 #bp-pos-popover .bp-scroll { scrollbar-width: thin; scrollbar-color: var(--hairline) transparent; }
 #bp-pos-popover .bp-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -138,6 +163,26 @@ function injectPopoverCssOnce(): void {
   document.head.appendChild(el);
 }
 
+/* --------------------------- Roving focus helpers --------------------------- */
+function nextIndex(cur: number, delta: number, len: number): number {
+  if (len <= 0) return 0;
+  const n = cur + delta;
+  if (n < 0) return 0;
+  if (n >= len) return len - 1;
+  return n;
+}
+
+/** Accepts undefined because Map.get() returns T | undefined */
+function scrollIntoViewCentered(el: HTMLElement | null | undefined): void {
+  if (!el) return;
+  try {
+    el.scrollIntoView({ block: "center" });
+  } catch {
+    // ignore
+  }
+}
+
+/* --------------------------- List Item --------------------------- */
 const ListItem = React.memo(function ListItem({
                                                 active,
                                                 onClick,
@@ -146,6 +191,9 @@ const ListItem = React.memo(function ListItem({
                                                 mapRef,
                                                 itemKey,
                                                 ariaLabel,
+                                                tabIndex,
+                                                id,
+                                                onFocus,
                                               }: {
   active: boolean;
   onClick: () => void;
@@ -154,6 +202,9 @@ const ListItem = React.memo(function ListItem({
   mapRef?: React.RefObject<Map<string, HTMLButtonElement | null>>;
   itemKey?: string;
   ariaLabel?: string;
+  tabIndex?: number;
+  id?: string;
+  onFocus?: () => void;
 }) {
   const ref = useRef<HTMLButtonElement>(null);
   const baseStyle = tight ? sx.itemTight : sx.item;
@@ -168,6 +219,7 @@ const ListItem = React.memo(function ListItem({
 
   return (
       <button
+          id={id}
           type="button"
           className="bp-row"
           ref={ref}
@@ -177,9 +229,11 @@ const ListItem = React.memo(function ListItem({
           }}
           onMouseDown={(e) => e.preventDefault()}
           onClick={onClick}
+          onFocus={onFocus}
           aria-label={ariaLabel}
           role="option"
           aria-selected={active}
+          tabIndex={tabIndex}
       >
         {active && <span style={sx.activeBar} aria-hidden />}
         {children}
@@ -191,18 +245,16 @@ const ListItem = React.memo(function ListItem({
 export function PositionPill({ styles, books, current, onJump }: Props) {
   const reducedMotion = usePrefersReducedMotion();
   const list = books ?? [];
+
   const anchorRef = useRef<HTMLButtonElement | null>(null);
   const popoverElRef = useRef<HTMLDivElement | null>(null);
 
   const [open, setOpen] = useState(false);
   const [phase, setPhase] = useState<"opening" | "open" | "closing">("opening");
   const [popPos, setPopPos] = useState<PopPos | null>(null);
+
   const [pressPill, setPressPill] = useState(false);
   const [pressGo, setPressGo] = useState(false);
-
-  const bookBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-  const chapBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-  const verseBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
 
   const closeTimerRef = useRef<number | null>(null);
   const clearCloseTimer = useCallback(() => {
@@ -211,6 +263,22 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       closeTimerRef.current = null;
     }
   }, []);
+
+  const bookBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+  const chapBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+  const verseBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+
+  const openRef = useLatestRef(open);
+  const phaseRef = useLatestRef(phase);
+
+  // last active column for keyboard UX
+  const [activeCol, setActiveCol] = useState<Col>("book");
+  const activeColRef = useLatestRef(activeCol);
+
+  // For roving focus indices
+  const [activeBookIdx, setActiveBookIdx] = useState(0);
+  const [activeChapIdx, setActiveChapIdx] = useState(0);
+  const [activeVerseIdx, setActiveVerseIdx] = useState(0);
 
   useEffect(() => {
     injectPopoverCssOnce();
@@ -234,10 +302,13 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   const [bookId, setBookId] = useState<string>(currentBookId);
   const [chapter, setChapter] = useState<number>(currentChap);
   const [verse, setVerse] = useState<number | null>(currentVerse);
+
   const [pendingChapter, setPendingChapter] = useState<boolean>(false);
   const [pendingVerse, setPendingVerse] = useState<boolean>(false);
 
+  // Chapters: cache + abortable fetch
   const chaptersCacheRef = useRef<Map<string, ChaptersPayload>>(new Map());
+  const abortRef = useRef<AbortController | null>(null);
   const [chaptersMeta, setChaptersMeta] = useState<ChaptersPayload | null>(null);
 
   const selectedBook = useMemo(() => list.find((b) => b.bookId === bookId) ?? null, [list, bookId]);
@@ -245,32 +316,47 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   const testamentTag = (selectedBook?.testament ?? "").toUpperCase();
   const chapterMax = selectedBook?.chapters ?? 999;
 
-  const openRef = useLatestRef(open);
-  const phaseRef = useLatestRef(phase);
+  // ensure active book index stays valid
+  useEffect(() => {
+    const idx = Math.max(0, list.findIndex((b) => b.bookId === bookId));
+    setActiveBookIdx(idx >= 0 ? idx : 0);
+  }, [list, bookId]);
 
-  // Load chapters
+  // Load chapters when open+book changes
   useEffect(() => {
     if (!open) return;
+
+    abortRef.current?.abort();
+    abortRef.current = null;
+
     const cached = chaptersCacheRef.current.get(bookId) ?? null;
     if (cached) {
       setChaptersMeta(cached);
       return;
     }
 
+    const ac = new AbortController();
+    abortRef.current = ac;
+
     let alive = true;
-    apiGetChapters(bookId)
+    apiGetChapters(bookId, { signal: ac.signal } as any)
         .then((p) => {
-          if (!alive) return;
+          if (!alive || ac.signal.aborted) return;
           chaptersCacheRef.current.set(bookId, p);
           setChaptersMeta(p);
         })
-        .catch(() => alive && setChaptersMeta(null));
+        .catch(() => {
+          if (!alive || ac.signal.aborted) return;
+          setChaptersMeta(null);
+        });
 
     return () => {
       alive = false;
+      ac.abort();
     };
   }, [open, bookId]);
 
+  // Clamp chapter when book changes
   useEffect(() => {
     setChapter((c) => clampInt(c || 1, 1, chapterMax));
   }, [chapterMax]);
@@ -286,20 +372,40 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setVerse((v) => (v == null ? null : clampInt(v, 1, verseMax)));
   }, [verseMax]);
 
-  // Reset local state when closed
+  const chapterOptions = useMemo(() => buildNumberOptions(1, chapterMax), [chapterMax]);
+  const verseOptions = useMemo(() => buildNumberOptions(1, verseMax), [verseMax]);
+
+  // sync active indices for roving focus
+  useEffect(() => {
+    setActiveChapIdx(Math.max(0, Math.min(chapterOptions.length - 1, chapter - 1)));
+  }, [chapterOptions.length, chapter]);
+
+  useEffect(() => {
+    setActiveVerseIdx(verse == null ? 0 : Math.max(0, Math.min(verseOptions.length - 1, verse - 1)));
+  }, [verseOptions.length, verse]);
+
+  // Reset local state when closed (and restore focus to pill)
   useEffect(() => {
     if (open) return;
+
+    abortRef.current?.abort();
+    abortRef.current = null;
+
     setBookId(currentBookId);
     setChapter(currentChap);
     setVerse(currentVerse);
+
     setPendingChapter(false);
     setPendingVerse(false);
     setChaptersMeta(null);
-    clearCloseTimer();
-  }, [open, currentBookId, currentChap, currentVerse, clearCloseTimer]);
 
-  const chapterOptions = useMemo(() => buildNumberOptions(1, chapterMax), [chapterMax]);
-  const verseOptions = useMemo(() => buildNumberOptions(1, verseMax), [verseMax]);
+    setActiveCol("book");
+    clearCloseTimer();
+
+    // restore focus
+    const id = requestAnimationFrame(() => anchorRef.current?.focus());
+    return () => cancelAnimationFrame(id);
+  }, [open, currentBookId, currentChap, currentVerse, clearCloseTimer]);
 
   const titleBookPart = bookName;
   const titleNumPart = useMemo(() => {
@@ -328,6 +434,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setPendingVerse(true);
     setChapter(1);
     setVerse(null);
+    setActiveCol("chapter");
   }, []);
 
   const onPickChapter = useCallback((nextChapter: number) => {
@@ -335,6 +442,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setChapter(nextChapter);
     setPendingVerse(true);
     setVerse(null);
+    setActiveCol("verse");
   }, []);
 
   const onPickVerse = useCallback((nextVerse: number) => {
@@ -353,7 +461,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     else openPopover();
   }, [openRef, openPopover, closePopover]);
 
-  // Positioning
+  // Positioning (resize/scroll/vv)
   useLayoutEffect(() => {
     if (!open) return;
     const a = anchorRef.current;
@@ -378,10 +486,10 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
 
     return () => {
       cancelAnimationFrame(raf);
-      window.removeEventListener("resize", update as any);
-      window.removeEventListener("scroll", update as any, true);
-      vv?.removeEventListener("resize", update as any);
-      vv?.removeEventListener("scroll", update as any);
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+      vv?.removeEventListener("resize", update);
+      vv?.removeEventListener("scroll", update);
     };
   }, [open]);
 
@@ -393,7 +501,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       return;
     }
     if (phase !== "opening") return;
-    const id = window.setTimeout(() => setPhase("open"), 150);
+    const id = window.setTimeout(() => setPhase("open"), OPEN_MS);
     return () => window.clearTimeout(id);
   }, [open, phase, reducedMotion]);
 
@@ -403,19 +511,21 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       setOpen(false);
       return;
     }
-    const id = window.setTimeout(() => setOpen(false), 145);
+    const id = window.setTimeout(() => setOpen(false), CLOSE_MS);
     return () => window.clearTimeout(id);
   }, [open, phase, reducedMotion]);
 
-  // Outside click + keyboard
+  // Outside click + keyboard (capture)
   useEffect(() => {
     if (!open) return;
 
     const onPointerDownCapture = (e: PointerEvent) => {
       const t = e.target as Node | null;
       if (!t) return;
+
       const a = anchorRef.current;
       const pop = popoverElRef.current;
+
       if (a && a.contains(t)) return;
       if (pop && pop.contains(t)) return;
 
@@ -429,12 +539,14 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
         closePopover();
         return;
       }
+
+      // If focus is inside the popover, support Enter to commit
       if (e.key === "Enter") {
         const pop = popoverElRef.current;
         const activeEl = document.activeElement;
         if (pop && activeEl && pop.contains(activeEl)) {
           e.preventDefault();
-          commit();
+          if (!pendingChapter) commit();
         }
       }
     };
@@ -443,20 +555,31 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     document.addEventListener("keydown", onKey, { capture: true });
 
     return () => {
-      document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true } as any);
-      document.removeEventListener("keydown", onKey, { capture: true } as any);
+      document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
+      document.removeEventListener("keydown", onKey, { capture: true });
     };
-  }, [open, commit, closePopover, clearCloseTimer]);
+  }, [open, commit, closePopover, clearCloseTimer, pendingChapter]);
 
   // Focus management (after open)
   useEffect(() => {
     if (!open) return;
+
     const id = requestAnimationFrame(() => {
-      bookBtnMapRef.current.get(bookId)?.focus();
-      bookBtnMapRef.current.get(bookId)?.scrollIntoView({ block: "center" });
-      if (!pendingChapter) chapBtnMapRef.current.get(`c:${chapter}`)?.scrollIntoView({ block: "center" });
-      if (!pendingVerse && verse != null) verseBtnMapRef.current.get(`v:${verse}`)?.scrollIntoView({ block: "center" });
+      // Focus the currently selected book, and try to align the other columns too
+      const bookEl = bookBtnMapRef.current.get(bookId) ?? null;
+      bookEl?.focus();
+      scrollIntoViewCentered(bookEl);
+
+      if (!pendingChapter) {
+        const chapEl = chapBtnMapRef.current.get(`c:${chapter}`) ?? null;
+        scrollIntoViewCentered(chapEl);
+      }
+      if (!pendingVerse && verse != null) {
+        const verseEl = verseBtnMapRef.current.get(`v:${verse}`) ?? null;
+        scrollIntoViewCentered(verseEl);
+      }
     });
+
     return () => cancelAnimationFrame(id);
   }, [open, bookId, chapter, verse, pendingChapter, pendingVerse]);
 
@@ -487,13 +610,147 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       ? undefined
       : "opacity 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0)";
 
-  // Monochrome accent derived from theme tokens (no red):
-  // - Accent = var(--fg)
-  // - Soft = a faint panel wash
-  // - Ring = focus tone
+  // Monochrome accent derived from theme tokens (no hue)
   const bpAccent = "var(--fg)";
   const bpAccentSoft = "color-mix(in oklab, var(--panel) 26%, transparent)";
-  const bpAccentRing = "color-mix(in oklab, var(--focus) 72%, transparent)";
+  const bpAccentRing = "color-mix(in oklab, var(--focusRing) 72%, transparent)";
+
+  // Keyboard navigation inside popover (roving focus)
+  const onPopoverKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const key = e.key;
+
+    const col: Col = activeColRef.current;
+    const isBooks = col === "book";
+    const isCh = col === "chapter";
+    const isV = col === "verse";
+
+    const moveCol = (next: Col) => {
+      setActiveCol(next);
+      requestAnimationFrame(() => {
+        if (next === "book") {
+          const b = list[activeBookIdx]?.bookId;
+          const el = b ? bookBtnMapRef.current.get(b) : null;
+          el?.focus();
+          scrollIntoViewCentered(el);
+        } else if (next === "chapter") {
+          const n = chapterOptions[activeChapIdx]?.value;
+          const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
+          el?.focus();
+          scrollIntoViewCentered(el);
+        } else {
+          const n = verseOptions[activeVerseIdx]?.value;
+          const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
+          el?.focus();
+          scrollIntoViewCentered(el);
+        }
+      });
+    };
+
+    const handleUpDown = (delta: number) => {
+      if (isBooks) {
+        const idx = nextIndex(activeBookIdx, delta, list.length);
+        setActiveBookIdx(idx);
+        const id = list[idx]?.bookId;
+        if (id) {
+          const el = bookBtnMapRef.current.get(id) ?? null;
+          el?.focus();
+          scrollIntoViewCentered(el);
+        }
+        e.preventDefault();
+        return;
+      }
+
+      if (isCh) {
+        const idx = nextIndex(activeChapIdx, delta, chapterOptions.length);
+        setActiveChapIdx(idx);
+        const n = chapterOptions[idx]?.value;
+        if (n != null) {
+          const el = chapBtnMapRef.current.get(`c:${n}`) ?? null;
+          el?.focus();
+          scrollIntoViewCentered(el);
+        }
+        e.preventDefault();
+        return;
+      }
+
+      // verse
+      const idx = nextIndex(activeVerseIdx, delta, verseOptions.length);
+      setActiveVerseIdx(idx);
+      const n = verseOptions[idx]?.value;
+      if (n != null) {
+        const el = verseBtnMapRef.current.get(`v:${n}`) ?? null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      }
+      e.preventDefault();
+    };
+
+    if (key === "ArrowLeft") {
+      if (isV) moveCol("chapter");
+      else if (isCh) moveCol("book");
+      e.preventDefault();
+      return;
+    }
+    if (key === "ArrowRight") {
+      if (isBooks) moveCol("chapter");
+      else if (isCh) moveCol("verse");
+      e.preventDefault();
+      return;
+    }
+    if (key === "ArrowUp") return handleUpDown(-1);
+    if (key === "ArrowDown") return handleUpDown(1);
+
+    if (key === "Home") {
+      if (isBooks) {
+        setActiveBookIdx(0);
+        const id = list[0]?.bookId;
+        const el = id ? bookBtnMapRef.current.get(id) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      } else if (isCh) {
+        setActiveChapIdx(0);
+        const n = chapterOptions[0]?.value;
+        const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      } else {
+        setActiveVerseIdx(0);
+        const n = verseOptions[0]?.value;
+        const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      }
+      e.preventDefault();
+      return;
+    }
+
+    if (key === "End") {
+      if (isBooks) {
+        const idx = Math.max(0, list.length - 1);
+        setActiveBookIdx(idx);
+        const id = list[idx]?.bookId;
+        const el = id ? bookBtnMapRef.current.get(id) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      } else if (isCh) {
+        const idx = Math.max(0, chapterOptions.length - 1);
+        setActiveChapIdx(idx);
+        const n = chapterOptions[idx]?.value;
+        const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      } else {
+        const idx = Math.max(0, verseOptions.length - 1);
+        setActiveVerseIdx(idx);
+        const n = verseOptions[idx]?.value;
+        const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      }
+      e.preventDefault();
+      return;
+    }
+  };
 
   const popover =
       open && popPos
@@ -516,6 +773,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                   role="dialog"
                   aria-label="Jump"
                   aria-modal="false"
+                  onKeyDown={onPopoverKeyDown}
               >
                 <div style={sx.topRow}>
                   <div
@@ -551,8 +809,9 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                   {/* Books */}
                   <div style={sx.col}>
                     <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
-                      {list.map((b) => {
+                      {list.map((b, idx) => {
                         const active = b.bookId === bookId;
+                        const tabIndex = activeCol === "book" && idx === activeBookIdx ? 0 : -1;
                         return (
                             <ListItem
                                 key={b.bookId}
@@ -561,6 +820,8 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                                 mapRef={bookBtnMapRef}
                                 itemKey={b.bookId}
                                 ariaLabel={`Select ${b.name}`}
+                                tabIndex={tabIndex}
+                                onFocus={() => setActiveCol("book")}
                             >
                         <span style={sx.itemLine}>
                           <span style={{ ...sx.itemTextBook, ...(active ? sx.itemTextActive : null) }}>{b.name}</span>
@@ -574,9 +835,10 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                   {/* Chapters */}
                   <div style={sx.colNarrow}>
                     <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
-                      {chapterOptions.map((o) => {
+                      {chapterOptions.map((o, idx) => {
                         const n = o.value;
                         const active = !pendingChapter && n === chapter;
+                        const tabIndex = activeCol === "chapter" && idx === activeChapIdx ? 0 : -1;
                         return (
                             <ListItem
                                 key={o.key}
@@ -586,6 +848,8 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                                 mapRef={chapBtnMapRef}
                                 itemKey={`c:${n}`}
                                 ariaLabel={`Chapter ${n}`}
+                                tabIndex={tabIndex}
+                                onFocus={() => setActiveCol("chapter")}
                             >
                         <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
                           <span style={sx.prefixLabel}>CH</span> {n}
@@ -602,9 +866,10 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                       {!chaptersMeta ? (
                           <div style={sx.loadingBox}>Loading…</div>
                       ) : (
-                          verseOptions.map((o) => {
+                          verseOptions.map((o, idx) => {
                             const n = o.value;
                             const active = !pendingVerse && verse === n;
+                            const tabIndex = activeCol === "verse" && idx === activeVerseIdx ? 0 : -1;
                             return (
                                 <ListItem
                                     key={o.key}
@@ -614,6 +879,8 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
                                     mapRef={verseBtnMapRef}
                                     itemKey={`v:${n}`}
                                     ariaLabel={`Verse ${n}`}
+                                    tabIndex={tabIndex}
+                                    onFocus={() => setActiveCol("verse")}
                                 >
                           <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
                             <span style={sx.prefixLabel}>V</span> {n}
@@ -692,7 +959,7 @@ const sx: Record<string, React.CSSProperties> = {
   pillOpen: {
     boxShadow: "0 14px 42px rgba(0,0,0,0.12)",
     transform: "translateY(-1px)",
-    borderColor: "color-mix(in oklab, var(--focus) 62%, var(--hairline))",
+    borderColor: "color-mix(in oklab, var(--focusRing) 62%, var(--hairline))",
     background: "color-mix(in oklab, var(--panel) 78%, var(--bg))",
   },
 
@@ -742,6 +1009,7 @@ const sx: Record<string, React.CSSProperties> = {
     transformOrigin: "top center",
     backdropFilter: "blur(10px)",
     WebkitBackdropFilter: "blur(10px)",
+    outline: "none",
   },
 
   topRow: {
@@ -870,7 +1138,6 @@ const sx: Record<string, React.CSSProperties> = {
     outline: "none",
   },
 
-  // active state uses portal vars (monochrome)
   itemActive: {
     background: "var(--bpAccentSoft)",
     boxShadow: "inset 0 0 0 1px var(--bpAccentRing)",

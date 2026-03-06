@@ -1,4 +1,20 @@
-/* apps/web/src/base.css — Biblia Populi (minimal, reading-first) */
+/* apps/web/src/base.css — Biblia.to (minimal, reading-first, premium)
+ *
+ * Goals:
+ * - Paper-soft light mode (less harsh than pure white)
+ * - Ink-like dark mode (high contrast, calm)
+ * - Stable layout (no scrollbar jump)
+ * - Premium transitions (theme swap without jitter)
+ * - Excellent focus/accessibility defaults
+ * - Scrollbars: subtle, themed, not obnoxious
+ * - Overlay primitives (search/panels/popovers)
+ * - Reader typography tokens (fixed measure; user controls font/weight/size)
+ * - Annotation-friendly primitives (selection, ink layer, highlight color tokens)
+ *
+ * Notes:
+ * - Avoid “global transitions always on”: only enable transitions during theme swap via html.bp-theme-swap
+ * - Keep tokens orientation-first. Component CSS can build on these primitives.
+ */
 
 /* =========================================================
    Root Tokens
@@ -7,10 +23,8 @@
     /* ---------------- Fonts ---------------- */
     --font-sans: "Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans",
     "Apple Color Emoji", "Segoe UI Emoji";
-
     --font-serif: "Literata Variable", Literata, ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
     "Times New Roman", Times, serif;
-
     --font-rounded: "Quicksand Variable", Quicksand, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial;
 
     /* ---------------- Reader Typography ---------------- */
@@ -18,6 +32,8 @@
     --bpScriptureSize: 18px;
     --bpScriptureLeading: 1.75;
     --bpScriptureWeight: 400;
+
+    /* Fixed width measure; user can change only font/weight/size in UI */
     --bpReaderMeasure: 840px;
 
     /* ---------------- Layout ---------------- */
@@ -25,50 +41,115 @@
     --reading: 720px;
 
     /* ---------------- Radii ---------------- */
-    --radius: 16px;
-    --radius-sm: 12px;
+    --radius: 18px;
+    --radius-sm: 13px;
+    --radius-xs: 10px;
+
+    /* ---------------- Borders / Hairlines ---------------- */
+    --hairlineW: 1px;
 
     /* ---------------- Text ---------------- */
     --text: 16px;
     --leading: 1.6;
+    --tracking-tight: -0.02em;
+    --tracking-normal: 0.01em;
 
     /* ---------------- Theme transition ---------------- */
     --themeDur: 320ms;
     --themeEase: cubic-bezier(0.2, 0.8, 0.2, 1);
 
+    /* ---------------- Motion primitives ---------------- */
+    --dur-1: 140ms;
+    --dur-2: 220ms;
+    --dur-3: 320ms;
+    --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+    --ease-in: cubic-bezier(0.4, 0, 1, 1);
+
     /* ---------------- Light Theme (Paper) ---------------- */
     --bg: #f6f4f0;
     --fg: #101012;
-    --muted: rgba(16,16,18,0.58);
-    --hairline: rgba(16,16,18,0.11);
-    --focus: rgba(16,16,18,0.14);
-    --focusRing: rgba(16,16,18,0.1);
+    --muted: rgba(16, 16, 18, 0.58);
+    --muted2: rgba(16, 16, 18, 0.44);
 
-    --panel: rgba(16,16,18,0.025);
+    --hairline: rgba(16, 16, 18, 0.11);
+    --hairline2: rgba(16, 16, 18, 0.075);
 
-    --overlay: rgba(246,244,240,0.9);
-    --overlay2: rgba(246,244,240,0.96);
-    --activeBg: rgba(16,16,18,0.045);
+    --panel: rgba(16, 16, 18, 0.025);
+    --panel2: rgba(16, 16, 18, 0.04);
 
-    --selectionBg: rgba(16,16,18,0.12);
+    --overlay: rgba(246, 244, 240, 0.9);
+    --overlay2: rgba(246, 244, 240, 0.96);
+    --activeBg: rgba(16, 16, 18, 0.045);
 
-    --shadowSoft: 0 10px 32px rgba(0,0,0,0.1);
-    --shadowPop: 0 24px 90px rgba(0,0,0,0.18);
+    /* Brand / accents (keep subtle; UI can opt-in) */
+    --accent: rgba(170, 34, 34, 0.92); /* your red cross */
+    --accent2: rgba(170, 34, 34, 0.22);
+    --link: rgba(16, 16, 18, 0.86);
 
-    /* Fallback ambient */
-    --ambientInk: rgba(16,16,18,0.06);
-    --ambientInk2: rgba(16,16,18,0.04);
-    --ambientParticle: rgba(16,16,18,0.30);
-    --focusShadow: 0 0 0 6px rgba(16,16,18,0.08);
+    /* Selection */
+    --selectionBg: rgba(16, 16, 18, 0.12);
+
+    /* Focus */
+    --focusRing: rgba(16, 16, 18, 0.12);
+    --focusShadow: 0 0 0 6px rgba(16, 16, 18, 0.08);
+
+    /* Shadows */
+    --shadowSoft: 0 10px 32px rgba(0, 0, 0, 0.1);
+    --shadowPop: 0 24px 90px rgba(0, 0, 0, 0.18);
+    --shadowInset: inset 0 1px 0 rgba(255, 255, 255, 0.35);
+
+    /* Scrollbars */
+    --scrollTrack: rgba(16, 16, 18, 0.06);
+    --scrollThumb: rgba(16, 16, 18, 0.18);
+    --scrollThumbHover: rgba(16, 16, 18, 0.28);
+
+    /* Ambient (optional) */
+    --ambientInk: rgba(16, 16, 18, 0.06);
+    --ambientInk2: rgba(16, 16, 18, 0.04);
+    --ambientParticle: rgba(16, 16, 18, 0.3);
+
+    /* Annotation-friendly defaults */
+    --hl-yellow: rgba(255, 213, 74, 0.45);
+    --hl-green: rgba(72, 201, 176, 0.28);
+    --hl-blue: rgba(120, 180, 255, 0.24);
+    --ink: rgba(16, 16, 18, 0.72);
+    --ink-soft: rgba(16, 16, 18, 0.42);
 }
 
-/* Enable color-mix when supported */
+/* Prefer color-mix when supported (better theme coherence) */
 @supports (color: color-mix(in oklab, white, black)) {
     :root {
+        --muted: color-mix(in oklab, var(--fg) 58%, transparent);
+        --muted2: color-mix(in oklab, var(--fg) 44%, transparent);
+
+        --hairline: color-mix(in oklab, var(--fg) 12%, transparent);
+        --hairline2: color-mix(in oklab, var(--fg) 8%, transparent);
+
+        --panel: color-mix(in oklab, var(--fg) 3%, transparent);
+        --panel2: color-mix(in oklab, var(--fg) 5%, transparent);
+
+        --overlay: color-mix(in oklab, var(--bg) 90%, transparent);
+        --overlay2: color-mix(in oklab, var(--bg) 96%, transparent);
+        --activeBg: color-mix(in oklab, var(--fg) 5%, transparent);
+
+        --selectionBg: color-mix(in oklab, var(--fg) 14%, transparent);
+
+        --focusRing: color-mix(in oklab, var(--fg) 13%, transparent);
+        --focusShadow: 0 0 0 6px color-mix(in oklab, var(--fg) 10%, transparent);
+
+        --scrollTrack: color-mix(in oklab, var(--fg) 6%, transparent);
+        --scrollThumb: color-mix(in oklab, var(--fg) 18%, transparent);
+        --scrollThumbHover: color-mix(in oklab, var(--fg) 28%, transparent);
+
         --ambientInk: color-mix(in oklab, var(--fg) 6%, transparent);
         --ambientInk2: color-mix(in oklab, var(--fg) 4%, transparent);
         --ambientParticle: color-mix(in oklab, var(--fg) 70%, transparent);
-        --focusShadow: 0 0 0 6px color-mix(in oklab, var(--focusRing) 70%, transparent);
+
+        --hl-yellow: color-mix(in oklab, #ffd54a 52%, transparent);
+        --hl-green: color-mix(in oklab, #48c9b0 34%, transparent);
+        --hl-blue: color-mix(in oklab, #78b4ff 32%, transparent);
+        --ink: color-mix(in oklab, var(--fg) 78%, transparent);
+        --ink-soft: color-mix(in oklab, var(--fg) 46%, transparent);
     }
 }
 
@@ -78,26 +159,70 @@
 html[data-theme="dark"] {
     --bg: #0b0b0c;
     --fg: #f4f3f1;
-    --muted: rgba(244,243,241,0.66);
-    --hairline: rgba(255,255,255,0.1);
-    --focus: rgba(255,255,255,0.22);
-    --focusRing: rgba(255,255,255,0.13);
+    --muted: rgba(244, 243, 241, 0.66);
+    --muted2: rgba(244, 243, 241, 0.5);
 
-    --panel: rgba(255,255,255,0.045);
+    --hairline: rgba(255, 255, 255, 0.1);
+    --hairline2: rgba(255, 255, 255, 0.07);
 
-    --overlay: rgba(11,11,12,0.76);
-    --overlay2: rgba(11,11,12,0.88);
-    --activeBg: rgba(255,255,255,0.065);
+    --panel: rgba(255, 255, 255, 0.045);
+    --panel2: rgba(255, 255, 255, 0.065);
 
-    --selectionBg: rgba(244,243,241,0.18);
+    --overlay: rgba(11, 11, 12, 0.76);
+    --overlay2: rgba(11, 11, 12, 0.88);
+    --activeBg: rgba(255, 255, 255, 0.065);
 
-    --shadowSoft: 0 10px 36px rgba(0,0,0,0.36);
-    --shadowPop: 0 26px 110px rgba(0,0,0,0.58);
+    --accent: rgba(220, 70, 70, 0.92);
+    --accent2: rgba(220, 70, 70, 0.26);
+    --link: rgba(244, 243, 241, 0.9);
 
-    --ambientInk: rgba(244,243,241,0.07);
-    --ambientInk2: rgba(244,243,241,0.05);
-    --ambientParticle: rgba(244,243,241,0.75);
-    --focusShadow: 0 0 0 7px rgba(255,255,255,0.08);
+    --selectionBg: rgba(244, 243, 241, 0.18);
+
+    --focusRing: rgba(255, 255, 255, 0.14);
+    --focusShadow: 0 0 0 7px rgba(255, 255, 255, 0.08);
+
+    --shadowSoft: 0 10px 36px rgba(0, 0, 0, 0.36);
+    --shadowPop: 0 26px 110px rgba(0, 0, 0, 0.58);
+    --shadowInset: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+
+    --scrollTrack: rgba(255, 255, 255, 0.08);
+    --scrollThumb: rgba(255, 255, 255, 0.18);
+    --scrollThumbHover: rgba(255, 255, 255, 0.28);
+
+    --ambientInk: rgba(244, 243, 241, 0.07);
+    --ambientInk2: rgba(244, 243, 241, 0.05);
+    --ambientParticle: rgba(244, 243, 241, 0.75);
+
+    --hl-yellow: rgba(255, 213, 74, 0.26);
+    --hl-green: rgba(72, 201, 176, 0.2);
+    --hl-blue: rgba(120, 180, 255, 0.18);
+    --ink: rgba(244, 243, 241, 0.78);
+    --ink-soft: rgba(244, 243, 241, 0.46);
+}
+
+@supports (color: color-mix(in oklab, white, black)) {
+    html[data-theme="dark"] {
+        --muted: color-mix(in oklab, var(--fg) 66%, transparent);
+        --muted2: color-mix(in oklab, var(--fg) 50%, transparent);
+
+        --hairline: color-mix(in oklab, var(--fg) 11%, transparent);
+        --hairline2: color-mix(in oklab, var(--fg) 8%, transparent);
+
+        --panel: color-mix(in oklab, var(--fg) 5%, transparent);
+        --panel2: color-mix(in oklab, var(--fg) 7%, transparent);
+
+        --scrollTrack: color-mix(in oklab, var(--fg) 10%, transparent);
+        --scrollThumb: color-mix(in oklab, var(--fg) 20%, transparent);
+        --scrollThumbHover: color-mix(in oklab, var(--fg) 30%, transparent);
+
+        --selectionBg: color-mix(in oklab, var(--fg) 18%, transparent);
+
+        --hl-yellow: color-mix(in oklab, #ffd54a 30%, transparent);
+        --hl-green: color-mix(in oklab, #48c9b0 22%, transparent);
+        --hl-blue: color-mix(in oklab, #78b4ff 20%, transparent);
+        --ink: color-mix(in oklab, var(--fg) 78%, transparent);
+        --ink-soft: color-mix(in oklab, var(--fg) 46%, transparent);
+    }
 }
 
 /* =========================================================
@@ -111,9 +236,14 @@ html {
     background: var(--bg);
     color: var(--fg);
     text-size-adjust: 100%;
+    -webkit-text-size-adjust: 100%;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     color-scheme: light dark;
+
+    /* Better underline default */
+    text-underline-offset: 3px;
+    text-decoration-thickness: 1.25px;
 }
 
 body {
@@ -136,13 +266,17 @@ html.bp-theme-swap #root,
 html.bp-theme-swap button,
 html.bp-theme-swap input,
 html.bp-theme-swap textarea,
-html.bp-theme-swap select {
+html.bp-theme-swap select,
+html.bp-theme-swap a,
+html.bp-theme-swap [role="dialog"],
+html.bp-theme-swap [data-overlay] {
     transition:
             background-color var(--themeDur) var(--themeEase),
             color var(--themeDur) var(--themeEase),
             border-color var(--themeDur) var(--themeEase),
             outline-color var(--themeDur) var(--themeEase),
-            box-shadow var(--themeDur) var(--themeEase);
+            box-shadow var(--themeDur) var(--themeEase),
+            fill var(--themeDur) var(--themeEase);
 }
 
 /* Reduced motion */
@@ -155,7 +289,7 @@ html.bp-theme-swap select {
 }
 
 /* =========================================================
-   Reset
+   Reset / Defaults
 ========================================================= */
 *,
 *::before,
@@ -163,21 +297,36 @@ html.bp-theme-swap select {
     box-sizing: border-box;
 }
 
-h1,h2,h3,h4 {
-    margin: 0;
-    font-weight: 600;
-    letter-spacing: -0.02em;
+img,
+svg,
+video,
+canvas {
+    display: block;
+    max-width: 100%;
 }
 
-p { margin: 0; }
+h1,
+h2,
+h3,
+h4 {
+    margin: 0;
+    font-weight: 650;
+    letter-spacing: var(--tracking-tight);
+}
+
+p {
+    margin: 0;
+}
 
 a {
-    color: inherit;
+    color: var(--link);
     text-decoration: none;
 }
 a:hover {
     text-decoration: underline;
-    text-underline-offset: 3px;
+}
+a:active {
+    opacity: 0.92;
 }
 
 ::selection {
@@ -193,6 +342,36 @@ select {
     color: inherit;
 }
 
+button {
+    border: 0;
+    background: transparent;
+    padding: 0;
+    cursor: pointer;
+}
+
+input,
+textarea,
+select {
+    border: var(--hairlineW) solid var(--hairline);
+    background: var(--panel);
+    border-radius: 12px;
+    outline: none;
+    box-shadow: var(--shadowInset);
+}
+
+@supports (color: color-mix(in oklab, white, black)) {
+    input,
+    textarea,
+    select {
+        background: color-mix(in oklab, var(--panel) 70%, transparent);
+    }
+}
+
+input::placeholder,
+textarea::placeholder {
+    color: var(--muted);
+}
+
 /* Calm focus */
 :focus-visible {
     outline: 2px solid var(--focusRing);
@@ -202,6 +381,55 @@ select {
 
 .focus-shadow:focus-visible {
     box-shadow: var(--focusShadow);
+}
+
+/* Disable iOS tap highlight where it causes glare */
+a,
+button {
+    -webkit-tap-highlight-color: transparent;
+}
+
+/* =========================================================
+   Scrollbars (nice but subtle)
+   - Styles are best-effort: macOS overlay scrollbars may ignore
+========================================================= */
+:root {
+    --scrollSize: 10px;
+    --scrollRadius: 999px;
+}
+
+/* Firefox */
+* {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollThumb) var(--scrollTrack);
+}
+
+/* Chromium/Safari */
+*::-webkit-scrollbar {
+    width: var(--scrollSize);
+    height: var(--scrollSize);
+}
+*::-webkit-scrollbar-track {
+    background: var(--scrollTrack);
+}
+*::-webkit-scrollbar-thumb {
+    background: var(--scrollThumb);
+    border-radius: var(--scrollRadius);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+    background: var(--scrollThumbHover);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+}
+
+/* Optional utility: hide scrollbars but keep scroll */
+.scrollbars-none {
+    scrollbar-width: none;
+}
+.scrollbars-none::-webkit-scrollbar {
+    display: none;
 }
 
 /* =========================================================
@@ -219,8 +447,59 @@ select {
 
 .surface {
     background: var(--panel);
-    border: 1px solid var(--hairline);
+    border: var(--hairlineW) solid var(--hairline);
     border-radius: var(--radius-sm);
+    box-shadow: var(--shadowInset);
+}
+
+.hairline {
+    border: var(--hairlineW) solid var(--hairline);
+}
+.muted {
+    color: var(--muted);
+}
+.muted2 {
+    color: var(--muted2);
+}
+.shadow-soft {
+    box-shadow: var(--shadowSoft);
+}
+.shadow-pop {
+    box-shadow: var(--shadowPop);
+}
+
+/* =========================================================
+   Buttons (basic primitives)
+========================================================= */
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: var(--hairlineW) solid var(--hairline);
+    background: var(--panel);
+    color: var(--fg);
+    user-select: none;
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.06);
+}
+.btn:hover {
+    border-color: var(--hairline2);
+}
+.btn:active {
+    transform: translateY(0.5px);
+}
+
+/* Subtle “pill” */
+.pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border-radius: 999px;
+    border: var(--hairlineW) solid var(--hairline);
+    background: var(--panel);
 }
 
 /* =========================================================
@@ -242,20 +521,98 @@ select {
 
     text-rendering: optimizeLegibility;
     font-kerning: normal;
+    font-variant-ligatures: common-ligatures contextual;
     font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
+}
+
+/* Fixed measure wrapper (use in ReaderViewport) */
+.measure {
+    width: min(var(--bpReaderMeasure), calc(100% - 32px));
+    margin-inline: auto;
+}
+
+/* Numbers / refs in scripture */
+.scripture .vnum,
+.scripture .cnum {
+    font-family: var(--font-sans);
+    font-size: 12px;
+    letter-spacing: 0.02em;
+    color: var(--muted);
+    user-select: none;
+}
+
+/* =========================================================
+   Overlay primitives (search panels, popovers)
+========================================================= */
+.bp-overlay {
+    background: var(--overlay);
+    border: var(--hairlineW) solid var(--hairline);
+    box-shadow: var(--shadowPop);
+    border-radius: var(--radius);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+.bp-overlay--solid {
+    background: var(--overlay2);
+}
+
+.bp-active {
+    background: var(--activeBg);
+}
+
+/* =========================================================
+   Annotation helpers (optional UI classes)
+========================================================= */
+
+/* highlight markup (you can render spans with this class) */
+.bp-hl {
+    background: var(--hl-yellow);
+    border-radius: 6px;
+    padding: 0 2px;
+}
+.bp-hl--green {
+    background: var(--hl-green);
+}
+.bp-hl--blue {
+    background: var(--hl-blue);
+}
+
+/* Ink layer: place over text; make sure it doesn't steal scroll */
+.bp-ink-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none; /* enable only while drawing */
+}
+
+/* When actively drawing, enable pointer events */
+.bp-ink-layer.is-drawing {
+    pointer-events: auto;
 }
 
 /* =========================================================
    Ambient Helpers (optional)
 ========================================================= */
 @keyframes bp-ambient-pulse {
-    0%,100% { transform: scale(1); opacity: 0.42; }
-    50% { transform: scale(1.06); opacity: 0.62; }
+    0%,
+    100% {
+        transform: scale(1);
+        opacity: 0.42;
+    }
+    50% {
+        transform: scale(1.06);
+        opacity: 0.62;
+    }
 }
 
 @keyframes bp-ambient-float {
-    0%,100% { transform: translate3d(0,0,0); }
-    50% { transform: translate3d(16px,-10px,0); }
+    0%,
+    100% {
+        transform: translate3d(0, 0, 0);
+    }
+    50% {
+        transform: translate3d(16px, -10px, 0);
+    }
 }
 
 .ambient {
@@ -301,6 +658,11 @@ select {
     }
 
     .container {
+        width: calc(100% - 24px);
+    }
+
+    .reading,
+    .measure {
         width: calc(100% - 24px);
     }
 }

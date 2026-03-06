@@ -84,23 +84,26 @@ export function Reader(props: Props) {
 
     // Load books + spine once
     useEffect(() => {
+        const ac = new AbortController();
         let alive = true;
 
         (async () => {
             try {
+                // If your api helpers don't accept AbortSignal, this still safely no-ops.
                 const [b, s] = await Promise.all([apiGetBooks(), apiGetSpine()]);
-                if (!alive) return;
+                if (!alive || ac.signal.aborted) return;
                 setBooks(b.books);
                 setSpine(s);
             } catch (e: unknown) {
                 const msg = e instanceof Error ? e.message : String(e);
-                if (!alive) return;
+                if (!alive || ac.signal.aborted) return;
                 setErr(msg);
             }
         })();
 
         return () => {
             alive = false;
+            ac.abort();
         };
     }, []);
 
@@ -146,6 +149,7 @@ export function Reader(props: Props) {
             setErr(null);
 
             const seq = ++resolveSeqRef.current;
+
             try {
                 const loc = await apiResolveLoc(bookId, chapter, verse);
                 if (seq !== resolveSeqRef.current) return; // stale
@@ -231,9 +235,27 @@ export function Reader(props: Props) {
     }, []);
 
     // Avoid re-render storms by ignoring identical position objects.
+    // NOTE: object identity for verse/book may change; compare stable fields.
     const handlePosition = useCallback((p: ReaderPosition) => {
         setPos((prev) => {
-            if (prev.ord === p.ord && prev.verse === p.verse && prev.book === p.book) return prev;
+            const prevV = prev.verse;
+            const nextV = p.verse;
+
+            const sameOrd = prev.ord === p.ord;
+
+            const sameVerse =
+                prevV === nextV ||
+                (!!prevV &&
+                    !!nextV &&
+                    prevV.bookId === nextV.bookId &&
+                    prevV.chapter === nextV.chapter &&
+                    prevV.verse === nextV.verse);
+
+            const sameBook =
+                prev.book === p.book ||
+                (!!prev.book && !!p.book && prev.book.bookId === p.book.bookId);
+
+            if (sameOrd && sameVerse && sameBook) return prev;
             return p;
         });
     }, []);
@@ -276,5 +298,6 @@ export function Reader(props: Props) {
             onReady={handleReady}
             err={err}
         />
+
     );
 }

@@ -1,25 +1,46 @@
 // apps/web/src/reader/typography.ts
 //
 // Reader typography + layout tuning (scripture + measure)
-// - Robust storage (handles legacy keys + bad/malformed values)
-// - Deterministic normalization (always clamps to sane ranges)
-// - Single source of truth for CSS var application
+//
+// Principles:
+// - Persist stable IDs, not CSS strings.
+// - Resolve IDs -> actual font-family strings via FONT_PRESETS (which can point at CSS vars).
+// - Normalize/clamp deterministically (safe JSON round-trip).
+// - One authoritative apply() that sets CSS vars on <html>.
+// - Optional font-load readiness helpers (for stable measurement / virtualizer calm).
 //
 // CSS vars expected (defined in base.css):
-// --bpScriptureFont
-// --bpScriptureSize
-// --bpScriptureLeading
-// --bpScriptureWeight
-// --bpReaderMeasure
+// --bpScriptureFont         (font-family value)
+// --bpScriptureSize         (px)
+// --bpScriptureLeading      (number)
+// --bpScriptureWeight       (number)
+// --bpReaderMeasure         (px)
 
-export type TypographyFont = "serif" | "sans" | "rounded" | "book" | "human";
+export type TypographyFont =
+    | "serif"
+    | "sans"
+    | "rounded"
+    | "book"
+    | "human"
+    // reserved slots for future (hosted/uploaded/custom):
+    | "custom_1"
+    | "custom_2";
 
 export type ReaderTypography = Readonly<{
-    font: TypographyFont; // Scripture text only
+    /** Stable id, resolved to actual font-family via FONT_PRESETS. */
+    font: TypographyFont;
+
+    /** Scripture text size in px (clamped). */
     sizePx: number; // 12..30
-    weight: number; // 200..650 (integer)
+
+    /** font-weight (integer). */
+    weight: number; // 200..650
+
+    /** line-height multiplier. */
     leading: number; // 0.95..2.1
-    measurePx: number; // 240..980
+
+    /** max line length (measure) in px. */
+    measurePx: number; // 535..980
 }>;
 
 export const DEFAULT_TYPOGRAPHY: ReaderTypography = Object.freeze({
@@ -30,15 +51,21 @@ export const DEFAULT_TYPOGRAPHY: ReaderTypography = Object.freeze({
     measurePx: 840,
 });
 
-// Current storage key
+// Storage key
 const STORAGE_KEY_V2 = "bp_reader_typography_v2";
 
 // Legacy keys (kept for migration)
 const STORAGE_KEY_V1 = "bp_reader_typography_v1";
 const LEGACY_KEYS = Object.freeze(["bp_reader_typography", "bp_typography"]);
 
+// Optional: future envelope (we still accept raw v2 objects for backward compat)
+type TypographyEnvelopeV1 = Readonly<{
+    v: 1;
+    t: ReaderTypography;
+}>;
+
 // ──────────────────────────────────────────────────────────────
-// Limits — synced with UI (sizePx now floors at 12px)
+// Limits — keep UI + normalization synced
 // ──────────────────────────────────────────────────────────────
 const LIMITS = Object.freeze({
     sizePx: { lo: 12, hi: 30, step: 1 },
@@ -47,21 +74,23 @@ const LIMITS = Object.freeze({
     measurePx: { lo: 535, hi: 980, step: 1 },
 });
 
+/**
+ * Font presets.
+ * - `css` must be a valid font-family value.
+ * - For app fonts, point at CSS vars (base.css controls actual stacks/loaded fonts).
+ * - For system fallbacks, provide explicit stacks.
+ */
 export const FONT_PRESETS: Readonly<Record<TypographyFont, { label: string; css: string }>> = Object.freeze({
-    // These should resolve via CSS variables in base.css
     serif: { label: "Literata", css: "var(--font-serif)" },
     sans: { label: "Inter", css: "var(--font-sans)" },
     rounded: { label: "Quicksand", css: "var(--font-rounded)" },
 
-    // Always-available system-ish stacks
-    book: {
-        label: "Book",
-        css: 'ui-serif, Charter, "Iowan Old Style", Georgia, "Times New Roman", Times, serif',
-    },
-    human: {
-        label: "Human",
-        css: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", sans-serif',
-    },
+    book: { label: "Book", css: 'ui-serif, Charter, "Iowan Old Style", Georgia, "Times New Roman", Times, serif' },
+    human: { label: "Human", css: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", sans-serif' },
+
+    // Future: if you add CSS vars like --font-custom-1, --font-custom-2 in base.css:
+    custom_1: { label: "Custom 1", css: "var(--font-custom-1, var(--font-serif))" },
+    custom_2: { label: "Custom 2", css: "var(--font-custom-2, var(--font-serif))" },
 });
 
 // ──────────────────────────────────────────────────────────────
@@ -133,11 +162,23 @@ function safeLocalStorageRemove(key: string): void {
     }
 }
 
+function isTypographyFont(x: string): x is TypographyFont {
+    return (
+        x === "serif" ||
+        x === "sans" ||
+        x === "rounded" ||
+        x === "book" ||
+        x === "human" ||
+        x === "custom_1" ||
+        x === "custom_2"
+    );
+}
+
 function normalizeFont(raw: unknown): TypographyFont {
     const s = (toString(raw) ?? "").trim().toLowerCase();
 
     // Direct ids
-    if (s === "serif" || s === "sans" || s === "rounded" || s === "book" || s === "human") return s as TypographyFont;
+    if (isTypographyFont(s)) return s;
 
     // Common synonyms (old saves / human inputs)
     if (s.includes("literata")) return "serif";
@@ -170,33 +211,61 @@ function normalizeTypography(t: Partial<ReaderTypography> | null | undefined): R
     });
 }
 
+function unwrapTypographyPayload(parsed: unknown): ReaderTypography | null {
+    if (!parsed || typeof parsed !== "object") return null;
+
+    // Envelope form: { v: 1, t: {...} }
+    const anyObj = parsed as Record<string, unknown>;
+    if (anyObj.v === 1 && anyObj.t && typeof anyObj.t === "object") {
+        return normalizeTypography(anyObj.t as Partial<ReaderTypography>);
+    }
+
+    // Raw form: { font, sizePx, ... } (your current v2/v1)
+    return normalizeTypography(anyObj as Partial<ReaderTypography>);
+}
+
+/**
+ * A stable signature for projections/caches.
+ * Use this to know when to recompute highlight rects, drawing projections, etc.
+ */
+export function typographySignature(t: ReaderTypography): string {
+    // Keep it short and stable (order matters).
+    return `f=${t.font}|s=${t.sizePx}|w=${t.weight}|l=${t.leading}|m=${t.measurePx}`;
+}
+
 // ──────────────────────────────────────────────────────────────
 // Public API
 // ──────────────────────────────────────────────────────────────
 
-/** Public helper for UI (e.g. titles, tooltips) */
+export function typographyLimits() {
+    return LIMITS;
+}
+
+/** UI helper */
 export function getFontLabel(font: TypographyFont): string {
     return FONT_PRESETS[font]?.label ?? font;
 }
 
-/** Public helper for UI previews / tooltips (actual CSS font-family string) */
+/** Actual CSS `font-family` string */
 export function getFontCssFamily(font: TypographyFont): string {
     return FONT_PRESETS[font]?.css ?? "var(--font-serif)";
 }
 
-/** Try v2 → v1 → legacy keys */
+/**
+ * Try v2 → v1 → legacy keys, normalize, and migrate to v2.
+ */
 export function loadReaderTypography(): ReaderTypography | null {
     const rawV2 = safeLocalStorageGet(STORAGE_KEY_V2);
     if (rawV2) {
         const parsed = safeJsonParse(rawV2);
-        const t = parsed ? normalizeTypography(parsed as Partial<ReaderTypography>) : null;
+        const t = unwrapTypographyPayload(parsed);
         if (t) return t;
     }
 
     const rawV1 = safeLocalStorageGet(STORAGE_KEY_V1);
     if (rawV1) {
         const parsed = safeJsonParse(rawV1);
-        const t = parsed ? normalizeTypography(parsed as Partial<ReaderTypography>) : null;
+        const t = unwrapTypographyPayload(parsed);
         if (t) {
             saveReaderTypography(t);
             safeLocalStorageRemove(STORAGE_KEY_V1);
@@ -208,7 +277,7 @@ export function loadReaderTypography(): ReaderTypography | null {
         const raw = safeLocalStorageGet(k);
         if (!raw) continue;
         const parsed = safeJsonParse(raw);
-        const t = parsed ? normalizeTypography(parsed as Partial<ReaderTypography>) : null;
+        const t = unwrapTypographyPayload(parsed);
         if (t) {
             saveReaderTypography(t);
             safeLocalStorageRemove(k);
@@ -220,7 +289,12 @@ export function loadReaderTypography(): ReaderTypography | null {
 }
 
 export function saveReaderTypography(t: ReaderTypography): void {
+    // Keep raw shape for maximum backward compatibility (simple, readable).
     safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(t));
+
+    // If you ever want to switch to envelope, you can do:
+    // const env: TypographyEnvelopeV1 = { v: 1, t };
+    // safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(env));
 }
 
 export function clearReaderTypography(): void {
@@ -229,7 +303,7 @@ export function clearReaderTypography(): void {
 
 /**
  * Apply CSS vars to <html>.
- * NOTE: --bpScriptureFont is a font-family *value* (string), not a token name.
+ * NOTE: --bpScriptureFont is a *font-family value* (string), not an id.
  */
 export function applyReaderTypography(t: ReaderTypography | null): void {
     if (typeof document === "undefined") return;
@@ -259,9 +333,12 @@ export function applyReaderTypographyFromStorage(): ReaderTypography | null {
     return t;
 }
 
+export function updateTypography(base: ReaderTypography, patch: Partial<ReaderTypography>): ReaderTypography {
+    return normalizeTypography({ ...base, ...patch });
+}
+
 /**
- * UI options.
- * IMPORTANT: cssFamily is what makes previews actually render different fonts.
+ * UI options (previews can use cssFamily to render different fonts in the picker).
  */
 export function fontOptions(): Array<{ id: TypographyFont; label: string; cssFamily: string }> {
     return (Object.keys(FONT_PRESETS) as TypographyFont[]).map((k) => ({
@@ -271,10 +348,22 @@ export function fontOptions(): Array<{ id: TypographyFont; label: string; cssFam
     }));
 }
 
-export function typographyLimits() {
-    return LIMITS;
-}
+/**
+ * Optional: Wait for fonts to be ready after applying.
+ * Useful if you notice measurement jitter with virtualizer when switching fonts.
+ */
+export async function waitForFontsIfSupported(timeoutMs = 600): Promise<void> {
+    if (typeof document === "undefined") return;
+    const fonts: FontFaceSet | undefined = (document as any).fonts;
+    if (!fonts || typeof fonts.ready?.then !== "function") return;
 
-export function updateTypography(base: ReaderTypography, patch: Partial<ReaderTypography>): ReaderTypography {
-    return normalizeTypography({ ...base, ...patch });
+    // race with timeout so we never hang
+    await Promise.race([
+        fonts.ready.then(() => undefined),
+        new Promise<void>((resolve) => {
+            const id = window.setTimeout(() => resolve(), timeoutMs);
+            // best-effort cleanup is handled by resolve path
+            void id;
+        }),
+    ]);
 }

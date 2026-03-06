@@ -1,23 +1,91 @@
 <!doctype html>
 <html lang="en">
 <head>
+  <!-- Basics -->
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="color-scheme" content="dark light" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
 
-  <title>Biblia Populi</title>
+  <title>Biblia.to</title>
   <meta
           name="description"
-          content="Biblia Populi — The Word of God, open to all. Centered on Jesus Christ, crucified and risen."
+          content="Biblia.to — The Word of God, open to all. Centered on Jesus Christ, crucified and risen."
   />
 
+  <!-- Canonical (set your real URL when ready) -->
+  <link rel="canonical" href="https://biblia.to/" />
+
+  <!-- Theme color (pairs well with color-scheme; browsers pick appropriate one) -->
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f3ea" />
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0b0b0c" />
+
+  <!-- Robots (safe default; change to index,follow when public) -->
+  <meta name="robots" content="index,follow" />
+
+  <!-- Open Graph -->
+  <meta property="og:site_name" content="Biblia.to" />
+  <meta property="og:title" content="Biblia.to" />
+  <meta
+          property="og:description"
+          content="The Word of God, open to all. Centered on Jesus Christ, crucified and risen."
+  />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://biblia.to/" />
+  <!-- Provide these files in /public when you have them -->
+  <meta property="og:image" content="/og.png" />
+  <meta property="og:image:alt" content="Biblia.to" />
+
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Biblia.to" />
+  <meta
+          name="twitter:description"
+          content="The Word of God, open to all. Centered on Jesus Christ, crucified and risen."
+  />
+  <meta name="twitter:image" content="/og.png" />
+
   <!-- Favicons -->
+  <link rel="icon" href="/favicon.ico" />
   <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png" />
   <link rel="icon" type="image/png" sizes="16x16" href="/icon-16.png" />
   <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+
+  <!-- PWA-ish (optional, safe even without service worker) -->
+  <meta name="application-name" content="Biblia.to" />
+  <meta name="apple-mobile-web-app-title" content="Biblia.to" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="format-detection" content="telephone=no" />
+
+  <!-- Performance -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+
+  <!-- If you use these fonts, keep; otherwise delete -->
+  <!-- <link rel="preload" href="/fonts/Inter-Variable.woff2" as="font" type="font/woff2" crossorigin /> -->
+  <!-- <link rel="preload" href="/fonts/Literata-Variable.woff2" as="font" type="font/woff2" crossorigin /> -->
+
+  <!-- Tiny inline base to prevent flash + keep background correct before React loads -->
+  <style>
+    :root { color-scheme: light dark; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg, #0b0b0c);
+      color: var(--fg, #f2f2f2);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    #root { min-height: 100%; }
+  </style>
 </head>
 
 <body>
+<noscript>
+  <div style="padding:16px; font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Arial; color:#fff; background:#0b0b0c;">
+    Biblia.to needs JavaScript enabled to run.
+  </div>
+</noscript>
+
 <div id="root"></div>
 <script type="module" src="/src/main.tsx"></script>
 </body>

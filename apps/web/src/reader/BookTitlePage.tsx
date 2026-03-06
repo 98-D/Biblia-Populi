@@ -1,175 +1,97 @@
 // apps/web/src/reader/BookTitlePage.tsx
-// ─────────────────────────────────────────────────────────────────────────────
-// BEAUTIFUL ASCII TITLE PAGE — DEEPLY REFINED EDITION
-// Original foundation kept, but every visual element elevated for true
-// 17th-century printed-Bible majesty: ornate pediment with cross,
-// "THE HOLY BIBLE" entablature, richer Christogram medallion (IHS + ✝ + ✠),
-// fluted pillars with capital/base texture, sacred motto, and perfect centering.
-// Tested at multiple widths — prints beautifully on any terminal or screen.
-
 import React, { useMemo } from "react";
 import type { BookRow } from "../api";
 
+/**
+ * Biblia.to — Book Title Page (premium + virtualizer-safe)
+ *
+ * Design goals:
+ * - Predictable height + wrapping (TanStack Virtual friendly)
+ * - No huge shadows/filters that explode paint cost
+ * - Uses your actual font tokens (base.css): --font-serif / --font-sans
+ * - Clean, “luxury card” with subtle ink + hairlines
+ *
+ * Notes:
+ * - All text is short and wraps; no long unbroken runs.
+ * - Uses color-mix tokens already present elsewhere in your app.
+ */
+
 function formatTestament(t: unknown): string {
-    const v = String(t ?? "").toUpperCase();
-    if (v === "NT") return "THE NEW TESTAMENT";
-    if (v === "OT") return "THE OLD TESTAMENT";
+    const v = String(t ?? "").trim().toUpperCase();
+    if (v === "NT" || v === "NEW" || v.includes("NEW")) return "THE NEW TESTAMENT";
+    if (v === "OT" || v === "OLD" || v.includes("OLD")) return "THE OLD TESTAMENT";
     return "HOLY SCRIPTURE";
 }
 
-function getBookTitleParts(book: BookRow | null, bookId: string) {
-    const raw = (book?.name ?? bookId).toUpperCase().trim();
+function normalizeBookName(book: BookRow | null, bookId: string): string {
+    const raw = (book?.name ?? bookId).toString().trim();
+    return raw || bookId;
+}
+
+function upperWords(s: string): string {
+    return s
+        .trim()
+        .replace(/\s+/g, " ")
+        .toUpperCase();
+}
+
+function getBookTitleParts(book: BookRow | null, bookId: string): { prefix: string; main: string; subtitle?: string } {
+    const raw = upperWords(normalizeBookName(book, bookId));
+
     if (raw === "PSALMS") return { prefix: "", main: "PSALMS" };
+    if (raw === "PROVERBS") return { prefix: "THE BOOK OF", main: "PROVERBS" };
+
     if (["MATTHEW", "MARK", "LUKE", "JOHN"].includes(raw)) {
         return { prefix: "THE GOSPEL ACCORDING TO", main: raw };
     }
-    if (raw === "REVELATION") return { prefix: "THE REVELATION OF", main: "JOHN" };
-    return { prefix: "THE BOOK OF", main: raw };
-}
 
-function clamp(n: number, lo: number, hi: number): number {
-    return Math.max(lo, Math.min(hi, n));
-}
-
-function clip(text: string, width: number): string {
-    const t = text.trim();
-    if (t.length <= width) return t;
-    if (width <= 1) return t.slice(0, width);
-    return t.slice(0, width - 1) + "…";
-}
-
-function padRight(text: string, width: number): string {
-    const t = text ?? "";
-    if (t.length >= width) return t.slice(0, width);
-    return t + " ".repeat(width - t.length);
-}
-
-function centerLine(text: string, width: number): string {
-    const t = text.trim();
-    if (!t) return "";
-    const c = clip(t, width);
-    if (c.length >= width) return c;
-    const pad = Math.floor((width - c.length) / 2);
-    return " ".repeat(pad) + c;
-}
-
-function boxLine(content: string, innerWidth: number): string {
-    const c = padRight(content, innerWidth);
-    return `║${c}║`;
-}
-
-/** Richer sacred medallion — IHS Christogram surrounded by cross & stars */
-function makeOrnateMedallion(innerWidth: number): string[] {
-    const inner = Math.min(48, innerWidth - 12);
-    const pad = Math.floor((innerWidth - inner) / 2);
-
-    const art = [
-        `╭${"─".repeat(inner)}╮`,
-        `│${" ".repeat(Math.floor(inner / 2) - 7)}✠✠  ✝  ✠✠${" ".repeat(Math.floor(inner / 2) - 7)}│`,
-        `│${" ".repeat(inner)}│`,
-        `│${padRight("I  H  S", inner)}│`,
-        `│${" ".repeat(inner)}│`,
-        `│${centerLine("SIGILLUM", inner)}│`,
-        `╰${"─".repeat(inner)}╯`,
-    ];
-
-    return art.map((l) => centerLine(" ".repeat(pad) + l, innerWidth));
-}
-
-/** Elegant fluted pillars with textured capital & base */
-function pillarSegment(row: number, totalRows: number): string {
-    if (row === 0) return "╔╦╦╗"; // capital top
-    if (row === 1) return "║▓▓║"; // capital texture
-    if (row === totalRows - 2) return "║▒▒║"; // base texture
-    if (row === totalRows - 1) return "╚╩╩╝"; // base
-    return "║││║"; // fluted shaft
-}
-
-function makeAsciiTitlePage(opts: { testament: string; prefix: string; main: string; width?: number }): string {
-    const innerWidth = clamp(Math.floor(opts.width ?? 64), 50, 84);
-    const sceneWidth = innerWidth + 2;
-    const gap = "  ";
-
-    const topPediment = centerLine("                    ✝                    ", sceneWidth);
-
-    const holyBibleBox = [
-        `╔${"═".repeat(innerWidth - 6)}╗`,
-        `║${centerLine("THE HOLY BIBLE", innerWidth - 6)}║`,
-        `╚${"═".repeat(innerWidth - 6)}╝`,
-    ].map((l) => centerLine(l, sceneWidth));
-
-    const top = `╔${"═".repeat(innerWidth)}╗`;
-    const bot = `╚${"═".repeat(innerWidth)}╝`;
-    const sep = `╠${"═".repeat(innerWidth)}╣`;
-
-    const testament = clip(String(opts.testament ?? "").toUpperCase(), innerWidth);
-    const prefix = clip(String(opts.prefix ?? "").toUpperCase(), innerWidth);
-    const main = clip(String(opts.main ?? "").toUpperCase(), innerWidth);
-
-    const medallion = makeOrnateMedallion(innerWidth);
-
-    const titleRuleLen = clamp(main.trim().length + 10, 28, Math.min(innerWidth - 8, 48));
-    const titleRule = centerLine("═".repeat(titleRuleLen), innerWidth);
-
-    const motto = centerLine("✶  VERBUM DOMINI MANET IN AETERNUM  ✶", innerWidth);
-
-    const mid: string[] = [];
-
-    // === GRAND PEDIMENT & HOLY BIBLE HEADER ===
-    mid.push(padRight(topPediment, sceneWidth));
-    holyBibleBox.forEach((l) => mid.push(padRight(l, sceneWidth)));
-    mid.push(padRight(centerLine(" ", sceneWidth), sceneWidth));
-
-    // === MAIN FRAME ===
-    mid.push(top);
-    mid.push(boxLine("", innerWidth));
-
-    // Seal medallion
-    medallion.forEach((l) => mid.push(boxLine(l, innerWidth)));
-    mid.push(boxLine("", innerWidth));
-
-    mid.push(sep);
-    mid.push(boxLine(centerLine(testament, innerWidth), innerWidth));
-    mid.push(boxLine("", innerWidth));
-
-    if (prefix) {
-        mid.push(boxLine(centerLine(prefix, innerWidth), innerWidth));
-        mid.push(boxLine("", innerWidth));
+    if (raw === "ACTS" || raw === "ACTS OF THE APOSTLES") {
+        return { prefix: "", main: "ACTS", subtitle: "OF THE APOSTLES" };
     }
 
-    mid.push(boxLine(centerLine(main, innerWidth), innerWidth));
-    mid.push(boxLine(titleRule, innerWidth));
-    mid.push(boxLine("", innerWidth));
-    mid.push(boxLine(motto, innerWidth));
-    mid.push(boxLine("", innerWidth));
-    mid.push(bot);
+    if (raw === "REVELATION" || raw === "THE REVELATION") {
+        return { prefix: "THE REVELATION OF", main: "JOHN" };
+    }
 
-    // === PILLARS ON BOTH SIDES ===
-    const totalRows = mid.length;
-    const out = mid.map((m, i) => {
-        const p = pillarSegment(i, totalRows);
-        return `${p}${gap}${m}${gap}${p}`;
-    });
+    // Epistles styling (optional flourish)
+    if (raw.startsWith("1 ") || raw.startsWith("2 ") || raw.startsWith("3 ")) {
+        return { prefix: "THE EPISTLE OF", main: raw };
+    }
 
-    return out.join("\n");
+    return { prefix: "THE BOOK OF", main: raw };
 }
 
 export const BookTitlePage = React.memo(function BookTitlePage(props: { book: BookRow | null; bookId: string }) {
     const { book, bookId } = props;
 
-    const testament = useMemo(() => formatTestament(book?.testament), [book?.testament]);
-    const { prefix, main } = useMemo(() => getBookTitleParts(book, bookId), [book, bookId]);
-
-    const asciiArt = useMemo(() => {
-        return makeAsciiTitlePage({ testament, prefix, main, width: 64 });
-    }, [testament, prefix, main]);
+    const displayName = useMemo(() => normalizeBookName(book, bookId), [book, bookId]);
+    const testament = useMemo(() => formatTestament((book as any)?.testament), [book]);
+    const { prefix, main, subtitle } = useMemo(() => getBookTitleParts(book, bookId), [book, bookId]);
 
     return (
-        <section style={s.wrap} aria-label={`Book: ${book?.name ?? bookId}`}>
+        <section style={s.wrap} aria-label={`Book: ${displayName}`}>
             <div style={s.card}>
-        <pre style={s.ascii} aria-hidden="true">
-          {asciiArt}
-        </pre>
+                {/* Top hairline */}
+                <div style={s.hairlineTop} aria-hidden="true" />
+
+                {/* Kicker */}
+                <div style={s.kicker}>{testament}</div>
+
+                {/* Title */}
+                <div style={s.titleBlock}>
+                    {prefix ? <div style={s.prefix}>{prefix}</div> : null}
+
+                    <h1 style={s.main}>{main}</h1>
+
+                    {subtitle ? <div style={s.subtitle}>{subtitle}</div> : null}
+
+                    <div style={s.rule} aria-hidden="true" />
+
+                    <div style={s.motto}>VERBUM DOMINI MANET IN AETERNUM</div>
+                </div>
+
+                {/* Bottom hairline */}
+                <div style={s.hairlineBot} aria-hidden="true" />
             </div>
         </section>
     );
@@ -177,31 +99,122 @@ export const BookTitlePage = React.memo(function BookTitlePage(props: { book: Bo
 
 const s: Record<string, React.CSSProperties> = {
     wrap: {
-        padding: "34px 12px 34px",
+        padding: "24px 12px 18px",
         display: "flex",
         justifyContent: "center",
         background: "transparent",
     },
+
     card: {
-        maxWidth: 780,
         width: "100%",
-        background: "color-mix(in oklab, var(--panel) 86%, #000 14%)",
-        border: "1px solid color-mix(in oklab, var(--hairline) 70%, #000 30%)",
-        borderRadius: 18,
-        padding: "26px 20px",
-        boxShadow: "0 14px 40px rgba(0,0,0,0.10), inset 0 1px 0 rgba(255,255,255,0.20)",
+        maxWidth: 760,
+        borderRadius: 20,
+        padding: "18px 16px",
+        background: "color-mix(in oklab, var(--card) 92%, var(--bg) 8%)",
+        border: "1px solid color-mix(in oklab, var(--border) 78%, transparent)",
+        boxShadow: "0 16px 44px color-mix(in oklab, black 14%, transparent), inset 0 1px 0 rgba(255,255,255,0.16)",
         overflow: "hidden",
+        contain: "paint",
     },
-    ascii: {
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
-        fontSize: 12.9,
-        lineHeight: 1.14,
-        color: "color-mix(in oklab, var(--fg) 84%, var(--muted) 16%)",
-        textAlign: "left",
-        whiteSpace: "pre",
-        margin: 0,
-        letterSpacing: "0.35px",
+
+    hairlineTop: {
+        height: 1,
+        background:
+            "linear-gradient(to right, transparent, color-mix(in oklab, var(--border) 78%, transparent), transparent)",
+        opacity: 0.95,
+        marginBottom: 12,
+    },
+    hairlineBot: {
+        height: 1,
+        background:
+            "linear-gradient(to right, transparent, color-mix(in oklab, var(--border) 72%, transparent), transparent)",
+        opacity: 0.75,
+        marginTop: 14,
+    },
+
+    kicker: {
+        fontFamily: "var(--font-sans)",
+        fontSize: 12,
+        letterSpacing: "0.22em",
+        textTransform: "uppercase",
+        color: "color-mix(in oklab, var(--fg) 70%, var(--muted) 30%)",
+        textAlign: "center",
+        marginBottom: 12,
         userSelect: "none",
-        textShadow: "0 1px 0 rgba(0,0,0,0.16)",
+    },
+
+    titleBlock: {
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: 8,
+        padding: "4px 0 2px",
+    },
+
+    prefix: {
+        fontFamily: "var(--font-sans)",
+        fontSize: 12.5,
+        letterSpacing: "0.18em",
+        textTransform: "uppercase",
+        color: "color-mix(in oklab, var(--fg) 72%, var(--muted) 28%)",
+        textAlign: "center",
+        userSelect: "none",
+        maxWidth: 560,
+        lineHeight: 1.25,
+        padding: "0 6px",
+    },
+
+    main: {
+        margin: 0,
+        fontFamily: "var(--font-serif)",
+        fontWeight: 760,
+        fontSize: 34,
+        letterSpacing: "0.05em",
+        textTransform: "uppercase",
+        textAlign: "center",
+        color: "color-mix(in oklab, var(--fg) 92%, var(--muted) 8%)",
+        lineHeight: 1.06,
+        userSelect: "none",
+        maxWidth: 660,
+        padding: "0 6px",
+        overflowWrap: "anywhere",
+        textWrap: "balance",
+    },
+
+    subtitle: {
+        fontFamily: "var(--font-serif)",
+        fontSize: 16,
+        fontWeight: 620,
+        letterSpacing: "0.14em",
+        textTransform: "uppercase",
+        color: "color-mix(in oklab, var(--fg) 78%, var(--muted) 22%)",
+        textAlign: "center",
+        userSelect: "none",
+        maxWidth: 660,
+        lineHeight: 1.12,
+        padding: "0 8px",
+        overflowWrap: "anywhere",
+    },
+
+    rule: {
+        width: "min(520px, 86%)",
+        height: 1,
+        background: "color-mix(in oklab, var(--border) 75%, transparent)",
+        opacity: 0.9,
+        marginTop: 2,
+    },
+
+    motto: {
+        marginTop: 8,
+        fontFamily: "var(--font-sans)",
+        fontSize: 11.5,
+        letterSpacing: "0.16em",
+        textTransform: "uppercase",
+        color: "color-mix(in oklab, var(--fg) 62%, var(--muted) 38%)",
+        textAlign: "center",
+        userSelect: "none",
+        maxWidth: 620,
+        lineHeight: 1.25,
+        padding: "0 8px",
     },
 };
