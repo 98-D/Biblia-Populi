@@ -1,5 +1,6 @@
 // apps/web/src/reader/types.ts
 import type { BookRow } from "../api";
+import type { TypographyFont } from "./typography";
 
 /**
  * Reader types (web) — Biblia.to
@@ -9,12 +10,27 @@ import type { BookRow } from "../api";
  * - Canon anchored (verseKey + verseOrd are immutable anchors)
  * - Token-ready selection + annotation
  * - Overlay-ready with deterministic anchoring
+ * - Local-first + sync-friendly
  *
- * Principle:
+ * Principles:
  * - Layout is ephemeral
- * - Anchors must be semantic
+ * - Anchors are semantic
  * - Pixel geometry is a projection cache only
+ * - Runtime code may derive richer projections, but these types stay transport-safe
  */
+
+/* =============================================================================
+   Small utility aliases
+============================================================================= */
+
+export type IsoDateTimeString = string;
+export type ReaderId = string;
+export type VerseKey = string;
+export type BookId = string;
+export type TranslationId = string;
+export type TokenizerId = string;
+export type DeviceId = string;
+export type Revision = number;
 
 /* =============================================================================
    Core Reader Data
@@ -27,27 +43,27 @@ export type SpineStats = Readonly<{
 }>;
 
 export type VerseRef = Readonly<{
-    bookId: string;
+    bookId: BookId;
     chapter: number;
     verse?: number | null;
 }>;
 
 export type TranslationRef = Readonly<{
-    translationId: string;
+    translationId: TranslationId;
     label?: string | null;
 }>;
 
 export type SliceTokenKind =
-    | "WORD"
-    | "PUNCT"
-    | "SPACE"
-    | "LINEBREAK"
-    | "MARKER"
-    | "NUMBER"
-    | "SYMBOL";
+     | "WORD"
+     | "PUNCT"
+     | "SPACE"
+     | "LINEBREAK"
+     | "MARKER"
+     | "NUMBER"
+     | "SYMBOL";
 
 export type TokenizerRef = Readonly<{
-    tokenizerId: string;
+    tokenizerId: TokenizerId;
     version?: string | null;
 }>;
 
@@ -62,10 +78,10 @@ export type SliceVerseToken = Readonly<{
 }>;
 
 export type SliceVerse = Readonly<{
-    verseKey: string;
+    verseKey: VerseKey;
     verseOrd: number;
 
-    bookId: string;
+    bookId: BookId;
     chapter: number;
     verse: number;
 
@@ -87,7 +103,7 @@ export type ReaderPosition = Readonly<{
 export type ReaderCurrentPos = Readonly<{
     label: string;
     ord: number;
-    bookId: string | null;
+    bookId: BookId | null;
     chapter: number | null;
     verse: number | null;
 }>;
@@ -100,9 +116,9 @@ export type ReaderJump = VerseRef;
 
 export type ReaderAnchor = Readonly<{
     verseOrd: number;
-    verseKey: string;
-    translationId?: string | null;
-    tokenizerId?: string | null;
+    verseKey: VerseKey;
+    translationId?: TranslationId | null;
+    tokenizerId?: TokenizerId | null;
     tokenStart?: number | null;
     tokenEnd?: number | null;
     charStart?: number | null;
@@ -110,12 +126,12 @@ export type ReaderAnchor = Readonly<{
 }>;
 
 export type ReaderSelectionOrigin =
-    | "MOUSE_DRAG"
-    | "KEYBOARD"
-    | "TOUCH"
-    | "PROGRAM"
-    | "SEARCH"
-    | "SHARE_LINK";
+     | "MOUSE_DRAG"
+     | "KEYBOARD"
+     | "TOUCH"
+     | "PROGRAM"
+     | "SEARCH"
+     | "SHARE_LINK";
 
 export type ReaderRange = Readonly<{
     start: ReaderAnchor;
@@ -125,9 +141,16 @@ export type ReaderRange = Readonly<{
 
 export type ReaderTokenSpan = Readonly<{
     verseOrd: number;
-    verseKey: string;
+    verseKey: VerseKey;
     tokenStart: number;
     tokenEnd: number;
+}>;
+
+export type ReaderVerseSpan = Readonly<{
+    startVerseOrd: number;
+    endVerseOrd: number;
+    startVerseKey: VerseKey;
+    endVerseKey: VerseKey;
 }>;
 
 /* =============================================================================
@@ -135,84 +158,85 @@ export type ReaderTokenSpan = Readonly<{
 ============================================================================= */
 
 export type ReaderAnnotationKind =
-    | "HIGHLIGHT"
-    | "UNDERLINE"
-    | "NOTE"
-    | "BOOKMARK"
-    | "LINK"
-    | "DRAWING";
+     | "HIGHLIGHT"
+     | "UNDERLINE"
+     | "NOTE"
+     | "BOOKMARK"
+     | "LINK"
+     | "DRAWING";
 
+export type ReaderAnnotationScope = "RANGE" | "WHOLE_VERSE";
 export type ReaderVisibility = "PRIVATE" | "SHARED" | "PUBLIC";
-export type ReaderId = string;
 
 export type ReaderInk =
-    | "INK_0"
-    | "INK_1"
-    | "INK_2"
-    | "INK_3"
-    | "INK_4"
-    | "INK_5";
+     | "INK_0"
+     | "INK_1"
+     | "INK_2"
+     | "INK_3"
+     | "INK_4"
+     | "INK_5";
 
 export type ReaderHighlightStyle = "SOLID" | "SOFT" | "UNDERLINE" | "OUTLINE";
+export type ReaderUnderlineStyle = "SINGLE" | "DOUBLE";
 
 export type ReaderNoteBody =
-    | Readonly<{ format: "PLAINTEXT"; text: string }>
-    | Readonly<{ format: "MARKDOWN"; md: string }>;
+     | Readonly<{ format: "PLAINTEXT"; text: string }>
+     | Readonly<{ format: "MARKDOWN"; md: string }>;
 
 export type ReaderAnnotationBase = Readonly<{
     id: ReaderId;
     kind: ReaderAnnotationKind;
     range: ReaderRange;
-    scope?: "RANGE" | "WHOLE_VERSE" | null;
+    scope?: ReaderAnnotationScope | null;
     ink?: ReaderInk | null;
     visibility?: ReaderVisibility | null;
     tags?: ReadonlyArray<string> | null;
-    createdAt: string;
-    updatedAt: string;
-    deletedAt?: string | null;
-    rev?: number | null;
-    deviceId?: string | null;
+    createdAt: IsoDateTimeString;
+    updatedAt: IsoDateTimeString;
+    deletedAt?: IsoDateTimeString | null;
+    rev?: Revision | null;
+    deviceId?: DeviceId | null;
 }>;
 
 export type ReaderHighlight = ReaderAnnotationBase &
-    Readonly<{
-        kind: "HIGHLIGHT";
-        style?: ReaderHighlightStyle | null;
-        strength?: number | null;
-    }>;
+     Readonly<{
+         kind: "HIGHLIGHT";
+         style?: ReaderHighlightStyle | null;
+         strength?: number | null;
+     }>;
 
 export type ReaderUnderline = ReaderAnnotationBase &
-    Readonly<{
-        kind: "UNDERLINE";
-        style?: "SINGLE" | "DOUBLE" | null;
-    }>;
+     Readonly<{
+         kind: "UNDERLINE";
+         style?: ReaderUnderlineStyle | null;
+     }>;
 
 export type ReaderNote = ReaderAnnotationBase &
-    Readonly<{
-        kind: "NOTE";
-        title?: string | null;
-        body: ReaderNoteBody;
-        uiState?: Readonly<{ collapsed?: boolean | null }> | null;
-    }>;
+     Readonly<{
+         kind: "NOTE";
+         title?: string | null;
+         body: ReaderNoteBody;
+         uiState?: Readonly<{ collapsed?: boolean | null }> | null;
+     }>;
 
 export type ReaderBookmark = ReaderAnnotationBase &
-    Readonly<{
-        kind: "BOOKMARK";
-        label?: string | null;
-    }>;
+     Readonly<{
+         kind: "BOOKMARK";
+         label?: string | null;
+     }>;
 
 export type ReaderLinkTarget =
-    | Readonly<{ type: "VERSE_REF"; ref: VerseRef }>
-    | Readonly<{ type: "RANGE"; range: ReaderRange }>
-    | Readonly<{ type: "URL"; url: string }>
-    | Readonly<{ type: "SEARCH"; query: string }>;
+     | Readonly<{ type: "VERSE_REF"; ref: VerseRef }>
+     | Readonly<{ type: "RANGE"; range: ReaderRange }>
+     | Readonly<{ type: "URL"; url: string }>
+     | Readonly<{ type: "SEARCH"; query: string }>;
 
 export type ReaderLink = ReaderAnnotationBase &
-    Readonly<{
-        kind: "LINK";
-        target: ReaderLinkTarget;
-        label?: string | null;
-    }>;
+     Readonly<{
+         kind: "LINK";
+         target: ReaderLinkTarget;
+         label?: string | null;
+     }>;
 
 export type ReaderDrawingProjection = "VERSE_BLOCK" | "RANGE_BLOCK" | "PAGE_VIEW";
 
@@ -239,19 +263,19 @@ export type ReaderDrawingPayload = Readonly<{
 }>;
 
 export type ReaderDrawing = ReaderAnnotationBase &
-    Readonly<{
-        kind: "DRAWING";
-        drawing: ReaderDrawingPayload;
-        projection?: ReaderDrawingProjection | null;
-    }>;
+     Readonly<{
+         kind: "DRAWING";
+         drawing: ReaderDrawingPayload;
+         projection?: ReaderDrawingProjection | null;
+     }>;
 
 export type ReaderAnnotation =
-    | ReaderHighlight
-    | ReaderUnderline
-    | ReaderNote
-    | ReaderBookmark
-    | ReaderLink
-    | ReaderDrawing;
+     | ReaderHighlight
+     | ReaderUnderline
+     | ReaderNote
+     | ReaderBookmark
+     | ReaderLink
+     | ReaderDrawing;
 
 /* =============================================================================
    UI Geometry Projections
@@ -272,7 +296,7 @@ export type ViewportRect = Readonly<{
 export type RangeOverlayProjection = Readonly<{
     range: ReaderRange;
     rects: ReadonlyArray<ViewportRect>;
-    computedAt: string;
+    computedAt: IsoDateTimeString;
     typographySig?: string | null;
 }>;
 
@@ -281,9 +305,9 @@ export type RangeOverlayProjection = Readonly<{
 ============================================================================= */
 
 export type ReaderExportLine = Readonly<{
-    verseKey: string;
+    verseKey: VerseKey;
     verseOrd: number;
-    bookId: string;
+    bookId: BookId;
     chapter: number;
     verse: number;
     text: string;
@@ -294,7 +318,7 @@ export type ReaderExportBlock = Readonly<{
     text: string;
     lines?: ReadonlyArray<ReaderExportLine> | null;
     refLabel?: string | null;
-    translationId?: string | null;
+    translationId?: TranslationId | null;
 }>;
 
 /* =============================================================================
@@ -303,24 +327,28 @@ export type ReaderExportBlock = Readonly<{
 
 export type ReaderTypographyPrefs = Readonly<{
     enabled: boolean;
-    font: string;
+    font: TypographyFont;
     sizePx: number;
     weight: number;
     leading: number;
     measurePx: number;
 }>;
 
+export type ReaderTokenizationPrefs = Readonly<{
+    enabled: boolean;
+    tokenizerId?: TokenizerId | null;
+}>;
+
+export type ReaderAnnotationPrefs = Readonly<{
+    ink?: ReaderInk | null;
+    highlightStyle?: ReaderHighlightStyle | null;
+    visibility?: ReaderVisibility | null;
+}>;
+
 export type ReaderPrefs = Readonly<{
     typography: ReaderTypographyPrefs;
-    tokenization?: Readonly<{
-        enabled: boolean;
-        tokenizerId?: string | null;
-    }> | null;
-    annotation?: Readonly<{
-        ink?: ReaderInk | null;
-        highlightStyle?: ReaderHighlightStyle | null;
-        visibility?: ReaderVisibility | null;
-    }> | null;
+    tokenization?: ReaderTokenizationPrefs | null;
+    annotation?: ReaderAnnotationPrefs | null;
 }>;
 
 /* =============================================================================
@@ -328,14 +356,14 @@ export type ReaderPrefs = Readonly<{
 ============================================================================= */
 
 export type ReaderAnnotationSyncRequest = Readonly<{
-    sinceRev?: number | null;
-    deviceId?: string | null;
+    sinceRev?: Revision | null;
+    deviceId?: DeviceId | null;
     upserts?: ReadonlyArray<ReaderAnnotation> | null;
     deletes?: ReadonlyArray<ReaderId> | null;
 }>;
 
 export type ReaderAnnotationSyncResponse = Readonly<{
-    rev: number;
+    rev: Revision;
     upserts: ReadonlyArray<ReaderAnnotation>;
     deletes: ReadonlyArray<ReaderId>;
 }>;
@@ -348,3 +376,17 @@ export type SlicePayload = Readonly<{
     verses: ReadonlyArray<SliceVerse>;
     spine: SpineStats;
 }>;
+
+/* =============================================================================
+   Convenient unions / helpers
+============================================================================= */
+
+export type ReaderEntity =
+     | SliceVerse
+     | ReaderAnnotation
+     | ReaderRange
+     | ReaderExportBlock;
+
+export type ReaderAnnotationMap = ReadonlyMap<ReaderId, ReaderAnnotation>;
+export type VerseIndexMap = ReadonlyMap<number, SliceVerse>;
+export type BookIndexMap = ReadonlyMap<BookId, BookRow>;

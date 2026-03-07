@@ -1,3 +1,4 @@
+// apps/web/src/reader/annotationStore.ts
 import {
     ANNOTATION_KIND,
     createAnnotation,
@@ -53,16 +54,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null;
 }
 
-function hasNonEmptyStringProp(
-    value: Record<string, unknown>,
-    key: string,
-): boolean {
-    const v = value[key];
-    return typeof v === "string" && v.trim().length > 0;
+function hasNonEmptyStringProp(value: Record<string, unknown>, key: string): boolean {
+    const candidate = value[key];
+    return typeof candidate === "string" && candidate.trim().length > 0;
 }
 
 function isPersistedAnnotationEventEnvelope(
-    value: unknown,
+     value: unknown,
 ): value is PersistedAnnotationEventEnvelope {
     if (!isRecord(value)) return false;
     return hasNonEmptyStringProp(value, "type") && hasNonEmptyStringProp(value, "eventId");
@@ -77,8 +75,12 @@ function safeJsonParse<T>(raw: string | null): T | null {
     }
 }
 
-function safeJsonStringify(value: unknown): string {
-    return JSON.stringify(value);
+function safeJsonStringify(value: unknown): string | null {
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return null;
+    }
 }
 
 function canUseWindowStorage(): boolean {
@@ -99,7 +101,7 @@ function safeStorageSet(key: string, value: string): void {
     try {
         window.localStorage.setItem(key, value);
     } catch {
-        // ignore
+        // ignore storage quota / privacy mode failures
     }
 }
 
@@ -115,7 +117,10 @@ function safeStorageRemove(key: string): void {
 function randomHex(bytes = 10): string {
     const out = new Uint8Array(bytes);
 
-    if (typeof globalThis.crypto !== "undefined" && typeof globalThis.crypto.getRandomValues === "function") {
+    if (
+         typeof globalThis.crypto !== "undefined" &&
+         typeof globalThis.crypto.getRandomValues === "function"
+    ) {
         globalThis.crypto.getRandomValues(out);
     } else {
         for (let i = 0; i < out.length; i += 1) {
@@ -127,15 +132,19 @@ function randomHex(bytes = 10): string {
 }
 
 function loadOrCreateBrandedId<T extends string>(
-    key: string,
-    create: (seed?: string) => T,
+     key: string,
+     create: (seed?: string) => T,
 ): T {
     const raw = safeStorageGet(key);
     if (typeof raw === "string" && raw.trim().length > 0) {
-        return raw as T;
+        try {
+            return create(raw.trim());
+        } catch {
+            // fall through and reissue
+        }
     }
 
-    const next = create(randomHex(6));
+    const next = create(randomHex(8));
     safeStorageSet(key, next);
     return next;
 }
@@ -148,13 +157,65 @@ function materializeEvents(input: unknown): AnnotationEvent[] {
         if (!isPersistedAnnotationEventEnvelope(item)) continue;
         out.push(item as unknown as AnnotationEvent);
     }
-
     return out;
 }
 
 function sortAnnotationsNewestFirst(a: Annotation, b: Annotation): number {
     if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
+    if (a.createdAt !== b.createdAt) return b.createdAt - a.createdAt;
     return a.annotationId.localeCompare(b.annotationId);
+}
+
+function normalizeStringList(input: readonly string[] | undefined): string[] {
+    if (!input || input.length === 0) return [];
+
+    const seen = new Set<string>();
+    const out: string[] = [];
+
+    for (const item of input) {
+        if (typeof item !== "string") continue;
+        const value = item.trim();
+        if (!value) continue;
+        if (seen.has(value)) continue;
+        seen.add(value);
+        out.push(value);
+    }
+
+    return out;
+}
+
+function normalizeNullableText(value: string | null | undefined): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeSelectionText(value: string | null | undefined): string | null {
+    if (typeof value !== "string") return null;
+    const collapsed = value.replace(/\s+/g, " ").trim();
+    return collapsed.length > 0 ? collapsed : null;
+}
+
+function getKind(
+     value: CreateTextAnnotationInput["kind"] | undefined,
+): Annotation["kind"] {
+    switch (value) {
+        case "NOTE":
+            return ANNOTATION_KIND.NOTE;
+        case "BOOKMARK":
+            return ANNOTATION_KIND.BOOKMARK;
+        case "HIGHLIGHT":
+        default:
+            return ANNOTATION_KIND.HIGHLIGHT;
+    }
+}
+
+function normalizeVerseOrdRange(startOrd: number, endOrd: number): {
+    startOrd: number;
+    endOrd: number;
+} {
+    if (startOrd <= endOrd) return { startOrd, endOrd };
+    return { startOrd: endOrd, endOrd: startOrd };
 }
 
 export class ReaderAnnotationStore {
@@ -180,7 +241,7 @@ export class ReaderAnnotationStore {
         this.deviceId = loadOrCreateBrandedId(this.deviceStorageKey, createDeviceId);
         this.userId = loadOrCreateBrandedId(this.userStorageKey, createUserId);
 
-        const raw = safeStorageGet(this.storageKey);
+        const raw = this.persist ? safeStorageGet(this.storageKey) : null;
         this.events = materializeEvents(safeJsonParse<unknown>(raw));
 
         try {
@@ -220,8 +281,8 @@ export class ReaderAnnotationStore {
 
     listAnnotations(): readonly Annotation[] {
         return [...this.snapshot.annotations.values()]
-            .filter((annotation) => annotation.deletedAt === null)
-            .sort(sortAnnotationsNewestFirst);
+             .filter((annotation) => annotation.deletedAt === null)
+             .sort(sortAnnotationsNewestFirst);
     }
 
     listAnnotationsForVerseOrd(verseOrd: number): readonly Annotation[] {
@@ -230,12 +291,13 @@ export class ReaderAnnotationStore {
         for (const annotation of this.snapshot.annotations.values()) {
             if (annotation.deletedAt !== null) continue;
 
-            const hit = annotation.spans.some((span: Annotation["spans"][number]) => {
-                return (
-                    span.deletedAt === null &&
-                    span.start.verseOrd <= verseOrd &&
-                    span.end.verseOrd >= verseOrd
+            const hit = annotation.spans.some((span) => {
+                if (span.deletedAt !== null) return false;
+                const range = normalizeVerseOrdRange(
+                     span.start.verseOrd,
+                     span.end.verseOrd,
                 );
+                return verseOrd >= range.startOrd && verseOrd <= range.endOrd;
             });
 
             if (hit) out.push(annotation);
@@ -269,17 +331,18 @@ export class ReaderAnnotationStore {
     }
 
     createTextAnnotation(input: CreateTextAnnotationInput): AnnotationId {
-        const now = this.now();
-        const annotationId = createAnnotationId(input.selection.start.verseKey);
+        const createdAt = this.now();
+        const selection = input.selection;
+        const annotationId = createAnnotationId(selection.start.verseKey);
 
         const span = createAnnotationSpan({
-            start: input.selection.start,
-            end: input.selection.end,
-            text: input.selection.text,
-            translationId: input.selection.translationId,
+            start: selection.start,
+            end: selection.end,
+            text: normalizeSelectionText(selection.text),
+            translationId: normalizeNullableText(selection.translationId),
             ordinal: 1,
-            createdAt: now,
-            updatedAt: now,
+            createdAt,
+            updatedAt: createdAt,
             deletedAt: null,
         });
 
@@ -289,28 +352,23 @@ export class ReaderAnnotationStore {
             createdByUserId: this.userId,
             updatedByUserId: this.userId,
             deviceId: this.deviceId,
-            kind:
-                input.kind === "NOTE"
-                    ? ANNOTATION_KIND.NOTE
-                    : input.kind === "BOOKMARK"
-                        ? ANNOTATION_KIND.BOOKMARK
-                        : ANNOTATION_KIND.HIGHLIGHT,
-            title: input.title ?? null,
-            body: input.body ?? null,
-            color: input.color ?? null,
-            labels: input.labels ?? [],
-            collectionIds: input.collectionIds ?? [],
+            kind: getKind(input.kind),
+            title: normalizeNullableText(input.title),
+            body: normalizeNullableText(input.body),
+            color: normalizeNullableText(input.color),
+            labels: normalizeStringList(input.labels),
+            collectionIds: normalizeStringList(input.collectionIds),
             spans: [span],
             strokes: [],
             pinned: input.pinned ?? false,
             archived: input.archived ?? false,
-            createdAt: now,
-            updatedAt: now,
+            createdAt,
+            updatedAt: createdAt,
             deletedAt: null,
             revision: 1,
         });
 
-        const meta = this.makeEventMeta(now);
+        const meta = this.makeEventMeta(createdAt);
         const event = createAnnotationCreatedEvent(annotation, meta);
 
         this.append(event);
@@ -346,7 +404,9 @@ export class ReaderAnnotationStore {
 
     private persistNow(): void {
         if (!this.persist) return;
-        safeStorageSet(this.storageKey, safeJsonStringify(this.events));
+        const raw = safeJsonStringify(this.events);
+        if (raw === null) return;
+        safeStorageSet(this.storageKey, raw);
     }
 
     private emit(): void {

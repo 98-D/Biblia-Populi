@@ -1,11 +1,11 @@
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-06T23:40:23.222Z
-Root: C:\Users\dannydekker\Desktop\Biblia-Populi
+Generated: 2026-03-07T23:43:54.466Z
+Root: /Users/dan/Desktop/Biblia-Populi
 Total files: 70
-Total raw bytes (all included files): 1996629
+Total raw bytes (all included files): 1888192
 Truncated/skipped files: 1
-Export time: 62ms
+Export time: 12ms
 
 ## Notes
 
@@ -5558,7 +5558,7 @@ export default {
 //noinspection SpellCheckingInspection
 // apps/api/scripts/import-osis.ts
 //
-// Biblia Populi — OSIS XML importer (bp_* schema)
+// Biblia.to — hardened OSIS XML importer (bp_* schema)
 //
 // Imports an OSIS Bible XML (e.g. KJV OSIS) into SQLite for reading.
 //
@@ -5574,6 +5574,8 @@ export default {
 // - supports milestone style: <verse sID="Gen.1.1"/> ... <verse eID="Gen.1.1"/>
 // - ignores text inside <note> while collecting verse text
 // - chunked transactions for speed + resilience
+// - idempotent no-op path when source fingerprint already imported
+// - guarded destructive modes
 //
 // Usage (repo root):
 //   bun add saxes
@@ -5590,6 +5592,9 @@ export default {
 //   BP_IMPORT_CLEAR_SPINE              "1" -> deletes bp_verse + bp_chapter (DANGER; rebuilds ordinals from file)
 //   BP_IMPORT_BATCH_SIZE               default: 5000 (commit interval)
 //   BP_IMPORT_LOG_EVERY                default: 2500
+//   BP_IMPORT_SKIP_IF_SAME             default: 1
+//   BP_IMPORT_FORCE                    "1" -> bypass source fingerprint skip
+//   BP_IMPORT_ALLOW_SPINE_REBUILD      required when BP_IMPORT_CLEAR_SPINE=1
 //
 // Notes:
 // - Run migrations first: bun --cwd apps/api run db:migrate
@@ -5604,31 +5609,85 @@ import { openDb } from "../src/db/client";
 
 /* -------------------------------- Config ---------------------------------- */
 
-const TRANSLATION_ID = (process.env.BP_IMPORT_TRANSLATION_ID ?? "KJV").trim();
-const TRANSLATION_NAME = (process.env.BP_IMPORT_TRANSLATION_NAME ?? "King James Version").trim();
-const LANGUAGE = (process.env.BP_IMPORT_LANGUAGE ?? "en").trim();
+const TRANSLATION_ID = envNonEmpty("BP_IMPORT_TRANSLATION_ID", "KJV");
+const TRANSLATION_NAME = envNonEmpty("BP_IMPORT_TRANSLATION_NAME", "King James Version");
+const LANGUAGE = envNonEmpty("BP_IMPORT_LANGUAGE", "en");
 
-const LICENSE_KIND = (process.env.BP_IMPORT_LICENSE_KIND ?? "PUBLIC_DOMAIN").trim(); // PUBLIC_DOMAIN | LICENSED | CUSTOM
-const SET_DEFAULT = (process.env.BP_IMPORT_SET_DEFAULT ?? "").trim() === "1";
+const LICENSE_KIND = envNonEmpty("BP_IMPORT_LICENSE_KIND", "PUBLIC_DOMAIN"); // PUBLIC_DOMAIN | LICENSED | CUSTOM
+const SET_DEFAULT = envBool("BP_IMPORT_SET_DEFAULT", false);
 
-const CLEAR_TEXT = (process.env.BP_IMPORT_CLEAR_TEXT ?? "").trim() === "1";
-const CLEAR_SPINE = (process.env.BP_IMPORT_CLEAR_SPINE ?? "").trim() === "1"; // deletes bp_verse/bp_chapter
+const CLEAR_TEXT = envBool("BP_IMPORT_CLEAR_TEXT", false);
+const CLEAR_SPINE = envBool("BP_IMPORT_CLEAR_SPINE", false); // deletes bp_verse/bp_chapter
+const ALLOW_SPINE_REBUILD = envBool("BP_IMPORT_ALLOW_SPINE_REBUILD", false);
 
-const BATCH_SIZE = Number(process.env.BP_IMPORT_BATCH_SIZE ?? "5000");
-const LOG_EVERY = Number(process.env.BP_IMPORT_LOG_EVERY ?? "2500");
+const BATCH_SIZE = envInt("BP_IMPORT_BATCH_SIZE", 5000);
+const LOG_EVERY = envInt("BP_IMPORT_LOG_EVERY", 2500);
 
-function log(...args: unknown[]) {
+const SKIP_IF_SAME = envBool("BP_IMPORT_SKIP_IF_SAME", true);
+const FORCE = envBool("BP_IMPORT_FORCE", false);
+
+const IMPORTER_VERSION = "2026-03-07.1";
+
+/* -------------------------------- Logging --------------------------------- */
+
+function log(...args: unknown[]): void {
     // eslint-disable-next-line no-console
     console.log("[import:osis]", ...args);
 }
-function warn(...args: unknown[]) {
+
+function warn(...args: unknown[]): void {
     // eslint-disable-next-line no-console
     console.warn("[import:osis]", ...args);
 }
+
 function fatal(...args: unknown[]): never {
     // eslint-disable-next-line no-console
     console.error("[import:osis]", ...args);
     process.exit(1);
+}
+
+/* ------------------------------ Env helpers ------------------------------- */
+
+function envStr(name: string, fallback = ""): string {
+    const raw = process.env[name];
+    if (typeof raw !== "string") return fallback;
+    const trimmed = raw.trim();
+    return trimmed.length > 0 ? trimmed : fallback;
+}
+
+function envNonEmpty(name: string, fallback: string): string {
+    const value = envStr(name, fallback);
+    if (!value) {
+        fatal(`${name} resolved to empty string`);
+    }
+    return value;
+}
+
+function envBool(name: string, fallback = false): boolean {
+    const raw = envStr(name, "");
+    if (!raw) return fallback;
+
+    switch (raw.toLowerCase()) {
+        case "1":
+        case "true":
+        case "yes":
+        case "on":
+            return true;
+        case "0":
+        case "false":
+        case "no":
+        case "off":
+            return false;
+        default:
+            return fallback;
+    }
+}
+
+function envInt(name: string, fallback: number): number {
+    const raw = envStr(name, "");
+    if (!raw) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) ? Math.trunc(n) : fallback;
 }
 
 /* ------------------------------ Utilities ---------------------------------- */
@@ -5641,12 +5700,49 @@ function normalizeForSearch(s: string): string {
     return normalizeText(s).toLowerCase();
 }
 
-function sha256Hex(s: string): string {
+function sha256HexText(s: string): string {
     return crypto.createHash("sha256").update(s, "utf8").digest("hex");
+}
+
+function sha256HexFile(filePath: string): string {
+    const hash = crypto.createHash("sha256");
+    const fd = fs.openSync(filePath, "r");
+
+    try {
+        const buf = Buffer.allocUnsafe(1024 * 1024);
+        for (;;) {
+            const n = fs.readSync(fd, buf, 0, buf.length, null);
+            if (n <= 0) break;
+            hash.update(n === buf.length ? buf : buf.subarray(0, n));
+        }
+    } finally {
+        fs.closeSync(fd);
+    }
+
+    return hash.digest("hex");
 }
 
 function isFinitePosInt(n: number): boolean {
     return Number.isFinite(n) && n > 0 && Math.floor(n) === n;
+}
+
+function isSafeNonNegativeInt(n: number): boolean {
+    return Number.isFinite(n) && n >= 0 && Math.floor(n) === n;
+}
+
+function normalizeAbs(p: string): string {
+    return path.isAbsolute(p) ? path.normalize(p) : path.resolve(process.cwd(), p);
+}
+
+function inspectErrorCode(error: unknown): string | undefined {
+    if (typeof error !== "object" || error === null) return undefined;
+    if (!("code" in error)) return undefined;
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+}
+
+function sqlStringLiteral(value: string): string {
+    return `'${value.replace(/'/g, "''")}'`;
 }
 
 /* -------------------------- OSIS → BP book mapping -------------------------- */
@@ -5728,9 +5824,6 @@ function mapBookId(osisBookId: string): string | null {
 }
 
 function sanitizeOsisId(ref: string): string {
-    // Drop range suffixes or segment suffixes if present:
-    // Gen.1.1-Gen.1.2  => Gen.1.1
-    // Gen.1.1!a        => Gen.1.1
     const first = ref.split("-")[0] ?? ref;
     return (first.split("!")[0] ?? first).trim();
 }
@@ -5754,10 +5847,12 @@ function makeVerseKey(bookId: string, chapter: number, verse: number): string {
 
 /* ------------------------------ DB glue types ------------------------------ */
 
+type SqliteScalar = string | number | bigint | Uint8Array | Buffer | null;
+
 type SqliteStmt = {
-    run: (...params: any[]) => unknown;
-    get: (...params: any[]) => unknown;
-    all: (...params: any[]) => unknown[];
+    run: (...params: SqliteScalar[]) => unknown;
+    get: (...params: SqliteScalar[]) => unknown;
+    all: (...params: SqliteScalar[]) => unknown[];
 };
 
 type SqliteLike = {
@@ -5765,411 +5860,758 @@ type SqliteLike = {
     query: (sql: string) => SqliteStmt;
 };
 
+type ImportHistoryRow = {
+    import_id: number;
+    translation_id: string;
+    source_path: string;
+    source_hash: string;
+    file_size: number;
+    importer_version: string;
+    status: string;
+    started_at: string;
+    completed_at: string | null;
+    verse_count: number | null;
+};
+
+type ImportRun = {
+    importId: number;
+    sourcePath: string;
+    sourceHash: string;
+    fileSize: number;
+};
+
 /* ------------------------------ DB helpers --------------------------------- */
 
 function ensureSchemaPresent(sqlite: SqliteLike): void {
     const mustHave = ["bp_book", "bp_translation", "bp_verse", "bp_verse_text"];
-    for (const t of mustHave) {
+    for (const tableName of mustHave) {
         const ok = sqlite
-            .query(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;`)
-            .get(t);
-        if (!ok) fatal(`missing table "${t}". Run: bun --cwd apps/api run db:migrate`);
+             .query(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;`)
+             .get(tableName);
+
+        if (!ok) {
+            fatal(`missing table "${tableName}". Run: bun --cwd apps/api run db:migrate`);
+        }
     }
 }
 
 function ensureBooksSeeded(sqlite: SqliteLike): void {
     const row = sqlite.query(`SELECT COUNT(1) AS n FROM bp_book;`).get() as { n?: number } | undefined;
     const n = Number(row?.n ?? 0);
+
     if (!Number.isFinite(n) || n <= 0) {
         fatal(`bp_book is empty. Run: bun --cwd apps/api run db:seed`);
     }
 }
 
+function ensureImportHistoryTable(sqlite: SqliteLike): void {
+    sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS bp_import_history(
+            import_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            translation_id TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            importer_version TEXT NOT NULL,
+            status TEXT NOT NULL, -- STARTED | SUCCEEDED | FAILED
+            started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            completed_at TEXT NULL,
+            verse_count INTEGER NULL,
+            notes TEXT NULL
+        );
+    `);
+
+    sqlite.exec(`
+        CREATE INDEX IF NOT EXISTS idx_bp_import_history_lookup
+        ON bp_import_history(translation_id, source_hash, importer_version, status);
+    `);
+
+    sqlite.exec(`
+        CREATE INDEX IF NOT EXISTS idx_bp_import_history_started
+        ON bp_import_history(started_at);
+    `);
+}
+
+function assertDestructiveModesAllowed(): void {
+    if (CLEAR_SPINE && !ALLOW_SPINE_REBUILD) {
+        fatal(
+             "BP_IMPORT_CLEAR_SPINE=1 is destructive and requires BP_IMPORT_ALLOW_SPINE_REBUILD=1",
+        );
+    }
+}
+
 function upsertTranslation(sqlite: SqliteLike): void {
-    // Optionally enforce single default
     if (SET_DEFAULT) {
         sqlite.query(`UPDATE bp_translation SET is_default = 0;`).run();
     }
 
     sqlite
-        .query(
-            `INSERT INTO bp_translation(
-          translation_id, name, language, derived_from, license_kind, license_text, source_url, is_default, created_at
-       ) VALUES (?, ?, ?, NULL, ?, NULL, NULL, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-       ON CONFLICT(translation_id) DO UPDATE SET
-          name=excluded.name,
-          language=excluded.language,
-          license_kind=excluded.license_kind,
-          is_default=CASE WHEN excluded.is_default=1 THEN 1 ELSE bp_translation.is_default END;`,
-        )
-        .run(TRANSLATION_ID, TRANSLATION_NAME, LANGUAGE, LICENSE_KIND, SET_DEFAULT ? 1 : 0);
+         .query(
+              `INSERT INTO bp_translation(
+                translation_id,
+                name,
+                language,
+                derived_from,
+                license_kind,
+                license_text,
+                source_url,
+                is_default,
+                created_at
+            ) VALUES (
+                ?, ?, ?, NULL, ?, NULL, NULL, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            )
+            ON CONFLICT(translation_id) DO UPDATE SET
+                name=excluded.name,
+                language=excluded.language,
+                license_kind=excluded.license_kind,
+                is_default=CASE
+                    WHEN excluded.is_default=1 THEN 1
+                    ELSE bp_translation.is_default
+                END;`,
+         )
+         .run(TRANSLATION_ID, TRANSLATION_NAME, LANGUAGE, LICENSE_KIND, SET_DEFAULT ? 1 : 0);
 }
 
 function maybeClearText(sqlite: SqliteLike): void {
     if (!CLEAR_TEXT) return;
-    log("clearing bp_verse_text for translation…", TRANSLATION_ID);
+    log("clearing bp_verse_text for translation:", TRANSLATION_ID);
     sqlite.query(`DELETE FROM bp_verse_text WHERE translation_id = ?;`).run(TRANSLATION_ID);
 }
 
 function maybeClearSpine(sqlite: SqliteLike): void {
     if (!CLEAR_SPINE) return;
-    warn("BP_IMPORT_CLEAR_SPINE=1 set — deleting bp_chapter + bp_verse (rebuilds ordinals from file).");
+
+    warn("BP_IMPORT_CLEAR_SPINE=1 -> deleting bp_chapter + bp_verse and rebuilding ordinals from OSIS order");
     sqlite.query(`DELETE FROM bp_chapter;`).run();
     sqlite.query(`DELETE FROM bp_verse;`).run();
 }
 
 function rebuildChapters(sqlite: SqliteLike): void {
-    // Rebuild bp_chapter from bp_verse (safe + deterministic).
     sqlite.exec(`
-    DELETE FROM bp_chapter;
-    INSERT INTO bp_chapter(book_id, chapter, start_verse_ord, end_verse_ord, verse_count)
-    SELECT
-      book_id,
-      chapter,
-      MIN(verse_ord) AS start_verse_ord,
-      MAX(verse_ord) AS end_verse_ord,
-      COUNT(*)        AS verse_count
-    FROM bp_verse
-    GROUP BY book_id, chapter
-    ORDER BY book_id, chapter;
-  `);
+        DELETE FROM bp_chapter;
+
+        INSERT INTO bp_chapter(book_id, chapter, start_verse_ord, end_verse_ord, verse_count)
+        SELECT
+            book_id,
+            chapter,
+            MIN(verse_ord) AS start_verse_ord,
+            MAX(verse_ord) AS end_verse_ord,
+            COUNT(*) AS verse_count
+        FROM bp_verse
+        GROUP BY book_id, chapter
+        ORDER BY book_id, chapter;
+    `);
+}
+
+function hasFtsTable(sqlite: SqliteLike): boolean {
+    return Boolean(
+         sqlite.query(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='bp_verse_text_fts' LIMIT 1;`).get(),
+    );
+}
+
+function begin(sqlite: SqliteLike): void {
+    sqlite.exec("BEGIN;");
+}
+
+function commit(sqlite: SqliteLike): void {
+    sqlite.exec("COMMIT;");
+}
+
+function rollbackQuiet(sqlite: SqliteLike): void {
+    try {
+        sqlite.exec("ROLLBACK;");
+    } catch {
+        // ignore
+    }
+}
+
+function startImportHistory(
+     sqlite: SqliteLike,
+     sourcePath: string,
+     sourceHash: string,
+     fileSize: number,
+): ImportRun {
+    sqlite
+         .query(
+              `INSERT INTO bp_import_history(
+                translation_id,
+                source_path,
+                source_hash,
+                file_size,
+                importer_version,
+                status,
+                started_at,
+                completed_at,
+                verse_count,
+                notes
+            ) VALUES (
+                ?, ?, ?, ?, ?, 'STARTED', strftime('%Y-%m-%dT%H:%M:%fZ','now'), NULL, NULL, NULL
+            );`,
+         )
+         .run(TRANSLATION_ID, sourcePath, sourceHash, fileSize, IMPORTER_VERSION);
+
+    const row = sqlite.query(`SELECT last_insert_rowid() AS id;`).get() as { id?: number | bigint } | undefined;
+    const idNum = Number(row?.id ?? NaN);
+
+    if (!isFinitePosInt(idNum)) {
+        fatal("failed to create bp_import_history row");
+    }
+
+    return {
+        importId: idNum,
+        sourcePath,
+        sourceHash,
+        fileSize,
+    };
+}
+
+function markImportSucceeded(sqlite: SqliteLike, run: ImportRun, verseCount: number, notes: string | null): void {
+    sqlite
+         .query(
+              `UPDATE bp_import_history
+             SET status='SUCCEEDED',
+                 completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                 verse_count=?,
+                 notes=?
+             WHERE import_id=?;`,
+         )
+         .run(verseCount, notes, run.importId);
+}
+
+function markImportFailed(sqlite: SqliteLike, run: ImportRun | null, notes: string): void {
+    if (!run) return;
+
+    sqlite
+         .query(
+              `UPDATE bp_import_history
+             SET status='FAILED',
+                 completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                 notes=?
+             WHERE import_id=?;`,
+         )
+         .run(notes, run.importId);
+}
+
+function getLastSuccessfulImport(
+     sqlite: SqliteLike,
+     sourceHash: string,
+): ImportHistoryRow | null {
+    const row = sqlite
+         .query(
+              `SELECT
+                import_id,
+                translation_id,
+                source_path,
+                source_hash,
+                file_size,
+                importer_version,
+                status,
+                started_at,
+                completed_at,
+                verse_count
+             FROM bp_import_history
+             WHERE translation_id = ?
+               AND source_hash = ?
+               AND importer_version = ?
+               AND status = 'SUCCEEDED'
+             ORDER BY import_id DESC
+             LIMIT 1;`,
+         )
+         .get(TRANSLATION_ID, sourceHash, IMPORTER_VERSION) as ImportHistoryRow | undefined;
+
+    return row ?? null;
+}
+
+function canSkipSameImport(
+     sqlite: SqliteLike,
+     sourceHash: string,
+): boolean {
+    if (!SKIP_IF_SAME || FORCE) return false;
+    if (CLEAR_TEXT || CLEAR_SPINE) return false;
+
+    const prior = getLastSuccessfulImport(sqlite, sourceHash);
+    return prior !== null;
+}
+
+function warnAboutPreexistingSpine(sqlite: SqliteLike): void {
+    const verseRow = sqlite.query(`SELECT COUNT(1) AS n FROM bp_verse;`).get() as { n?: number } | undefined;
+    const verseCount = Number(verseRow?.n ?? 0);
+
+    if (verseCount > 0 && CLEAR_SPINE) {
+        warn(`existing bp_verse rows will be rebuilt: ${verseCount}`);
+    }
+}
+
+function maybeDeleteTextForTranslationWhenForce(sqlite: SqliteLike): void {
+    if (CLEAR_TEXT) return;
+    if (!FORCE) return;
+
+    warn("BP_IMPORT_FORCE=1 without BP_IMPORT_CLEAR_TEXT=1 may overwrite existing verse text rows for translation:", TRANSLATION_ID);
+}
+
+function formatUnknownError(error: unknown): string {
+    if (error instanceof Error) {
+        return `${error.name}: ${error.message}`;
+    }
+    return String(error);
+}
+
+function ensureReadableFile(xmlPath: string): { size: number } {
+    let stat: fs.Stats;
+    try {
+        stat = fs.statSync(xmlPath);
+    } catch (error: unknown) {
+        fatal("unable to stat xml file:", xmlPath, formatUnknownError(error));
+    }
+
+    if (!stat.isFile()) {
+        fatal("xml path is not a file:", xmlPath);
+    }
+
+    if (!Number.isFinite(stat.size) || stat.size <= 0) {
+        fatal("xml file is empty:", xmlPath);
+    }
+
+    return { size: stat.size };
+}
+
+function assertConfig(): void {
+    if (!isFinitePosInt(BATCH_SIZE) || BATCH_SIZE < 500) {
+        fatal("BP_IMPORT_BATCH_SIZE must be >= 500. got:", BATCH_SIZE);
+    }
+
+    if (!isSafeNonNegativeInt(LOG_EVERY)) {
+        fatal("BP_IMPORT_LOG_EVERY must be >= 0. got:", LOG_EVERY);
+    }
+
+    assertDestructiveModesAllowed();
+}
+
+function pragmaTune(sqlite: SqliteLike): void {
+    sqlite.exec(`
+        PRAGMA foreign_keys = ON;
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA temp_store = MEMORY;
+        PRAGMA busy_timeout = 5000;
+    `);
+}
+
+function maybeCreateImportView(sqlite: SqliteLike): void {
+    // Optional convenience view. Safe if schema evolves.
+    try {
+        sqlite.exec(`
+            CREATE VIEW IF NOT EXISTS bp_import_history_latest AS
+            SELECT *
+            FROM bp_import_history
+            WHERE import_id IN (
+                SELECT MAX(import_id)
+                FROM bp_import_history
+                GROUP BY translation_id, source_hash, importer_version, status
+            );
+        `);
+    } catch {
+        // ignore
+    }
 }
 
 /* -------------------------------- Importer -------------------------------- */
 
 type VerseFinalize = { osisId: string; text: string };
 
+type ImportStats = {
+    inserted: number;
+    skipped: number;
+    verseStartsSeen: number;
+    verseOrd: number;
+    unknownBooks: Set<string>;
+};
+
 async function main(): Promise<void> {
     const fileArg = process.argv[2];
-    if (!fileArg) fatal("missing xml file path. Example: bun apps/api/scripts/import-osis.ts ./resources/kjv.xml");
-
-    const xmlPath = path.resolve(process.cwd(), fileArg);
-    if (!fs.existsSync(xmlPath)) fatal("file not found:", xmlPath);
-
-    if (!Number.isFinite(BATCH_SIZE) || BATCH_SIZE < 500) {
-        fatal("BP_IMPORT_BATCH_SIZE must be >= 500. got:", BATCH_SIZE);
+    if (!fileArg) {
+        fatal("missing xml file path. Example: bun apps/api/scripts/import-osis.ts ./resources/kjv.xml");
     }
+
+    const xmlPath = normalizeAbs(fileArg);
+    if (!fs.existsSync(xmlPath)) {
+        fatal("file not found:", xmlPath);
+    }
+
+    assertConfig();
+
+    const { size: fileSize } = ensureReadableFile(xmlPath);
+    const sourceHash = sha256HexFile(xmlPath);
 
     const { sqlite, dbPath, close } = openDb();
     const s = sqlite as unknown as SqliteLike;
 
-    ensureSchemaPresent(s);
-    ensureBooksSeeded(s);
+    let importRun: ImportRun | null = null;
 
-    upsertTranslation(s);
-
-    s.exec("BEGIN;");
     try {
-        maybeClearText(s);
-        maybeClearSpine(s);
+        pragmaTune(s);
+        ensureSchemaPresent(s);
+        ensureBooksSeeded(s);
+        ensureImportHistoryTable(s);
+        maybeCreateImportView(s);
 
-        s.exec("COMMIT;");
-    } catch (e) {
-        s.exec("ROLLBACK;");
-        close();
-        throw e;
-    }
+        if (canSkipSameImport(s, sourceHash)) {
+            log("skip: identical source already imported for translation");
+            log("dbPath:", dbPath);
+            log("translationId:", TRANSLATION_ID);
+            log("sourceHash:", sourceHash);
+            return;
+        }
 
-    log("dbPath:", dbPath);
-    log("translationId:", TRANSLATION_ID);
-    log("batchSize:", BATCH_SIZE);
-    log("logEvery:", LOG_EVERY);
-    log("fts table present:", !!s.query(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='bp_verse_text_fts' LIMIT 1;`).get());
+        warnAboutPreexistingSpine(s);
+        maybeDeleteTextForTranslationWhenForce(s);
 
-    // Prepared statements
-    const stmtBookOrd = s.query(`SELECT ordinal AS ord FROM bp_book WHERE book_id = ? LIMIT 1;`);
-
-    const stmtUpsertVerse = s.query(
-        `INSERT INTO bp_verse(verse_key, book_id, chapter, verse, verse_ord, chapter_ord, is_superscription, is_deuterocanon)
-         VALUES (?, ?, ?, ?, ?, NULL, 0, 0)
-             ON CONFLICT(verse_key) DO UPDATE SET
-            book_id=excluded.book_id,
-                                           chapter=excluded.chapter,
-                                           verse=excluded.verse,
-                                           verse_ord=excluded.verse_ord;`,
-    );
-
-    const stmtUpsertVerseText = s.query(
-        `INSERT INTO bp_verse_text(translation_id, verse_key, text, text_norm, hash, updated_at)
-     VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-     ON CONFLICT(translation_id, verse_key) DO UPDATE SET
-       text=excluded.text,
-       text_norm=excluded.text_norm,
-       hash=excluded.hash,
-       updated_at=excluded.updated_at;`,
-    );
-
-    // Ordinal state
-    let verseOrd = 0;
-
-    // If spine exists and we're not clearing it, continue after max to avoid collisions.
-    if (!CLEAR_SPINE) {
-        const row = s.query(`SELECT MAX(verse_ord) AS mx FROM bp_verse;`).get() as { mx?: number } | undefined;
-        verseOrd = Number(row?.mx ?? 0);
-        if (!Number.isFinite(verseOrd)) verseOrd = 0;
-    }
-
-    // Transaction batching
-    let inTx = false;
-    let pending = 0;
-
-    const beginTx = () => {
-        if (inTx) return;
-        s.exec("BEGIN;");
-        inTx = true;
-    };
-
-    const commitTx = () => {
-        if (!inTx) return;
-        s.exec("COMMIT;");
-        inTx = false;
-        pending = 0;
-    };
-
-    const rollbackTx = () => {
-        if (!inTx) return;
+        begin(s);
         try {
-            s.exec("ROLLBACK;");
-        } catch {}
-        inTx = false;
-        pending = 0;
-    };
-
-    const flushMaybe = () => {
-        if (pending >= BATCH_SIZE) commitTx();
-    };
-
-    // IMPORTANT: xmlns=false so attributes are plain strings for OSIS default namespace docs.
-    const parser = new SaxesParser({ xmlns: false });
-
-    let currentVerseId: string | null = null;
-    let collecting = false;
-
-    let endOnCloseTag = false;
-    let endOnEidMilestone = false;
-
-    let buf = "";
-    let ignoreNoteDepth = 0;
-
-    let inserted = 0;
-    let skipped = 0;
-    const unknownBooks = new Set<string>();
-    let verseStartsSeen = 0;
-
-    function getBookOrdinal(bookId: string): number | null {
-        const row = stmtBookOrd.get(bookId) as { ord?: number } | undefined;
-        const ord = Number(row?.ord ?? NaN);
-        return Number.isFinite(ord) ? ord : null;
-    }
-
-    function finalizeVerse(v: VerseFinalize): void {
-        const ref = parseOsisRef(v.osisId);
-        if (!ref) {
-            skipped += 1;
-            return;
+            upsertTranslation(s);
+            maybeClearText(s);
+            maybeClearSpine(s);
+            commit(s);
+        } catch (error: unknown) {
+            rollbackQuiet(s);
+            throw error;
         }
 
-        const bpBookId = mapBookId(ref.osisBook);
-        if (!bpBookId) {
-            unknownBooks.add(ref.osisBook);
-            skipped += 1;
-            return;
+        importRun = startImportHistory(s, xmlPath, sourceHash, fileSize);
+
+        log("dbPath:", dbPath);
+        log("translationId:", TRANSLATION_ID);
+        log("translationName:", TRANSLATION_NAME);
+        log("language:", LANGUAGE);
+        log("sourcePath:", xmlPath);
+        log("sourceHash:", sourceHash);
+        log("fileSize:", fileSize);
+        log("batchSize:", BATCH_SIZE);
+        log("logEvery:", LOG_EVERY);
+        log("fts table present:", hasFtsTable(s));
+
+        const stmtBookOrd = s.query(`SELECT ordinal AS ord FROM bp_book WHERE book_id = ? LIMIT 1;`);
+
+        const stmtUpsertVerse = s.query(
+             `INSERT INTO bp_verse(
+                verse_key,
+                book_id,
+                chapter,
+                verse,
+                verse_ord,
+                chapter_ord,
+                is_superscription,
+                is_deuterocanon
+            ) VALUES (?, ?, ?, ?, ?, NULL, 0, 0)
+            ON CONFLICT(verse_key) DO UPDATE SET
+                book_id=excluded.book_id,
+                chapter=excluded.chapter,
+                verse=excluded.verse,
+                verse_ord=excluded.verse_ord;`,
+        );
+
+        const stmtUpsertVerseText = s.query(
+             `INSERT INTO bp_verse_text(
+                translation_id,
+                verse_key,
+                text,
+                text_norm,
+                hash,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            ON CONFLICT(translation_id, verse_key) DO UPDATE SET
+                text=excluded.text,
+                text_norm=excluded.text_norm,
+                hash=excluded.hash,
+                updated_at=excluded.updated_at;`,
+        );
+
+        let verseOrd = 0;
+        if (!CLEAR_SPINE) {
+            const row = s.query(`SELECT MAX(verse_ord) AS mx FROM bp_verse;`).get() as { mx?: number } | undefined;
+            const maxOrd = Number(row?.mx ?? 0);
+            verseOrd = Number.isFinite(maxOrd) ? Math.max(0, Math.trunc(maxOrd)) : 0;
         }
 
-        // Ensure bp_book exists (seed should have done it)
-        const bOrd = getBookOrdinal(bpBookId);
-        if (bOrd == null) {
-            unknownBooks.add(ref.osisBook);
-            skipped += 1;
-            return;
-        }
+        let inTx = false;
+        let pending = 0;
 
-        const text = normalizeText(v.text);
-        if (!text) {
-            skipped += 1;
-            return;
-        }
+        const beginTx = (): void => {
+            if (inTx) return;
+            begin(s);
+            inTx = true;
+        };
 
-        const verseKey = makeVerseKey(bpBookId, ref.chap, ref.verse);
+        const commitTx = (): void => {
+            if (!inTx) return;
+            commit(s);
+            inTx = false;
+            pending = 0;
+        };
 
-        beginTx();
+        const rollbackTx = (): void => {
+            if (!inTx) return;
+            rollbackQuiet(s);
+            inTx = false;
+            pending = 0;
+        };
 
-        // If we cleared spine, verseOrd starts at 0; otherwise continues.
-        // This is deterministic *per import run* (OSIS order).
-        verseOrd += 1;
-
-        stmtUpsertVerse.run(verseKey, bpBookId, ref.chap, ref.verse, verseOrd);
-
-        const textNorm = normalizeForSearch(text);
-        const hash = sha256Hex(text);
-
-        stmtUpsertVerseText.run(TRANSLATION_ID, verseKey, text, textNorm, hash);
-
-        inserted += 1;
-        pending += 1;
-
-        if (LOG_EVERY > 0 && inserted % LOG_EVERY === 0) {
-            log("progress:", inserted, "verses…");
-        }
-
-        flushMaybe();
-    }
-
-    function resetVerseState(): void {
-        collecting = false;
-        currentVerseId = null;
-        endOnCloseTag = false;
-        endOnEidMilestone = false;
-        buf = "";
-        ignoreNoteDepth = 0;
-    }
-
-    parser.on("error", (e) => {
-        throw e;
-    });
-
-    parser.on("opentag", (tag: SaxesTagPlain) => {
-        const name = tag.name;
-
-        if (collecting && name === "note") {
-            ignoreNoteDepth += 1;
-            return;
-        }
-
-        if (name !== "verse") return;
-
-        const attrs = tag.attributes as Record<string, unknown>;
-        const osisID = attrs["osisID"];
-        const sID = attrs["sID"];
-        const eID = attrs["eID"];
-
-        // milestone end: <verse eID="Gen.1.1"/>
-        if (typeof eID === "string" && eID.length > 0) {
-            if (collecting && endOnEidMilestone && currentVerseId === eID) {
-                finalizeVerse({ osisId: eID, text: buf });
-                resetVerseState();
+        const flushMaybe = (): void => {
+            if (pending >= BATCH_SIZE) {
+                commitTx();
             }
-            return;
+        };
+
+        const parser = new SaxesParser({ xmlns: false });
+
+        let currentVerseId: string | null = null;
+        let collecting = false;
+        let endOnCloseTag = false;
+        let endOnEidMilestone = false;
+        let buf = "";
+        let ignoreNoteDepth = 0;
+
+        let inserted = 0;
+        let skipped = 0;
+        const unknownBooks = new Set<string>();
+        let verseStartsSeen = 0;
+
+        function getBookOrdinal(bookId: string): number | null {
+            const row = stmtBookOrd.get(bookId) as { ord?: number } | undefined;
+            const ord = Number(row?.ord ?? NaN);
+            return Number.isFinite(ord) ? ord : null;
         }
 
-        const startId =
-            typeof osisID === "string" && osisID.length > 0
-                ? osisID
-                : typeof sID === "string" && sID.length > 0
-                    ? sID
-                    : null;
+        function finalizeVerse(v: VerseFinalize): void {
+            const ref = parseOsisRef(v.osisId);
+            if (!ref) {
+                skipped += 1;
+                return;
+            }
 
-        if (!startId) return;
+            const bpBookId = mapBookId(ref.osisBook);
+            if (!bpBookId) {
+                unknownBooks.add(ref.osisBook);
+                skipped += 1;
+                return;
+            }
 
-        verseStartsSeen += 1;
+            const bookOrd = getBookOrdinal(bpBookId);
+            if (bookOrd == null) {
+                unknownBooks.add(ref.osisBook);
+                skipped += 1;
+                return;
+            }
 
-        // If a new verse begins while collecting, finalize previous.
-        if (collecting && currentVerseId) {
-            finalizeVerse({ osisId: currentVerseId, text: buf });
+            const text = normalizeText(v.text);
+            if (!text) {
+                skipped += 1;
+                return;
+            }
+
+            const verseKey = makeVerseKey(bpBookId, ref.chap, ref.verse);
+
+            beginTx();
+
+            verseOrd += 1;
+
+            stmtUpsertVerse.run(verseKey, bpBookId, ref.chap, ref.verse, verseOrd);
+
+            const textNorm = normalizeForSearch(text);
+            const hash = sha256HexText(text);
+
+            stmtUpsertVerseText.run(TRANSLATION_ID, verseKey, text, textNorm, hash);
+
+            inserted += 1;
+            pending += 1;
+
+            if (LOG_EVERY > 0 && inserted % LOG_EVERY === 0) {
+                log("progress:", inserted, "verses");
+            }
+
+            flushMaybe();
         }
 
-        collecting = true;
-        currentVerseId = startId;
-        buf = "";
-        ignoreNoteDepth = 0;
-
-        // close-tag style <verse osisID="...">...</verse>
-        endOnCloseTag = typeof osisID === "string" && osisID.length > 0;
-        // milestone style <verse sID="..."/> ... <verse eID="..."/>
-        endOnEidMilestone = !endOnCloseTag && typeof sID === "string" && sID.length > 0;
-    });
-
-    parser.on("text", (txt: string) => {
-        if (!collecting) return;
-        if (ignoreNoteDepth > 0) return;
-        buf += txt;
-    });
-
-    parser.on("cdata", (txt: string) => {
-        if (!collecting) return;
-        if (ignoreNoteDepth > 0) return;
-        buf += txt;
-    });
-
-    parser.on("closetag", (t: string | SaxesTagPlain) => {
-        const name = typeof t === "string" ? t : t.name;
-
-        if (collecting && name === "note" && ignoreNoteDepth > 0) {
-            ignoreNoteDepth -= 1;
-            return;
+        function resetVerseState(): void {
+            collecting = false;
+            currentVerseId = null;
+            endOnCloseTag = false;
+            endOnEidMilestone = false;
+            buf = "";
+            ignoreNoteDepth = 0;
         }
 
-        if (name === "verse") {
-            if (collecting && endOnCloseTag && currentVerseId) {
+        parser.on("error", (error: Error) => {
+            throw error;
+        });
+
+        parser.on("opentag", (tag: SaxesTagPlain) => {
+            const name = tag.name;
+
+            if (collecting && name === "note") {
+                ignoreNoteDepth += 1;
+                return;
+            }
+
+            if (name !== "verse") return;
+
+            const attrs = tag.attributes as Record<string, unknown>;
+            const osisID = attrs["osisID"];
+            const sID = attrs["sID"];
+            const eID = attrs["eID"];
+
+            if (typeof eID === "string" && eID.length > 0) {
+                if (collecting && endOnEidMilestone && currentVerseId === eID) {
+                    finalizeVerse({ osisId: eID, text: buf });
+                    resetVerseState();
+                }
+                return;
+            }
+
+            const startId =
+                 typeof osisID === "string" && osisID.length > 0
+                      ? osisID
+                      : typeof sID === "string" && sID.length > 0
+                           ? sID
+                           : null;
+
+            if (!startId) return;
+
+            verseStartsSeen += 1;
+
+            if (collecting && currentVerseId) {
+                finalizeVerse({ osisId: currentVerseId, text: buf });
+            }
+
+            collecting = true;
+            currentVerseId = startId;
+            buf = "";
+            ignoreNoteDepth = 0;
+
+            endOnCloseTag = typeof osisID === "string" && osisID.length > 0;
+            endOnEidMilestone = !endOnCloseTag && typeof sID === "string" && sID.length > 0;
+        });
+
+        parser.on("text", (txt: string) => {
+            if (!collecting) return;
+            if (ignoreNoteDepth > 0) return;
+            buf += txt;
+        });
+
+        parser.on("cdata", (txt: string) => {
+            if (!collecting) return;
+            if (ignoreNoteDepth > 0) return;
+            buf += txt;
+        });
+
+        parser.on("closetag", (t: string | SaxesTagPlain) => {
+            const name = typeof t === "string" ? t : t.name;
+
+            if (collecting && name === "note" && ignoreNoteDepth > 0) {
+                ignoreNoteDepth -= 1;
+                return;
+            }
+
+            if (name === "verse") {
+                if (collecting && endOnCloseTag && currentVerseId) {
+                    finalizeVerse({ osisId: currentVerseId, text: buf });
+                    resetVerseState();
+                }
+            }
+        });
+
+        log("importing:", xmlPath);
+
+        const stream = fs.createReadStream(xmlPath, { encoding: "utf8" });
+
+        try {
+            await new Promise<void>((resolve, reject) => {
+                stream.on("data", (chunk: string) => {
+                    try {
+                        parser.write(chunk);
+                    } catch (error: unknown) {
+                        reject(error);
+                    }
+                });
+
+                stream.on("end", () => {
+                    try {
+                        parser.close();
+                        resolve();
+                    } catch (error: unknown) {
+                        reject(error);
+                    }
+                });
+
+                stream.on("error", (error: Error) => {
+                    reject(error);
+                });
+            });
+
+            if (collecting && currentVerseId) {
                 finalizeVerse({ osisId: currentVerseId, text: buf });
                 resetVerseState();
             }
+
+            commitTx();
+
+            begin(s);
+            try {
+                rebuildChapters(s);
+                commit(s);
+            } catch (error: unknown) {
+                rollbackQuiet(s);
+                throw error;
+            }
+
+            const stats: ImportStats = {
+                inserted,
+                skipped,
+                verseStartsSeen,
+                verseOrd,
+                unknownBooks,
+            };
+
+            const notes =
+                 stats.unknownBooks.size > 0
+                      ? `unknown_books=${Array.from(stats.unknownBooks).sort().join(",")}`
+                      : null;
+
+            markImportSucceeded(s, importRun, stats.inserted, notes);
+
+            log("done.");
+            log("verseStartsSeen:", stats.verseStartsSeen);
+            log("inserted:", stats.inserted, "skipped:", stats.skipped);
+            log("max verse_ord now:", stats.verseOrd);
+
+            if (stats.verseStartsSeen === 0) {
+                warn("No <verse> tags detected. Paste ~40 lines around a verse and adapt parser shape.");
+            }
+
+            if (stats.unknownBooks.size > 0) {
+                warn("unknown OSIS book ids encountered:", Array.from(stats.unknownBooks).sort().join(", "));
+                warn("If legit, add mappings in OSIS_TO_BP.");
+            }
+        } catch (error: unknown) {
+            rollbackTx();
+            const note = formatUnknownError(error);
+            markImportFailed(s, importRun, note);
+            throw error;
+        } finally {
+            try {
+                stream.close();
+            } catch {
+                // ignore
+            }
         }
-    });
-
-    log("importing:", xmlPath);
-
-    const stream = fs.createReadStream(xmlPath, { encoding: "utf8" });
-
-    try {
-        await new Promise<void>((resolve, reject) => {
-            stream.on("data", (chunk) => {
-                try {
-                    parser.write(chunk);
-                } catch (e) {
-                    reject(e);
-                }
-            });
-            stream.on("end", () => {
-                try {
-                    parser.close();
-                    resolve();
-                } catch (e) {
-                    reject(e);
-                }
-            });
-            stream.on("error", reject);
-        });
-
-        // finalize trailing verse if needed
-        if (collecting && currentVerseId) {
-            finalizeVerse({ osisId: currentVerseId, text: buf });
-            resetVerseState();
-        }
-
-        commitTx();
-
-        // Build bp_chapter (optional but recommended)
-        s.exec("BEGIN;");
-        try {
-            rebuildChapters(s);
-            s.exec("COMMIT;");
-        } catch (e) {
-            s.exec("ROLLBACK;");
-            throw e;
-        }
-
-        log("done.");
-        log("verseStartsSeen:", verseStartsSeen);
-        log("inserted:", inserted, "skipped:", skipped);
-        log("max verse_ord now:", verseOrd);
-
-        if (verseStartsSeen === 0) {
-            warn("No <verse> tags detected. Paste ~40 lines around a verse and I’ll adapt the parser.");
-        }
-        if (unknownBooks.size > 0) {
-            warn("unknown OSIS book ids encountered:", Array.from(unknownBooks).sort().join(", "));
-            warn("If these are legit, add mappings in OSIS_TO_BP.");
-        }
-    } catch (err) {
-        rollbackTx();
-        fatal(err);
     } finally {
         close();
     }
 }
 
-main().catch((e) => fatal(e));
+void main().catch((error: unknown) => {
+    fatal(formatUnknownError(error));
+});
 ```
 
 ### apps/api/scripts/reset-db.ts
@@ -6177,27 +6619,47 @@ main().catch((e) => fatal(e));
 ```ts
 // apps/api/scripts/reset-db.ts
 //
-// Bun-only DB reset:
-// - deletes the sqlite file (default or BP_DB_PATH)
-// - runs migrate then seed (through TS entrypoints)
+// Biblia.to — hardened Bun-only DB reset
+//
+// Purpose:
+// - delete the SQLite database file and sidecar artifacts
+// - run migrate then seed
 //
 // Usage:
 //   bun --cwd apps/api run db:reset
 //
+// Env:
+//   BP_DB_PATH=./data/biblia.sqlite
+//   BP_ALLOW_DB_RESET=1               optional explicit guard
+//   BP_DB_RESET_SKIP_SEED=1           optional
+//   BP_DB_RESET_SKIP_MIGRATE=1        optional
+//   BP_DB_RESET_FORCE=1               bypass env guard / prod-ish refusal
+//
 // Notes:
 // - Handles WAL / SHM / JOURNAL artifacts
-// - Refuses to delete ":memory:" paths (will fall back to default file path)
-// - Uses Bun.spawn (bun-only), no Node child_process
-// - On Windows, resolves the real Bun executable path instead of assuming "bun" is on spawn PATH
+// - Refuses to operate on memory DB targets; falls back to default file path
+// - Uses Bun.spawn only
+// - Resolves Bun executable robustly
+// - Anchors paths from apps/api root, not arbitrary cwd
+// - Guards destructive reset in prod-ish environments unless forced
 
-import * as path from "node:path";
 import * as fs from "node:fs";
+import * as path from "node:path";
+import * as process from "node:process";
 
 type Spawned = ReturnType<typeof Bun.spawn>;
 
-function log(...args: unknown[]) {
+const APP_ROOT = path.resolve(import.meta.dir, "..");
+const DEFAULT_DB_PATH = path.join(APP_ROOT, "data", "biblia.sqlite");
+
+function log(...args: unknown[]): void {
     // eslint-disable-next-line no-console
     console.log("[db:reset]", ...args);
+}
+
+function warn(...args: unknown[]): void {
+    // eslint-disable-next-line no-console
+    console.warn("[db:reset]", ...args);
 }
 
 function fatal(...args: unknown[]): never {
@@ -6206,106 +6668,232 @@ function fatal(...args: unknown[]): never {
     process.exit(1);
 }
 
+function envStr(name: string, fallback = ""): string {
+    const raw = process.env[name];
+    if (typeof raw !== "string") return fallback;
+    const trimmed = raw.trim();
+    return trimmed.length > 0 ? trimmed : fallback;
+}
+
+function envBool(name: string, fallback = false): boolean {
+    const raw = envStr(name, "");
+    if (!raw) return fallback;
+
+    switch (raw.toLowerCase()) {
+        case "1":
+        case "true":
+        case "yes":
+        case "on":
+            return true;
+        case "0":
+        case "false":
+        case "no":
+        case "off":
+            return false;
+        default:
+            return fallback;
+    }
+}
+
+function formatError(error: unknown): string {
+    if (error instanceof Error) {
+        return `${error.name}: ${error.message}`;
+    }
+    return String(error);
+}
+
+function inspectErrorCode(error: unknown): string | undefined {
+    if (typeof error !== "object" || error === null) return undefined;
+    if (!("code" in error)) return undefined;
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+}
+
 function isMemoryDb(p: string): boolean {
-    const s = (p ?? "").trim();
+    const s = p.trim().toLowerCase();
     return s === ":memory:" || s.startsWith("file::memory:");
 }
 
+function isLikelyProdEnv(): boolean {
+    const nodeEnv = envStr("NODE_ENV", "").toLowerCase();
+    const appEnv = envStr("BP_ENV", "").toLowerCase();
+
+    return nodeEnv === "production" || appEnv === "production";
+}
+
 function resolveDbPath(): string {
-    const raw = (process.env.BP_DB_PATH ?? "").trim();
+    const raw = envStr("BP_DB_PATH", "");
 
-    if (!raw) return path.resolve(process.cwd(), "data", "biblia.sqlite");
-    if (isMemoryDb(raw)) return path.resolve(process.cwd(), "data", "biblia.sqlite");
+    if (!raw) return DEFAULT_DB_PATH;
+    if (isMemoryDb(raw)) {
+        warn(`BP_DB_PATH=${raw} points to memory DB; using file-backed fallback instead: ${DEFAULT_DB_PATH}`);
+        return DEFAULT_DB_PATH;
+    }
 
-    return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
+    return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(APP_ROOT, raw);
 }
 
 function resolveBunExecutable(): string {
-    // Bun exposes the current executable path here in Bun runtime.
-    const fromExecPath = (process.execPath ?? "").trim();
-    if (fromExecPath) return fromExecPath;
+    const fromExecPath = envStr("BUN_EXEC_PATH", "") || (process.execPath ?? "").trim();
+    if (fromExecPath && fromExecPath.toLowerCase().includes("bun")) {
+        return fromExecPath;
+    }
 
     const fromWhich = Bun.which("bun");
     if (fromWhich) return fromWhich;
 
     fatal(
-        "unable to resolve Bun executable path.",
-        JSON.stringify({
-            processExecPath: process.execPath ?? null,
-            hint: "Run this script with Bun, not node.",
-        }),
+         "unable to resolve Bun executable path",
+         JSON.stringify({
+             processExecPath: process.execPath ?? null,
+             appRoot: APP_ROOT,
+             hint: "Run this script with Bun, not node.",
+         }),
     );
 }
 
-async function run(cmd: string[], env?: Record<string, string>) {
-    const bunExe = resolveBunExecutable();
-    const fullCmd = [bunExe, ...cmd];
+function ensureSafeToReset(dbPath: string): void {
+    const force = envBool("BP_DB_RESET_FORCE", false);
+    const allow = envBool("BP_ALLOW_DB_RESET", false);
 
-    log("spawn:", fullCmd.join(" "));
+    if (force) {
+        warn("BP_DB_RESET_FORCE=1 -> bypassing reset safety guard");
+        return;
+    }
 
-    const p: Spawned = Bun.spawn({
-        cmd: fullCmd,
-        cwd: process.cwd(),
-        stdout: "inherit",
-        stderr: "inherit",
-        env: { ...process.env, ...(env ?? {}) },
-    });
+    if (isLikelyProdEnv()) {
+        fatal("refusing db reset in production environment; set BP_DB_RESET_FORCE=1 to override");
+    }
 
-    const code = await p.exited;
-    if (code !== 0) fatal("command failed:", fullCmd.join(" "), "exit", code);
+    if (!allow) {
+        fatal("db reset is destructive; set BP_ALLOW_DB_RESET=1 to proceed");
+    }
+
+    if (!path.isAbsolute(dbPath)) {
+        fatal("resolved DB path is not absolute:", dbPath);
+    }
+
+    const normalizedAppRoot = path.normalize(APP_ROOT + path.sep);
+    const normalizedDbPath = path.normalize(dbPath);
+
+    if (!normalizedDbPath.startsWith(normalizedAppRoot)) {
+        fatal("refusing to delete DB outside apps/api root:", dbPath);
+    }
 }
 
-function safeUnlink(filePath: string): void {
+function safeMkdir(dirPath: string): void {
+    try {
+        fs.mkdirSync(dirPath, { recursive: true });
+    } catch (error: unknown) {
+        fatal("failed to create directory:", dirPath, formatError(error));
+    }
+}
+
+function safeUnlink(filePath: string): boolean {
     try {
         fs.unlinkSync(filePath);
-    } catch (e: any) {
-        if (e?.code === "ENOENT") return;
-        throw e;
+        return true;
+    } catch (error: unknown) {
+        const code = inspectErrorCode(error);
+        if (code === "ENOENT") return false;
+        throw error;
     }
 }
 
-function safeMkdir(dir: string): void {
-    try {
-        fs.mkdirSync(dir, { recursive: true });
-    } catch {
-        // ignore; will fail later if truly unwritable
+function deleteDbArtifacts(dbPath: string): { deleted: string[]; missing: string[] } {
+    const targets = [
+        dbPath,
+        `${dbPath}-wal`,
+        `${dbPath}-shm`,
+        `${dbPath}-journal`,
+    ];
+
+    const deleted: string[] = [];
+    const missing: string[] = [];
+
+    for (const target of targets) {
+        const removed = safeUnlink(target);
+        if (removed) {
+            deleted.push(target);
+        } else {
+            missing.push(target);
+        }
+    }
+
+    return { deleted, missing };
+}
+
+async function run(args: string[], extraEnv?: Record<string, string>): Promise<void> {
+    const bunExe = resolveBunExecutable();
+    const cmd = [bunExe, ...args];
+
+    log("spawn:", cmd.join(" "));
+
+    const proc: Spawned = Bun.spawn({
+        cmd,
+        cwd: APP_ROOT,
+        stdout: "inherit",
+        stderr: "inherit",
+        env: {
+            ...process.env,
+            ...(extraEnv ?? {}),
+        },
+    });
+
+    const code = await proc.exited;
+    if (code !== 0) {
+        fatal("command failed:", cmd.join(" "), "exit", code);
     }
 }
 
-function deleteDbArtifacts(dbPath: string) {
-    if (fs.existsSync(dbPath)) {
-        log("deleting:", dbPath);
-        safeUnlink(dbPath);
-    } else {
-        log("no db file to delete");
-    }
-
-    safeUnlink(dbPath + "-wal");
-    safeUnlink(dbPath + "-shm");
-    safeUnlink(dbPath + "-journal");
-}
-
-async function main() {
+async function main(): Promise<void> {
     const dbPath = resolveDbPath();
+    const skipMigrate = envBool("BP_DB_RESET_SKIP_MIGRATE", false);
+    const skipSeed = envBool("BP_DB_RESET_SKIP_SEED", false);
+
+    ensureSafeToReset(dbPath);
+
+    log("appRoot:", APP_ROOT);
     log("dbPath:", dbPath);
 
-    if (!isMemoryDb(dbPath)) {
-        safeMkdir(path.dirname(dbPath));
-    }
+    safeMkdir(path.dirname(dbPath));
 
     try {
-        deleteDbArtifacts(dbPath);
-    } catch (e) {
-        fatal("failed to delete db artifacts:", e);
+        const { deleted, missing } = deleteDbArtifacts(dbPath);
+
+        if (deleted.length > 0) {
+            for (const filePath of deleted) {
+                log("deleted:", filePath);
+            }
+        } else {
+            log("no db artifacts deleted");
+        }
+
+        if (missing.length > 0) {
+            log("missing:", missing.length, "artifact(s)");
+        }
+    } catch (error: unknown) {
+        fatal("failed to delete db artifacts:", formatError(error));
     }
 
-    await run(["src/db/migrate.ts"]);
-    await run(["src/db/seed.ts"]);
+    if (!skipMigrate) {
+        await run(["run", "src/db/migrate.ts"]);
+    } else {
+        warn("BP_DB_RESET_SKIP_MIGRATE=1 -> skipping migrate");
+    }
+
+    if (!skipSeed) {
+        await run(["run", "src/db/seed.ts"]);
+    } else {
+        warn("BP_DB_RESET_SKIP_SEED=1 -> skipping seed");
+    }
 
     log("done.");
 }
 
-main().catch((e) => fatal(e));
+void main().catch((error: unknown) => {
+    fatal("unhandled failure:", formatError(error));
+});
 ```
 
 ### apps/api/scripts/verify-db.ts
@@ -6313,7 +6901,7 @@ main().catch((e) => fatal(e));
 ```ts
 // apps/api/scripts/verify-db.ts
 //
-// Bun-only DB sanity check + counts.
+// Biblia.to — hardened Bun-only DB verification / sanity check
 //
 // Prints:
 // - bp_book count
@@ -6322,16 +6910,76 @@ main().catch((e) => fatal(e));
 // - bp_translation count + default translation
 // - bp_verse_text count for active translation_id
 // - FTS presence + row count (bp_verse_text_fts)
+// - optional import history summary if present
 //
 // Usage:
 //   bun --cwd apps/api run db:verify
 //   bun --cwd apps/api run db:build
+//
+// Env:
+//   BP_TRANSLATION_ID=KJV
+//   BP_VERIFY_STRICT=1                fail on warnings that indicate broken/incomplete DB
+//   BP_VERIFY_SAMPLE_VERSE=GEN.1.1    default sample verse
+//
+// Notes:
+// - exits non-zero for missing required schema
+// - optionally exits non-zero in strict mode when content sanity checks fail
+// - uses only Bun runtime + your existing openDb()
 
+import * as process from "node:process";
 import { openDb } from "../src/db/client";
 
-function log(...args: unknown[]) {
+type SqliteScalar = string | number | bigint | Uint8Array | Buffer | null;
+
+type SqliteStmt = {
+    get: (...params: SqliteScalar[]) => unknown;
+};
+
+type SqliteLike = {
+    query: (sql: string) => SqliteStmt;
+    exec?: (sql: string) => void;
+};
+
+type DefaultTranslationRow = {
+    id?: string;
+    name?: string;
+};
+
+type VerseOrdBoundsRow = {
+    mn?: number | string | bigint | null;
+    mx?: number | string | bigint | null;
+};
+
+type SampleRow = {
+    verseKey?: string;
+    text?: string;
+};
+
+type ImportHistorySummaryRow = {
+    total_runs?: number | string | bigint | null;
+    successful_runs?: number | string | bigint | null;
+    failed_runs?: number | string | bigint | null;
+};
+
+type LastImportRow = {
+    translation_id?: string;
+    source_path?: string;
+    source_hash?: string;
+    importer_version?: string;
+    status?: string;
+    verse_count?: number | string | bigint | null;
+    started_at?: string;
+    completed_at?: string | null;
+};
+
+function log(...args: unknown[]): void {
     // eslint-disable-next-line no-console
     console.log("[db:verify]", ...args);
+}
+
+function warn(...args: unknown[]): void {
+    // eslint-disable-next-line no-console
+    console.warn("[db:verify]", ...args);
 }
 
 function fatal(...args: unknown[]): never {
@@ -6340,68 +6988,117 @@ function fatal(...args: unknown[]): never {
     process.exit(1);
 }
 
-type SqliteStmt = {
-    get: (...params: any[]) => unknown;
-};
+function envStr(name: string, fallback = ""): string {
+    const raw = process.env[name];
+    if (typeof raw !== "string") return fallback;
+    const trimmed = raw.trim();
+    return trimmed.length > 0 ? trimmed : fallback;
+}
 
-type SqliteLike = {
-    query: (sql: string) => SqliteStmt;
-};
+function envBool(name: string, fallback = false): boolean {
+    const raw = envStr(name, "");
+    if (!raw) return fallback;
+
+    switch (raw.toLowerCase()) {
+        case "1":
+        case "true":
+        case "yes":
+        case "on":
+            return true;
+        case "0":
+        case "false":
+        case "no":
+        case "off":
+            return false;
+        default:
+            return fallback;
+    }
+}
 
 function asNum(v: unknown): number {
-    const n = typeof v === "number" ? v : Number(v);
+    if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+    if (typeof v === "bigint") return Number(v);
+    const n = Number(v);
     return Number.isFinite(n) ? n : 0;
 }
 
-function getScalar(sqlite: SqliteLike, sql: string, params: any[] = []): unknown {
+function asStr(v: unknown): string | null {
+    return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+function getScalar(sqlite: SqliteLike, sql: string, params: SqliteScalar[] = []): unknown {
     const row = sqlite.query(sql).get(...params) as Record<string, unknown> | undefined;
     if (!row) return null;
-    const k = Object.keys(row)[0];
-    return k ? row[k] : null;
+    const firstKey = Object.keys(row)[0];
+    return firstKey ? row[firstKey] : null;
 }
 
 function getCount(sqlite: SqliteLike, table: string): number {
-    // table is internal constant in this script; not user input
     return asNum(getScalar(sqlite, `SELECT COUNT(*) AS c FROM ${table};`));
 }
 
 function hasTable(sqlite: SqliteLike, name: string): boolean {
     const row = sqlite
-        .query(`SELECT 1 AS one FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;`)
-        .get(name) as { one?: number } | undefined;
+         .query(`SELECT 1 AS one FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;`)
+         .get(name) as { one?: number } | undefined;
+
     return row != null;
 }
 
 function resolveTranslationId(sqlite: SqliteLike): string | null {
-    const envId = (process.env.BP_TRANSLATION_ID ?? "").trim();
+    const envId = envStr("BP_TRANSLATION_ID", "");
     if (envId) return envId;
 
     const row = sqlite
-        .query(`SELECT translation_id AS id FROM bp_translation WHERE is_default = 1 LIMIT 1;`)
-        .get() as { id?: string } | undefined;
+         .query(`SELECT translation_id AS id FROM bp_translation WHERE is_default = 1 LIMIT 1;`)
+         .get() as { id?: string } | undefined;
 
     return row?.id ?? null;
 }
 
 function getVerseOrdBounds(sqlite: SqliteLike): { min: number; max: number } {
     const row = sqlite
-        .query(`SELECT MIN(verse_ord) AS mn, MAX(verse_ord) AS mx FROM bp_verse;`)
-        .get() as { mn?: number; mx?: number } | undefined;
+         .query(`SELECT MIN(verse_ord) AS mn, MAX(verse_ord) AS mx FROM bp_verse;`)
+         .get() as VerseOrdBoundsRow | undefined;
 
-    return { min: asNum(row?.mn), max: asNum(row?.mx) };
+    return {
+        min: asNum(row?.mn),
+        max: asNum(row?.mx),
+    };
 }
 
 function getDefaultTranslation(sqlite: SqliteLike): { id: string; name: string } | null {
     const row = sqlite
-        .query(`SELECT translation_id AS id, name AS name FROM bp_translation WHERE is_default = 1 LIMIT 1;`)
-        .get() as { id?: string; name?: string } | undefined;
+         .query(`SELECT translation_id AS id, name AS name FROM bp_translation WHERE is_default = 1 LIMIT 1;`)
+         .get() as DefaultTranslationRow | undefined;
 
-    if (!row?.id) return null;
-    return { id: row.id, name: row.name ?? row.id };
+    const id = asStr(row?.id);
+    if (!id) return null;
+
+    return {
+        id,
+        name: asStr(row?.name) ?? id,
+    };
 }
 
 function getVerseTextCount(sqlite: SqliteLike, translationId: string): number {
-    return asNum(getScalar(sqlite, `SELECT COUNT(*) AS c FROM bp_verse_text WHERE translation_id = ?;`, [translationId]));
+    return asNum(
+         getScalar(
+              sqlite,
+              `SELECT COUNT(*) AS c FROM bp_verse_text WHERE translation_id = ?;`,
+              [translationId],
+         ),
+    );
+}
+
+function getDistinctVerseTextKeys(sqlite: SqliteLike, translationId: string): number {
+    return asNum(
+         getScalar(
+              sqlite,
+              `SELECT COUNT(DISTINCT verse_key) AS c FROM bp_verse_text WHERE translation_id = ?;`,
+              [translationId],
+         ),
+    );
 }
 
 function getFtsCount(sqlite: SqliteLike): number {
@@ -6409,50 +7106,177 @@ function getFtsCount(sqlite: SqliteLike): number {
 }
 
 function getSample(
-    sqlite: SqliteLike,
-    translationId: string,
-    verseKey = "GEN.1.1",
+     sqlite: SqliteLike,
+     translationId: string,
+     verseKey: string,
 ): { verseKey: string; text: string } | null {
     const row = sqlite
-        .query(
-            `
-                SELECT t.verse_key AS verseKey, t.text AS text
-                FROM bp_verse_text t
-                WHERE t.translation_id = ? AND t.verse_key = ?
-                    LIMIT 1;
+         .query(
+              `
+            SELECT t.verse_key AS verseKey, t.text AS text
+            FROM bp_verse_text t
+            WHERE t.translation_id = ? AND t.verse_key = ?
+            LIMIT 1;
             `,
-        )
-        .get(translationId, verseKey) as { verseKey?: string; text?: string } | undefined;
+         )
+         .get(translationId, verseKey) as SampleRow | undefined;
 
-    if (!row?.verseKey || !row?.text) return null;
-    return { verseKey: row.verseKey, text: row.text };
+    const key = asStr(row?.verseKey);
+    const text = asStr(row?.text);
+
+    if (!key || !text) return null;
+    return { verseKey: key, text };
 }
 
 function fmtSample(text: string, n = 90): string {
     const s = text.replace(/\s+/g, " ").trim();
-    return s.length > n ? s.slice(0, n) + "…" : s;
+    return s.length > n ? `${s.slice(0, n)}…` : s;
 }
 
-async function main() {
+function getImportHistorySummary(sqlite: SqliteLike): ImportHistorySummaryRow | null {
+    if (!hasTable(sqlite, "bp_import_history")) return null;
+
+    const row = sqlite
+         .query(
+              `
+            SELECT
+                COUNT(*) AS total_runs,
+                SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) AS successful_runs,
+                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed_runs
+            FROM bp_import_history;
+            `,
+         )
+         .get() as ImportHistorySummaryRow | undefined;
+
+    return row ?? null;
+}
+
+function getLastImport(sqlite: SqliteLike): LastImportRow | null {
+    if (!hasTable(sqlite, "bp_import_history")) return null;
+
+    const row = sqlite
+         .query(
+              `
+            SELECT
+                translation_id,
+                source_path,
+                source_hash,
+                importer_version,
+                status,
+                verse_count,
+                started_at,
+                completed_at
+            FROM bp_import_history
+            ORDER BY import_id DESC
+            LIMIT 1;
+            `,
+         )
+         .get() as LastImportRow | undefined;
+
+    return row ?? null;
+}
+
+function getMissingVerseTextCount(sqlite: SqliteLike, translationId: string): number {
+    return asNum(
+         getScalar(
+              sqlite,
+              `
+            SELECT COUNT(*) AS c
+            FROM bp_verse v
+            LEFT JOIN bp_verse_text t
+              ON t.verse_key = v.verse_key
+             AND t.translation_id = ?
+            WHERE t.verse_key IS NULL;
+            `,
+              [translationId],
+         ),
+    );
+}
+
+function getOrphanVerseTextCount(sqlite: SqliteLike, translationId: string): number {
+    return asNum(
+         getScalar(
+              sqlite,
+              `
+            SELECT COUNT(*) AS c
+            FROM bp_verse_text t
+            LEFT JOIN bp_verse v
+              ON v.verse_key = t.verse_key
+            WHERE t.translation_id = ?
+              AND v.verse_key IS NULL;
+            `,
+              [translationId],
+         ),
+    );
+}
+
+function getChapterIntegritySummary(
+     sqlite: SqliteLike,
+): { chapterCount: number; badRanges: number } {
+    if (!hasTable(sqlite, "bp_chapter")) {
+        return { chapterCount: 0, badRanges: 0 };
+    }
+
+    const chapterCount = getCount(sqlite, "bp_chapter");
+
+    const badRanges = asNum(
+         getScalar(
+              sqlite,
+              `
+            SELECT COUNT(*) AS c
+            FROM bp_chapter
+            WHERE start_verse_ord IS NULL
+               OR end_verse_ord IS NULL
+               OR verse_count IS NULL
+               OR start_verse_ord <= 0
+               OR end_verse_ord < start_verse_ord
+               OR verse_count <= 0;
+            `,
+         ),
+    );
+
+    return { chapterCount, badRanges };
+}
+
+function percentage(numerator: number, denominator: number): string {
+    const base = Math.max(1, denominator);
+    const pct = Math.round((numerator / base) * 10000) / 100;
+    return `${pct}%`;
+}
+
+function assertRequiredTables(sqlite: SqliteLike): void {
+    const required = ["bp_book", "bp_translation", "bp_verse", "bp_verse_text"];
+    for (const tableName of required) {
+        if (!hasTable(sqlite, tableName)) {
+            fatal(`missing table "${tableName}". Run db:migrate first.`);
+        }
+    }
+}
+
+async function main(): Promise<void> {
+    const strict = envBool("BP_VERIFY_STRICT", false);
+    const sampleVerseKey = envStr("BP_VERIFY_SAMPLE_VERSE", "GEN.1.1");
+
     const { sqlite, dbPath, close } = openDb();
     const s = sqlite as unknown as SqliteLike;
+
+    const warnings: string[] = [];
+    const strictFailures: string[] = [];
 
     try {
         log("dbPath:", dbPath);
 
-        // Basic presence checks (avoid confusing errors)
-        const required = ["bp_book", "bp_translation", "bp_verse", "bp_verse_text"];
-        for (const t of required) {
-            if (!hasTable(s, t)) fatal(`missing table "${t}". Run db:migrate first.`);
-        }
+        assertRequiredTables(s);
 
         const bookCount = getCount(s, "bp_book");
         const verseCount = getCount(s, "bp_verse");
-        const chapterCount = hasTable(s, "bp_chapter") ? getCount(s, "bp_chapter") : 0;
-        const translationCount = getCount(s, "bp_translation");
         const bounds = getVerseOrdBounds(s);
+        const translationCount = getCount(s, "bp_translation");
 
-        const defaultT = getDefaultTranslation(s);
+        const chapterSummary = getChapterIntegritySummary(s);
+        const chapterCount = chapterSummary.chapterCount;
+
+        const defaultTranslation = getDefaultTranslation(s);
         const translationId = resolveTranslationId(s);
 
         const ftsPresent = hasTable(s, "bp_verse_text_fts");
@@ -6462,35 +7286,158 @@ async function main() {
         log("bp_verse:", verseCount, `(verse_ord min=${bounds.min} max=${bounds.max})`);
         log("bp_chapter:", chapterCount);
         log("bp_translation:", translationCount);
-        log("default translation:", defaultT ? `${defaultT.id} (${defaultT.name})` : "none");
+        log(
+             "default translation:",
+             defaultTranslation ? `${defaultTranslation.id} (${defaultTranslation.name})` : "none",
+        );
+
+        if (chapterSummary.badRanges > 0) {
+            warnings.push(`bp_chapter has ${chapterSummary.badRanges} invalid range row(s)`);
+        }
 
         if (!translationId) {
             log("active translationId: none (set BP_TRANSLATION_ID or set bp_translation.is_default=1)");
-            log("bp_verse_text: (skipped)");
+            log("bp_verse_text: skipped");
+
+            warnings.push("no active translationId resolved");
+            if (strict) {
+                strictFailures.push("no active translationId resolved");
+            }
         } else {
             const textCount = getVerseTextCount(s, translationId);
+            const distinctVerseKeys = getDistinctVerseTextKeys(s, translationId);
+            const missingVerseTextCount = verseCount > 0 ? getMissingVerseTextCount(s, translationId) : 0;
+            const orphanVerseTextCount = getOrphanVerseTextCount(s, translationId);
+
             log("active translationId:", translationId);
             log("bp_verse_text:", textCount, `(translation_id=${translationId})`);
+            log("bp_verse_text distinct verse_key:", distinctVerseKeys);
 
-            const sample = getSample(s, translationId, "GEN.1.1");
-            if (sample) log("sample:", sample.verseKey, "=>", fmtSample(sample.text));
-            else log("sample:", "GEN.1.1 not found for this translation_id (maybe different translation_id was imported)");
+            const sample = getSample(s, translationId, sampleVerseKey);
+            if (sample) {
+                log("sample:", sample.verseKey, "=>", fmtSample(sample.text));
+            } else {
+                log("sample:", `${sampleVerseKey} not found for this translation_id`);
+            }
 
             if (verseCount > 0) {
-                const ratio = Math.round((textCount / Math.max(1, verseCount)) * 10000) / 100;
-                log("coverage:", `${ratio}% (bp_verse_text / bp_verse)`);
+                log("coverage:", `${percentage(textCount, verseCount)} (bp_verse_text / bp_verse)`);
+                log("missing verse_text rows:", missingVerseTextCount);
+            }
+
+            if (orphanVerseTextCount > 0) {
+                log("orphan verse_text rows:", orphanVerseTextCount);
+            }
+
+            if (textCount === 0) {
+                warnings.push(`bp_verse_text is empty for translation ${translationId}`);
+                if (strict) {
+                    strictFailures.push(`bp_verse_text is empty for translation ${translationId}`);
+                }
+            }
+
+            if (verseCount > 0 && missingVerseTextCount > 0) {
+                warnings.push(`${missingVerseTextCount} bp_verse row(s) missing bp_verse_text for ${translationId}`);
+                if (strict) {
+                    strictFailures.push(`${missingVerseTextCount} bp_verse row(s) missing bp_verse_text for ${translationId}`);
+                }
+            }
+
+            if (orphanVerseTextCount > 0) {
+                warnings.push(`${orphanVerseTextCount} orphan bp_verse_text row(s) for ${translationId}`);
+                if (strict) {
+                    strictFailures.push(`${orphanVerseTextCount} orphan bp_verse_text row(s) for ${translationId}`);
+                }
+            }
+
+            if (!sample) {
+                warnings.push(`sample verse ${sampleVerseKey} not found for translation ${translationId}`);
             }
         }
 
         log("FTS (bp_verse_text_fts):", ftsPresent ? `present (${ftsCount} rows)` : "missing");
 
-        // Friendly warnings (non-fatal)
-        if (bookCount !== 66) log("WARN: expected 66 bp_book rows (seed may not have run).");
-        if (verseCount === 0) log("WARN: bp_verse is empty (import/builder likely not run, or import failed).");
-        if (!defaultT && !process.env.BP_TRANSLATION_ID) {
-            log("WARN: no default translation and BP_TRANSLATION_ID not set -> /meta will 404.");
+        const importSummary = getImportHistorySummary(s);
+        if (importSummary) {
+            log(
+                 "import history:",
+                 `total=${asNum(importSummary.total_runs)}`,
+                 `succeeded=${asNum(importSummary.successful_runs)}`,
+                 `failed=${asNum(importSummary.failed_runs)}`,
+            );
+
+            const lastImport = getLastImport(s);
+            if (lastImport) {
+                log(
+                     "last import:",
+                     [
+                         `status=${asStr(lastImport.status) ?? "unknown"}`,
+                         `translation=${asStr(lastImport.translation_id) ?? "unknown"}`,
+                         `verse_count=${asNum(lastImport.verse_count)}`,
+                         `importer=${asStr(lastImport.importer_version) ?? "unknown"}`,
+                     ].join(" "),
+                );
+
+                if (asStr(lastImport.source_path)) {
+                    log("last import source:", lastImport.source_path);
+                }
+                if (asStr(lastImport.started_at)) {
+                    log("last import started:", lastImport.started_at);
+                }
+                if (asStr(lastImport.completed_at)) {
+                    log("last import completed:", lastImport.completed_at);
+                }
+            }
         }
-        if (!ftsPresent) log("NOTE: FTS is optional. Ensure your migrate creates bp_verse_text_fts if you want /search to use FTS mode.");
+
+        if (bookCount !== 66) {
+            warnings.push(`expected 66 bp_book rows, found ${bookCount}`);
+            if (strict) {
+                strictFailures.push(`expected 66 bp_book rows, found ${bookCount}`);
+            }
+        }
+
+        if (verseCount === 0) {
+            warnings.push("bp_verse is empty");
+            if (strict) {
+                strictFailures.push("bp_verse is empty");
+            }
+        }
+
+        if (verseCount > 0) {
+            if (bounds.min <= 0) {
+                warnings.push(`bp_verse min verse_ord should be > 0, found ${bounds.min}`);
+                if (strict) {
+                    strictFailures.push(`bp_verse min verse_ord should be > 0, found ${bounds.min}`);
+                }
+            }
+
+            if (bounds.max < bounds.min) {
+                warnings.push(`bp_verse max verse_ord < min verse_ord (${bounds.max} < ${bounds.min})`);
+                if (strict) {
+                    strictFailures.push(`bp_verse max verse_ord < min verse_ord (${bounds.max} < ${bounds.min})`);
+                }
+            }
+        }
+
+        if (!defaultTranslation && !envStr("BP_TRANSLATION_ID", "")) {
+            warnings.push("no default translation and BP_TRANSLATION_ID not set");
+            if (strict) {
+                strictFailures.push("no default translation and BP_TRANSLATION_ID not set");
+            }
+        }
+
+        if (!ftsPresent) {
+            warnings.push("FTS table missing; search may not use FTS mode");
+        }
+
+        for (const message of warnings) {
+            warn(message);
+        }
+
+        if (strictFailures.length > 0) {
+            fatal("strict verification failed:", strictFailures.join(" | "));
+        }
 
         log("ok.");
     } finally {
@@ -6498,7 +7445,9 @@ async function main() {
     }
 }
 
-main().catch((e) => fatal(e));
+void main().catch((error: unknown) => {
+    fatal(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
+});
 ```
 
 ### apps/api/src/db/annotationSchema.ts
@@ -10055,102 +11004,18 @@ import {
 } from "./db/schema";
 import { bpUser, bpAuthAccount, bpSession } from "./db/authSchema";
 
-/* --------------------------------- Config --------------------------------- */
-
-const PORT = parseEnvInt(process.env.PORT, 3000, { min: 1, max: 65535 });
-const NODE_ENV = (process.env.NODE_ENV ?? "development").trim().toLowerCase();
-const IS_PROD = NODE_ENV === "production";
-
-// Public URLs
-const BP_PUBLIC_URL = trimTrailingSlash(process.env.BP_PUBLIC_URL ?? `http://localhost:${PORT}`);
-const BP_WEB_ORIGIN_RAW = (process.env.BP_WEB_ORIGIN ?? process.env.BP_CORS_ORIGIN ?? "").trim();
-
-// Explicit env default translation, else DB default.
-const ENV_TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "").trim();
-
-// CORS
-const CORS_LIST = splitCsv(BP_WEB_ORIGIN_RAW);
-const CORS_WILDCARD = CORS_LIST.length === 0 || CORS_LIST.includes("*");
-
-// Auth
-const AUTH_ENABLED = parseEnvBool(process.env.BP_AUTH_ENABLED, true);
-const AUTH_COOKIE = nonEmptyOr(process.env.BP_AUTH_COOKIE, "bp_session");
-const AUTH_COOKIE_DOMAIN = nonEmptyOrUndefined(process.env.BP_AUTH_COOKIE_DOMAIN);
-const AUTH_COOKIE_PATH = nonEmptyOr(process.env.BP_AUTH_COOKIE_PATH, "/");
-const AUTH_COOKIE_SECURE = parseEnvBool(
-    process.env.BP_AUTH_COOKIE_SECURE,
-    IS_PROD,
-);
-const AUTH_SESSION_DAYS = parseEnvInt(process.env.BP_AUTH_SESSION_DAYS, 30, { min: 1, max: 365 });
-
-// Cookie signing
-const AUTH_COOKIE_SECRET = (process.env.BP_AUTH_COOKIE_SECRET ?? "").trim();
-const AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE = parseEnvBool(
-    process.env.BP_AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE,
-    !IS_PROD,
-);
-
-// Google OAuth
-const GOOGLE_CLIENT_ID = (process.env.BP_GOOGLE_CLIENT_ID ?? process.env.GOOGLE_CLIENT_ID ?? "").trim();
-const GOOGLE_CLIENT_SECRET = (process.env.BP_GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_CLIENT_SECRET ?? "").trim();
-const GOOGLE_REDIRECT_URI = (
-    process.env.BP_GOOGLE_REDIRECT_URI ??
-    process.env.GOOGLE_REDIRECT_URI ??
-    `${BP_PUBLIC_URL}/auth/google/callback`
-).trim();
-const GOOGLE_SCOPES = ["openid", "email", "profile"] as const;
-
-// Redirects
-const AUTH_AFTER_LOGIN_URL = (
-    process.env.BP_AUTH_AFTER_LOGIN_URL ??
-    (CORS_WILDCARD ? "" : `${CORS_LIST[0]}/reader`)
-).trim();
-const AUTH_AFTER_LOGOUT_URL = (
-    process.env.BP_AUTH_AFTER_LOGOUT_URL ??
-    (CORS_WILDCARD ? "" : `${CORS_LIST[0]}/`)
-).trim();
-
-// Bun listen
-const LISTEN = parseEnvBool(process.env.BP_API_LISTEN, true);
-
-// Network timeouts
-const OAUTH_FETCH_TIMEOUT_MS = parseEnvInt(process.env.BP_OAUTH_FETCH_TIMEOUT_MS, 10_000, {
-    min: 1_000,
-    max: 60_000,
-});
-
-// Basic in-memory rate limits
-const AUTH_RATE_LIMIT_WINDOW_MS = parseEnvInt(process.env.BP_AUTH_RATE_LIMIT_WINDOW_MS, 60_000, {
-    min: 5_000,
-    max: 3600_000,
-});
-const AUTH_RATE_LIMIT_MAX = parseEnvInt(process.env.BP_AUTH_RATE_LIMIT_MAX, 30, {
-    min: 1,
-    max: 10_000,
-});
-const SEARCH_RATE_LIMIT_WINDOW_MS = parseEnvInt(process.env.BP_SEARCH_RATE_LIMIT_WINDOW_MS, 60_000, {
-    min: 5_000,
-    max: 3600_000,
-});
-const SEARCH_RATE_LIMIT_MAX = parseEnvInt(process.env.BP_SEARCH_RATE_LIMIT_MAX, 120, {
-    min: 1,
-    max: 10_000,
-});
-
-/* ------------------------------ Startup checks ----------------------------- */
-
-validateStartup();
-
 /* --------------------------------- Helpers -------------------------------- */
 
 type ApiOk<T> = Readonly<{ ok: true; data: T }>;
 type ApiErr = Readonly<{ ok: false; error: { code: string; message: string } }>;
 
-type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500;
+type JsonStatus = 200 | 201 | 302 | 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500;
+type PortSource = "BP_API_PORT" | "PORT" | "default";
 
 function toJsonStatus(n: number): JsonStatus {
     if (n === 200) return 200;
     if (n === 201) return 201;
+    if (n === 302) return 302;
     if (n === 400) return 400;
     if (n === 401) return 401;
     if (n === 403) return 403;
@@ -10161,8 +11026,17 @@ function toJsonStatus(n: number): JsonStatus {
     return 500;
 }
 
-function jsonOk<T>(c: Context, data: T, extraHeaders?: Record<string, string>, status: 200 | 201 = 200) {
-    if (extraHeaders) for (const [k, v] of Object.entries(extraHeaders)) c.header(k, v);
+function jsonOk<T>(
+     c: Context,
+     data: T,
+     extraHeaders?: Record<string, string>,
+     status: 200 | 201 = 200,
+) {
+    if (extraHeaders) {
+        for (const [k, v] of Object.entries(extraHeaders)) {
+            c.header(k, v);
+        }
+    }
     const body: ApiOk<T> = { ok: true, data };
     return c.json(body, { status });
 }
@@ -10188,9 +11062,9 @@ function nonEmptyOrUndefined(v: string | undefined): string | undefined {
 
 function splitCsv(s: string): string[] {
     return s
-        .split(",")
-        .map((v) => v.trim())
-        .filter(Boolean);
+         .split(",")
+         .map((v) => v.trim())
+         .filter(Boolean);
 }
 
 function parseEnvBool(v: string | undefined, fallback: boolean): boolean {
@@ -10202,15 +11076,45 @@ function parseEnvBool(v: string | undefined, fallback: boolean): boolean {
 }
 
 function parseEnvInt(
-    v: string | undefined,
-    fallback: number,
-    bounds?: { min?: number; max?: number },
+     v: string | undefined,
+     fallback: number,
+     bounds?: { min?: number; max?: number },
 ): number {
-    const n = Number((v ?? "").trim());
+    const s = (v ?? "").trim();
+    const n = Number(s);
     let out = Number.isFinite(n) ? Math.trunc(n) : fallback;
     if (bounds?.min != null && out < bounds.min) out = bounds.min;
     if (bounds?.max != null && out > bounds.max) out = bounds.max;
     return out;
+}
+
+function parsePortCandidate(raw: string | undefined): number | null {
+    const s = (raw ?? "").trim();
+    if (!s) return null;
+    if (!/^\d+$/.test(s)) return null;
+
+    const n = Number(s);
+    if (!Number.isInteger(n)) return null;
+    if (n < 1024 || n > 65535) return null;
+
+    return n;
+}
+
+function resolveListenPort(): { port: number; source: PortSource; raw: string | null } {
+    const bpApiPortRaw = process.env.BP_API_PORT;
+    const portRaw = process.env.PORT;
+
+    const appPort = parsePortCandidate(bpApiPortRaw);
+    if (appPort != null) {
+        return { port: appPort, source: "BP_API_PORT", raw: bpApiPortRaw ?? null };
+    }
+
+    const genericPort = parsePortCandidate(portRaw);
+    if (genericPort != null) {
+        return { port: genericPort, source: "PORT", raw: portRaw ?? null };
+    }
+
+    return { port: 3000, source: "default", raw: null };
 }
 
 function assertAbsoluteHttpUrl(name: string, value: string): void {
@@ -10222,34 +11126,6 @@ function assertAbsoluteHttpUrl(name: string, value: string): void {
     }
     if (u.protocol !== "http:" && u.protocol !== "https:") {
         throw new Error(`[api] ${name} must use http or https`);
-    }
-}
-
-function validateStartup(): void {
-    assertAbsoluteHttpUrl("BP_PUBLIC_URL", BP_PUBLIC_URL);
-
-    if (AUTH_ENABLED) {
-        if (CORS_WILDCARD) {
-            throw new Error(
-                "[api] Auth is enabled but BP_WEB_ORIGIN/BP_CORS_ORIGIN resolves to wildcard/empty. Cookies require a specific origin.",
-            );
-        }
-
-        for (const origin of CORS_LIST) {
-            assertAbsoluteHttpUrl("BP_WEB_ORIGIN/BP_CORS_ORIGIN entry", origin);
-        }
-
-        assertAbsoluteHttpUrl("AUTH_AFTER_LOGIN_URL", AUTH_AFTER_LOGIN_URL);
-        assertAbsoluteHttpUrl("AUTH_AFTER_LOGOUT_URL", AUTH_AFTER_LOGOUT_URL);
-
-        if (IS_PROD && !AUTH_COOKIE_SECRET) {
-            throw new Error("[api] BP_AUTH_COOKIE_SECRET is required in production when auth is enabled.");
-        }
-
-        if (!GOOGLE_REDIRECT_URI) {
-            throw new Error("[api] GOOGLE_REDIRECT_URI resolved empty.");
-        }
-        assertAbsoluteHttpUrl("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI);
     }
 }
 
@@ -10276,10 +11152,10 @@ function qstr(c: Context, key: string): string | null {
 
 function b64url(bytes: Uint8Array): string {
     return Buffer.from(bytes)
-        .toString("base64")
-        .replace(/\+/g, "-")
-        .replace(/\//g, "_")
-        .replace(/=+$/g, "");
+         .toString("base64")
+         .replace(/\+/g, "-")
+         .replace(/\//g, "_")
+         .replace(/=+$/g, "");
 }
 
 function randId(bytes = 18): string {
@@ -10299,6 +11175,20 @@ function daysMs(days: number): number {
     return Math.max(1, Math.trunc(d)) * 24 * 60 * 60 * 1000;
 }
 
+function appendVary(current: string | null | undefined, value: string): string {
+    const parts = new Set(
+         (current ?? "")
+              .split(",")
+              .map((v) => v.trim())
+              .filter(Boolean),
+    );
+    for (const part of value.split(",")) {
+        const clean = part.trim();
+        if (clean) parts.add(clean);
+    }
+    return Array.from(parts).join(", ");
+}
+
 function cookieOpts(expiresAt?: Date): CookieOptions {
     const base: CookieOptions = {
         httpOnly: true,
@@ -10311,15 +11201,190 @@ function cookieOpts(expiresAt?: Date): CookieOptions {
     return base;
 }
 
-function getClientIp(c: Context): string {
-    const xff = c.req.header("x-forwarded-for");
-    if (xff) {
-        const first = xff.split(",")[0]?.trim();
-        if (first) return first;
+function normalizeOrigin(origin: string): string {
+    const u = new URL(origin);
+    return u.origin;
+}
+
+function isAllowedOrigin(origin: string): boolean {
+    if (CORS_WILDCARD) return true;
+    try {
+        const normalized = normalizeOrigin(origin);
+        return CORS_SET.has(normalized);
+    } catch {
+        return false;
     }
-    const xr = c.req.header("x-real-ip")?.trim();
-    if (xr) return xr;
+}
+
+function assertRedirectUrlAllowed(name: string, value: string): void {
+    assertAbsoluteHttpUrl(name, value);
+    if (!isAllowedOrigin(value)) {
+        throw new Error(`[api] ${name} origin must be one of the configured web origins`);
+    }
+}
+
+function getClientIp(c: Context): string {
+    if (TRUST_PROXY) {
+        const xff = c.req.header("x-forwarded-for");
+        if (xff) {
+            const first = xff.split(",")[0]?.trim();
+            if (first) return first;
+        }
+
+        const xr = c.req.header("x-real-ip")?.trim();
+        if (xr) return xr;
+    }
+
+    const cf = c.req.header("cf-connecting-ip")?.trim();
+    if (TRUST_PROXY && cf) return cf;
+
     return "unknown";
+}
+
+function escapeLike(input: string): string {
+    return input.replace(/[\\%_]/g, "\\$&");
+}
+
+function safeUrlEquals(a: string, b: string): boolean {
+    try {
+        return normalizeOrigin(a) === normalizeOrigin(b);
+    } catch {
+        return false;
+    }
+}
+
+/* --------------------------------- Config --------------------------------- */
+
+const PORT_INFO = resolveListenPort();
+const PORT = PORT_INFO.port;
+
+const NODE_ENV = (process.env.NODE_ENV ?? "development").trim().toLowerCase();
+const IS_PROD = NODE_ENV === "production";
+
+// Bun listen
+const LISTEN = parseEnvBool(process.env.BP_API_LISTEN, true);
+
+// Public URLs
+const BP_PUBLIC_URL = trimTrailingSlash(process.env.BP_PUBLIC_URL ?? `http://localhost:${PORT}`);
+const BP_WEB_ORIGIN_RAW = (process.env.BP_WEB_ORIGIN ?? process.env.BP_CORS_ORIGIN ?? "").trim();
+
+// Explicit env default translation, else DB default.
+const ENV_TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "").trim();
+
+// CORS
+const CORS_LIST = splitCsv(BP_WEB_ORIGIN_RAW).map(trimTrailingSlash);
+const CORS_WILDCARD = CORS_LIST.length === 0 || CORS_LIST.includes("*");
+const CORS_SET = new Set(
+     CORS_WILDCARD
+          ? []
+          : CORS_LIST.map((origin) => {
+              assertAbsoluteHttpUrl("BP_WEB_ORIGIN/BP_CORS_ORIGIN entry", origin);
+              return normalizeOrigin(origin);
+          }),
+);
+
+// Auth
+const AUTH_ENABLED = parseEnvBool(process.env.BP_AUTH_ENABLED, true);
+const AUTH_COOKIE = nonEmptyOr(process.env.BP_AUTH_COOKIE, "bp_session");
+const AUTH_COOKIE_DOMAIN = nonEmptyOrUndefined(process.env.BP_AUTH_COOKIE_DOMAIN);
+const AUTH_COOKIE_PATH = nonEmptyOr(process.env.BP_AUTH_COOKIE_PATH, "/");
+const AUTH_COOKIE_SECURE = parseEnvBool(process.env.BP_AUTH_COOKIE_SECURE, IS_PROD);
+const AUTH_SESSION_DAYS = parseEnvInt(process.env.BP_AUTH_SESSION_DAYS, 30, { min: 1, max: 365 });
+const AUTH_SESSION_REFRESH_WINDOW_MS = parseEnvInt(
+     process.env.BP_AUTH_SESSION_REFRESH_WINDOW_MS,
+     7 * 24 * 60 * 60 * 1000,
+     { min: 60_000, max: 365 * 24 * 60 * 60 * 1000 },
+);
+
+// Cookie signing
+const AUTH_COOKIE_SECRET = (process.env.BP_AUTH_COOKIE_SECRET ?? "").trim();
+const AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE = parseEnvBool(
+     process.env.BP_AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE,
+     !IS_PROD,
+);
+
+// Proxy awareness
+const TRUST_PROXY = parseEnvBool(process.env.BP_TRUST_PROXY, IS_PROD);
+
+// Google OAuth
+const GOOGLE_CLIENT_ID = (process.env.BP_GOOGLE_CLIENT_ID ?? process.env.GOOGLE_CLIENT_ID ?? "").trim();
+const GOOGLE_CLIENT_SECRET = (process.env.BP_GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_CLIENT_SECRET ?? "").trim();
+const GOOGLE_REDIRECT_URI = (
+     process.env.BP_GOOGLE_REDIRECT_URI ??
+     process.env.GOOGLE_REDIRECT_URI ??
+     `${BP_PUBLIC_URL}/auth/google/callback`
+).trim();
+const GOOGLE_SCOPES = ["openid", "email", "profile"] as const;
+
+// Redirects
+const DEFAULT_WEB_ORIGIN = !CORS_WILDCARD ? CORS_LIST[0]! : BP_PUBLIC_URL;
+const AUTH_AFTER_LOGIN_URL = (
+     process.env.BP_AUTH_AFTER_LOGIN_URL ??
+     `${trimTrailingSlash(DEFAULT_WEB_ORIGIN)}/reader`
+).trim();
+const AUTH_AFTER_LOGOUT_URL = (
+     process.env.BP_AUTH_AFTER_LOGOUT_URL ??
+     `${trimTrailingSlash(DEFAULT_WEB_ORIGIN)}/`
+).trim();
+
+// Network timeouts
+const OAUTH_FETCH_TIMEOUT_MS = parseEnvInt(process.env.BP_OAUTH_FETCH_TIMEOUT_MS, 10_000, {
+    min: 1_000,
+    max: 60_000,
+});
+
+// Basic in-memory rate limits
+const AUTH_RATE_LIMIT_WINDOW_MS = parseEnvInt(process.env.BP_AUTH_RATE_LIMIT_WINDOW_MS, 60_000, {
+    min: 5_000,
+    max: 3_600_000,
+});
+const AUTH_RATE_LIMIT_MAX = parseEnvInt(process.env.BP_AUTH_RATE_LIMIT_MAX, 30, {
+    min: 1,
+    max: 10_000,
+});
+const SEARCH_RATE_LIMIT_WINDOW_MS = parseEnvInt(process.env.BP_SEARCH_RATE_LIMIT_WINDOW_MS, 60_000, {
+    min: 5_000,
+    max: 3_600_000,
+});
+const SEARCH_RATE_LIMIT_MAX = parseEnvInt(process.env.BP_SEARCH_RATE_LIMIT_MAX, 120, {
+    min: 1,
+    max: 10_000,
+});
+
+/* ------------------------------ Startup checks ----------------------------- */
+
+validateStartup();
+
+function validateStartup(): void {
+    assertAbsoluteHttpUrl("BP_PUBLIC_URL", BP_PUBLIC_URL);
+
+    if (!AUTH_COOKIE.trim()) {
+        throw new Error("[api] BP_AUTH_COOKIE resolved empty.");
+    }
+
+    if (!AUTH_COOKIE_PATH.startsWith("/")) {
+        throw new Error("[api] BP_AUTH_COOKIE_PATH must start with '/'.");
+    }
+
+    if (AUTH_ENABLED) {
+        if (CORS_WILDCARD) {
+            throw new Error(
+                 "[api] Auth is enabled but BP_WEB_ORIGIN/BP_CORS_ORIGIN resolves to wildcard/empty. Cookies require a specific origin.",
+            );
+        }
+
+        if (IS_PROD && !AUTH_COOKIE_SECRET) {
+            throw new Error("[api] BP_AUTH_COOKIE_SECRET is required in production when auth is enabled.");
+        }
+
+        assertAbsoluteHttpUrl("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI);
+        assertRedirectUrlAllowed("AUTH_AFTER_LOGIN_URL", AUTH_AFTER_LOGIN_URL);
+        assertRedirectUrlAllowed("AUTH_AFTER_LOGOUT_URL", AUTH_AFTER_LOGOUT_URL);
+
+        if (!safeUrlEquals(GOOGLE_REDIRECT_URI, `${BP_PUBLIC_URL}/auth/google/callback`)) {
+            assertAbsoluteHttpUrl("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI);
+        }
+    }
 }
 
 /* ------------------------------ Cookie signing ----------------------------- */
@@ -10347,8 +11412,8 @@ function packCookieValue(value: string): string {
 }
 
 type UnpackCookieResult =
-    | { ok: true; value: string }
-    | { ok: false; reason: "empty" | "bad_sig" | "legacy_disallowed" };
+     | { ok: true; value: string }
+     | { ok: false; reason: "empty" | "bad_sig" | "legacy_disallowed" };
 
 function unpackCookieValue(packed: string): UnpackCookieResult {
     const s = packed.trim();
@@ -10367,23 +11432,26 @@ function unpackCookieValue(packed: string): UnpackCookieResult {
     const value = s.slice(0, dot);
     const sig = s.slice(dot + 1);
     const expected = hmacSig(value);
+
     if (!sig || !expected || !safeEqual(sig, expected)) {
         return { ok: false, reason: "bad_sig" };
     }
+
     return { ok: true, value };
 }
 
 /* --------------------------------- Schemas -------------------------------- */
 
-const RefBookIdSchema = z.string().min(2).max(8).regex(/^[A-Z0-9_]+$/);
+const RefBookIdSchema = z.string().trim().min(2).max(8).regex(/^[A-Z0-9_]+$/);
 const ChapterNumSchema = z.coerce.number().int().min(1).max(200);
-const VerseNumSchema = z.coerce.number().int().min(1).max(200);
+const VerseNumSchema = z.coerce.number().int().min(1).max(300);
 
 const SearchQuerySchema = z.string().trim().min(1).max(200);
 const SliceFromSchema = z.coerce.number().int().min(1).max(1_000_000);
 const SliceLimitSchema = z.coerce.number().int().min(1).max(2_000);
 
 const TranslationIdSchema = z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9._-]+$/);
+const EntityIdSchema = z.string().trim().min(1).max(128);
 
 /* ---------------------------- Translation metadata -------------------------- */
 
@@ -10395,8 +11463,14 @@ type TranslationRow = Readonly<{
     licenseKind: string | null;
     licenseText: string | null;
     sourceUrl: string | null;
+    publisher: string | null;
+    editionLabel: string | null;
+    abbreviation: string | null;
+    normalizationForm: string | null;
     isDefault: number;
+    isPublic: number;
     createdAt: string | null;
+    updatedAt: string | null;
 }>;
 
 type TranslationMeta = Readonly<{
@@ -10407,8 +11481,14 @@ type TranslationMeta = Readonly<{
     licenseKind: string | null;
     licenseText: string | null;
     sourceUrl: string | null;
+    publisher: string | null;
+    editionLabel: string | null;
+    abbreviation: string | null;
+    normalizationForm: string | null;
     isDefault: boolean;
+    isPublic: boolean;
     createdAt: string | null;
+    updatedAt: string | null;
 }>;
 
 function toTranslationMeta(r: TranslationRow): TranslationMeta {
@@ -10420,8 +11500,14 @@ function toTranslationMeta(r: TranslationRow): TranslationMeta {
         licenseKind: r.licenseKind,
         licenseText: r.licenseText,
         sourceUrl: r.sourceUrl,
+        publisher: r.publisher,
+        editionLabel: r.editionLabel,
+        abbreviation: r.abbreviation,
+        normalizationForm: r.normalizationForm,
         isDefault: !!r.isDefault,
+        isPublic: !!r.isPublic,
         createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
     };
 }
 
@@ -10430,8 +11516,8 @@ function toTranslationMeta(r: TranslationRow): TranslationMeta {
 const TRANSLATIONS_CACHE_MS = 30_000;
 
 let _translationsCache:
-    | null
-    | Readonly<{
+     | null
+     | Readonly<{
     at: number;
     rows: TranslationRow[];
     byId: Map<string, TranslationRow>;
@@ -10440,23 +11526,29 @@ let _translationsCache:
 
 function readTranslationsRaw(): TranslationRow[] {
     const rows = sqlite
-        .query(
-            `
+         .query(
+              `
                 SELECT
-                    translation_id AS translationId,
-                    name           AS name,
-                    language       AS language,
-                    derived_from   AS derivedFrom,
-                    license_kind   AS licenseKind,
-                    license_text   AS licenseText,
-                    source_url     AS sourceUrl,
-                    is_default     AS isDefault,
-                    created_at     AS createdAt
+                    translation_id      AS translationId,
+                    name                AS name,
+                    language            AS language,
+                    derived_from        AS derivedFrom,
+                    license_kind        AS licenseKind,
+                    license_text        AS licenseText,
+                    source_url          AS sourceUrl,
+                    publisher           AS publisher,
+                    edition_label       AS editionLabel,
+                    abbreviation        AS abbreviation,
+                    normalization_form  AS normalizationForm,
+                    is_default          AS isDefault,
+                    is_public           AS isPublic,
+                    created_at          AS createdAt,
+                    updated_at          AS updatedAt
                 FROM bp_translation
                 ORDER BY is_default DESC, name ASC, translation_id ASC;
             `,
-        )
-        .all() as TranslationRow[];
+         )
+         .all() as TranslationRow[];
 
     return rows ?? [];
 }
@@ -10486,6 +11578,7 @@ function getTranslationsCached(): Readonly<{
 }
 
 let _resolvedTranslationId: string | null = null;
+
 async function resolveDefaultTranslationId(): Promise<string | null> {
     if (_resolvedTranslationId) return _resolvedTranslationId;
 
@@ -10501,10 +11594,10 @@ async function resolveDefaultTranslationId(): Promise<string | null> {
     }
 
     const rows = await db
-        .select({ translationId: bpTranslation.translationId })
-        .from(bpTranslation)
-        .where(eq(bpTranslation.isDefault, true))
-        .limit(1);
+         .select({ translationId: bpTranslation.translationId })
+         .from(bpTranslation)
+         .where(eq(bpTranslation.isDefault, true))
+         .limit(1);
 
     _resolvedTranslationId = rows[0]?.translationId ?? null;
     return _resolvedTranslationId;
@@ -10533,10 +11626,10 @@ async function pickTranslation(c: Context): Promise<PickedTranslation | Response
     const def = await resolveDefaultTranslationId();
     if (!def) {
         return jsonErr(
-            c,
-            404,
-            "NO_TRANSLATION",
-            "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
+             c,
+             404,
+             "NO_TRANSLATION",
+             "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
         );
     }
 
@@ -10550,12 +11643,13 @@ async function pickTranslation(c: Context): Promise<PickedTranslation | Response
 /* ----------------------------- Other fast caches ---------------------------- */
 
 let _hasFts: boolean | null = null;
+
 function hasFts(): boolean {
     if (_hasFts != null) return _hasFts;
 
     const row = sqlite
-        .query(`SELECT 1 AS one FROM sqlite_master WHERE type='table' AND name='bp_verse_text_fts' LIMIT 1;`)
-        .get() as { one?: number } | undefined;
+         .query(`SELECT 1 AS one FROM sqlite_master WHERE type='table' AND name='bp_verse_text_fts' LIMIT 1;`)
+         .get() as { one?: number } | undefined;
 
     _hasFts = row != null;
     return _hasFts;
@@ -10572,16 +11666,16 @@ function getSpineStats(): SpineStats {
     if (_spineStats) return _spineStats;
 
     const row = sqlite
-        .query(
-            `
+         .query(
+              `
                 SELECT
                     MIN(verse_ord) AS mn,
                     MAX(verse_ord) AS mx,
                     COUNT(*)       AS c
                 FROM bp_verse;
             `,
-        )
-        .get() as { mn?: number; mx?: number; c?: number } | undefined;
+         )
+         .get() as { mn?: number; mx?: number; c?: number } | undefined;
 
     const mn = Number(row?.mn ?? 0);
     const mx = Number(row?.mx ?? 0);
@@ -10605,14 +11699,14 @@ type ChapterBounds = Readonly<{
 
 async function getChapterBounds(bookId: string, chapter: number): Promise<ChapterBounds | null> {
     const byChapter = await db
-        .select({
-            startVerseOrd: bpChapter.startVerseOrd,
-            endVerseOrd: bpChapter.endVerseOrd,
-            verseCount: bpChapter.verseCount,
-        })
-        .from(bpChapter)
-        .where(and(eq(bpChapter.bookId, bookId), eq(bpChapter.chapter, chapter)))
-        .limit(1);
+         .select({
+             startVerseOrd: bpChapter.startVerseOrd,
+             endVerseOrd: bpChapter.endVerseOrd,
+             verseCount: bpChapter.verseCount,
+         })
+         .from(bpChapter)
+         .where(and(eq(bpChapter.bookId, bookId), eq(bpChapter.chapter, chapter)))
+         .limit(1);
 
     if (byChapter[0]) {
         return {
@@ -10624,14 +11718,14 @@ async function getChapterBounds(bookId: string, chapter: number): Promise<Chapte
     }
 
     const agg = await db
-        .select({
-            startVerseOrd: dsql<number>`min(${bpVerse.verseOrd})`.as("start_verse_ord"),
-            endVerseOrd: dsql<number>`max(${bpVerse.verseOrd})`.as("end_verse_ord"),
-            verseCount: dsql<number>`count(*)`.as("verse_count"),
-        })
-        .from(bpVerse)
-        .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapter)))
-        .limit(1);
+         .select({
+             startVerseOrd: dsql<number>`min(${bpVerse.verseOrd})`.as("start_verse_ord"),
+             endVerseOrd: dsql<number>`max(${bpVerse.verseOrd})`.as("end_verse_ord"),
+             verseCount: dsql<number>`count(*)`.as("verse_count"),
+         })
+         .from(bpVerse)
+         .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapter)))
+         .limit(1);
 
     const row = agg[0];
     if (!row || row.startVerseOrd == null || row.endVerseOrd == null) return null;
@@ -10644,35 +11738,63 @@ async function getChapterBounds(bookId: string, chapter: number): Promise<Chapte
     };
 }
 
+async function fetchChaptersForBook(bookId: string) {
+    const fromChapter = await db
+         .select({
+             chapter: bpChapter.chapter,
+             startVerseOrd: bpChapter.startVerseOrd,
+             endVerseOrd: bpChapter.endVerseOrd,
+             verseCount: bpChapter.verseCount,
+         })
+         .from(bpChapter)
+         .where(eq(bpChapter.bookId, bookId))
+         .orderBy(asc(bpChapter.chapter));
+
+    if (fromChapter.length > 0) return fromChapter;
+
+    return await db
+         .select({
+             chapter: bpVerse.chapter,
+             startVerseOrd: dsql<number>`min(${bpVerse.verseOrd})`.as("start_verse_ord"),
+             endVerseOrd: dsql<number>`max(${bpVerse.verseOrd})`.as("end_verse_ord"),
+             verseCount: dsql<number>`count(*)`.as("verse_count"),
+         })
+         .from(bpVerse)
+         .where(eq(bpVerse.bookId, bookId))
+         .groupBy(bpVerse.chapter)
+         .orderBy(asc(bpVerse.chapter));
+}
+
 async function fetchEntityBase(kind: "PERSON" | "PLACE", id: string) {
     const ent = await db
-        .select({
-            entityId: bpEntity.entityId,
-            kind: bpEntity.kind,
-            canonicalName: bpEntity.canonicalName,
-            slug: bpEntity.slug,
-            summaryNeutral: bpEntity.summaryNeutral,
-            confidence: bpEntity.confidence,
-            createdAt: bpEntity.createdAt,
-        })
-        .from(bpEntity)
-        .where(and(eq(bpEntity.entityId, id), eq(bpEntity.kind, kind)))
-        .limit(1);
+         .select({
+             entityId: bpEntity.entityId,
+             kind: bpEntity.kind,
+             canonicalName: bpEntity.canonicalName,
+             slug: bpEntity.slug,
+             summaryNeutral: bpEntity.summaryNeutral,
+             confidence: bpEntity.confidence,
+             createdAt: bpEntity.createdAt,
+             updatedAt: bpEntity.updatedAt,
+         })
+         .from(bpEntity)
+         .where(and(eq(bpEntity.entityId, id), eq(bpEntity.kind, kind)))
+         .limit(1);
 
     if (!ent[0]) return null;
 
     const names = await db
-        .select({
-            entityNameId: bpEntityName.entityNameId,
-            name: bpEntityName.name,
-            language: bpEntityName.language,
-            isPrimary: bpEntityName.isPrimary,
-            source: bpEntityName.source,
-            confidence: bpEntityName.confidence,
-        })
-        .from(bpEntityName)
-        .where(eq(bpEntityName.entityId, id))
-        .orderBy(asc(bpEntityName.name));
+         .select({
+             entityNameId: bpEntityName.entityNameId,
+             name: bpEntityName.name,
+             language: bpEntityName.language,
+             isPrimary: bpEntityName.isPrimary,
+             source: bpEntityName.source,
+             confidence: bpEntityName.confidence,
+         })
+         .from(bpEntityName)
+         .where(eq(bpEntityName.entityId, id))
+         .orderBy(desc(bpEntityName.isPrimary), asc(bpEntityName.name));
 
     return { entity: ent[0], names };
 }
@@ -10688,11 +11810,14 @@ class MemoryRateLimiter {
     private readonly buckets = new Map<string, RateBucket>();
 
     constructor(
-        private readonly windowMs: number,
-        private readonly maxHits: number,
+         private readonly windowMs: number,
+         private readonly maxHits: number,
     ) {}
 
-    hit(key: string, now = Date.now()): { ok: true; remaining: number; resetAt: number } | { ok: false; retryAfterSec: number; resetAt: number } {
+    hit(
+         key: string,
+         now = Date.now(),
+    ): { ok: true; remaining: number; resetAt: number } | { ok: false; retryAfterSec: number; resetAt: number } {
         const cur = this.buckets.get(key);
         if (!cur || now >= cur.resetAt) {
             const resetAt = now + this.windowMs;
@@ -10726,24 +11851,27 @@ const searchLimiter = new MemoryRateLimiter(SEARCH_RATE_LIMIT_WINDOW_MS, SEARCH_
 
 function withRateLimit(name: "auth" | "search") {
     const limiter = name === "auth" ? authLimiter : searchLimiter;
+    const limit = name === "auth" ? AUTH_RATE_LIMIT_MAX : SEARCH_RATE_LIMIT_MAX;
 
     return async (c: Context, next: Next) => {
         const key = `${name}:${getClientIp(c)}`;
         const hit = limiter.hit(key);
+
         if (!hit.ok) {
             c.header("Retry-After", String(hit.retryAfterSec));
-            c.header("X-RateLimit-Limit", String(name === "auth" ? AUTH_RATE_LIMIT_MAX : SEARCH_RATE_LIMIT_MAX));
+            c.header("X-RateLimit-Limit", String(limit));
             c.header("X-RateLimit-Reset", String(hit.resetAt));
             return jsonErr(c, 429, "RATE_LIMITED", "Too many requests.");
         }
-        c.header("X-RateLimit-Limit", String(name === "auth" ? AUTH_RATE_LIMIT_MAX : SEARCH_RATE_LIMIT_MAX));
+
+        c.header("X-RateLimit-Limit", String(limit));
         c.header("X-RateLimit-Remaining", String(hit.remaining));
         c.header("X-RateLimit-Reset", String(hit.resetAt));
         return next();
     };
 }
 
-/* ------------------------------ Auth helpers -------------------------------- */
+/* ------------------------------ Auth helpers ------------------------------- */
 
 type AuthedUser = Readonly<{
     id: string;
@@ -10758,23 +11886,31 @@ type AppVars = {
     sessionId: string | null;
 };
 
+function authDisabledResponse(c: Context) {
+    cacheNoStore(c);
+    return jsonErr(c, 403, "AUTH_DISABLED", "Authentication is disabled.");
+}
+
 /* ------------------------------- Sessions ---------------------------------- */
 
-async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null> {
+async function loadUserFromSession(sessionId: string): Promise<{
+    user: AuthedUser | null;
+    sessionExpiresAt: number | null;
+}> {
     const now = nowMs();
 
     const sess = await db
-        .select({
-            id: bpSession.id,
-            userId: bpSession.userId,
-            expiresAt: bpSession.expiresAt,
-        })
-        .from(bpSession)
-        .where(eq(bpSession.id, sessionId))
-        .limit(1);
+         .select({
+             id: bpSession.id,
+             userId: bpSession.userId,
+             expiresAt: bpSession.expiresAt,
+         })
+         .from(bpSession)
+         .where(eq(bpSession.id, sessionId))
+         .limit(1);
 
     const s = sess[0];
-    if (!s) return null;
+    if (!s) return { user: null, sessionExpiresAt: null };
 
     if (Number(s.expiresAt) <= now) {
         try {
@@ -10782,32 +11918,47 @@ async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null
         } catch {
             // ignore cleanup failure
         }
-        return null;
+        return { user: null, sessionExpiresAt: null };
     }
 
     const rows = await db
-        .select({
-            id: bpUser.id,
-            displayName: bpUser.displayName,
-            email: bpUser.email,
-            emailVerifiedAt: bpUser.emailVerifiedAt,
-            disabledAt: bpUser.disabledAt,
-        })
-        .from(bpUser)
-        .where(eq(bpUser.id, s.userId))
-        .limit(1);
+         .select({
+             id: bpUser.id,
+             displayName: bpUser.displayName,
+             email: bpUser.email,
+             emailVerifiedAt: bpUser.emailVerifiedAt,
+             disabledAt: bpUser.disabledAt,
+         })
+         .from(bpUser)
+         .where(eq(bpUser.id, s.userId))
+         .limit(1);
 
     const u = rows[0];
-    if (!u) return null;
-    if (u.disabledAt != null) return null;
+    if (!u) return { user: null, sessionExpiresAt: Number(s.expiresAt) };
+    if (u.disabledAt != null) return { user: null, sessionExpiresAt: Number(s.expiresAt) };
 
     return {
-        id: u.id,
-        displayName: u.displayName ?? null,
-        email: u.email ?? null,
-        emailVerifiedAt: u.emailVerifiedAt != null ? msToDate(Number(u.emailVerifiedAt)) : null,
-        disabledAt: u.disabledAt != null ? msToDate(Number(u.disabledAt)) : null,
+        user: {
+            id: u.id,
+            displayName: u.displayName ?? null,
+            email: u.email ?? null,
+            emailVerifiedAt: u.emailVerifiedAt != null ? msToDate(Number(u.emailVerifiedAt)) : null,
+            disabledAt: u.disabledAt != null ? msToDate(Number(u.disabledAt)) : null,
+        },
+        sessionExpiresAt: Number(s.expiresAt),
     };
+}
+
+async function refreshSessionCookie(c: Context, sessionId: string): Promise<void> {
+    const now = nowMs();
+    const nextExpiresAt = now + daysMs(AUTH_SESSION_DAYS);
+
+    await db
+         .update(bpSession)
+         .set({ expiresAt: nextExpiresAt })
+         .where(eq(bpSession.id, sessionId));
+
+    setCookie(c, AUTH_COOKIE, packCookieValue(sessionId), cookieOpts(msToDate(nextExpiresAt)));
 }
 
 async function createSessionForUser(c: Context, userId: string): Promise<string> {
@@ -10849,14 +12000,13 @@ const OAUTH_TMP_MS = 10 * 60 * 1000;
 
 function oauthTmpCookieOpts(): CookieOptions {
     const exp = new Date(Date.now() + OAUTH_TMP_MS);
-    const base: CookieOptions = {
+    return {
         ...cookieOpts(exp),
         httpOnly: true,
         sameSite: "Lax",
         secure: AUTH_COOKIE_SECURE,
         path: "/",
     };
-    return base;
 }
 
 function sha256Base64Url(s: string): string {
@@ -10874,6 +12024,7 @@ function googleAuthUrl(state: string, codeChallenge: string): string {
     u.searchParams.set("code_challenge", codeChallenge);
     u.searchParams.set("code_challenge_method", "S256");
     u.searchParams.set("access_type", "offline");
+    u.searchParams.set("prompt", "consent");
     return u.toString();
 }
 
@@ -10903,13 +12054,13 @@ async function googleExchangeCode(code: string, codeVerifier: string): Promise<G
     form.set("code_verifier", codeVerifier);
 
     const res = await fetchWithTimeout(
-        "https://oauth2.googleapis.com/token",
-        {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: form.toString(),
-        },
-        OAUTH_FETCH_TIMEOUT_MS,
+         "https://oauth2.googleapis.com/token",
+         {
+             method: "POST",
+             headers: { "Content-Type": "application/x-www-form-urlencoded" },
+             body: form.toString(),
+         },
+         OAUTH_FETCH_TIMEOUT_MS,
     );
 
     if (!res.ok) {
@@ -10929,36 +12080,38 @@ type GoogleUserInfo = {
 
 async function googleFetchUserInfo(accessToken: string): Promise<GoogleUserInfo> {
     const res = await fetchWithTimeout(
-        "https://openidconnect.googleapis.com/v1/userinfo",
-        {
-            headers: { Authorization: `Bearer ${accessToken}` },
-        },
-        OAUTH_FETCH_TIMEOUT_MS,
+         "https://openidconnect.googleapis.com/v1/userinfo",
+         {
+             headers: { Authorization: `Bearer ${accessToken}` },
+         },
+         OAUTH_FETCH_TIMEOUT_MS,
     );
+
     if (!res.ok) {
         const text = await res.text().catch(() => "");
         throw new Error(`google userinfo failed: ${res.status} ${text}`);
     }
+
     return (await res.json()) as GoogleUserInfo;
 }
 
 async function upsertGoogleUser(
-    info: GoogleUserInfo,
-    tokens: GoogleTokenResponse,
+     info: GoogleUserInfo,
+     tokens: GoogleTokenResponse,
 ): Promise<{ userId: string; displayName: string | null; email: string | null }> {
     const now = nowMs();
     const provider = "google";
     const providerUserId = info.sub;
 
     const existingAcc = await db
-        .select({ id: bpAuthAccount.id, userId: bpAuthAccount.userId })
-        .from(bpAuthAccount)
-        .where(and(eq(bpAuthAccount.provider, provider), eq(bpAuthAccount.providerUserId, providerUserId)))
-        .limit(1);
+         .select({ id: bpAuthAccount.id, userId: bpAuthAccount.userId })
+         .from(bpAuthAccount)
+         .where(and(eq(bpAuthAccount.provider, provider), eq(bpAuthAccount.providerUserId, providerUserId)))
+         .limit(1);
 
     let userId: string | null = existingAcc[0]?.userId ?? null;
 
-    const email = info.email?.trim() ? info.email.trim() : null;
+    const email = info.email?.trim() ? info.email.trim().toLowerCase() : null;
     const displayName = info.name?.trim() ? info.name.trim() : null;
     const emailVerifiedAt: number | null = info.email_verified ? now : null;
 
@@ -10983,52 +12136,53 @@ async function upsertGoogleUser(
         ]);
     } else {
         await db
-            .update(bpUser)
-            .set({
-                updatedAt: now,
-                displayName: displayName ?? null,
-                email: email ?? null,
-                emailVerifiedAt: emailVerifiedAt ?? null,
-            })
-            .where(eq(bpUser.id, userId));
+             .update(bpUser)
+             .set({
+                 updatedAt: now,
+                 displayName: displayName ?? null,
+                 email: email ?? null,
+                 emailVerifiedAt: emailVerifiedAt ?? null,
+             })
+             .where(eq(bpUser.id, userId));
     }
 
     const accId = existingAcc[0]?.id ?? randId(18);
     const accessTokenExpiresAt: number | null = tokens.expires_in ? now + tokens.expires_in * 1000 : null;
 
     await db
-        .insert(bpAuthAccount)
-        .values([
-            {
-                id: accId,
-                createdAt: now,
-                updatedAt: now,
-                userId,
-                provider,
-                providerUserId,
-                accessToken: tokens.access_token ?? null,
-                refreshToken: tokens.refresh_token ?? null,
-                accessTokenExpiresAt,
-                scope: tokens.scope ?? null,
-            },
-        ])
-        .onConflictDoUpdate({
-            target: [bpAuthAccount.provider, bpAuthAccount.providerUserId],
-            set: {
-                updatedAt: now,
-                userId,
-                accessToken: tokens.access_token ?? null,
-                refreshToken: tokens.refresh_token ?? null,
-                accessTokenExpiresAt,
-                scope: tokens.scope ?? null,
-            },
-        });
+         .insert(bpAuthAccount)
+         .values([
+             {
+                 id: accId,
+                 createdAt: now,
+                 updatedAt: now,
+                 userId,
+                 provider,
+                 providerUserId,
+                 accessToken: tokens.access_token ?? null,
+                 refreshToken: tokens.refresh_token ?? null,
+                 accessTokenExpiresAt,
+                 scope: tokens.scope ?? null,
+             },
+         ])
+         .onConflictDoUpdate({
+             target: [bpAuthAccount.provider, bpAuthAccount.providerUserId],
+             set: {
+                 updatedAt: now,
+                 userId,
+                 accessToken: tokens.access_token ?? null,
+                 refreshToken: tokens.refresh_token ?? null,
+                 accessTokenExpiresAt,
+                 scope: tokens.scope ?? null,
+             },
+         });
 
     return { userId, displayName, email };
 }
 
 function authMisconfigured(): boolean {
-    return !!(AUTH_ENABLED && (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI));
+    if (!AUTH_ENABLED) return false;
+    return !GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI;
 }
 
 /* ----------------------------------- App ---------------------------------- */
@@ -11036,7 +12190,7 @@ function authMisconfigured(): boolean {
 const app = new Hono<{ Variables: AppVars }>();
 
 app.use("*", async (c, next) => {
-    c.header("Vary", "Origin, Accept-Encoding");
+    c.header("Vary", appendVary(c.res.headers.get("Vary"), "Origin, Accept-Encoding"));
     c.header("X-Content-Type-Options", "nosniff");
     c.header("Referrer-Policy", "no-referrer");
     c.header("X-Frame-Options", "DENY");
@@ -11052,22 +12206,26 @@ app.use("*", compress());
 app.use("*", etag());
 
 app.use(
-    "*",
-    cors({
-        origin: CORS_WILDCARD
-            ? "*"
-            : (origin: string) => {
-                if (!origin) return null;
-                return CORS_LIST.includes(origin) ? origin : null;
-            },
-        allowHeaders: ["Content-Type", "Authorization"],
-        allowMethods: ["GET", "POST", "OPTIONS"],
-        credentials: !CORS_WILDCARD,
-        maxAge: 600,
-    }),
+     "*",
+     cors({
+         origin: CORS_WILDCARD
+              ? "*"
+              : (origin: string) => {
+                  if (!origin) return null;
+                  try {
+                      const normalized = normalizeOrigin(origin);
+                      return CORS_SET.has(normalized) ? normalized : null;
+                  } catch {
+                      return null;
+                  }
+              },
+         allowHeaders: ["Content-Type", "Authorization"],
+         allowMethods: ["GET", "POST", "OPTIONS"],
+         credentials: !CORS_WILDCARD,
+         maxAge: 600,
+     }),
 );
 
-// Session middleware
 app.use("*", async (c, next) => {
     if (!AUTH_ENABLED) {
         c.set("user", null);
@@ -11092,14 +12250,23 @@ app.use("*", async (c, next) => {
 
     try {
         const sid = unpacked.value;
-        const u = await loadUserFromSession(sid);
+        const loaded = await loadUserFromSession(sid);
+        const u = loaded.user;
+
         c.set("user", u);
         c.set("sessionId", u ? sid : null);
 
         if (!u) {
             deleteCookie(c, AUTH_COOKIE, cookieOpts());
-        } else if (AUTH_COOKIE_SECRET && raw !== packCookieValue(sid)) {
-            setCookie(c, AUTH_COOKIE, packCookieValue(sid), cookieOpts());
+        } else {
+            if (AUTH_COOKIE_SECRET && raw !== packCookieValue(sid)) {
+                setCookie(c, AUTH_COOKIE, packCookieValue(sid), cookieOpts());
+            }
+
+            const expiresAt = loaded.sessionExpiresAt ?? 0;
+            if (expiresAt - nowMs() <= AUTH_SESSION_REFRESH_WINDOW_MS) {
+                await refreshSessionCookie(c, sid);
+            }
         }
     } catch {
         deleteCookie(c, AUTH_COOKIE, cookieOpts());
@@ -11118,34 +12285,32 @@ app.onError((err, c) => {
 
 /* ---------------------------------- Routes -------------------------------- */
 
-// Root
 app.get("/", (c) => {
     cacheNoStore(c);
     return c.redirect("/health", 302);
 });
 
-// Health
 app.get("/health", (c) => {
     cacheNoStore(c);
     return c.text("ok");
 });
 
-// Auth: me
 app.get("/auth/me", (c) => {
     cacheNoStore(c);
     return jsonOk(c, { user: c.get("user") });
 });
 
-// Auth: start google
 app.get("/auth/google/start", withRateLimit("auth"), (c) => {
     cacheNoStore(c);
 
+    if (!AUTH_ENABLED) return authDisabledResponse(c);
+
     if (authMisconfigured()) {
         return jsonErr(
-            c,
-            500,
-            "AUTH_MISCONFIGURED",
-            "Google OAuth is not configured. Set BP_GOOGLE_CLIENT_ID/BP_GOOGLE_CLIENT_SECRET (and BP_PUBLIC_URL or BP_GOOGLE_REDIRECT_URI) and enable auth.",
+             c,
+             500,
+             "AUTH_MISCONFIGURED",
+             "Google OAuth is not configured. Set BP_GOOGLE_CLIENT_ID/BP_GOOGLE_CLIENT_SECRET (and BP_PUBLIC_URL or BP_GOOGLE_REDIRECT_URI) and enable auth.",
         );
     }
 
@@ -11159,16 +12324,17 @@ app.get("/auth/google/start", withRateLimit("auth"), (c) => {
     return c.redirect(googleAuthUrl(state, challenge), 302);
 });
 
-// Auth: callback
 app.get("/auth/google/callback", withRateLimit("auth"), async (c) => {
     cacheNoStore(c);
 
+    if (!AUTH_ENABLED) return authDisabledResponse(c);
+
     if (authMisconfigured()) {
         return jsonErr(
-            c,
-            500,
-            "AUTH_MISCONFIGURED",
-            "Google OAuth is not configured. Set BP_GOOGLE_CLIENT_ID/BP_GOOGLE_CLIENT_SECRET (and BP_PUBLIC_URL or BP_GOOGLE_REDIRECT_URI) and enable auth.",
+             c,
+             500,
+             "AUTH_MISCONFIGURED",
+             "Google OAuth is not configured. Set BP_GOOGLE_CLIENT_ID/BP_GOOGLE_CLIENT_SECRET (and BP_PUBLIC_URL or BP_GOOGLE_REDIRECT_URI) and enable auth.",
         );
     }
 
@@ -11191,7 +12357,7 @@ app.get("/auth/google/callback", withRateLimit("auth"), async (c) => {
     const stateCookie = stateCookieRes.ok ? stateCookieRes.value : null;
     const verifierCookie = verifierCookieRes.ok ? verifierCookieRes.value : null;
 
-    if (!stateCookie || stateCookie !== state || !verifierCookie) {
+    if (!stateCookie || !safeEqual(stateCookie, state) || !verifierCookie) {
         return jsonErr(c, 401, "OAUTH_STATE_MISMATCH", "Invalid OAuth state.");
     }
 
@@ -11214,22 +12380,22 @@ app.get("/auth/google/callback", withRateLimit("auth"), async (c) => {
     }
 });
 
-// Auth: logout
 app.post("/auth/logout", withRateLimit("auth"), async (c) => {
     cacheNoStore(c);
+
+    if (!AUTH_ENABLED) return authDisabledResponse(c);
+
     const sid = c.get("sessionId");
     await destroySession(c, sid);
     return jsonOk(c, { redirect: AUTH_AFTER_LOGOUT_URL });
 });
 
-// List available translations
 app.get("/translations", (c) => {
     cachePublic(c, 60);
     const cached = getTranslationsCached();
     return jsonOk(c, { translations: cached.rows.map(toTranslationMeta) });
 });
 
-// Meta
 app.get("/meta", async (c) => {
     cacheNoStore(c);
 
@@ -11247,16 +12413,18 @@ app.get("/meta", async (c) => {
             enabled: AUTH_ENABLED,
             user: c.get("user"),
         },
+        listen: {
+            port: PORT,
+            source: PORT_INFO.source,
+        },
     });
 });
 
-// Spine
 app.get("/spine", (c) => {
     cachePublic(c, 30);
     return jsonOk(c, getSpineStats());
 });
 
-// Slice
 app.get("/slice", async (c) => {
     cachePublic(c, 10);
 
@@ -11287,8 +12455,8 @@ app.get("/slice", async (c) => {
     const limit = clamp(limitP.data, 1, 2000);
 
     const verses = sqlite
-        .query(
-            `
+         .query(
+              `
                 SELECT
                     v.verse_key  AS verseKey,
                     v.verse_ord  AS verseOrd,
@@ -11305,8 +12473,8 @@ app.get("/slice", async (c) => {
                 ORDER BY v.verse_ord
                 LIMIT ?;
             `,
-        )
-        .all(translationId, fromOrd, limit) as Array<{
+         )
+         .all(translationId, fromOrd, limit) as Array<{
         verseKey: string;
         verseOrd: number;
         bookId: string;
@@ -11323,7 +12491,6 @@ app.get("/slice", async (c) => {
     return jsonOk(c, { translationId, fromOrd, limit, verses, done, nextFromOrd, spine });
 });
 
-// Resolve ref to verse_ord
 app.get("/loc", async (c) => {
     cachePublic(c, 60);
 
@@ -11344,8 +12511,8 @@ app.get("/loc", async (c) => {
         const verse = verseP.data;
 
         const row = sqlite
-            .query(
-                `
+             .query(
+                  `
                     SELECT
                         verse_key AS verseKey,
                         verse_ord AS verseOrd,
@@ -11358,17 +12525,17 @@ app.get("/loc", async (c) => {
                       AND verse = ?
                     LIMIT 1;
                 `,
-            )
-            .get(bookId, chapter, verse) as
-            | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
-            | undefined;
+             )
+             .get(bookId, chapter, verse) as
+             | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
+             | undefined;
 
         return jsonOk(c, row ?? null);
     }
 
     const first = sqlite
-        .query(
-            `
+         .query(
+              `
                 SELECT
                     verse_key AS verseKey,
                     verse_ord AS verseOrd,
@@ -11381,36 +12548,34 @@ app.get("/loc", async (c) => {
                 ORDER BY verse
                 LIMIT 1;
             `,
-        )
-        .get(bookId, chapter) as
-        | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
-        | undefined;
+         )
+         .get(bookId, chapter) as
+         | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
+         | undefined;
 
     return jsonOk(c, first ?? null);
 });
 
-// Books
 app.get("/books", async (c) => {
     cachePublic(c, 60);
 
     const books = await db
-        .select({
-            bookId: bpBook.bookId,
-            ordinal: bpBook.ordinal,
-            testament: bpBook.testament,
-            name: bpBook.name,
-            nameShort: bpBook.nameShort,
-            chapters: bpBook.chapters,
-            osised: bpBook.osised,
-            abbrs: bpBook.abbrs,
-        })
-        .from(bpBook)
-        .orderBy(asc(bpBook.ordinal));
+         .select({
+             bookId: bpBook.bookId,
+             ordinal: bpBook.ordinal,
+             testament: bpBook.testament,
+             name: bpBook.name,
+             nameShort: bpBook.nameShort,
+             chapters: bpBook.chapters,
+             osised: bpBook.osised,
+             abbrs: bpBook.abbrs,
+         })
+         .from(bpBook)
+         .orderBy(asc(bpBook.ordinal));
 
     return jsonOk(c, { books });
 });
 
-// Chapters
 app.get("/chapters/:bookId", async (c) => {
     cachePublic(c, 60);
 
@@ -11418,22 +12583,11 @@ app.get("/chapters/:bookId", async (c) => {
     if (!bookIdP.success) return jsonErr(c, 400, "BAD_BOOK", "Invalid bookId.");
 
     const bookId = bookIdP.data;
+    const chapters = await fetchChaptersForBook(bookId);
 
-    const rows = await db
-        .select({
-            chapter: bpChapter.chapter,
-            startVerseOrd: bpChapter.startVerseOrd,
-            endVerseOrd: bpChapter.endVerseOrd,
-            verseCount: bpChapter.verseCount,
-        })
-        .from(bpChapter)
-        .where(eq(bpChapter.bookId, bookId))
-        .orderBy(asc(bpChapter.chapter));
-
-    return jsonOk(c, { bookId, chapters: rows });
+    return jsonOk(c, { bookId, chapters });
 });
 
-// Chapter payload
 app.get("/chapter/:bookId/:chapter", async (c) => {
     cachePublic(c, 30);
 
@@ -11454,75 +12608,79 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
     if (!bounds) return jsonErr(c, 404, "CHAPTER_NOT_FOUND", "Chapter not found in bp_verse.");
 
     const verses = await db
-        .select({
-            verseKey: bpVerse.verseKey,
-            verseOrd: bpVerse.verseOrd,
-            chapter: bpVerse.chapter,
-            verse: bpVerse.verse,
-            text: bpVerseText.text,
-            updatedAt: bpVerseText.updatedAt,
-        })
-        .from(bpVerse)
-        .leftJoin(
-            bpVerseText,
-            and(eq(bpVerseText.verseKey, bpVerse.verseKey), eq(bpVerseText.translationId, translationId)),
-        )
-        .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapterNum)))
-        .orderBy(asc(bpVerse.verse));
+         .select({
+             verseKey: bpVerse.verseKey,
+             verseOrd: bpVerse.verseOrd,
+             chapter: bpVerse.chapter,
+             verse: bpVerse.verse,
+             text: bpVerseText.text,
+             updatedAt: bpVerseText.updatedAt,
+         })
+         .from(bpVerse)
+         .leftJoin(
+              bpVerseText,
+              and(eq(bpVerseText.verseKey, bpVerse.verseKey), eq(bpVerseText.translationId, translationId)),
+         )
+         .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapterNum)))
+         .orderBy(asc(bpVerse.verse));
 
     const ranges = await db
-        .select({
-            rangeId: bpRange.rangeId,
-            startVerseOrd: bpRange.startVerseOrd,
-            endVerseOrd: bpRange.endVerseOrd,
-            startVerseKey: bpRange.startVerseKey,
-            endVerseKey: bpRange.endVerseKey,
-            label: bpRange.label,
-        })
-        .from(bpRange)
-        .where(
-            and(
-                dsql`${bpRange.startVerseOrd} <= ${bounds.endVerseOrd}`,
-                dsql`${bpRange.endVerseOrd} >= ${bounds.startVerseOrd}`,
-            ),
-        )
-        .orderBy(asc(bpRange.startVerseOrd), asc(bpRange.endVerseOrd));
+         .select({
+             rangeId: bpRange.rangeId,
+             startVerseOrd: bpRange.startVerseOrd,
+             endVerseOrd: bpRange.endVerseOrd,
+             startVerseKey: bpRange.startVerseKey,
+             endVerseKey: bpRange.endVerseKey,
+             label: bpRange.label,
+             verseCount: bpRange.verseCount,
+             chapterCount: bpRange.chapterCount,
+             createdAt: bpRange.createdAt,
+         })
+         .from(bpRange)
+         .where(
+              and(
+                   dsql`${bpRange.startVerseOrd} <= ${bounds.endVerseOrd}`,
+                   dsql`${bpRange.endVerseOrd} >= ${bounds.startVerseOrd}`,
+              ),
+         )
+         .orderBy(asc(bpRange.startVerseOrd), asc(bpRange.endVerseOrd));
 
     const rangeIds = ranges.map((r) => r.rangeId);
 
     const links =
-        rangeIds.length === 0
-            ? []
-            : await db
-                .select({
-                    linkId: bpLink.linkId,
-                    rangeId: bpLink.rangeId,
-                    targetKind: bpLink.targetKind,
-                    targetId: bpLink.targetId,
-                    linkKind: bpLink.linkKind,
-                    weight: bpLink.weight,
-                    source: bpLink.source,
-                    confidence: bpLink.confidence,
-                })
-                .from(bpLink)
-                .where(inArray(bpLink.rangeId, rangeIds))
-                .orderBy(asc(bpLink.rangeId), asc(bpLink.linkKind));
+         rangeIds.length === 0
+              ? []
+              : await db
+                   .select({
+                       linkId: bpLink.linkId,
+                       rangeId: bpLink.rangeId,
+                       targetKind: bpLink.targetKind,
+                       targetId: bpLink.targetId,
+                       linkKind: bpLink.linkKind,
+                       weight: bpLink.weight,
+                       source: bpLink.source,
+                       confidence: bpLink.confidence,
+                   })
+                   .from(bpLink)
+                   .where(inArray(bpLink.rangeId, rangeIds))
+                   .orderBy(asc(bpLink.rangeId), asc(bpLink.linkKind));
 
     const crossrefs =
-        rangeIds.length === 0
-            ? []
-            : await db
-                .select({
-                    crossrefId: bpCrossref.crossrefId,
-                    fromRangeId: bpCrossref.fromRangeId,
-                    toRangeId: bpCrossref.toRangeId,
-                    kind: bpCrossref.kind,
-                    source: bpCrossref.source,
-                    confidence: bpCrossref.confidence,
-                })
-                .from(bpCrossref)
-                .where(inArray(bpCrossref.fromRangeId, rangeIds))
-                .orderBy(asc(bpCrossref.fromRangeId));
+         rangeIds.length === 0
+              ? []
+              : await db
+                   .select({
+                       crossrefId: bpCrossref.crossrefId,
+                       fromRangeId: bpCrossref.fromRangeId,
+                       toRangeId: bpCrossref.toRangeId,
+                       kind: bpCrossref.kind,
+                       source: bpCrossref.source,
+                       confidence: bpCrossref.confidence,
+                       noteNeutral: bpCrossref.noteNeutral,
+                   })
+                   .from(bpCrossref)
+                   .where(inArray(bpCrossref.fromRangeId, rangeIds))
+                   .orderBy(asc(bpCrossref.fromRangeId));
 
     return jsonOk(c, {
         translationId,
@@ -11539,107 +12697,114 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
     });
 });
 
-// PERSON drawer
 app.get("/people/:id", async (c) => {
     cachePublic(c, 60);
-    const id = c.req.param("id");
 
+    const idP = EntityIdSchema.safeParse(c.req.param("id"));
+    if (!idP.success) return jsonErr(c, 400, "BAD_ID", "Invalid id.");
+
+    const id = idP.data;
     const base = await fetchEntityBase("PERSON", id);
     if (!base) return jsonOk(c, null);
 
     const relFrom = await db
-        .select({
-            relationId: bpEntityRelation.relationId,
-            fromEntityId: bpEntityRelation.fromEntityId,
-            toEntityId: bpEntityRelation.toEntityId,
-            kind: bpEntityRelation.kind,
-            timeSpanId: bpEntityRelation.timeSpanId,
-            source: bpEntityRelation.source,
-            confidence: bpEntityRelation.confidence,
-            noteNeutral: bpEntityRelation.noteNeutral,
-        })
-        .from(bpEntityRelation)
-        .where(eq(bpEntityRelation.fromEntityId, id));
+         .select({
+             relationId: bpEntityRelation.relationId,
+             fromEntityId: bpEntityRelation.fromEntityId,
+             toEntityId: bpEntityRelation.toEntityId,
+             kind: bpEntityRelation.kind,
+             timeSpanId: bpEntityRelation.timeSpanId,
+             source: bpEntityRelation.source,
+             confidence: bpEntityRelation.confidence,
+             noteNeutral: bpEntityRelation.noteNeutral,
+         })
+         .from(bpEntityRelation)
+         .where(eq(bpEntityRelation.fromEntityId, id));
 
     const relTo = await db
-        .select({
-            relationId: bpEntityRelation.relationId,
-            fromEntityId: bpEntityRelation.fromEntityId,
-            toEntityId: bpEntityRelation.toEntityId,
-            kind: bpEntityRelation.kind,
-            timeSpanId: bpEntityRelation.timeSpanId,
-            source: bpEntityRelation.source,
-            confidence: bpEntityRelation.confidence,
-            noteNeutral: bpEntityRelation.noteNeutral,
-        })
-        .from(bpEntityRelation)
-        .where(eq(bpEntityRelation.toEntityId, id));
+         .select({
+             relationId: bpEntityRelation.relationId,
+             fromEntityId: bpEntityRelation.fromEntityId,
+             toEntityId: bpEntityRelation.toEntityId,
+             kind: bpEntityRelation.kind,
+             timeSpanId: bpEntityRelation.timeSpanId,
+             source: bpEntityRelation.source,
+             confidence: bpEntityRelation.confidence,
+             noteNeutral: bpEntityRelation.noteNeutral,
+         })
+         .from(bpEntityRelation)
+         .where(eq(bpEntityRelation.toEntityId, id));
 
     return jsonOk(c, { ...base, relations: { from: relFrom, to: relTo } });
 });
 
-// PLACE drawer
 app.get("/places/:id", async (c) => {
     cachePublic(c, 60);
-    const id = c.req.param("id");
 
+    const idP = EntityIdSchema.safeParse(c.req.param("id"));
+    if (!idP.success) return jsonErr(c, 400, "BAD_ID", "Invalid id.");
+
+    const id = idP.data;
     const base = await fetchEntityBase("PLACE", id);
     if (!base) return jsonOk(c, null);
 
     const geos = await db
-        .select({
-            placeGeoId: bpPlaceGeo.placeGeoId,
-            geoType: bpPlaceGeo.geoType,
-            lat: bpPlaceGeo.lat,
-            lng: bpPlaceGeo.lng,
-            bbox: bpPlaceGeo.bbox,
-            polygon: bpPlaceGeo.polygon,
-            precisionM: bpPlaceGeo.precisionM,
-            source: bpPlaceGeo.source,
-            confidence: bpPlaceGeo.confidence,
-        })
-        .from(bpPlaceGeo)
-        .where(eq(bpPlaceGeo.entityId, id));
+         .select({
+             placeGeoId: bpPlaceGeo.placeGeoId,
+             geoType: bpPlaceGeo.geoType,
+             lat: bpPlaceGeo.lat,
+             lng: bpPlaceGeo.lng,
+             bbox: bpPlaceGeo.bbox,
+             polygon: bpPlaceGeo.polygon,
+             precisionM: bpPlaceGeo.precisionM,
+             source: bpPlaceGeo.source,
+             confidence: bpPlaceGeo.confidence,
+         })
+         .from(bpPlaceGeo)
+         .where(eq(bpPlaceGeo.entityId, id));
 
     return jsonOk(c, { ...base, geos });
 });
 
-// EVENT drawer
 app.get("/events/:id", async (c) => {
     cachePublic(c, 60);
-    const id = c.req.param("id");
+
+    const idP = EntityIdSchema.safeParse(c.req.param("id"));
+    if (!idP.success) return jsonErr(c, 400, "BAD_ID", "Invalid id.");
+
+    const id = idP.data;
 
     const ev = await db
-        .select({
-            eventId: bpEvent.eventId,
-            canonicalTitle: bpEvent.canonicalTitle,
-            kind: bpEvent.kind,
-            primaryRangeId: bpEvent.primaryRangeId,
-            timeSpanId: bpEvent.timeSpanId,
-            primaryPlaceId: bpEvent.primaryPlaceId,
-            source: bpEvent.source,
-            confidence: bpEvent.confidence,
-        })
-        .from(bpEvent)
-        .where(eq(bpEvent.eventId, id))
-        .limit(1);
+         .select({
+             eventId: bpEvent.eventId,
+             canonicalTitle: bpEvent.canonicalTitle,
+             kind: bpEvent.kind,
+             primaryRangeId: bpEvent.primaryRangeId,
+             timeSpanId: bpEvent.timeSpanId,
+             primaryPlaceId: bpEvent.primaryPlaceId,
+             source: bpEvent.source,
+             confidence: bpEvent.confidence,
+             summaryNeutral: bpEvent.summaryNeutral,
+         })
+         .from(bpEvent)
+         .where(eq(bpEvent.eventId, id))
+         .limit(1);
 
     if (!ev[0]) return jsonOk(c, null);
 
     const participants = await db
-        .select({
-            eventParticipantId: bpEventParticipant.eventParticipantId,
-            entityId: bpEventParticipant.entityId,
-            role: bpEventParticipant.role,
-            confidence: bpEventParticipant.confidence,
-        })
-        .from(bpEventParticipant)
-        .where(eq(bpEventParticipant.eventId, id));
+         .select({
+             eventParticipantId: bpEventParticipant.eventParticipantId,
+             entityId: bpEventParticipant.entityId,
+             role: bpEventParticipant.role,
+             confidence: bpEventParticipant.confidence,
+         })
+         .from(bpEventParticipant)
+         .where(eq(bpEventParticipant.eventId, id));
 
     return jsonOk(c, { event: ev[0], participants });
 });
 
-// Search
 app.get("/search", withRateLimit("search"), async (c) => {
     cachePrivate(c, 10);
 
@@ -11655,52 +12820,56 @@ app.get("/search", withRateLimit("search"), async (c) => {
     const translationId = picked.translationId;
 
     if (hasFts()) {
-        const rows = sqlite
-            .query(
-                `
-                    SELECT
-                        v.book_id    AS bookId,
-                        v.chapter    AS chapter,
-                        v.verse      AS verse,
-                        v.verse_key  AS verseKey,
-                        v.verse_ord  AS verseOrd,
-                        snippet(bp_verse_text_fts, 2, '‹', '›', '…', 24) AS snippet
-                    FROM bp_verse_text_fts
-                    JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
-                    JOIN bp_verse v      ON v.verse_key = t.verse_key
-                    WHERE bp_verse_text_fts MATCH ?
-                      AND t.translation_id = ?
-                    ORDER BY bm25(bp_verse_text_fts)
-                    LIMIT ?;
-                `,
-            )
-            .all(q, translationId, limit) as Array<{
-            bookId: string;
-            chapter: number;
-            verse: number;
-            verseKey: string;
-            verseOrd: number;
-            snippet: string;
-        }>;
+        try {
+            const rows = sqlite
+                 .query(
+                      `
+                        SELECT
+                            v.book_id    AS bookId,
+                            v.chapter    AS chapter,
+                            v.verse      AS verse,
+                            v.verse_key  AS verseKey,
+                            v.verse_ord  AS verseOrd,
+                            snippet(bp_verse_text_fts, 2, '‹', '›', '…', 24) AS snippet
+                        FROM bp_verse_text_fts
+                        JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
+                        JOIN bp_verse v      ON v.verse_key = t.verse_key
+                        WHERE bp_verse_text_fts MATCH ?
+                          AND t.translation_id = ?
+                        ORDER BY bm25(bp_verse_text_fts)
+                        LIMIT ?;
+                    `,
+                 )
+                 .all(q, translationId, limit) as Array<{
+                bookId: string;
+                chapter: number;
+                verse: number;
+                verseKey: string;
+                verseOrd: number;
+                snippet: string;
+            }>;
 
-        return jsonOk(c, { q, mode: "fts" as const, results: rows });
+            return jsonOk(c, { q, mode: "fts" as const, results: rows });
+        } catch {
+            // fall through to LIKE for malformed FTS query syntax
+        }
     }
 
-    const likeQ = `%${q}%`;
+    const likeQ = `%${escapeLike(q)}%`;
     const rows = await db
-        .select({
-            verseKey: bpVerse.verseKey,
-            bookId: bpVerse.bookId,
-            chapter: bpVerse.chapter,
-            verse: bpVerse.verse,
-            verseOrd: bpVerse.verseOrd,
-            text: bpVerseText.text,
-        })
-        .from(bpVerseText)
-        .innerJoin(bpVerse, eq(bpVerse.verseKey, bpVerseText.verseKey))
-        .where(and(eq(bpVerseText.translationId, translationId), like(bpVerseText.text, likeQ)))
-        .orderBy(desc(bpVerse.verseOrd))
-        .limit(limit);
+         .select({
+             verseKey: bpVerse.verseKey,
+             bookId: bpVerse.bookId,
+             chapter: bpVerse.chapter,
+             verse: bpVerse.verse,
+             verseOrd: bpVerse.verseOrd,
+             text: bpVerseText.text,
+         })
+         .from(bpVerseText)
+         .innerJoin(bpVerse, eq(bpVerse.verseKey, bpVerseText.verseKey))
+         .where(and(eq(bpVerseText.translationId, translationId), like(bpVerseText.text, likeQ)))
+         .orderBy(desc(bpVerse.verseOrd))
+         .limit(limit);
 
     const results = rows.map((r) => {
         const text = r.text ?? "";
@@ -11710,7 +12879,7 @@ app.get("/search", withRateLimit("search"), async (c) => {
             verse: r.verse,
             verseKey: r.verseKey,
             verseOrd: r.verseOrd,
-            snippet: text.length > 200 ? text.slice(0, 197) + "…" : text,
+            snippet: text.length > 200 ? `${text.slice(0, 197)}…` : text,
         };
     });
 
@@ -11730,13 +12899,17 @@ if (LISTEN) {
     const server = Bun.serve({ port: PORT, fetch: apiFetch });
 
     // eslint-disable-next-line no-console
-    console.log(`[api] listening on http://localhost:${server.port}`);
+    console.log(
+         `[api] listening on http://localhost:${server.port} (source=${PORT_INFO.source}${
+              PORT_INFO.raw ? ` raw=${JSON.stringify(PORT_INFO.raw)}` : ""
+         })`,
+    );
 
     // eslint-disable-next-line no-console
     console.log(
-        `[api] translation=${ENV_TRANSLATION_ID || cachedTranslations.defaultId || "(none)"} fts=${
-            hasFts() ? "on" : "off"
-        } verses=${spine.verseCount} ordMax=${spine.verseOrdMax} auth=${AUTH_ENABLED ? "on" : "off"} env=${NODE_ENV}`,
+         `[api] translation=${ENV_TRANSLATION_ID || cachedTranslations.defaultId || "(none)"} fts=${
+              hasFts() ? "on" : "off"
+         } verses=${spine.verseCount} ordMax=${spine.verseOrdMax} auth=${AUTH_ENABLED ? "on" : "off"} env=${NODE_ENV}`,
     );
 
     let shuttingDown = false;
@@ -11764,13 +12937,13 @@ if (LISTEN) {
 
 /* ------------------------------- Dev exports ------------------------------- */
 
-// Useful for tests/admin hooks if you later add them.
 export const __internal = {
     invalidateTranslationsCache,
     invalidateSpineStats,
     hasFts,
     getSpineStats,
     getTranslationsCached,
+    escapeLike,
 };
 ```
 
@@ -13535,39 +14708,17 @@ import React, {
     useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { LogIn, LogOut, RefreshCcw, UserRound, ChevronDown } from "lucide-react";
+import { ChevronDown, LogIn, LogOut, RefreshCcw, UserRound } from "lucide-react";
 import { useAuth } from "./useAuth";
 
 type Size = "sm" | "md";
 
 export type Props = {
     size?: Size;
-
-    /**
-     * Default: false (toolbar mode) — icon-only trigger.
-     * If true, shows a compact label next to the avatar when signed in.
-     */
     showLabelWhenSignedIn?: boolean;
-
     align?: "left" | "right";
     style?: React.CSSProperties;
 };
-
-// Safe layout effect for SSR compatibility
-const useIsomorphicLayoutEffect =
-    typeof window !== "undefined" ? useLayoutEffect : useEffect;
-
-function initials(nameOrEmail: string): string {
-    const s = String(nameOrEmail ?? "").trim();
-    if (!s) return "U";
-    const parts = s.split(/\s+/g).filter(Boolean);
-    if (parts.length >= 2) return (parts[0]![0] + parts[1]![0]).toUpperCase();
-    return s.slice(0, 2).toUpperCase();
-}
-
-function clamp(n: number, lo: number, hi: number): number {
-    return Math.max(lo, Math.min(hi, n));
-}
 
 type PopPos = {
     top: number;
@@ -13577,10 +14728,21 @@ type PopPos = {
     transformOrigin: string;
 };
 
-function safeFocus(el: HTMLElement | null | undefined) {
+type MenuActionState = "idle" | "refreshing" | "signing_out" | "signing_in";
+
+const MENU_WIDTH = 264;
+
+const useIsomorphicLayoutEffect =
+     typeof window !== "undefined" ? useLayoutEffect : useEffect;
+
+function clamp(n: number, lo: number, hi: number): number {
+    return Math.max(lo, Math.min(hi, n));
+}
+
+function safeFocus(el: HTMLElement | null | undefined): void {
     if (!el) return;
     try {
-        el.focus({ preventScroll: true } as FocusOptions);
+        el.focus({ preventScroll: true });
     } catch {
         el.focus();
     }
@@ -13593,6 +14755,31 @@ function prefersReducedMotion(): boolean {
     } catch {
         return false;
     }
+}
+
+function formatUserLabel(user: { displayName: string | null; email: string | null } | null): string {
+    return user?.displayName?.trim() || user?.email?.trim() || "User";
+}
+
+function formatTriggerTitle(user: { displayName: string | null; email: string | null } | null): string {
+    if (!user) return "Sign in";
+    return user.displayName?.trim() || user.email?.trim() || "Account";
+}
+
+function initialsFromUser(user: { displayName: string | null; email: string | null } | null): string {
+    const base = formatUserLabel(user);
+    const s = base.trim();
+    if (!s) return "U";
+
+    const emailName = s.includes("@") ? s.split("@")[0] ?? s : s;
+    const normalized = emailName.replace(/[._-]+/g, " ").trim();
+    const parts = normalized.split(/\s+/g).filter(Boolean);
+
+    if (parts.length >= 2) {
+        return `${parts[0]![0] ?? ""}${parts[1]![0] ?? ""}`.toUpperCase();
+    }
+
+    return normalized.slice(0, 2).toUpperCase() || "U";
 }
 
 function usePopoverPosition(args: {
@@ -13618,9 +14805,9 @@ function usePopoverPosition(args: {
         const mh = menuRef.current?.getBoundingClientRect().height ?? 0;
 
         const left =
-            align === "right"
-                ? clamp(r.right - mw, margin, window.innerWidth - mw - margin)
-                : clamp(r.left, margin, window.innerWidth - mw - margin);
+             align === "right"
+                  ? clamp(r.right - mw, margin, window.innerWidth - mw - margin)
+                  : clamp(r.left, margin, window.innerWidth - mw - margin);
 
         const belowTop = r.bottom + gap;
         const aboveTop = r.top - gap - mh;
@@ -13629,12 +14816,10 @@ function usePopoverPosition(args: {
         const canFitAbove = aboveTop >= margin;
 
         const placement: PopPos["placement"] =
-            !canFitBelow && canFitAbove ? "top" : "bottom";
+             !canFitBelow && canFitAbove ? "top" : "bottom";
 
-        const top =
-            placement === "top"
-                ? aboveTop
-                : clamp(belowTop, margin, window.innerHeight - margin);
+        const unclampedTop = placement === "top" ? aboveTop : belowTop;
+        const top = clamp(unclampedTop, margin, Math.max(margin, window.innerHeight - mh - margin));
 
         const originX = align === "right" ? "right" : "left";
         const originY = placement === "top" ? "bottom" : "top";
@@ -13651,6 +14836,7 @@ function usePopoverPosition(args: {
     const schedule = useCallback(() => {
         if (typeof window === "undefined") return;
         if (rafRef.current != null) return;
+
         rafRef.current = window.requestAnimationFrame(() => {
             rafRef.current = null;
             compute();
@@ -13665,6 +14851,8 @@ function usePopoverPosition(args: {
 
         compute();
 
+        if (typeof window === "undefined") return;
+
         const onScroll = () => schedule();
         const onResize = () => schedule();
 
@@ -13674,100 +14862,81 @@ function usePopoverPosition(args: {
         const t = window.setTimeout(() => schedule(), 0);
 
         let ro: ResizeObserver | null = null;
-        if (typeof ResizeObserver !== "undefined" && menuRef.current) {
+        if (typeof ResizeObserver !== "undefined") {
             ro = new ResizeObserver(() => schedule());
-            ro.observe(menuRef.current);
+            if (menuRef.current) ro.observe(menuRef.current);
+            if (anchorRef.current) ro.observe(anchorRef.current);
         }
 
         return () => {
             window.clearTimeout(t);
             window.removeEventListener("resize", onResize);
             window.removeEventListener("scroll", onScroll, true);
+
             if (rafRef.current != null) {
                 window.cancelAnimationFrame(rafRef.current);
                 rafRef.current = null;
             }
+
             if (ro) ro.disconnect();
         };
-    }, [open, compute, schedule, menuRef]);
+    }, [open, compute, schedule, menuRef, anchorRef]);
 
     return pos;
 }
 
-/* --------------------------------- UI bits -------------------------------- */
-
 function AvatarCircle(props: {
-    userLabel: string;
-    pictureUrl?: string | null;
+    user: { displayName: string | null; email: string | null } | null;
     sizePx: number;
     signedIn: boolean;
 }) {
-    const { userLabel, pictureUrl, sizePx, signedIn } = props;
-    const [imgError, setImgError] = useState(false);
+    const { user, sizePx, signedIn } = props;
 
     const ring = "0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent)";
     const bg =
-        "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))";
-
-    if (pictureUrl && !imgError) {
-        return (
-            <img
-                src={pictureUrl}
-                alt={`${userLabel}'s avatar`}
-                draggable={false}
-                onError={() => setImgError(true)}
-                style={{
-                    width: sizePx,
-                    height: sizePx,
-                    borderRadius: 999,
-                    objectFit: "cover",
-                    boxShadow: ring,
-                    userSelect: "none",
-                    display: "block",
-                }}
-            />
-        );
-    }
+         "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))";
 
     if (!signedIn) {
         return (
-            <div
-                aria-hidden="true"
-                style={{
-                    width: sizePx,
-                    height: sizePx,
-                    borderRadius: 999,
-                    display: "grid",
-                    placeItems: "center",
-                    background: bg,
-                    boxShadow: ring,
-                }}
-            >
-                <UserRound size={Math.max(16, Math.floor(sizePx * 0.62))} />
-            </div>
+             <div
+                  aria-hidden="true"
+                  style={{
+                      width: sizePx,
+                      height: sizePx,
+                      borderRadius: 999,
+                      display: "grid",
+                      placeItems: "center",
+                      background: bg,
+                      boxShadow: ring,
+                      flex: "0 0 auto",
+                  }}
+             >
+                 <UserRound size={Math.max(16, Math.floor(sizePx * 0.62))} />
+             </div>
         );
     }
 
     return (
-        <div
-            aria-hidden="true"
-            style={{
-                width: sizePx,
-                height: sizePx,
-                borderRadius: 999,
-                display: "grid",
-                placeItems: "center",
-                fontSize: Math.max(11, Math.floor(sizePx * 0.46)),
-                fontWeight: 800,
-                letterSpacing: "0.04em",
-                color: "var(--fg)",
-                background: bg,
-                boxShadow: ring,
-                userSelect: "none",
-            }}
-        >
-            {initials(userLabel)}
-        </div>
+         <div
+              aria-hidden="true"
+              style={{
+                  width: sizePx,
+                  height: sizePx,
+                  borderRadius: 999,
+                  display: "grid",
+                  placeItems: "center",
+                  fontSize: Math.max(11, Math.floor(sizePx * 0.46)),
+                  fontWeight: 800,
+                  letterSpacing: "0.04em",
+                  color: "var(--fg)",
+                  background: bg,
+                  boxShadow: ring,
+                  userSelect: "none",
+                  flex: "0 0 auto",
+              }}
+         >
+             {initialsFromUser(user)}
+         </div>
     );
 }
 
@@ -13779,8 +14948,12 @@ function RowButton(props: {
     disabled?: boolean;
     autoFocus?: boolean;
     danger?: boolean;
+    busy?: boolean;
 }) {
+    const { label, hint, icon, onClick, disabled, autoFocus, danger, busy } = props;
     const [hover, setHover] = useState(false);
+
+    const isDisabled = !!disabled || !!busy;
 
     const base: React.CSSProperties = {
         width: "100%",
@@ -13791,66 +14964,66 @@ function RowButton(props: {
         borderRadius: 12,
         border: "1px solid transparent",
         background: "transparent",
-        color: props.danger ? "color-mix(in srgb, var(--fg) 82%, #b00020)" : "var(--fg)",
-        cursor: props.disabled ? "default" : "pointer",
+        color: danger ? "color-mix(in srgb, var(--fg) 82%, #b00020)" : "var(--fg)",
+        cursor: isDisabled ? "default" : "pointer",
         textAlign: "left",
         fontSize: 13,
         lineHeight: 1.2,
-        opacity: props.disabled ? 0.55 : 1,
+        opacity: isDisabled ? 0.58 : 1,
         userSelect: "none",
         WebkitTapHighlightColor: "transparent",
         outline: "none",
         transition: "all 0.15s cubic-bezier(0.16, 1, 0.3, 1)",
     };
 
-    const hoverStyle: React.CSSProperties = props.disabled
-        ? {}
-        : {
-            background: "color-mix(in srgb, var(--activeBg) 70%, transparent)",
-            borderColor: "color-mix(in srgb, var(--border) 60%, transparent)",
-        };
+    const hoverStyle: React.CSSProperties = isDisabled
+         ? {}
+         : {
+             background: "color-mix(in srgb, var(--activeBg) 70%, transparent)",
+             borderColor: "color-mix(in srgb, var(--border) 60%, transparent)",
+         };
 
     return (
-        <button
-            type="button"
-            role="menuitem"
-            disabled={props.disabled}
-            autoFocus={props.autoFocus}
-            onClick={() => {
-                if (props.disabled) return;
-                void props.onClick();
-            }}
-            onPointerEnter={() => setHover(true)}
-            onPointerLeave={() => setHover(false)}
-            onFocus={() => setHover(true)}
-            onBlur={() => setHover(false)}
-            style={{ ...base, ...(hover ? hoverStyle : null) }}
-        >
-            {props.icon ? (
-                <span
-                    aria-hidden="true"
-                    style={{
-                        width: 18,
-                        display: "grid",
-                        placeItems: "center",
-                        opacity: 0.95,
-                    }}
-                >
-          {props.icon}
-        </span>
-            ) : null}
+         <button
+              type="button"
+              role="menuitem"
+              disabled={isDisabled}
+              autoFocus={autoFocus}
+              aria-busy={busy || undefined}
+              onClick={() => {
+                  if (isDisabled) return;
+                  void onClick();
+              }}
+              onPointerEnter={() => setHover(true)}
+              onPointerLeave={() => setHover(false)}
+              onFocus={() => setHover(true)}
+              onBlur={() => setHover(false)}
+              style={{ ...base, ...(hover ? hoverStyle : null) }}
+         >
+             {icon ? (
+                  <span
+                       aria-hidden="true"
+                       style={{
+                           width: 18,
+                           display: "grid",
+                           placeItems: "center",
+                           opacity: 0.95,
+                           flex: "0 0 auto",
+                       }}
+                  >
+                    {icon}
+                </span>
+             ) : null}
 
-            <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ fontWeight: 780 }}>{props.label}</div>
-                {props.hint ? (
-                    <div style={{ fontSize: 12, opacity: 0.78, marginTop: 2 }}>{props.hint}</div>
-                ) : null}
-            </div>
-        </button>
+             <div style={{ minWidth: 0, flex: 1 }}>
+                 <div style={{ fontWeight: 780 }}>{label}</div>
+                 {hint ? (
+                      <div style={{ fontSize: 12, opacity: 0.78, marginTop: 2 }}>{hint}</div>
+                 ) : null}
+             </div>
+         </button>
     );
 }
-
-/* --------------------------------- Component -------------------------------- */
 
 export function AccountMenu({
                                 size = "sm",
@@ -13862,22 +15035,37 @@ export function AccountMenu({
 
     const btnRef = useRef<HTMLButtonElement | null>(null);
     const menuRef = useRef<HTMLDivElement | null>(null);
-    const wasOpen = useRef(false);
+    const wasOpenRef = useRef(false);
+    const mountedRef = useRef(true);
 
     const [open, setOpen] = useState(false);
     const [pressed, setPressed] = useState(false);
+    const [actionState, setActionState] = useState<MenuActionState>("idle");
 
     const reactId = useId();
     const triggerId = `acct-trigger-${reactId}`;
     const menuId = `acct-menu-${reactId}`;
 
+    const reducedMotion = useMemo(() => prefersReducedMotion(), []);
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+        };
+    }, []);
+
     const dims = useMemo(() => {
-        if (size === "md") return { btn: 38, avatar: 28, labelMax: 220, chevron: 16 };
+        if (size === "md") {
+            return { btn: 38, avatar: 28, labelMax: 220, chevron: 16 };
+        }
         return { btn: 32, avatar: 24, labelMax: 160, chevron: 14 };
     }, [size]);
 
     const signedIn = !!user;
-    const userLabel = user?.name || user?.email || "User";
+    const userLabel = formatUserLabel(user);
+    const triggerTitle = formatTriggerTitle(user);
+    const showLabel = signedIn && showLabelWhenSignedIn;
 
     const close = useCallback(() => setOpen(false), []);
     const openMenu = useCallback(() => setOpen(true), []);
@@ -13889,11 +15077,10 @@ export function AccountMenu({
         const shadowIdle = "0 8px 18px color-mix(in srgb, black 12%, transparent)";
         const shadowOpen = "0 14px 34px color-mix(in srgb, black 18%, transparent)";
 
-        const showLabel = showLabelWhenSignedIn && signedIn;
-
         return {
             height: dims.btn,
             minWidth: dims.btn,
+            maxWidth: showLabel ? dims.labelMax + dims.avatar + 30 : dims.btn,
             display: "inline-flex",
             alignItems: "center",
             justifyContent: "center",
@@ -13908,41 +15095,42 @@ export function AccountMenu({
             userSelect: "none",
             WebkitTapHighlightColor: "transparent",
             transition:
-                "box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.08s ease-out, background 0.15s ease-out",
+                 "box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.08s ease-out, background 0.15s ease-out",
             touchAction: "manipulation",
             transform: pressed ? "scale(0.965)" : "scale(1)",
             backgroundImage: open
-                ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 62%, transparent), transparent)"
-                : "none",
+                 ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 62%, transparent), transparent)"
+                 : "none",
             ...style,
         };
-    }, [dims.btn, open, pressed, showLabelWhenSignedIn, signedIn, style]);
+    }, [dims, open, pressed, showLabel, style]);
 
     const pos = usePopoverPosition({
         open,
         align,
-        menuWidth: 264,
+        menuWidth: MENU_WIDTH,
         anchorRef: btnRef,
         menuRef,
     });
 
-    const focusFirstItem = useCallback(() => {
-        const items = Array.from(
-            menuRef.current?.querySelectorAll('[role="menuitem"]:not([disabled])') || [],
-        ) as HTMLElement[];
-        safeFocus(items[0] ?? null);
+    const focusableItems = useCallback((): HTMLElement[] => {
+        return Array.from(
+             menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])') ?? [],
+        );
     }, []);
+
+    const focusFirstItem = useCallback(() => {
+        const items = focusableItems();
+        safeFocus(items[0] ?? null);
+    }, [focusableItems]);
 
     const focusLastItem = useCallback(() => {
-        const items = Array.from(
-            menuRef.current?.querySelectorAll('[role="menuitem"]:not([disabled])') || [],
-        ) as HTMLElement[];
+        const items = focusableItems();
         safeFocus(items[items.length - 1] ?? null);
-    }, []);
+    }, [focusableItems]);
 
-    // Close on outside click / escape / focus leaving
     useEffect(() => {
-        if (!open) return;
+        if (!open || typeof window === "undefined") return;
 
         const onKeyDown = (e: KeyboardEvent) => {
             if (e.key === "Escape") {
@@ -13952,20 +15140,20 @@ export function AccountMenu({
         };
 
         const onPointerDownCapture = (e: PointerEvent) => {
-            const t = e.target as Node | null;
-            if (!t || !btnRef.current || !menuRef.current) return;
+            const target = e.target as Node | null;
+            if (!target) return;
 
-            const inBtn = btnRef.current.contains(t);
-            const inMenu = menuRef.current.contains(t);
+            const inBtn = btnRef.current?.contains(target) ?? false;
+            const inMenu = menuRef.current?.contains(target) ?? false;
             if (!inBtn && !inMenu) close();
         };
 
         const onFocusInCapture = (e: FocusEvent) => {
-            const t = e.target as Node | null;
-            if (!t || !btnRef.current || !menuRef.current) return;
+            const target = e.target as Node | null;
+            if (!target) return;
 
-            const inBtn = btnRef.current.contains(t);
-            const inMenu = menuRef.current.contains(t);
+            const inBtn = btnRef.current?.contains(target) ?? false;
+            const inMenu = menuRef.current?.contains(target) ?? false;
             if (!inBtn && !inMenu) close();
         };
 
@@ -13980,306 +15168,350 @@ export function AccountMenu({
         };
     }, [open, close]);
 
-    // Return focus to trigger on close
     useEffect(() => {
-        if (wasOpen.current && !open) safeFocus(btnRef.current);
-        wasOpen.current = open;
+        if (wasOpenRef.current && !open) {
+            safeFocus(btnRef.current);
+        }
+        wasOpenRef.current = open;
     }, [open]);
 
-    // When opening, nudge focus into the menu after it's mounted
     useEffect(() => {
-        if (!open) return;
+        if (!open || typeof window === "undefined") return;
         const t = window.setTimeout(() => focusFirstItem(), 0);
         return () => window.clearTimeout(t);
     }, [open, focusFirstItem]);
 
-    // Keyboard navigation inside the menu (roving focus + wrap)
-    const handleMenuKeyDown = (e: React.KeyboardEvent) => {
-        if (e.key === "Tab") {
-            const items = Array.from(
-                menuRef.current?.querySelectorAll('[role="menuitem"]:not([disabled])') || [],
-            ) as HTMLElement[];
-            if (!items.length) return;
+    const handleMenuKeyDown = useCallback(
+         (e: React.KeyboardEvent) => {
+             const items = focusableItems();
 
-            const first = items[0]!;
-            const last = items[items.length - 1]!;
-            const active = document.activeElement as HTMLElement | null;
+             if (e.key === "Tab") {
+                 if (!items.length) return;
 
-            if (e.shiftKey) {
-                if (active === first || !menuRef.current?.contains(active)) {
-                    e.preventDefault();
-                    safeFocus(last);
-                }
-            } else {
-                if (active === last) {
-                    e.preventDefault();
-                    safeFocus(first);
-                }
+                 const first = items[0]!;
+                 const last = items[items.length - 1]!;
+                 const active = document.activeElement as HTMLElement | null;
+
+                 if (e.shiftKey) {
+                     if (active === first || !menuRef.current?.contains(active)) {
+                         e.preventDefault();
+                         safeFocus(last);
+                     }
+                 } else if (active === last) {
+                     e.preventDefault();
+                     safeFocus(first);
+                 }
+                 return;
+             }
+
+             if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                 e.preventDefault();
+                 if (!items.length) return;
+
+                 const active = document.activeElement as HTMLElement | null;
+                 const index = items.indexOf(active ?? items[0]!);
+                 let nextIndex = e.key === "ArrowDown" ? index + 1 : index - 1;
+
+                 if (nextIndex >= items.length) nextIndex = 0;
+                 if (nextIndex < 0) nextIndex = items.length - 1;
+
+                 safeFocus(items[nextIndex] ?? null);
+                 return;
+             }
+
+             if (e.key === "Home") {
+                 e.preventDefault();
+                 focusFirstItem();
+                 return;
+             }
+
+             if (e.key === "End") {
+                 e.preventDefault();
+                 focusLastItem();
+             }
+         },
+         [focusableItems, focusFirstItem, focusLastItem],
+    );
+
+    const onTriggerKeyDown = useCallback(
+         (e: React.KeyboardEvent) => {
+             if (e.key === "ArrowDown") {
+                 e.preventDefault();
+                 if (!open) openMenu();
+                 else focusFirstItem();
+                 return;
+             }
+
+             if (e.key === "ArrowUp") {
+                 e.preventDefault();
+                 if (!open) openMenu();
+                 else focusLastItem();
+                 return;
+             }
+
+             if (e.key === "Enter" || e.key === " ") {
+                 e.preventDefault();
+                 toggle();
+                 return;
+             }
+
+             if (e.key === "Escape" && open) {
+                 e.preventDefault();
+                 close();
+             }
+         },
+         [open, openMenu, toggle, close, focusFirstItem, focusLastItem],
+    );
+
+    const busy = loading || actionState !== "idle";
+
+    const handleRefresh = useCallback(async () => {
+        setActionState("refreshing");
+        try {
+            await refresh();
+        } finally {
+            if (mountedRef.current) {
+                setActionState("idle");
+                close();
             }
-            return;
         }
+    }, [refresh, close]);
 
-        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-            e.preventDefault();
-            const items = Array.from(
-                menuRef.current?.querySelectorAll('[role="menuitem"]:not([disabled])') || [],
-            ) as HTMLElement[];
-            if (!items.length) return;
-
-            const index = items.indexOf(document.activeElement as HTMLElement);
-            let nextIndex = e.key === "ArrowDown" ? index + 1 : index - 1;
-            if (nextIndex >= items.length) nextIndex = 0;
-            if (nextIndex < 0) nextIndex = items.length - 1;
-            safeFocus(items[nextIndex]);
-            return;
+    const handleSignOut = useCallback(async () => {
+        setActionState("signing_out");
+        try {
+            await signOut();
+        } finally {
+            if (mountedRef.current) {
+                setActionState("idle");
+                close();
+            }
         }
+    }, [signOut, close]);
 
-        if (e.key === "Home") {
-            e.preventDefault();
-            focusFirstItem();
-            return;
+    const handleSignIn = useCallback(() => {
+        setActionState("signing_in");
+        close();
+        try {
+            const returnTo =
+                 typeof window !== "undefined" ? window.location.href : undefined;
+            signInWithGoogle({ returnTo });
+        } catch {
+            if (mountedRef.current) {
+                setActionState("idle");
+            }
         }
+    }, [signInWithGoogle, close]);
 
-        if (e.key === "End") {
-            e.preventDefault();
-            focusLastItem();
-            return;
-        }
-    };
+    const menuStatusTitle = loading
+         ? "Checking…"
+         : signedIn
+              ? user?.displayName?.trim() || "Signed in"
+              : "Not signed in";
 
-    const onTriggerKeyDown = (e: React.KeyboardEvent) => {
-        if (e.key === "ArrowDown") {
-            e.preventDefault();
-            if (!open) openMenu();
-            return;
-        }
-        if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            toggle();
-            return;
-        }
-        if (e.key === "Escape" && open) {
-            e.preventDefault();
-            close();
-            return;
-        }
-    };
+    const menuStatusSubline = loading
+         ? "—"
+         : signedIn
+              ? user?.email?.trim() || "—"
+              : "Sign in to sync";
 
-    const reducedMotion = useMemo(() => prefersReducedMotion(), []);
+    const triggerText = loading ? "…" : triggerTitle;
 
-    const Menu =
-        open && pos
-            ? createPortal(
-                <>
-                    {/* Keep keyframes injected once per mount; respects reduced motion */}
-                    <style>{`
+    const menu =
+         open && pos && typeof document !== "undefined"
+              ? createPortal(
+                   <>
+                       <style>{`
               @keyframes acctScaleFadeIn {
                 from { opacity: 0; transform: translateY(-2px) scale(0.985); }
                 to { opacity: 1; transform: translateY(0) scale(1); }
               }
             `}</style>
 
-                    <div
-                        ref={menuRef}
-                        id={menuId}
-                        role="menu"
-                        aria-labelledby={triggerId}
-                        aria-label="Account menu"
-                        onKeyDown={handleMenuKeyDown}
-                        style={{
-                            position: "fixed",
-                            top: pos.top,
-                            left: pos.left,
-                            width: pos.width,
-                            zIndex: 100,
-                            borderRadius: 14,
-                            border: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
-                            background:
-                                "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))",
-                            boxShadow: "0 18px 60px color-mix(in srgb, black 22%, transparent)",
-                            backdropFilter: "blur(10px)",
-                            WebkitBackdropFilter: "blur(10px)",
-                            padding: 10,
-                            transformOrigin: pos.transformOrigin,
-                            animation: reducedMotion
-                                ? undefined
-                                : "acctScaleFadeIn 0.14s cubic-bezier(0.16, 1, 0.3, 1) forwards",
-                        }}
-                    >
-                        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 6px 8px 6px" }}>
-                            <AvatarCircle
-                                userLabel={userLabel}
-                                pictureUrl={user?.pictureUrl}
-                                sizePx={dims.avatar}
-                                signedIn={signedIn}
-                            />
-
-                            <div style={{ minWidth: 0, flex: 1 }}>
-                                <div
-                                    style={{
-                                        fontWeight: 820,
-                                        fontSize: 13,
-                                        whiteSpace: "nowrap",
-                                        overflow: "hidden",
-                                        textOverflow: "ellipsis",
-                                        opacity: loading ? 0.75 : 1,
-                                    }}
-                                >
-                                    {loading ? "Checking…" : signedIn ? user?.name || "Signed in" : "Not signed in"}
-                                </div>
-
-                                <div
-                                    style={{
-                                        fontSize: 12,
-                                        opacity: 0.78,
-                                        whiteSpace: "nowrap",
-                                        overflow: "hidden",
-                                        textOverflow: "ellipsis",
-                                    }}
-                                >
-                                    {loading ? "—" : signedIn ? user?.email || "—" : "Sign in to sync"}
-                                </div>
-                            </div>
-                        </div>
-
-                        {error ? (
-                            <div
-                                role="alert"
-                                style={{
-                                    margin: "0 6px 8px",
-                                    padding: "7px 9px",
-                                    borderRadius: 12,
-                                    border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
-                                    background: "color-mix(in srgb, var(--activeBg) 50%, transparent)",
-                                    fontSize: 12,
-                                    opacity: 0.9,
-                                }}
-                            >
-                                {error}
-                            </div>
-                        ) : null}
-
-                        <div
+                       <div
+                            ref={menuRef}
+                            id={menuId}
+                            role="menu"
+                            aria-labelledby={triggerId}
+                            aria-label="Account menu"
+                            onKeyDown={handleMenuKeyDown}
                             style={{
-                                height: 1,
-                                background: "color-mix(in srgb, var(--border) 70%, transparent)",
-                                margin: "6px 0 8px",
+                                position: "fixed",
+                                top: pos.top,
+                                left: pos.left,
+                                width: pos.width,
+                                zIndex: 100,
+                                borderRadius: 14,
+                                border: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
+                                background:
+                                     "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))",
+                                boxShadow: "0 18px 60px color-mix(in srgb, black 22%, transparent)",
+                                backdropFilter: "blur(10px)",
+                                WebkitBackdropFilter: "blur(10px)",
+                                padding: 10,
+                                transformOrigin: pos.transformOrigin,
+                                animation: reducedMotion
+                                     ? undefined
+                                     : "acctScaleFadeIn 0.14s cubic-bezier(0.16, 1, 0.3, 1) forwards",
                             }}
-                        />
-
-                        {!signedIn ? (
-                            <RowButton
-                                autoFocus
-                                label="Continue with Google"
-                                hint="Secure sign-in"
-                                disabled={loading}
-                                icon={<LogIn size={16} />}
-                                onClick={() => {
-                                    close();
-                                    // Always fire-and-forget; OAuth will navigate away.
-                                    try {
-                                        signInWithGoogle({ returnTo: window.location.href });
-                                    } catch {
-                                        /* no-op */
-                                    }
+                       >
+                           <div
+                                style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 10,
+                                    padding: "6px 6px 8px 6px",
                                 }}
-                            />
-                        ) : (
-                            <>
-                                <RowButton
-                                    autoFocus
-                                    label="Refresh session"
-                                    hint="Re-check login state"
-                                    disabled={loading}
-                                    icon={<RefreshCcw size={16} />}
-                                    onClick={async () => {
-                                        try {
-                                            await refresh();
-                                        } finally {
-                                            close();
-                                        }
-                                    }}
-                                />
+                           >
+                               <AvatarCircle user={user} sizePx={dims.avatar} signedIn={signedIn} />
 
-                                <RowButton
-                                    label="Sign out"
-                                    hint="End this session"
-                                    disabled={loading}
-                                    danger
-                                    icon={<LogOut size={16} />}
-                                    onClick={async () => {
-                                        try {
-                                            await signOut();
-                                        } finally {
-                                            close();
-                                        }
-                                    }}
-                                />
-                            </>
-                        )}
-                    </div>
-                </>,
-                document.body,
-            )
-            : null;
+                               <div style={{ minWidth: 0, flex: 1 }}>
+                                   <div
+                                        style={{
+                                            fontWeight: 820,
+                                            fontSize: 13,
+                                            whiteSpace: "nowrap",
+                                            overflow: "hidden",
+                                            textOverflow: "ellipsis",
+                                            opacity: loading ? 0.75 : 1,
+                                        }}
+                                   >
+                                       {menuStatusTitle}
+                                   </div>
 
-    const showLabel = signedIn && showLabelWhenSignedIn;
+                                   <div
+                                        style={{
+                                            fontSize: 12,
+                                            opacity: 0.78,
+                                            whiteSpace: "nowrap",
+                                            overflow: "hidden",
+                                            textOverflow: "ellipsis",
+                                        }}
+                                   >
+                                       {menuStatusSubline}
+                                   </div>
+                               </div>
+                           </div>
+
+                           {error ? (
+                                <div
+                                     role="alert"
+                                     style={{
+                                         margin: "0 6px 8px",
+                                         padding: "7px 9px",
+                                         borderRadius: 12,
+                                         border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
+                                         background: "color-mix(in srgb, var(--activeBg) 50%, transparent)",
+                                         fontSize: 12,
+                                         opacity: 0.9,
+                                     }}
+                                >
+                                    {error}
+                                </div>
+                           ) : null}
+
+                           <div
+                                style={{
+                                    height: 1,
+                                    background: "color-mix(in srgb, var(--border) 70%, transparent)",
+                                    margin: "6px 0 8px",
+                                }}
+                           />
+
+                           {!signedIn ? (
+                                <RowButton
+                                     autoFocus
+                                     label="Continue with Google"
+                                     hint="Secure sign-in"
+                                     disabled={loading}
+                                     busy={actionState === "signing_in"}
+                                     icon={<LogIn size={16} />}
+                                     onClick={handleSignIn}
+                                />
+                           ) : (
+                                <>
+                                    <RowButton
+                                         autoFocus
+                                         label="Refresh session"
+                                         hint="Re-check login state"
+                                         disabled={loading}
+                                         busy={actionState === "refreshing"}
+                                         icon={<RefreshCcw size={16} />}
+                                         onClick={handleRefresh}
+                                    />
+
+                                    <RowButton
+                                         label="Sign out"
+                                         hint="End this session"
+                                         disabled={loading}
+                                         busy={actionState === "signing_out"}
+                                         danger
+                                         icon={<LogOut size={16} />}
+                                         onClick={handleSignOut}
+                                    />
+                                </>
+                           )}
+                       </div>
+                   </>,
+                   document.body,
+              )
+              : null;
 
     return (
-        <>
-            <button
-                ref={btnRef}
-                id={triggerId}
-                type="button"
-                aria-haspopup="menu"
-                aria-controls={open ? menuId : undefined}
-                aria-expanded={open}
-                title={signedIn ? user?.name || user?.email || "Account" : "Sign in"}
-                onKeyDown={onTriggerKeyDown}
-                onClick={toggle}
-                onPointerDown={() => setPressed(true)}
-                onPointerUp={() => setPressed(false)}
-                onPointerCancel={() => setPressed(false)}
-                onPointerLeave={() => setPressed(false)}
-                style={anchorStyle}
-            >
-                <AvatarCircle userLabel={userLabel} pictureUrl={user?.pictureUrl} sizePx={dims.avatar} signedIn={signedIn} />
+         <>
+             <button
+                  ref={btnRef}
+                  id={triggerId}
+                  type="button"
+                  aria-haspopup="menu"
+                  aria-controls={open ? menuId : undefined}
+                  aria-expanded={open}
+                  title={triggerTitle}
+                  onKeyDown={onTriggerKeyDown}
+                  onClick={toggle}
+                  onPointerDown={() => setPressed(true)}
+                  onPointerUp={() => setPressed(false)}
+                  onPointerCancel={() => setPressed(false)}
+                  onPointerLeave={() => setPressed(false)}
+                  style={anchorStyle}
+             >
+                 <AvatarCircle user={user} sizePx={dims.avatar} signedIn={signedIn} />
 
-                {showLabel ? (
-                    <>
-            <span
-                style={{
-                    fontSize: 13,
-                    fontWeight: 780,
-                    whiteSpace: "nowrap",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    maxWidth: dims.labelMax,
-                    opacity: loading ? 0.7 : 1,
-                    paddingRight: 0,
-                }}
-            >
-              {loading ? "…" : user?.name || user?.email || "Account"}
-            </span>
-
-                        {/* tiny chevron gives “menu” affordance without clutter */}
+                 {showLabel ? (
+                      <>
                         <span
-                            aria-hidden="true"
-                            style={{
-                                display: "grid",
-                                placeItems: "center",
-                                opacity: 0.7,
-                                marginLeft: -2,
-                            }}
+                             style={{
+                                 fontSize: 13,
+                                 fontWeight: 780,
+                                 whiteSpace: "nowrap",
+                                 overflow: "hidden",
+                                 textOverflow: "ellipsis",
+                                 maxWidth: dims.labelMax,
+                                 opacity: loading ? 0.7 : 1,
+                                 paddingRight: 0,
+                             }}
                         >
-              <ChevronDown size={dims.chevron} />
-            </span>
-                    </>
-                ) : null}
-            </button>
+                            {triggerText}
+                        </span>
 
-            {Menu}
-        </>
+                          <span
+                               aria-hidden="true"
+                               style={{
+                                   display: "grid",
+                                   placeItems: "center",
+                                   opacity: 0.7,
+                                   marginLeft: -2,
+                                   flex: "0 0 auto",
+                               }}
+                          >
+                            <ChevronDown size={dims.chevron} />
+                        </span>
+                      </>
+                 ) : null}
+             </button>
+
+             {menu}
+         </>
     );
 }
 ```
@@ -14288,44 +15520,116 @@ export function AccountMenu({
 
 ```ts
 // apps/web/src/auth/authApi.ts
-// Biblia Populi — auth client (cookie session + Google OAuth redirect)
+// Biblia.to — auth client (cookie session + Google OAuth redirect)
+//
+// Aligned with current API envelope:
+//   { ok: true, data: ... }
+//   { ok: false, error: { code, message } }
+//
 // Goals:
-// - Never "fetch" an OAuth start URL (must be a top-level navigation)
-// - Robust JSON parsing (handles non-JSON + empty bodies)
-// - Standardized {ok:false,error} shape on transport failures
+// - Never fetch OAuth start URL; only top-level navigation
+// - Robust JSON parsing for empty / non-JSON / malformed responses
+// - Normalize transport/server failures into a stable ApiError
+// - Keep UI-facing auth types stable even if API internals evolve
+// - Align with current server.ts auth payloads
 
-export type ApiError = { code: string; message: string };
+export type ApiError = Readonly<{
+    code: string;
+    message: string;
+}>;
 
-export type AuthUser = {
+export type AuthUser = Readonly<{
     id: string;
     email: string | null;
-    name: string | null;
-    pictureUrl: string | null;
-};
+    displayName: string | null;
+    emailVerifiedAt: string | null;
+}>;
 
 export type AuthMePayload =
-    | { ok: true; user: AuthUser | null }
-    | { ok: false; error: ApiError };
+     | Readonly<{ ok: true; user: AuthUser | null }>
+     | Readonly<{ ok: false; error: ApiError }>;
 
-export type AuthOkPayload =
-    | { ok: true }
-    | { ok: false; error: ApiError };
+export type AuthLogoutPayload =
+     | Readonly<{ ok: true; redirect: string | null }>
+     | Readonly<{ ok: false; error: ApiError }>;
+
+type ApiEnvelopeOk<T> = Readonly<{ ok: true; data: T }>;
+type ApiEnvelopeErr = Readonly<{ ok: false; error: ApiError }>;
+type ApiEnvelope<T> = ApiEnvelopeOk<T> | ApiEnvelopeErr;
+
+type AuthMeResponseData = Readonly<{
+    user: {
+        id: string;
+        email: string | null;
+        displayName: string | null;
+        emailVerifiedAt: string | Date | null;
+        disabledAt?: string | Date | null;
+    } | null;
+}>;
+
+type AuthLogoutResponseData = Readonly<{
+    redirect?: string | null;
+}>;
 
 function trimSlash(s: string): string {
     return s.replace(/\/+$/, "");
 }
 
-export function apiBase(): string {
-    // Prefer Vite env, fallback to localhost API.
-    const v = (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_API_BASE;
-    if (typeof v === "string" && v.trim()) return trimSlash(v.trim());
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asStringOrNull(value: unknown): string | null {
+    return typeof value === "string" ? value : null;
+}
+
+function toIsoOrNull(value: unknown): string | null {
+    if (value == null) return null;
+    if (typeof value === "string") {
+        const t = value.trim();
+        return t.length > 0 ? t : null;
+    }
+    if (value instanceof Date && Number.isFinite(value.getTime())) {
+        return value.toISOString();
+    }
+    return null;
+}
+
+function normalizeAuthUser(input: unknown): AuthUser | null {
+    if (input == null) return null;
+    if (!isRecord(input)) return null;
+
+    const id = input.id;
+    if (typeof id !== "string" || id.trim().length === 0) return null;
+
+    return {
+        id: id.trim(),
+        email: asStringOrNull(input.email),
+        displayName: asStringOrNull(input.displayName),
+        emailVerifiedAt: toIsoOrNull(input.emailVerifiedAt),
+    };
+}
+
+function asApiError(code: string, message: string): ApiError {
+    const c = code.trim() || "unknown_error";
+    const m = message.trim() || c;
+    return { code: c, message: m };
+}
+
+function apiBase(): string {
+    const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
+    const explicit = env?.VITE_API_BASE;
+    if (typeof explicit === "string" && explicit.trim()) {
+        return trimSlash(explicit.trim());
+    }
     return "http://localhost:3000";
 }
+
+export { apiBase };
 
 function buildUrl(path: string): string {
     const base = apiBase();
     const p = path.startsWith("/") ? path : `/${path}`;
-    // Use URL to normalize any weirdness.
     return new URL(p, `${trimSlash(base)}/`).toString();
 }
 
@@ -14335,26 +15639,48 @@ function isJsonContentType(ct: string | null): boolean {
     return v.includes("application/json") || v.includes("+json");
 }
 
-function asApiError(code: string, message: string): ApiError {
-    return { code, message: message || code };
+function mergeHeaders(
+     base: Record<string, string>,
+     extra?: HeadersInit,
+): Headers {
+    const out = new Headers(base);
+    if (!extra) return out;
+
+    if (extra instanceof Headers) {
+        extra.forEach((value, key) => out.set(key, value));
+        return out;
+    }
+
+    if (Array.isArray(extra)) {
+        for (const [key, value] of extra) out.set(key, value);
+        return out;
+    }
+
+    for (const [key, value] of Object.entries(extra)) {
+        if (typeof value !== "undefined") out.set(key, String(value));
+    }
+    return out;
 }
 
-type FetchJsonOpts<T> = {
-    // When the server returns 204/empty body, return this value instead of erroring.
-    empty: T;
-};
+type FetchEnvelopeOptions<T> = Readonly<{
+    emptyOkData: T;
+}>;
 
-async function apiFetchJson<T>(path: string, init?: RequestInit, opts?: FetchJsonOpts<T>): Promise<T> {
+async function apiFetchEnvelope<T>(
+     path: string,
+     init: RequestInit,
+     opts: FetchEnvelopeOptions<T>,
+): Promise<ApiEnvelope<T>> {
     const url = buildUrl(path);
+    const hasBody = typeof init.body !== "undefined" && init.body !== null;
 
-    // NOTE: Do NOT force Content-Type for GET; it can trigger preflight.
-    // We send Accept and only send Content-Type when there is a body.
-    const hasBody = typeof init?.body !== "undefined" && init?.body !== null;
-    const headers: Record<string, string> = {
-        Accept: "application/json",
-        ...(hasBody ? { "Content-Type": "application/json" } : {}),
-        ...(init?.headers as Record<string, string> | undefined),
-    };
+    const headers = mergeHeaders(
+         {
+             Accept: "application/json",
+             ...(hasBody ? { "Content-Type": "application/json" } : {}),
+         },
+         init.headers,
+    );
 
     let res: Response;
     try {
@@ -14364,72 +15690,143 @@ async function apiFetchJson<T>(path: string, init?: RequestInit, opts?: FetchJso
             mode: "cors",
             headers,
         });
-    } catch (e) {
+    } catch (error) {
         return {
             ok: false,
-            error: asApiError("network_error", e instanceof Error ? e.message : "Network error"),
-        } as unknown as T;
+            error: asApiError(
+                 "network_error",
+                 error instanceof Error ? error.message : "Network error",
+            ),
+        };
     }
 
-    // Empty body (204 or no content)
-    if (res.status === 204) return opts?.empty ?? ({} as T);
+    if (res.status === 204) {
+        return { ok: true, data: opts.emptyOkData };
+    }
 
     const ct = res.headers.get("content-type");
     const text = await res.text();
-    const emptyBody = !text || !text.trim();
+    const trimmed = text.trim();
 
-    if (emptyBody) {
-        // Some servers will reply 200 with empty body on logout etc.
-        return opts?.empty ?? ((res.ok ? ({ ok: true } as unknown) : ({ ok: false } as unknown)) as T);
+    if (!trimmed) {
+        if (res.ok) {
+            return { ok: true, data: opts.emptyOkData };
+        }
+        return {
+            ok: false,
+            error: asApiError("empty_error_response", `HTTP ${res.status}`),
+        };
     }
 
-    if (isJsonContentType(ct)) {
-        try {
-            return JSON.parse(text) as T;
-        } catch {
+    if (!isJsonContentType(ct)) {
+        const msg = trimmed.length > 500 ? `${trimmed.slice(0, 500)}…` : trimmed;
+        return {
+            ok: false,
+            error: asApiError("non_json", msg || `HTTP ${res.status}`),
+        };
+    }
+
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(trimmed);
+    } catch {
+        return {
+            ok: false,
+            error: asApiError("bad_json", `Malformed JSON response (HTTP ${res.status})`),
+        };
+    }
+
+    if (!isRecord(parsed)) {
+        return {
+            ok: false,
+            error: asApiError("bad_payload", "Response payload is not an object"),
+        };
+    }
+
+    const ok = parsed.ok;
+    if (ok === false) {
+        const rawError = parsed.error;
+        if (isRecord(rawError)) {
             return {
                 ok: false,
-                error: asApiError("bad_json", text || `HTTP ${res.status}`),
-            } as unknown as T;
+                error: asApiError(
+                     typeof rawError.code === "string" ? rawError.code : "api_error",
+                     typeof rawError.message === "string" ? rawError.message : `HTTP ${res.status}`,
+                ),
+            };
         }
+        return {
+            ok: false,
+            error: asApiError("api_error", `HTTP ${res.status}`),
+        };
     }
 
-    // Non-JSON response: standardize into an API error shape.
-    // Keep the message short-ish; preserve status info.
-    const msg = text.length > 400 ? `${text.slice(0, 400)}…` : text;
+    if (ok === true) {
+        return {
+            ok: true,
+            data: ("data" in parsed ? (parsed.data as T) : opts.emptyOkData),
+        };
+    }
+
+    if (!res.ok) {
+        return {
+            ok: false,
+            error: asApiError("http_error", `HTTP ${res.status}`),
+        };
+    }
+
     return {
         ok: false,
-        error: asApiError("non_json", msg || `HTTP ${res.status}`),
-    } as unknown as T;
+        error: asApiError("bad_payload", "Missing ok field in API response"),
+    };
 }
 
 export async function apiAuthMe(signal?: AbortSignal): Promise<AuthMePayload> {
-    // If empty body: treat as signed out.
-    return apiFetchJson<AuthMePayload>("/auth/me", { method: "GET", signal }, { empty: { ok: true, user: null } });
+    const res = await apiFetchEnvelope<AuthMeResponseData>(
+         "/auth/me",
+         { method: "GET", signal },
+         { emptyOkData: { user: null } },
+    );
+
+    if (!res.ok) {
+        return res;
+    }
+
+    const user = normalizeAuthUser(res.data.user);
+    return { ok: true, user };
 }
 
-export async function apiAuthLogout(signal?: AbortSignal): Promise<AuthOkPayload> {
-    // If empty body: treat as ok.
-    return apiFetchJson<AuthOkPayload>("/auth/logout", { method: "POST", signal }, { empty: { ok: true } });
+export async function apiAuthLogout(signal?: AbortSignal): Promise<AuthLogoutPayload> {
+    const res = await apiFetchEnvelope<AuthLogoutResponseData>(
+         "/auth/logout",
+         { method: "POST", signal },
+         { emptyOkData: { redirect: null } },
+    );
+
+    if (!res.ok) {
+        return res;
+    }
+
+    return {
+        ok: true,
+        redirect: typeof res.data.redirect === "string" && res.data.redirect.trim()
+             ? res.data.redirect
+             : null,
+    };
 }
 
-export function googleStartUrl(returnTo?: string): string {
-    const base = buildUrl("/auth/google/start");
-    if (!returnTo) return base;
-
-    const u = new URL(base);
-    u.searchParams.set("returnTo", returnTo);
-    return u.toString();
+export function googleStartUrl(_returnTo?: string): string {
+    // Server currently owns redirect targets; ignore returnTo until explicitly supported server-side.
+    return buildUrl("/auth/google/start");
 }
 
 /**
- * IMPORTANT: OAuth start MUST be a top-level navigation, not fetch().
- * This helper exists so UI code can’t accidentally fetch it.
+ * IMPORTANT:
+ * OAuth start MUST be a top-level navigation, never fetch().
  */
 export function navigateToGoogleStart(returnTo?: string): void {
-    const rt = returnTo ?? (typeof window !== "undefined" ? window.location.href : "");
-    const url = googleStartUrl(rt);
-    // assign() preserves history semantics appropriately for login redirects
+    if (typeof window === "undefined") return;
+    const url = googleStartUrl(returnTo ?? window.location.href);
     window.location.assign(url);
 }
 ```
@@ -14438,229 +15835,349 @@ export function navigateToGoogleStart(returnTo?: string): void {
 
 ```tsx
 // apps/web/src/auth/useAuth.tsx
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import React, {
+    createContext,
+    useCallback,
+    useContext,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from "react";
 import { apiAuthLogout, apiAuthMe, navigateToGoogleStart, type AuthUser } from "./authApi";
 
 /**
- * Auth (calm + robust)
+ * Biblia.to — auth state provider
  *
- * Guarantees:
- * - Coalesces in-flight /auth/me (no storms)
- * - TTL caching (default 10s) to avoid hammering
- * - StrictMode-safe init (dev double-mount won’t double fetch)
- * - BroadcastChannel cross-tab sync (refresh on sign-in/out)
- * - signInWithGoogle navigates (never fetches OAuth start)
- *
- * Fixes vs your current version:
- * - No broadcast loops: we DO NOT broadcast "signed_in" from refresh().
- *   Only explicit signOut broadcasts (and optional external "refresh" can be sent by others).
- * - Correct return types: refreshImpl always returns Promise<void>.
- * - Safer event listeners (guard window/document existence).
- * - Better cleanup + abort handling.
+ * Properties:
+ * - coalesced /auth/me requests
+ * - TTL caching to avoid pointless hammering
+ * - StrictMode-safe initialization
+ * - cross-tab sync via BroadcastChannel + storage fallback
+ * - optimistic sign-out with server reconciliation
+ * - no OAuth fetch misuse; login is top-level navigation only
+ * - safe cleanup / abort / stale-request protection
  */
 
-type AuthState = {
+export type AuthState = Readonly<{
     loading: boolean;
     user: AuthUser | null;
     error: string | null;
 
     refresh: () => Promise<void>;
+    refreshForce: () => Promise<void>;
     signInWithGoogle: (opts?: { returnTo?: string }) => void;
     signOut: () => Promise<void>;
-};
+}>;
 
 const AuthContext = createContext<AuthState | null>(null);
 
 const AUTH_BC = "bp-auth";
+const AUTH_STORAGE_EVENT_KEY = "bp.auth.event.v1";
 const DEFAULT_ME_TTL_MS = 10_000;
 
-type Inflight = {
+type Inflight = Readonly<{
+    id: number;
     ac: AbortController;
     p: Promise<void>;
-};
+}>;
 
-type BroadcastMsg = { type: "refresh" | "signed_out" | "signed_in" };
+type BroadcastMsg = Readonly<{
+    type: "refresh" | "signed_out" | "signed_in";
+    at: number;
+}>;
 
 function nowMs(): number {
     return Date.now();
 }
 
+function isBrowser(): boolean {
+    return typeof window !== "undefined" && typeof document !== "undefined";
+}
+
+function isBroadcastMsg(value: unknown): value is BroadcastMsg {
+    if (!value || typeof value !== "object") return false;
+    const v = value as Record<string, unknown>;
+    return (
+         (v.type === "refresh" || v.type === "signed_out" || v.type === "signed_in") &&
+         typeof v.at === "number" &&
+         Number.isFinite(v.at)
+    );
+}
+
+function safePostStorageEvent(msg: BroadcastMsg): void {
+    if (!isBrowser()) return;
+    try {
+        window.localStorage.setItem(AUTH_STORAGE_EVENT_KEY, JSON.stringify(msg));
+    } catch {
+        // ignore
+    }
+}
+
+function safeParseStorageEvent(raw: string | null): BroadcastMsg | null {
+    if (!raw) return null;
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        return isBroadcastMsg(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
+function shouldRefreshForMessage(msg: BroadcastMsg): boolean {
+    return msg.type === "refresh" || msg.type === "signed_out" || msg.type === "signed_in";
+}
+
 export function AuthProvider(props: { children: React.ReactNode }) {
-    const [loading, setLoading] = useState(true);
+    const { children } = props;
+
+    const [loading, setLoading] = useState<boolean>(true);
     const [user, setUser] = useState<AuthUser | null>(null);
     const [error, setError] = useState<string | null>(null);
 
-    const inflight = useRef<Inflight | null>(null);
-    const hydrated = useRef(false);
-    const lastMeAt = useRef(0);
-
-    // StrictMode guard (effects can fire twice in dev)
-    const didInit = useRef(false);
+    const inflightRef = useRef<Inflight | null>(null);
+    const hydratedRef = useRef<boolean>(false);
+    const lastMeAtRef = useRef<number>(0);
+    const requestSeqRef = useRef<number>(0);
+    const initStartedRef = useRef<boolean>(false);
+    const unmountedRef = useRef<boolean>(false);
+    const bcRef = useRef<BroadcastChannel | null>(null);
+    const lastSeenBroadcastAtRef = useRef<number>(0);
 
     const postBroadcast = useCallback((msg: BroadcastMsg) => {
+        if (!isBrowser()) return;
+
+        lastSeenBroadcastAtRef.current = Math.max(lastSeenBroadcastAtRef.current, msg.at);
+
         try {
-            if (typeof window === "undefined") return;
-            if (!("BroadcastChannel" in window)) return;
-            const bc = new BroadcastChannel(AUTH_BC);
-            bc.postMessage(msg);
-            bc.close();
+            if ("BroadcastChannel" in window) {
+                if (!bcRef.current) {
+                    bcRef.current = new BroadcastChannel(AUTH_BC);
+                }
+                bcRef.current.postMessage(msg);
+            }
         } catch {
             // ignore
+        }
+
+        safePostStorageEvent(msg);
+    }, []);
+
+    const clearInflightIfSame = useCallback((id: number) => {
+        const current = inflightRef.current;
+        if (current && current.id === id) {
+            inflightRef.current = null;
         }
     }, []);
 
     const refreshImpl = useCallback(
-        async (force: boolean): Promise<void> => {
-            const t = nowMs();
+         async (force: boolean): Promise<void> => {
+             const now = nowMs();
 
-            // TTL gating
-            if (!force && hydrated.current && t - lastMeAt.current < DEFAULT_ME_TTL_MS) {
-                return;
-            }
+             if (!force && hydratedRef.current && now - lastMeAtRef.current < DEFAULT_ME_TTL_MS) {
+                 return;
+             }
 
-            // Coalesce if not forced
-            if (!force && inflight.current) {
-                return inflight.current.p;
-            }
+             if (!force && inflightRef.current) {
+                 return inflightRef.current.p;
+             }
 
-            // If forced, cancel the previous request
-            if (force && inflight.current) {
-                inflight.current.ac.abort();
-                inflight.current = null;
-            }
+             if (force && inflightRef.current) {
+                 inflightRef.current.ac.abort();
+                 inflightRef.current = null;
+             }
 
-            const ac = new AbortController();
+             const id = ++requestSeqRef.current;
+             const ac = new AbortController();
 
-            // Only show spinner for first hydration (avoid flicker)
-            if (!hydrated.current) setLoading(true);
+             if (!hydratedRef.current) {
+                 setLoading(true);
+             }
 
-            const p: Promise<void> = (async () => {
-                try {
-                    setError(null);
-                    const r = await apiAuthMe(ac.signal);
-                    if (ac.signal.aborted) return;
+             const p: Promise<void> = (async () => {
+                 try {
+                     setError(null);
 
-                    hydrated.current = true;
-                    lastMeAt.current = nowMs();
+                     const res = await apiAuthMe(ac.signal);
+                     if (ac.signal.aborted || unmountedRef.current) return;
 
-                    if (r.ok) {
-                        setUser(r.user);
-                        // IMPORTANT: do NOT broadcast "signed_in" here.
-                        // Broadcasting from refresh() causes cross-tab refresh loops.
-                    } else {
-                        setUser(null);
-                        // For non-ok, keep error message (useful in dev); prod could blank this.
-                        setError(r.error?.message ?? "Auth error");
-                    }
-                } catch (e) {
-                    if (ac.signal.aborted) return;
-                    hydrated.current = true;
-                    lastMeAt.current = nowMs();
-                    setUser(null);
-                    setError(e instanceof Error ? e.message : "Auth error");
-                } finally {
-                    if (!ac.signal.aborted) setLoading(false);
-                    if (inflight.current?.ac === ac) inflight.current = null;
-                }
-            })();
+                     hydratedRef.current = true;
+                     lastMeAtRef.current = nowMs();
 
-            inflight.current = { ac, p };
-            return p;
-        },
-        [],
+                     if (res.ok) {
+                         setUser(res.user);
+                         setError(null);
+                     } else {
+                         setUser(null);
+                         setError(res.error.message || "Auth error");
+                     }
+                 } catch (err) {
+                     if (ac.signal.aborted || unmountedRef.current) return;
+
+                     hydratedRef.current = true;
+                     lastMeAtRef.current = nowMs();
+                     setUser(null);
+                     setError(err instanceof Error ? err.message : "Auth error");
+                 } finally {
+                     if (!ac.signal.aborted && !unmountedRef.current) {
+                         setLoading(false);
+                     }
+                     clearInflightIfSame(id);
+                 }
+             })();
+
+             inflightRef.current = { id, ac, p };
+             return p;
+         },
+         [clearInflightIfSame],
     );
 
-    const refresh = useCallback(async () => {
+    const refresh = useCallback(async (): Promise<void> => {
         await refreshImpl(false);
     }, [refreshImpl]);
 
-    const refreshForce = useCallback(async () => {
+    const refreshForce = useCallback(async (): Promise<void> => {
         await refreshImpl(true);
     }, [refreshImpl]);
 
     useEffect(() => {
-        if (didInit.current) return;
-        didInit.current = true;
+        if (!isBrowser()) return;
+        if (initStartedRef.current) return;
 
-        if (typeof window === "undefined") return;
+        initStartedRef.current = true;
+        unmountedRef.current = false;
 
         void refreshForce();
 
-        const onFocus = () => void refreshForce();
-        const onVis = () => {
-            if (document.visibilityState === "visible") void refreshForce();
+        const onFocus = () => {
+            void refreshForce();
+        };
+
+        const onVisibilityChange = () => {
+            if (document.visibilityState === "visible") {
+                void refreshForce();
+            }
+        };
+
+        const onStorage = (ev: StorageEvent) => {
+            if (ev.key !== AUTH_STORAGE_EVENT_KEY) return;
+            const msg = safeParseStorageEvent(ev.newValue);
+            if (!msg) return;
+            if (msg.at <= lastSeenBroadcastAtRef.current) return;
+
+            lastSeenBroadcastAtRef.current = msg.at;
+            if (shouldRefreshForMessage(msg)) {
+                void refreshForce();
+            }
         };
 
         window.addEventListener("focus", onFocus);
-        document.addEventListener("visibilitychange", onVis);
+        document.addEventListener("visibilitychange", onVisibilityChange);
+        window.addEventListener("storage", onStorage);
 
-        // Cross-tab sync
-        let bc: BroadcastChannel | null = null;
         try {
             if ("BroadcastChannel" in window) {
-                bc = new BroadcastChannel(AUTH_BC);
-                bc.onmessage = (ev) => {
-                    const msg = ev?.data as Partial<BroadcastMsg> | undefined;
-                    if (!msg?.type) return;
+                bcRef.current = new BroadcastChannel(AUTH_BC);
+                bcRef.current.onmessage = (ev: MessageEvent<unknown>) => {
+                    const msg = ev.data;
+                    if (!isBroadcastMsg(msg)) return;
+                    if (msg.at <= lastSeenBroadcastAtRef.current) return;
 
-                    // Another tab tells us to refresh or changed auth state.
-                    if (msg.type === "refresh" || msg.type === "signed_out" || msg.type === "signed_in") {
+                    lastSeenBroadcastAtRef.current = msg.at;
+                    if (shouldRefreshForMessage(msg)) {
                         void refreshForce();
                     }
                 };
             }
         } catch {
-            bc = null;
+            bcRef.current = null;
         }
 
         return () => {
+            unmountedRef.current = true;
+
             window.removeEventListener("focus", onFocus);
-            document.removeEventListener("visibilitychange", onVis);
+            document.removeEventListener("visibilitychange", onVisibilityChange);
+            window.removeEventListener("storage", onStorage);
 
-            if (bc) bc.close();
+            const current = inflightRef.current;
+            if (current) {
+                current.ac.abort();
+                inflightRef.current = null;
+            }
 
-            inflight.current?.ac.abort();
-            inflight.current = null;
+            if (bcRef.current) {
+                try {
+                    bcRef.current.close();
+                } catch {
+                    // ignore
+                }
+                bcRef.current = null;
+            }
         };
     }, [refreshForce]);
 
     const signInWithGoogle = useCallback((opts?: { returnTo?: string }) => {
-        const rt = opts?.returnTo ?? window.location.href;
-        navigateToGoogleStart(rt);
-        // Optional: you *could* broadcast "signed_in" AFTER callback completes,
-        // but that should be done server-side redirect -> app load, not here.
+        if (!isBrowser()) return;
+        const returnTo = opts?.returnTo ?? window.location.href;
+        navigateToGoogleStart(returnTo);
     }, []);
 
-    const signOut = useCallback(async () => {
-        // Cancel any /me call; we're changing state
-        inflight.current?.ac.abort();
-        inflight.current = null;
+    const signOut = useCallback(async (): Promise<void> => {
+        const current = inflightRef.current;
+        if (current) {
+            current.ac.abort();
+            inflightRef.current = null;
+        }
 
-        // Optimistic local state
         setUser(null);
         setError(null);
+        setLoading(false);
 
         try {
             const ac = new AbortController();
-            await apiAuthLogout(ac.signal);
+            const res = await apiAuthLogout(ac.signal);
+
+            if (!res.ok) {
+                setError(res.error.message || "Sign out failed");
+            }
+
+            if (res.ok && res.redirect && isBrowser()) {
+                const redirect = res.redirect.trim();
+                if (redirect) {
+                    window.location.assign(redirect);
+                    return;
+                }
+            }
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Sign out failed");
         } finally {
-            // Notify other tabs, then force refresh to reflect server truth
-            postBroadcast({ type: "signed_out" });
+            postBroadcast({ type: "signed_out", at: nowMs() });
             await refreshForce();
         }
     }, [postBroadcast, refreshForce]);
 
     const value = useMemo<AuthState>(
-        () => ({ loading, user, error, refresh, signInWithGoogle, signOut }),
-        [loading, user, error, refresh, signInWithGoogle, signOut],
+         () => ({
+             loading,
+             user,
+             error,
+             refresh,
+             refreshForce,
+             signInWithGoogle,
+             signOut,
+         }),
+         [loading, user, error, refresh, refreshForce, signInWithGoogle, signOut],
     );
 
-    return <AuthContext.Provider value={value}>{props.children}</AuthContext.Provider>;
+    return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
 export function useAuth(): AuthState {
     const ctx = useContext(AuthContext);
-    if (!ctx) throw new Error("useAuth must be used within <AuthProvider />");
+    if (!ctx) {
+        throw new Error("useAuth must be used within <AuthProvider />");
+    }
     return ctx;
 }
 ```
@@ -14671,19 +16188,16 @@ export function useAuth(): AuthState {
 /* apps/web/src/base.css — Biblia.to (minimal, reading-first, premium)
  *
  * Goals:
- * - Paper-soft light mode (less harsh than pure white)
- * - Ink-like dark mode (high contrast, calm)
- * - Stable layout (no scrollbar jump)
- * - Premium transitions (theme swap without jitter)
- * - Excellent focus/accessibility defaults
- * - Scrollbars: subtle, themed, not obnoxious
- * - Overlay primitives (search/panels/popovers)
- * - Reader typography tokens (fixed measure; user controls font/weight/size)
- * - Annotation-friendly primitives (selection, ink layer, highlight color tokens)
+ * - Paper-soft light mode
+ * - Ink-like dark mode
+ * - Stable layout and scrollbars
+ * - Controlled theme transitions
+ * - Strong accessibility defaults
+ * - Reader/annotation-ready primitives
  *
  * Notes:
- * - Avoid “global transitions always on”: only enable transitions during theme swap via html.bp-theme-swap
- * - Keep tokens orientation-first. Component CSS can build on these primitives.
+ * - Theme transitions are enabled only during explicit swaps via html.bp-theme-swap
+ * - Layout tokens remain global primitives; component CSS should build on them
  */
 
 /* =========================================================
@@ -14691,19 +16205,44 @@ export function useAuth(): AuthState {
 ========================================================= */
 :root {
     /* ---------------- Fonts ---------------- */
-    --font-sans: "Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans",
-    "Apple Color Emoji", "Segoe UI Emoji";
-    --font-serif: "Literata Variable", Literata, ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
-    "Times New Roman", Times, serif;
-    --font-rounded: "Quicksand Variable", Quicksand, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial;
+    --font-sans:
+            "Inter Variable",
+            Inter,
+            ui-sans-serif,
+            system-ui,
+            -apple-system,
+            "Segoe UI",
+            Roboto,
+            Arial,
+            "Noto Sans",
+            "Apple Color Emoji",
+            "Segoe UI Emoji";
+    --font-serif:
+            "Literata Variable",
+            Literata,
+            ui-serif,
+            "Iowan Old Style",
+            "Palatino Linotype",
+            Palatino,
+            Georgia,
+            "Times New Roman",
+            Times,
+            serif;
+    --font-rounded:
+            "Quicksand Variable",
+            Quicksand,
+            ui-sans-serif,
+            system-ui,
+            -apple-system,
+            "Segoe UI",
+            Roboto,
+            Arial;
 
     /* ---------------- Reader Typography ---------------- */
     --bpScriptureFont: var(--font-serif);
     --bpScriptureSize: 18px;
     --bpScriptureLeading: 1.75;
     --bpScriptureWeight: 400;
-
-    /* Fixed width measure; user can change only font/weight/size in UI */
     --bpReaderMeasure: 840px;
 
     /* ---------------- Layout ---------------- */
@@ -14751,8 +16290,8 @@ export function useAuth(): AuthState {
     --overlay2: rgba(246, 244, 240, 0.96);
     --activeBg: rgba(16, 16, 18, 0.045);
 
-    /* Brand / accents (keep subtle; UI can opt-in) */
-    --accent: rgba(170, 34, 34, 0.92); /* your red cross */
+    /* Brand / accents */
+    --accent: rgba(170, 34, 34, 0.92);
     --accent2: rgba(170, 34, 34, 0.22);
     --link: rgba(16, 16, 18, 0.86);
 
@@ -14773,7 +16312,7 @@ export function useAuth(): AuthState {
     --scrollThumb: rgba(16, 16, 18, 0.18);
     --scrollThumbHover: rgba(16, 16, 18, 0.28);
 
-    /* Ambient (optional) */
+    /* Ambient */
     --ambientInk: rgba(16, 16, 18, 0.06);
     --ambientInk2: rgba(16, 16, 18, 0.04);
     --ambientParticle: rgba(16, 16, 18, 0.3);
@@ -14784,9 +16323,12 @@ export function useAuth(): AuthState {
     --hl-blue: rgba(120, 180, 255, 0.24);
     --ink: rgba(16, 16, 18, 0.72);
     --ink-soft: rgba(16, 16, 18, 0.42);
+
+    /* Scrollbar geometry */
+    --scrollSize: 10px;
+    --scrollRadius: 999px;
 }
 
-/* Prefer color-mix when supported (better theme coherence) */
 @supports (color: color-mix(in oklab, white, black)) {
     :root {
         --muted: color-mix(in oklab, var(--fg) 58%, transparent);
@@ -14909,11 +16451,16 @@ html {
     -webkit-text-size-adjust: 100%;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    color-scheme: light dark;
 
-    /* Better underline default */
+    /* Explicitly own form/control styling by theme */
+    color-scheme: light;
+
     text-underline-offset: 3px;
     text-decoration-thickness: 1.25px;
+}
+
+html[data-theme="dark"] {
+    color-scheme: dark;
 }
 
 body {
@@ -14951,10 +16498,15 @@ html.bp-theme-swap [data-overlay] {
 
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
-    * {
-        transition: none !important;
+    html {
+        scroll-behavior: auto;
+    }
+
+    *,
+    *::before,
+    *::after {
         animation: none !important;
-        scroll-behavior: auto !important;
+        transition: none !important;
     }
 }
 
@@ -15042,7 +16594,6 @@ textarea::placeholder {
     color: var(--muted);
 }
 
-/* Calm focus */
 :focus-visible {
     outline: 2px solid var(--focusRing);
     outline-offset: 2px;
@@ -15053,28 +16604,19 @@ textarea::placeholder {
     box-shadow: var(--focusShadow);
 }
 
-/* Disable iOS tap highlight where it causes glare */
 a,
 button {
     -webkit-tap-highlight-color: transparent;
 }
 
 /* =========================================================
-   Scrollbars (nice but subtle)
-   - Styles are best-effort: macOS overlay scrollbars may ignore
+   Scrollbars
 ========================================================= */
-:root {
-    --scrollSize: 10px;
-    --scrollRadius: 999px;
-}
-
-/* Firefox */
 * {
     scrollbar-width: thin;
     scrollbar-color: var(--scrollThumb) var(--scrollTrack);
 }
 
-/* Chromium/Safari */
 *::-webkit-scrollbar {
     width: var(--scrollSize);
     height: var(--scrollSize);
@@ -15094,7 +16636,6 @@ button {
     background-clip: padding-box;
 }
 
-/* Optional utility: hide scrollbars but keep scroll */
 .scrollbars-none {
     scrollbar-width: none;
 }
@@ -15125,21 +16666,25 @@ button {
 .hairline {
     border: var(--hairlineW) solid var(--hairline);
 }
+
 .muted {
     color: var(--muted);
 }
+
 .muted2 {
     color: var(--muted2);
 }
+
 .shadow-soft {
     box-shadow: var(--shadowSoft);
 }
+
 .shadow-pop {
     box-shadow: var(--shadowPop);
 }
 
 /* =========================================================
-   Buttons (basic primitives)
+   Buttons
 ========================================================= */
 .btn {
     display: inline-flex;
@@ -15154,14 +16699,15 @@ button {
     user-select: none;
     box-shadow: 0 8px 22px rgba(0, 0, 0, 0.06);
 }
+
 .btn:hover {
     border-color: var(--hairline2);
 }
+
 .btn:active {
     transform: translateY(0.5px);
 }
 
-/* Subtle “pill” */
 .pill {
     display: inline-flex;
     align-items: center;
@@ -15195,13 +16741,11 @@ button {
     font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
 }
 
-/* Fixed measure wrapper (use in ReaderViewport) */
 .measure {
     width: min(var(--bpReaderMeasure), calc(100% - 32px));
     margin-inline: auto;
 }
 
-/* Numbers / refs in scripture */
 .scripture .vnum,
 .scripture .cnum {
     font-family: var(--font-sans);
@@ -15212,7 +16756,7 @@ button {
 }
 
 /* =========================================================
-   Overlay primitives (search panels, popovers)
+   Overlay primitives
 ========================================================= */
 .bp-overlay {
     background: var(--overlay);
@@ -15232,36 +16776,34 @@ button {
 }
 
 /* =========================================================
-   Annotation helpers (optional UI classes)
+   Annotation helpers
 ========================================================= */
-
-/* highlight markup (you can render spans with this class) */
 .bp-hl {
     background: var(--hl-yellow);
     border-radius: 6px;
     padding: 0 2px;
 }
+
 .bp-hl--green {
     background: var(--hl-green);
 }
+
 .bp-hl--blue {
     background: var(--hl-blue);
 }
 
-/* Ink layer: place over text; make sure it doesn't steal scroll */
 .bp-ink-layer {
     position: absolute;
     inset: 0;
-    pointer-events: none; /* enable only while drawing */
+    pointer-events: none;
 }
 
-/* When actively drawing, enable pointer events */
 .bp-ink-layer.is-drawing {
     pointer-events: auto;
 }
 
 /* =========================================================
-   Ambient Helpers (optional)
+   Ambient Helpers
 ========================================================= */
 @keyframes bp-ambient-pulse {
     0%,
@@ -17965,7 +19507,15 @@ const s: Record<string, React.CSSProperties> = {
 
 ```tsx
 // apps/web/src/reader/prefs/ReaderPrefsProvider.tsx
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, {
+    createContext,
+    useCallback,
+    useContext,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from "react";
 import {
     applyReaderTypography,
     clearReaderTypography,
@@ -17979,14 +19529,15 @@ import {
 const LS_TRANSLATION = "bp_reader_translation_v1";
 
 type ReaderPrefsState = Readonly<{
-    // Typography overrides are enabled/disabled separately from the typography shape
-    // (because ReaderTypography itself does NOT include an `enabled` flag).
     typographyEnabled: boolean;
     setTypographyEnabled: (on: boolean) => void;
     toggleTypographyEnabled: () => void;
 
     typography: ReaderTypography;
-    setTypography: (patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>)) => void;
+    setTypography: (
+         patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>),
+    ) => void;
+    replaceTypography: (next: ReaderTypography) => void;
     resetTypography: () => void;
 
     translationId: string | null;
@@ -17995,143 +19546,225 @@ type ReaderPrefsState = Readonly<{
 
 const ReaderPrefsContext = createContext<ReaderPrefsState | null>(null);
 
+function isBrowser(): boolean {
+    return typeof window !== "undefined" && typeof document !== "undefined";
+}
+
 function safeGet(key: string): string | null {
     try {
-        return typeof window === "undefined" ? null : window.localStorage.getItem(key);
+        return isBrowser() ? window.localStorage.getItem(key) : null;
     } catch {
         return null;
     }
 }
+
 function safeSet(key: string, val: string): void {
     try {
-        if (typeof window === "undefined") return;
+        if (!isBrowser()) return;
         window.localStorage.setItem(key, val);
-    } catch {}
+    } catch {
+        // ignore
+    }
 }
+
 function safeDel(key: string): void {
     try {
-        if (typeof window === "undefined") return;
+        if (!isBrowser()) return;
         window.localStorage.removeItem(key);
-    } catch {}
+    } catch {
+        // ignore
+    }
+}
+
+function cleanTranslationId(value: string | null | undefined): string | null {
+    const s = (value ?? "").trim();
+    return s.length > 0 ? s : null;
 }
 
 function readTranslation(): string | null {
-    const v = safeGet(LS_TRANSLATION);
-    const s = (v ?? "").trim();
-    return s ? s : null;
+    return cleanTranslationId(safeGet(LS_TRANSLATION));
+}
+
+function cloneTypography(input: ReaderTypography): ReaderTypography {
+    return { ...input };
+}
+
+function safeLoadTypography(): ReaderTypography | null {
+    const loaded = loadReaderTypography();
+    return loaded ? cloneTypography(loaded) : null;
 }
 
 export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
-    const stored = useMemo(() => loadReaderTypography(), []);
+    const { children } = props;
 
-    const [typographyEnabled, setTypographyEnabledState] = useState<boolean>(!!stored);
-    const [typography, setTypographyState] = useState<ReaderTypography>(stored ?? DEFAULT_TYPOGRAPHY);
+    const initTypographyRef = useRef<ReaderTypography | null>(null);
+    if (initTypographyRef.current === null) {
+        initTypographyRef.current = safeLoadTypography();
+    }
 
+    const initialTypography = initTypographyRef.current;
+    const [typographyEnabled, setTypographyEnabledState] = useState<boolean>(!!initialTypography);
+    const [typography, setTypographyState] = useState<ReaderTypography>(
+         initialTypography ?? cloneTypography(DEFAULT_TYPOGRAPHY),
+    );
     const [translationId, setTranslationIdState] = useState<string | null>(() => readTranslation());
 
+    const mountedRef = useRef(true);
+    const appliedTypographyRef = useRef<string | null>(null);
+    const appliedTypographyEnabledRef = useRef<boolean | null>(null);
+    const lastWrittenTranslationRef = useRef<string | null>(translationId);
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+        };
+    }, []);
+
     const setTypographyEnabled = useCallback((on: boolean) => {
-        setTypographyEnabledState(!!on);
+        setTypographyEnabledState(Boolean(on));
     }, []);
 
     const toggleTypographyEnabled = useCallback(() => {
-        setTypographyEnabledState((v) => !v);
+        setTypographyEnabledState((prev) => !prev);
     }, []);
 
     const setTypography = useCallback(
-        (patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>)) => {
-            // Changing typography implies the user wants overrides ON.
-            setTypographyEnabledState(true);
+         (patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>)) => {
+             setTypographyEnabledState(true);
 
-            setTypographyState((prev) => {
-                const delta = typeof patch === "function" ? patch(prev) : patch;
-                return updateTypography(prev, delta);
-            });
-        },
-        [],
+             setTypographyState((prev) => {
+                 const delta = typeof patch === "function" ? patch(prev) : patch;
+                 return updateTypography(prev, delta ?? {});
+             });
+         },
+         [],
     );
 
+    const replaceTypography = useCallback((next: ReaderTypography) => {
+        setTypographyEnabledState(true);
+        setTypographyState(updateTypography(DEFAULT_TYPOGRAPHY, next));
+    }, []);
+
     const resetTypography = useCallback(() => {
-        // “Reset” means: turn overrides off and return to defaults.
         setTypographyEnabledState(false);
-        setTypographyState(DEFAULT_TYPOGRAPHY);
+        setTypographyState(cloneTypography(DEFAULT_TYPOGRAPHY));
     }, []);
 
     const setTranslationId = useCallback((id: string | null) => {
-        const clean = (id ?? "").trim();
-        const next = clean ? clean : null;
-        setTranslationIdState(next);
-        if (next) safeSet(LS_TRANSLATION, next);
-        else safeDel(LS_TRANSLATION);
+        const next = cleanTranslationId(id);
+        setTranslationIdState((prev) => {
+            if (prev === next) return prev;
+            return next;
+        });
     }, []);
 
-    // Apply + persist typography centrally.
     useEffect(() => {
+        const next = translationId;
+        if (lastWrittenTranslationRef.current === next) return;
+
+        lastWrittenTranslationRef.current = next;
+
+        if (next) safeSet(LS_TRANSLATION, next);
+        else safeDel(LS_TRANSLATION);
+    }, [translationId]);
+
+    useEffect(() => {
+        const serialized = JSON.stringify(typography);
+
+        if (
+             appliedTypographyEnabledRef.current === typographyEnabled &&
+             appliedTypographyRef.current === serialized
+        ) {
+            return;
+        }
+
+        appliedTypographyEnabledRef.current = typographyEnabled;
+        appliedTypographyRef.current = serialized;
+
         if (!typographyEnabled) {
-            // Remove overrides AND clear persisted typography.
             applyReaderTypography(null);
             clearReaderTypography();
             return;
         }
 
-        // Persist + apply.
         saveReaderTypography(typography);
         applyReaderTypography(typography);
     }, [typographyEnabled, typography]);
 
-    // Optional: react to cross-tab changes (translation + typography).
     useEffect(() => {
+        if (!isBrowser()) return;
+
         const onStorage = (e: StorageEvent) => {
+            if (!mountedRef.current) return;
             if (!e.key) return;
 
             if (e.key === LS_TRANSLATION) {
-                setTranslationIdState(readTranslation());
+                const next = cleanTranslationId(e.newValue);
+                lastWrittenTranslationRef.current = next;
+                setTranslationIdState((prev) => (prev === next ? prev : next));
                 return;
             }
 
-            // If the typography module’s key changes, this is still safe (just no-op).
-            // If your key is stable, replace this condition with an exact match.
-            if (e.key.toLowerCase().includes("typography")) {
-                const t = loadReaderTypography();
-                setTypographyEnabledState(!!t);
-                setTypographyState(t ?? DEFAULT_TYPOGRAPHY);
-            }
+            // Typography storage keys live inside the typography module.
+            // We keep this deliberately broad enough to pick up its writes,
+            // but narrow enough to avoid random unrelated storage churn.
+            const key = e.key.toLowerCase();
+            if (!key.includes("typography")) return;
+
+            const nextTypography = safeLoadTypography();
+            const nextEnabled = !!nextTypography;
+            const nextValue = nextTypography ?? cloneTypography(DEFAULT_TYPOGRAPHY);
+
+            setTypographyEnabledState((prev) => (prev === nextEnabled ? prev : nextEnabled));
+            setTypographyState((prev) => {
+                const prevSerialized = JSON.stringify(prev);
+                const nextSerialized = JSON.stringify(nextValue);
+                return prevSerialized === nextSerialized ? prev : nextValue;
+            });
         };
 
         window.addEventListener("storage", onStorage);
-        return () => window.removeEventListener("storage", onStorage);
+        return () => {
+            window.removeEventListener("storage", onStorage);
+        };
     }, []);
 
     const value = useMemo<ReaderPrefsState>(
-        () => ({
-            typographyEnabled,
-            setTypographyEnabled,
-            toggleTypographyEnabled,
+         () => ({
+             typographyEnabled,
+             setTypographyEnabled,
+             toggleTypographyEnabled,
 
-            typography,
-            setTypography,
-            resetTypography,
+             typography,
+             setTypography,
+             replaceTypography,
+             resetTypography,
 
-            translationId,
-            setTranslationId,
-        }),
-        [
-            typographyEnabled,
-            setTypographyEnabled,
-            toggleTypographyEnabled,
-            typography,
-            setTypography,
-            resetTypography,
-            translationId,
-            setTranslationId,
-        ],
+             translationId,
+             setTranslationId,
+         }),
+         [
+             typographyEnabled,
+             setTypographyEnabled,
+             toggleTypographyEnabled,
+             typography,
+             setTypography,
+             replaceTypography,
+             resetTypography,
+             translationId,
+             setTranslationId,
+         ],
     );
 
-    return <ReaderPrefsContext.Provider value={value}>{props.children}</ReaderPrefsContext.Provider>;
+    return <ReaderPrefsContext.Provider value={value}>{children}</ReaderPrefsContext.Provider>;
 }
 
 export function useReaderPrefs(): ReaderPrefsState {
     const ctx = useContext(ReaderPrefsContext);
-    if (!ctx) throw new Error("useReaderPrefs must be used within <ReaderPrefsProvider />");
+    if (!ctx) {
+        throw new Error("useReaderPrefs must be used within <ReaderPrefsProvider />");
+    }
     return ctx;
 }
 ```
@@ -21075,7 +22708,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 });
 ```
 
-### apps/web/src/reader/selectionResolver.ts
+### apps/web/src/reader/ReaderDomSelectionResolver.ts
 
 ```ts
 import type { DomSelectionResolver, DomSelectionTokenLocator } from "@biblia/annotation";
@@ -21240,22 +22873,21 @@ import type { CSSProperties } from "react";
 /**
  * Reader UI tokens (inline styles)
  *
- * Fixes / Overhaul:
- * - Header layout no longer fights children (no 1fr/1fr side columns).
- * - Center column is truly "minmax(0,1fr)" and won’t get squeezed by side minWidths.
- * - Remove “center forces children” pitfalls (no textAlign/justify side effects).
- * - Keeps iOS safe-area padding.
- * - Keeps the critical virtual-scroll rule: scroll container stays absolute/inset:0.
+ * Hardening notes:
+ * - true center column with shrinkable middle
+ * - safe-area aware
+ * - scroll viewport remains absolute/inset:0 for virtualizer stability
+ * - fixed invalid focus token usage
+ * - prefers dvh over vh for viewport correctness
  */
 
 const RADIUS = 14;
 
-// Hairline + washes
 const HAIRLINE = "color-mix(in oklab, var(--hairline) 92%, transparent)";
 const PANEL_WASH = "color-mix(in oklab, var(--panel) 22%, transparent)";
 const PANEL_WASH_FOCUS = "color-mix(in oklab, var(--panel) 26%, transparent)";
+const FOCUS_RING_WASH = "color-mix(in oklab, var(--focusRing) 90%, transparent)";
 
-// iOS safe area helpers (strings so env() survives)
 const SAFE_TOP = "env(safe-area-inset-top, 0px)";
 const SAFE_BOT = "env(safe-area-inset-bottom, 0px)";
 const SAFE_L = "env(safe-area-inset-left, 0px)";
@@ -21264,10 +22896,10 @@ const SAFE_R = "env(safe-area-inset-right, 0px)";
 export const sx: Record<string, CSSProperties> = {
     /* ---------- Shell ---------- */
     page: {
-        height: "100vh",
+        height: "100dvh",
+        minHeight: "100dvh",
         display: "flex",
         flexDirection: "column",
-        minHeight: 0,
         color: "var(--fg)",
         background: "var(--bg)",
         isolation: "isolate",
@@ -21279,27 +22911,19 @@ export const sx: Record<string, CSSProperties> = {
         position: "sticky",
         top: 0,
         zIndex: 60,
-
-        // Layout: true center column that can shrink, side columns auto-size.
         display: "grid",
         gridTemplateColumns: "auto minmax(0, 1fr) auto",
         alignItems: "center",
         columnGap: 12,
-
-        // Safe-area padding
         paddingTop: `calc(10px + ${SAFE_TOP})`,
         paddingBottom: 10,
         paddingLeft: `calc(12px + ${SAFE_L})`,
         paddingRight: `calc(12px + ${SAFE_R})`,
-
-        // Glass, but clean
         background: "color-mix(in oklab, var(--bg) 88%, transparent)",
         backdropFilter: "blur(12px)",
         WebkitBackdropFilter: "blur(12px)",
         borderBottom: `1px solid ${HAIRLINE}`,
         boxShadow: "0 10px 22px rgba(0, 0, 0, 0.032)",
-
-        // Avoid halo seams on some GPUs
         transform: "translateZ(0)",
     },
 
@@ -21317,8 +22941,6 @@ export const sx: Record<string, CSSProperties> = {
         alignItems: "center",
         justifyContent: "center",
         minWidth: 0,
-
-        // IMPORTANT: do not impose centering semantics on children
         textAlign: "initial",
     },
 
@@ -21338,10 +22960,10 @@ export const sx: Record<string, CSSProperties> = {
         minWidth: 0,
     },
 
-    // Let header components decide their own widths.
     searchWrap: {
         width: "clamp(200px, 26vw, 520px)",
         minWidth: 0,
+        maxWidth: "100%",
         flex: "1 1 auto",
     },
 
@@ -21365,7 +22987,6 @@ export const sx: Record<string, CSSProperties> = {
         userSelect: "none",
         whiteSpace: "nowrap",
         boxSizing: "border-box",
-
         boxShadow: "0 8px 18px rgba(0,0,0,0.055)",
         transition:
             "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease",
@@ -21395,27 +23016,22 @@ export const sx: Record<string, CSSProperties> = {
         contain: "layout paint",
     },
 
-    // CRITICAL: MUST remain absolute/inset:0 for virtualizer stability
     scroll: {
         position: "absolute",
         inset: 0,
-        overflow: "auto",
-
+        overflowX: "hidden",
+        overflowY: "auto",
         paddingTop: 18,
         paddingBottom: `calc(96px + ${SAFE_BOT})`,
-
         overscrollBehaviorY: "contain",
         scrollbarGutter: "stable",
         WebkitOverflowScrolling: "touch",
         touchAction: "pan-y",
-
         scrollbarWidth: "thin",
         scrollbarColor: "color-mix(in oklab, var(--hairline) 86%, transparent) transparent",
-
         transform: "translateZ(0)",
     },
 
-    // Reader column width driven by --bpReaderMeasure (typography UI)
     container: {
         paddingLeft: `calc(16px + ${SAFE_L})`,
         paddingRight: `calc(16px + ${SAFE_R})`,
@@ -21482,11 +23098,9 @@ export const sx: Record<string, CSSProperties> = {
         gridTemplateColumns: "34px minmax(0, 1fr)",
         gap: 12,
         alignItems: "start",
-
         borderRadius: RADIUS,
         padding: "9px 6px",
         boxSizing: "border-box",
-
         background: "transparent",
         transition: "background 140ms ease, transform 140ms ease, box-shadow 140ms ease",
         WebkitTapHighlightColor: "transparent",
@@ -21498,7 +23112,7 @@ export const sx: Record<string, CSSProperties> = {
 
     verseRowFocus: {
         background: PANEL_WASH_FOCUS,
-        boxShadow: "0 0 0 3px color-mix(in oklab, var(--focus) 18%, transparent)",
+        boxShadow: `0 0 0 3px ${FOCUS_RING_WASH}`,
     },
 
     verseRowSelected: {
@@ -21518,9 +23132,9 @@ export const sx: Record<string, CSSProperties> = {
     },
 
     verseText: {
+        minWidth: 0,
         overflowWrap: "anywhere",
         wordBreak: "break-word",
-        minWidth: 0,
     },
 
     /* ---------- Skeleton ---------- */
@@ -21549,444 +23163,292 @@ export const sx: Record<string, CSSProperties> = {
 ```ts
 // apps/web/src/reader/types.ts
 import type { BookRow } from "../api";
+import type { TypographyFont } from "./typography";
 
 /**
  * Reader types (web) — Biblia.to
  *
  * Design goals:
- * - JSON-safe, transport-friendly (server -> client -> localStorage -> server)
- * - Canon anchored (verseKey + verseOrd are the immutable scripture anchors)
- * - Token-ready selection + annotation (stable across font size/measure/line wrapping)
- * - Overlay-ready (highlights, notes, drawings, bookmarks) with deterministic anchoring
+ * - JSON-safe, transport-friendly
+ * - Canon anchored (verseKey + verseOrd are immutable anchors)
+ * - Token-ready selection + annotation
+ * - Overlay-ready with deterministic anchoring
+ * - Local-first + sync-friendly
  *
- * IMPORTANT PRINCIPLE:
- * - Layout is ephemeral. Anchors must be semantic (ord/keys + token/char ranges).
- * - Any pixel geometry is treated as a *view projection* and can be recomputed.
+ * Principles:
+ * - Layout is ephemeral
+ * - Anchors are semantic
+ * - Pixel geometry is a projection cache only
+ * - Runtime code may derive richer projections, but these types stay transport-safe
  */
 
 /* =============================================================================
-   Core Reader Data (transport)
+   Small utility aliases
 ============================================================================= */
 
-/** Global spine bounds (by canonical verse_ord). */
+export type IsoDateTimeString = string;
+export type ReaderId = string;
+export type VerseKey = string;
+export type BookId = string;
+export type TranslationId = string;
+export type TokenizerId = string;
+export type DeviceId = string;
+export type Revision = number;
+
+/* =============================================================================
+   Core Reader Data
+============================================================================= */
+
 export type SpineStats = Readonly<{
     verseOrdMin: number;
     verseOrdMax: number;
     verseCount: number;
 }>;
 
-/** A concrete scripture location (verse is optional for chapter-level jumps). */
 export type VerseRef = Readonly<{
-    bookId: string;
+    bookId: BookId;
     chapter: number;
     verse?: number | null;
 }>;
 
-/**
- * A translation identity (optional but extremely useful once you have multiple translations).
- * Keep it stringly-typed (slug) for transport simplicity.
- */
 export type TranslationRef = Readonly<{
-    /** e.g. "kjv", "esv", "niv", "lxx", etc */
-    translationId: string;
-    /** Optional: human label cached client-side */
+    translationId: TranslationId;
     label?: string | null;
 }>;
 
-/** Token kind for reader interactions (kept stable for DOM + selection logic). */
 export type SliceTokenKind =
-    | "WORD"
-    | "PUNCT"
-    | "SPACE"
-    | "LINEBREAK"
-    | "MARKER"
-    | "NUMBER"
-    | "SYMBOL";
+     | "WORD"
+     | "PUNCT"
+     | "SPACE"
+     | "LINEBREAK"
+     | "MARKER"
+     | "NUMBER"
+     | "SYMBOL";
 
-/**
- * Tokenization config identity.
- * If you ever change tokenization rules, bump tokenizerId to preserve stable selection replay.
- */
 export type TokenizerRef = Readonly<{
-    /** e.g. "tok_v1_en", "tok_v1_grc", "tok_v1_he" */
-    tokenizerId: string;
-    /** Optional: version/debug info */
+    tokenizerId: TokenizerId;
     version?: string | null;
 }>;
 
-/**
- * A token inside a verse (optional feature).
- * tokenIndex is local within the verse, 0..N-1, stable for (verseKey, translationId, tokenizerId).
- *
- * Offsets:
- * - charStart/charEnd are offsets into `text` string (if provided)
- * - Convention: [start, end) half-open
- */
 export type SliceVerseToken = Readonly<{
     tokenIndex: number;
-
-    /** surface string (can include spaces/punct depending on your tokenizer policy) */
     token: string;
-
-    /** optional normalized form for matching/search/highlight rules */
     tokenNorm?: string | null;
-
     tokenKind?: SliceTokenKind | null;
-
-    /** offsets into verse text string */
     charStart?: number | null;
     charEnd?: number | null;
-
-    /**
-     * Optional: "sub-identity" for special tokens (e.g., footnote markers, speaker tags)
-     * Keep opaque; renderer may interpret specific schemes.
-     */
     tokenTag?: string | null;
 }>;
 
-/**
- * A verse row returned by /slice (what the reader virtual list renders).
- *
- * Notes:
- * - verseKey + verseOrd are the canonical anchors.
- * - text can be null (missing overlay / redaction / not loaded).
- * - tokens are optional (backend might gate tokenization behind a flag).
- */
 export type SliceVerse = Readonly<{
-    verseKey: string; // stable scripture identity key for the canon
-    verseOrd: number; // global ordinal (bp_verse.verse_ord)
+    verseKey: VerseKey;
+    verseOrd: number;
 
-    bookId: string;
+    bookId: BookId;
     chapter: number;
     verse: number;
 
-    /** translation overlay text (or null if missing) */
     text: string | null;
 
-    /** optional translation identity for this row */
     translation?: TranslationRef | null;
-
-    /** optional tokenization identity for this row */
     tokenizer?: TokenizerRef | null;
-
-    /** Optional tokenization for selection/highlight/annotation */
     tokens?: ReadonlyArray<SliceVerseToken> | null;
 
-    /** ISO timestamp string (or null) */
     updatedAt: string | null;
 }>;
 
-/** Current reader position (used for sticky header + nav state). */
 export type ReaderPosition = Readonly<{
-    ord: number; // current topmost visible verse_ord
-    verse: SliceVerse | null; // populated once that ord has loaded
-    book: BookRow | null; // derived from verse.bookId
+    ord: number;
+    verse: SliceVerse | null;
+    book: BookRow | null;
 }>;
 
-/** Header-friendly representation of the current position. */
 export type ReaderCurrentPos = Readonly<{
     label: string;
     ord: number;
-    bookId: string | null;
+    bookId: BookId | null;
     chapter: number | null;
     verse: number | null;
 }>;
 
-/** Minimal “jump” intent used by controls. */
 export type ReaderJump = VerseRef;
 
 /* =============================================================================
-   Anchoring + Selection (token-first, char fallback)
+   Anchoring + Selection
 ============================================================================= */
 
-/**
- * A stable anchor inside scripture.
- *
- * Choose a policy:
- * - For partial selections: prefer token ranges (stable under reflow).
- * - If tokens are unavailable: use char offsets as a fallback.
- *
- * Invariants:
- * - Always include verseOrd + verseKey.
- * - tokenStart/tokenEnd and charStart/charEnd are optional, but at least one method should exist
- *   for partial anchors. Whole-verse anchors may omit ranges entirely.
- */
 export type ReaderAnchor = Readonly<{
     verseOrd: number;
-    verseKey: string;
-
-    /** Optional: tie anchor to translation/tokenizer identity for deterministic replay */
-    translationId?: string | null;
-    tokenizerId?: string | null;
-
-    /** Preferred: token offsets within verse tokens */
+    verseKey: VerseKey;
+    translationId?: TranslationId | null;
+    tokenizerId?: TokenizerId | null;
     tokenStart?: number | null;
-    tokenEnd?: number | null; // exclusive
-
-    /** Fallback: char offsets within verse text */
+    tokenEnd?: number | null;
     charStart?: number | null;
-    charEnd?: number | null; // exclusive
-}>;
-
-/**
- * A selection spanning scripture. Can span verses.
- *
- * Normalization rules (recommended):
- * - start must be <= end by (verseOrd, tokenStart/charStart).
- * - end is exclusive when using tokenEnd/charEnd (easy concatenation).
- */
-export type ReaderRange = Readonly<{
-    start: ReaderAnchor;
-    end: ReaderAnchor;
-
-    /** Optional: reason / origin (mouse selection, keyboard, programmatic, search result) */
-    origin?: ReaderSelectionOrigin | null;
+    charEnd?: number | null;
 }>;
 
 export type ReaderSelectionOrigin =
-    | "MOUSE_DRAG"
-    | "KEYBOARD"
-    | "TOUCH"
-    | "PROGRAM"
-    | "SEARCH"
-    | "SHARE_LINK";
+     | "MOUSE_DRAG"
+     | "KEYBOARD"
+     | "TOUCH"
+     | "PROGRAM"
+     | "SEARCH"
+     | "SHARE_LINK";
 
-/**
- * Convenience for “selected exactly these tokens”.
- * Useful for fast rendering of highlights without re-splitting.
- */
+export type ReaderRange = Readonly<{
+    start: ReaderAnchor;
+    end: ReaderAnchor;
+    origin?: ReaderSelectionOrigin | null;
+}>;
+
 export type ReaderTokenSpan = Readonly<{
     verseOrd: number;
-    verseKey: string;
+    verseKey: VerseKey;
     tokenStart: number;
-    tokenEnd: number; // exclusive
+    tokenEnd: number;
+}>;
+
+export type ReaderVerseSpan = Readonly<{
+    startVerseOrd: number;
+    endVerseOrd: number;
+    startVerseKey: VerseKey;
+    endVerseKey: VerseKey;
 }>;
 
 /* =============================================================================
-   Annotation System (orientation-only; no doctrine/commentary in canon)
+   Annotation System
 ============================================================================= */
 
-/**
- * Annotation kinds your reader UI can support.
- * Keep this small; add variants as your UX grows.
- */
 export type ReaderAnnotationKind =
-    | "HIGHLIGHT"
-    | "UNDERLINE"
-    | "NOTE"
-    | "BOOKMARK"
-    | "LINK"
-    | "DRAWING";
+     | "HIGHLIGHT"
+     | "UNDERLINE"
+     | "NOTE"
+     | "BOOKMARK"
+     | "LINK"
+     | "DRAWING";
 
-/**
- * Annotation visibility / scoping.
- * - PRIVATE: only the user
- * - SHARED: share link / group
- * - PUBLIC: (if you ever do this) visible broadly
- */
+export type ReaderAnnotationScope = "RANGE" | "WHOLE_VERSE";
 export type ReaderVisibility = "PRIVATE" | "SHARED" | "PUBLIC";
 
-/**
- * A stable identifier for local-first objects.
- * Use ULID if you want time-sortable ids; keep type as string for transport.
- */
-export type ReaderId = string;
-
-/**
- * A palette entry for monochrome (or “ink”) styling.
- * Keep it as tokens so you can skin via CSS variables.
- */
 export type ReaderInk =
-    | "INK_0"
-    | "INK_1"
-    | "INK_2"
-    | "INK_3"
-    | "INK_4"
-    | "INK_5";
+     | "INK_0"
+     | "INK_1"
+     | "INK_2"
+     | "INK_3"
+     | "INK_4"
+     | "INK_5";
 
-/** Highlight style variants. */
 export type ReaderHighlightStyle = "SOLID" | "SOFT" | "UNDERLINE" | "OUTLINE";
+export type ReaderUnderlineStyle = "SINGLE" | "DOUBLE";
 
-/**
- * Rich text payload for notes.
- * Keep it simple now; you can expand later (Markdown, ProseMirror JSON, etc).
- */
 export type ReaderNoteBody =
-    | Readonly<{ format: "PLAINTEXT"; text: string }>
-    | Readonly<{ format: "MARKDOWN"; md: string }>;
+     | Readonly<{ format: "PLAINTEXT"; text: string }>
+     | Readonly<{ format: "MARKDOWN"; md: string }>;
 
-/**
- * Base shape for any annotation.
- * - Anchors to a ReaderRange (or a single anchor for bookmarks)
- * - Carries metadata for sync + conflict resolution
- */
 export type ReaderAnnotationBase = Readonly<{
     id: ReaderId;
     kind: ReaderAnnotationKind;
-
-    /** anchor into canon */
     range: ReaderRange;
-
-    /** optional: if set, means "this annotation applies to whole verse(s) regardless of range offsets" */
-    scope?: "RANGE" | "WHOLE_VERSE" | null;
-
-    /** styling */
+    scope?: ReaderAnnotationScope | null;
     ink?: ReaderInk | null;
-
-    /** visibility */
     visibility?: ReaderVisibility | null;
-
-    /** tags for organizing (user-defined) */
     tags?: ReadonlyArray<string> | null;
-
-    /** timestamps (ISO) */
-    createdAt: string;
-    updatedAt: string;
-
-    /** soft delete */
-    deletedAt?: string | null;
-
-    /** sync metadata (optional) */
-    rev?: number | null; // monotonic revision for conflict resolution
-    deviceId?: string | null;
+    createdAt: IsoDateTimeString;
+    updatedAt: IsoDateTimeString;
+    deletedAt?: IsoDateTimeString | null;
+    rev?: Revision | null;
+    deviceId?: DeviceId | null;
 }>;
 
-/** Highlight annotation */
 export type ReaderHighlight = ReaderAnnotationBase &
-    Readonly<{
-        kind: "HIGHLIGHT";
-        style?: ReaderHighlightStyle | null;
-        /** intensity 0..1 (UI decides actual effect) */
-        strength?: number | null;
-    }>;
+     Readonly<{
+         kind: "HIGHLIGHT";
+         style?: ReaderHighlightStyle | null;
+         strength?: number | null;
+     }>;
 
-/** Underline annotation */
 export type ReaderUnderline = ReaderAnnotationBase &
-    Readonly<{
-        kind: "UNDERLINE";
-        style?: "SINGLE" | "DOUBLE" | null;
-    }>;
+     Readonly<{
+         kind: "UNDERLINE";
+         style?: ReaderUnderlineStyle | null;
+     }>;
 
-/** Note annotation (anchored to a range; UI can show pin/marker) */
 export type ReaderNote = ReaderAnnotationBase &
-    Readonly<{
-        kind: "NOTE";
-        title?: string | null;
-        body: ReaderNoteBody;
-        /** optional: collapsed/expanded in UI */
-        uiState?: Readonly<{ collapsed?: boolean | null }> | null;
-    }>;
+     Readonly<{
+         kind: "NOTE";
+         title?: string | null;
+         body: ReaderNoteBody;
+         uiState?: Readonly<{ collapsed?: boolean | null }> | null;
+     }>;
 
-/** Bookmark annotation (often whole verse/chapter) */
 export type ReaderBookmark = ReaderAnnotationBase &
-    Readonly<{
-        kind: "BOOKMARK";
-        label?: string | null;
-    }>;
-
-/** Link annotation (connects a range to some target) */
-export type ReaderLink = ReaderAnnotationBase &
-    Readonly<{
-        kind: "LINK";
-        target: ReaderLinkTarget;
-        label?: string | null;
-    }>;
+     Readonly<{
+         kind: "BOOKMARK";
+         label?: string | null;
+     }>;
 
 export type ReaderLinkTarget =
-    | Readonly<{ type: "VERSE_REF"; ref: VerseRef }>
-    | Readonly<{ type: "RANGE"; range: ReaderRange }>
-    | Readonly<{ type: "URL"; url: string }>
-    | Readonly<{ type: "SEARCH"; query: string }>;
+     | Readonly<{ type: "VERSE_REF"; ref: VerseRef }>
+     | Readonly<{ type: "RANGE"; range: ReaderRange }>
+     | Readonly<{ type: "URL"; url: string }>
+     | Readonly<{ type: "SEARCH"; query: string }>;
 
-/**
- * Drawing annotation (freehand marks).
- * IMPORTANT: DO NOT anchor drawings to pixel coords alone.
- * Anchor to scripture range + store strokes in *normalized local coordinates* relative to a layout box.
- */
-export type ReaderDrawing = ReaderAnnotationBase &
-    Readonly<{
-        kind: "DRAWING";
+export type ReaderLink = ReaderAnnotationBase &
+     Readonly<{
+         kind: "LINK";
+         target: ReaderLinkTarget;
+         label?: string | null;
+     }>;
 
-        /** strokes in a normalized coordinate space */
-        drawing: ReaderDrawingPayload;
-
-        /** optional: indicates which projection box the normalized coords refer to */
-        projection?: ReaderDrawingProjection | null;
-    }>;
-
-/**
- * Projection defines the coordinate space for drawing.
- * - "VERSE_BLOCK": normalize within each verse block
- * - "RANGE_BLOCK": normalize within a single selection rectangle spanning multiple verses (less ideal)
- * - "PAGE_VIEW": normalize within viewport snapshot (least stable; avoid unless necessary)
- */
 export type ReaderDrawingProjection = "VERSE_BLOCK" | "RANGE_BLOCK" | "PAGE_VIEW";
 
-/**
- * Drawing payload: vector strokes.
- * All coordinates are normalized [0..1] unless specified.
- */
-export type ReaderDrawingPayload = Readonly<{
-    version: 1;
-
-    /** which ink style */
-    ink?: ReaderInk | null;
-
-    /** stroke width normalized (UI scales based on font size / measure) */
-    width?: number | null; // e.g. 0.004
-
-    /** list of strokes */
-    strokes: ReadonlyArray<ReaderStroke>;
-}>;
-
-export type ReaderStroke = Readonly<{
-    /** stable id for incremental editing */
-    strokeId: ReaderId;
-
-    /** points in normalized space */
-    points: ReadonlyArray<ReaderPoint>;
-
-    /** optional per-stroke overrides */
-    ink?: ReaderInk | null;
-    width?: number | null;
-
-    /** smoothing hint (UI only) */
-    smooth?: boolean | null;
-}>;
-
 export type ReaderPoint = Readonly<{
-    x: number; // 0..1
-    y: number; // 0..1
-    /** optional pressure (pen) 0..1 */
+    x: number;
+    y: number;
     p?: number | null;
-    /** optional timestamp delta in ms for replay */
     t?: number | null;
 }>;
 
-/**
- * Union of all supported annotations.
- * (Keep this as the single payload type for sync and local storage.)
- */
-export type ReaderAnnotation = ReaderHighlight | ReaderUnderline | ReaderNote | ReaderBookmark | ReaderLink | ReaderDrawing;
+export type ReaderStroke = Readonly<{
+    strokeId: ReaderId;
+    points: ReadonlyArray<ReaderPoint>;
+    ink?: ReaderInk | null;
+    width?: number | null;
+    smooth?: boolean | null;
+}>;
+
+export type ReaderDrawingPayload = Readonly<{
+    version: 1;
+    ink?: ReaderInk | null;
+    width?: number | null;
+    strokes: ReadonlyArray<ReaderStroke>;
+}>;
+
+export type ReaderDrawing = ReaderAnnotationBase &
+     Readonly<{
+         kind: "DRAWING";
+         drawing: ReaderDrawingPayload;
+         projection?: ReaderDrawingProjection | null;
+     }>;
+
+export type ReaderAnnotation =
+     | ReaderHighlight
+     | ReaderUnderline
+     | ReaderNote
+     | ReaderBookmark
+     | ReaderLink
+     | ReaderDrawing;
 
 /* =============================================================================
-   UI Geometry Projections (ephemeral, recomputable)
+   UI Geometry Projections
 ============================================================================= */
 
-/**
- * A DOM-targeted selector for a verse in the viewport.
- * Useful when you need to map anchors -> DOM nodes.
- */
 export type VerseDomKey = Readonly<{
     verseOrd: number;
-    /** recommended: id like `ord-${verseOrd}` in your VerseRow wrapper */
     elementId: string;
 }>;
 
-/**
- * A projected rectangle in viewport coordinates (pixels).
- * This is NOT stable across layout changes; only use for rendering overlays in current view.
- */
 export type ViewportRect = Readonly<{
     left: number;
     top: number;
@@ -21994,16 +23456,10 @@ export type ViewportRect = Readonly<{
     height: number;
 }>;
 
-/**
- * A computed overlay quad(s) for a range highlight in the *current* viewport.
- * Store these only as cache; regenerate on scroll/resize/typography changes.
- */
 export type RangeOverlayProjection = Readonly<{
     range: ReaderRange;
     rects: ReadonlyArray<ViewportRect>;
-    /** computed at time */
-    computedAt: string;
-    /** optional: signature of typography settings used for this projection */
+    computedAt: IsoDateTimeString;
     typographySig?: string | null;
 }>;
 
@@ -22011,100 +23467,92 @@ export type RangeOverlayProjection = Readonly<{
    Copy / Export / Share
 ============================================================================= */
 
-/**
- * A normalized export block for sharing/copy.
- * Use this to power “Copy with refs”, “Export selection”, etc.
- */
-export type ReaderExportBlock = Readonly<{
-    range: ReaderRange;
-
-    /** Plain text suitable for clipboard */
-    text: string;
-
-    /** Optional: richer payload for share formats */
-    lines?: ReadonlyArray<ReaderExportLine> | null;
-
-    /** Reference string (e.g. "John 3:16–18") */
-    refLabel?: string | null;
-
-    /** Optional: translation used */
-    translationId?: string | null;
-}>;
-
 export type ReaderExportLine = Readonly<{
-    verseKey: string;
+    verseKey: VerseKey;
     verseOrd: number;
-    bookId: string;
+    bookId: BookId;
     chapter: number;
     verse: number;
     text: string;
 }>;
 
+export type ReaderExportBlock = Readonly<{
+    range: ReaderRange;
+    text: string;
+    lines?: ReadonlyArray<ReaderExportLine> | null;
+    refLabel?: string | null;
+    translationId?: TranslationId | null;
+}>;
+
 /* =============================================================================
-   Reader Preferences (localStorage-safe)
+   Reader Preferences
 ============================================================================= */
 
 export type ReaderTypographyPrefs = Readonly<{
     enabled: boolean;
-    font: string; // css family token
+    font: TypographyFont;
     sizePx: number;
     weight: number;
     leading: number;
     measurePx: number;
 }>;
 
+export type ReaderTokenizationPrefs = Readonly<{
+    enabled: boolean;
+    tokenizerId?: TokenizerId | null;
+}>;
+
+export type ReaderAnnotationPrefs = Readonly<{
+    ink?: ReaderInk | null;
+    highlightStyle?: ReaderHighlightStyle | null;
+    visibility?: ReaderVisibility | null;
+}>;
+
 export type ReaderPrefs = Readonly<{
     typography: ReaderTypographyPrefs;
-
-    /** Whether tokens are requested/used (if backend supports). */
-    tokenization?: Readonly<{
-        enabled: boolean;
-        tokenizerId?: string | null;
-    }> | null;
-
-    /** Annotation defaults */
-    annotation?: Readonly<{
-        ink?: ReaderInk | null;
-        highlightStyle?: ReaderHighlightStyle | null;
-        visibility?: ReaderVisibility | null;
-    }> | null;
+    tokenization?: ReaderTokenizationPrefs | null;
+    annotation?: ReaderAnnotationPrefs | null;
 }>;
 
 /* =============================================================================
-   Sync Shapes (optional; local-first friendly)
+   Sync Shapes
 ============================================================================= */
 
-/**
- * A batch payload to sync annotations.
- * Client can send "sinceRev" and receive deltas.
- */
 export type ReaderAnnotationSyncRequest = Readonly<{
-    sinceRev?: number | null;
-    deviceId?: string | null;
-    /** changed locally */
+    sinceRev?: Revision | null;
+    deviceId?: DeviceId | null;
     upserts?: ReadonlyArray<ReaderAnnotation> | null;
-    /** ids deleted locally */
     deletes?: ReadonlyArray<ReaderId> | null;
 }>;
 
 export type ReaderAnnotationSyncResponse = Readonly<{
-    /** latest server revision after applying request */
-    rev: number;
-    /** server-authoritative upserts */
+    rev: Revision;
     upserts: ReadonlyArray<ReaderAnnotation>;
-    /** server-authoritative deletions */
     deletes: ReadonlyArray<ReaderId>;
 }>;
 
 /* =============================================================================
-   Small utility types
+   Slice Payload
 ============================================================================= */
 
-/** Useful for APIs that return a slice of verses. */
 export type SlicePayload = Readonly<{
     verses: ReadonlyArray<SliceVerse>;
     spine: SpineStats;
 }>;
+
+/* =============================================================================
+   Convenient unions / helpers
+============================================================================= */
+
+export type ReaderEntity =
+     | SliceVerse
+     | ReaderAnnotation
+     | ReaderRange
+     | ReaderExportBlock;
+
+export type ReaderAnnotationMap = ReadonlyMap<ReaderId, ReaderAnnotation>;
+export type VerseIndexMap = ReadonlyMap<number, SliceVerse>;
+export type BookIndexMap = ReadonlyMap<BookId, BookRow>;
 ```
 
 ### apps/web/src/reader/typography.ts
@@ -22112,102 +23560,144 @@ export type SlicePayload = Readonly<{
 ```ts
 // apps/web/src/reader/typography.ts
 //
-// Reader typography + layout tuning (scripture + measure)
+// Biblia.to — reader typography + layout tuning
 //
-// Principles:
-// - Persist stable IDs, not CSS strings.
-// - Resolve IDs -> actual font-family strings via FONT_PRESETS (which can point at CSS vars).
-// - Normalize/clamp deterministically (safe JSON round-trip).
-// - One authoritative apply() that sets CSS vars on <html>.
-// - Optional font-load readiness helpers (for stable measurement / virtualizer calm).
-//
-// CSS vars expected (defined in base.css):
-// --bpScriptureFont         (font-family value)
-// --bpScriptureSize         (px)
-// --bpScriptureLeading      (number)
-// --bpScriptureWeight       (number)
-// --bpReaderMeasure         (px)
+// Goals:
+// - Persist stable font IDs, never raw CSS strings
+// - Normalize + clamp deterministically
+// - Migrate older saves cleanly
+// - One authoritative apply() to <html>
+// - Explicit modern font presets (Inter, Literata, Quicksand)
+// - Stable helpers for virtualizer / measurement calm
 
 export type TypographyFont =
-    | "serif"
-    | "sans"
-    | "rounded"
-    | "book"
-    | "human"
-    // reserved slots for future (hosted/uploaded/custom):
-    | "custom_1"
-    | "custom_2";
+     | "inter"
+     | "literata"
+     | "quicksand"
+     | "book"
+     | "human"
+     | "mono"
+     | "custom_1"
+     | "custom_2";
 
 export type ReaderTypography = Readonly<{
-    /** Stable id, resolved to actual font-family via FONT_PRESETS. */
     font: TypographyFont;
-
-    /** Scripture text size in px (clamped). */
-    sizePx: number; // 12..30
-
-    /** font-weight (integer). */
-    weight: number; // 200..650
-
-    /** line-height multiplier. */
-    leading: number; // 0.95..2.1
-
-    /** max line length (measure) in px. */
+    sizePx: number;   // 12..30
+    weight: number;   // 200..700
+    leading: number;  // 0.95..2.1
     measurePx: number; // 535..980
 }>;
 
+/**
+ * New default:
+ * - Inter is the default modern reading-first sans
+ * - slightly calmer measure than before
+ */
 export const DEFAULT_TYPOGRAPHY: ReaderTypography = Object.freeze({
-    font: "serif",
+    font: "inter",
     sizePx: 18,
     weight: 400,
-    leading: 1.75,
-    measurePx: 840,
+    leading: 1.72,
+    measurePx: 820,
 });
 
-// Storage key
 const STORAGE_KEY_V2 = "bp_reader_typography_v2";
-
-// Legacy keys (kept for migration)
 const STORAGE_KEY_V1 = "bp_reader_typography_v1";
 const LEGACY_KEYS = Object.freeze(["bp_reader_typography", "bp_typography"]);
 
-// Optional: future envelope (we still accept raw v2 objects for backward compat)
 type TypographyEnvelopeV1 = Readonly<{
     v: 1;
     t: ReaderTypography;
 }>;
 
-// ──────────────────────────────────────────────────────────────
-// Limits — keep UI + normalization synced
-// ──────────────────────────────────────────────────────────────
 const LIMITS = Object.freeze({
     sizePx: { lo: 12, hi: 30, step: 1 },
-    weight: { lo: 200, hi: 650, step: 1 },
+    weight: { lo: 200, hi: 700, step: 1 },
     leading: { lo: 0.95, hi: 2.1, digits: 2 },
     measurePx: { lo: 535, hi: 980, step: 1 },
 });
 
-/**
- * Font presets.
- * - `css` must be a valid font-family value.
- * - For app fonts, point at CSS vars (base.css controls actual stacks/loaded fonts).
- * - For system fallbacks, provide explicit stacks.
- */
-export const FONT_PRESETS: Readonly<Record<TypographyFont, { label: string; css: string }>> = Object.freeze({
-    serif: { label: "Literata", css: "var(--font-serif)" },
-    sans: { label: "Inter", css: "var(--font-sans)" },
-    rounded: { label: "Quicksand", css: "var(--font-rounded)" },
+export const FONT_PRESETS: Readonly<
+     Record<
+          TypographyFont,
+          Readonly<{
+              label: string;
+              css: string;
+              category: "sans" | "serif" | "rounded" | "mono" | "custom";
+          }>
+     >
+> = Object.freeze({
+    inter: {
+        label: "Inter",
+        css: "var(--font-sans)",
+        category: "sans",
+    },
 
-    book: { label: "Book", css: 'ui-serif, Charter, "Iowan Old Style", Georgia, "Times New Roman", Times, serif' },
-    human: { label: "Human", css: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", sans-serif' },
+    literata: {
+        label: "Literata",
+        css: "var(--font-serif)",
+        category: "serif",
+    },
 
-    // Future: if you add CSS vars like --font-custom-1, --font-custom-2 in base.css:
-    custom_1: { label: "Custom 1", css: "var(--font-custom-1, var(--font-serif))" },
-    custom_2: { label: "Custom 2", css: "var(--font-custom-2, var(--font-serif))" },
+    quicksand: {
+        label: "Quicksand",
+        css: "var(--font-rounded)",
+        category: "rounded",
+    },
+
+    book: {
+        label: "Book Serif",
+        css: 'ui-serif, Charter, "Iowan Old Style", Georgia, "Times New Roman", Times, serif',
+        category: "serif",
+    },
+
+    human: {
+        label: "Human Sans",
+        css: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", sans-serif',
+        category: "sans",
+    },
+
+    mono: {
+        label: "Reader Mono",
+        css: 'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+        category: "mono",
+    },
+
+    custom_1: {
+        label: "Custom 1",
+        css: "var(--font-custom-1, var(--font-sans))",
+        category: "custom",
+    },
+
+    custom_2: {
+        label: "Custom 2",
+        css: "var(--font-custom-2, var(--font-serif))",
+        category: "custom",
+    },
 });
 
-// ──────────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────────
+type FontOption = Readonly<{
+    id: TypographyFont;
+    label: string;
+    cssFamily: string;
+    category: "sans" | "serif" | "rounded" | "mono" | "custom";
+}>;
+
+/* ──────────────────────────────────────────────────────────────
+   Internal helpers
+────────────────────────────────────────────────────────────── */
+
+let lastAppliedSignature: string | null = null;
+let lastAppliedEnabled = false;
+
+function isBrowser(): boolean {
+    return typeof window !== "undefined";
+}
+
+function isDocumentAvailable(): boolean {
+    return typeof document !== "undefined";
+}
+
 function clamp(n: number, lo: number, hi: number): number {
     if (!Number.isFinite(n)) return lo;
     return Math.max(lo, Math.min(hi, n));
@@ -22219,8 +23709,8 @@ function clampInt(n: number, lo: number, hi: number): number {
 
 function clampFloat(n: number, lo: number, hi: number, digits: number): number {
     const v = clamp(n, lo, hi);
-    const f = Number(v.toFixed(digits));
-    return Number.isFinite(f) ? f : lo;
+    const out = Number(v.toFixed(digits));
+    return Number.isFinite(out) ? out : lo;
 }
 
 function toNumber(x: unknown): number | null {
@@ -22238,6 +23728,10 @@ function toString(x: unknown): string | null {
     return typeof x === "string" ? x : null;
 }
 
+function isRecord(x: unknown): x is Record<string, unknown> {
+    return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
 function safeJsonParse(text: string | null): unknown | null {
     if (!text) return null;
     try {
@@ -22248,7 +23742,7 @@ function safeJsonParse(text: string | null): unknown | null {
 }
 
 function safeLocalStorageGet(key: string): string | null {
-    if (typeof window === "undefined") return null;
+    if (!isBrowser()) return null;
     try {
         return window.localStorage.getItem(key);
     } catch {
@@ -22257,7 +23751,7 @@ function safeLocalStorageGet(key: string): string | null {
 }
 
 function safeLocalStorageSet(key: string, value: string): void {
-    if (typeof window === "undefined") return;
+    if (!isBrowser()) return;
     try {
         window.localStorage.setItem(key, value);
     } catch {
@@ -22266,7 +23760,7 @@ function safeLocalStorageSet(key: string, value: string): void {
 }
 
 function safeLocalStorageRemove(key: string): void {
-    if (typeof window === "undefined") return;
+    if (!isBrowser()) return;
     try {
         window.localStorage.removeItem(key);
     } catch {
@@ -22276,124 +23770,179 @@ function safeLocalStorageRemove(key: string): void {
 
 function isTypographyFont(x: string): x is TypographyFont {
     return (
-        x === "serif" ||
-        x === "sans" ||
-        x === "rounded" ||
-        x === "book" ||
-        x === "human" ||
-        x === "custom_1" ||
-        x === "custom_2"
+         x === "inter" ||
+         x === "literata" ||
+         x === "quicksand" ||
+         x === "book" ||
+         x === "human" ||
+         x === "mono" ||
+         x === "custom_1" ||
+         x === "custom_2"
     );
 }
 
 function normalizeFont(raw: unknown): TypographyFont {
     const s = (toString(raw) ?? "").trim().toLowerCase();
+    if (!s) return DEFAULT_TYPOGRAPHY.font;
 
-    // Direct ids
     if (isTypographyFont(s)) return s;
 
-    // Common synonyms (old saves / human inputs)
-    if (s.includes("literata")) return "serif";
-    if (s.includes("inter")) return "sans";
-    if (s.includes("quicksand")) return "rounded";
-    if (s.includes("charter") || s.includes("iowan") || s.includes("times")) return "book";
-    if (s.includes("ui") || s.includes("system") || s.includes("segoe") || s.includes("roboto")) return "human";
+    // Migrate older ids / synonyms
+    if (s === "sans") return "inter";
+    if (s === "serif") return "literata";
+    if (s === "rounded") return "quicksand";
+
+    // Human names / css fragments
+    if (s.includes("inter")) return "inter";
+    if (s.includes("literata")) return "literata";
+    if (s.includes("quicksand")) return "quicksand";
+
+    if (s.includes("charter") || s.includes("iowan") || s.includes("times") || s.includes("georgia")) {
+        return "book";
+    }
+
+    if (
+         s.includes("ui-sans") ||
+         s.includes("system-ui") ||
+         s.includes("segoe") ||
+         s.includes("roboto") ||
+         s.includes("noto sans")
+    ) {
+        return "human";
+    }
+
+    if (
+         s.includes("mono") ||
+         s.includes("menlo") ||
+         s.includes("monaco") ||
+         s.includes("consolas") ||
+         s.includes("sfmono")
+    ) {
+        return "mono";
+    }
+
+    if (s.includes("custom 1") || s.includes("custom_1")) return "custom_1";
+    if (s.includes("custom 2") || s.includes("custom_2")) return "custom_2";
 
     return DEFAULT_TYPOGRAPHY.font;
 }
 
 function normalizeTypography(t: Partial<ReaderTypography> | null | undefined): ReaderTypography {
-    const font = normalizeFont(t?.font);
-
     return Object.freeze({
-        font,
+        font: normalizeFont(t?.font),
         sizePx: clampInt(toNumber(t?.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx, LIMITS.sizePx.lo, LIMITS.sizePx.hi),
         weight: clampInt(toNumber(t?.weight) ?? DEFAULT_TYPOGRAPHY.weight, LIMITS.weight.lo, LIMITS.weight.hi),
         leading: clampFloat(
-            toNumber(t?.leading) ?? DEFAULT_TYPOGRAPHY.leading,
-            LIMITS.leading.lo,
-            LIMITS.leading.hi,
-            LIMITS.leading.digits,
+             toNumber(t?.leading) ?? DEFAULT_TYPOGRAPHY.leading,
+             LIMITS.leading.lo,
+             LIMITS.leading.hi,
+             LIMITS.leading.digits,
         ),
         measurePx: clampInt(
-            toNumber(t?.measurePx) ?? DEFAULT_TYPOGRAPHY.measurePx,
-            LIMITS.measurePx.lo,
-            LIMITS.measurePx.hi,
+             toNumber(t?.measurePx) ?? DEFAULT_TYPOGRAPHY.measurePx,
+             LIMITS.measurePx.lo,
+             LIMITS.measurePx.hi,
         ),
     });
 }
 
 function unwrapTypographyPayload(parsed: unknown): ReaderTypography | null {
-    if (!parsed || typeof parsed !== "object") return null;
+    if (!isRecord(parsed)) return null;
 
-    // Envelope form: { v: 1, t: {...} }
-    const anyObj = parsed as Record<string, unknown>;
-    if (anyObj.v === 1 && anyObj.t && typeof anyObj.t === "object") {
-        return normalizeTypography(anyObj.t as Partial<ReaderTypography>);
+    if (parsed.v === 1 && isRecord(parsed.t)) {
+        return normalizeTypography(parsed.t as Partial<ReaderTypography>);
     }
 
-    // Raw form: { font, sizePx, ... } (your current v2/v1)
-    return normalizeTypography(anyObj as Partial<ReaderTypography>);
+    return normalizeTypography(parsed as Partial<ReaderTypography>);
 }
 
-/**
- * A stable signature for projections/caches.
- * Use this to know when to recompute highlight rects, drawing projections, etc.
- */
-export function typographySignature(t: ReaderTypography): string {
-    // Keep it short and stable (order matters).
-    return `f=${t.font}|s=${t.sizePx}|w=${t.weight}|l=${t.leading}|m=${t.measurePx}`;
+function currentRoot(): HTMLElement | null {
+    if (!isDocumentAvailable()) return null;
+    return document.documentElement;
 }
 
-// ──────────────────────────────────────────────────────────────
-// Public API
-// ──────────────────────────────────────────────────────────────
+function removeTypographyVars(root: HTMLElement): void {
+    root.style.removeProperty("--bpScriptureFont");
+    root.style.removeProperty("--bpScriptureSize");
+    root.style.removeProperty("--bpScriptureLeading");
+    root.style.removeProperty("--bpScriptureWeight");
+    root.style.removeProperty("--bpReaderMeasure");
+}
+
+function fontLoadProbe(t: ReaderTypography): string {
+    const family = getFontCssFamily(t.font);
+
+    if (t.font === "inter" || t.font === "human" || t.font === "custom_1") {
+        return `${t.weight} ${t.sizePx}px ${family}`;
+    }
+
+    if (t.font === "mono") {
+        return `${t.weight} ${t.sizePx}px ${family}`;
+    }
+
+    return `${t.weight} ${t.sizePx}px ${family}`;
+}
+
+/* ──────────────────────────────────────────────────────────────
+   Public helpers
+────────────────────────────────────────────────────────────── */
 
 export function typographyLimits() {
     return LIMITS;
 }
 
-/** UI helper */
+export function typographySignature(t: ReaderTypography): string {
+    return `f=${t.font}|s=${t.sizePx}|w=${t.weight}|l=${t.leading}|m=${t.measurePx}`;
+}
+
 export function getFontLabel(font: TypographyFont): string {
     return FONT_PRESETS[font]?.label ?? font;
 }
 
-/** Actual CSS `font-family` string */
 export function getFontCssFamily(font: TypographyFont): string {
-    return FONT_PRESETS[font]?.css ?? "var(--font-serif)";
+    return FONT_PRESETS[font]?.css ?? "var(--font-sans)";
+}
+
+export function getFontCategory(font: TypographyFont): FontOption["category"] {
+    return FONT_PRESETS[font]?.category ?? "sans";
+}
+
+export function normalizeReaderTypography(
+     t: Partial<ReaderTypography> | ReaderTypography | null | undefined,
+): ReaderTypography {
+    return normalizeTypography(t ?? undefined);
+}
+
+export function isDefaultTypography(t: ReaderTypography): boolean {
+    return typographySignature(normalizeTypography(t)) === typographySignature(DEFAULT_TYPOGRAPHY);
 }
 
 /**
  * Try v2 → v1 → legacy keys, normalize, and migrate to v2.
  */
 export function loadReaderTypography(): ReaderTypography | null {
-    const rawV2 = safeLocalStorageGet(STORAGE_KEY_V2);
-    if (rawV2) {
-        const parsed = safeJsonParse(rawV2);
-        const t = unwrapTypographyPayload(parsed);
-        if (t) return t;
+    const tryKey = (key: string): ReaderTypography | null => {
+        const raw = safeLocalStorageGet(key);
+        if (!raw) return null;
+        return unwrapTypographyPayload(safeJsonParse(raw));
+    };
+
+    const v2 = tryKey(STORAGE_KEY_V2);
+    if (v2) return v2;
+
+    const v1 = tryKey(STORAGE_KEY_V1);
+    if (v1) {
+        saveReaderTypography(v1);
+        safeLocalStorageRemove(STORAGE_KEY_V1);
+        return v1;
     }
 
-    const rawV1 = safeLocalStorageGet(STORAGE_KEY_V1);
-    if (rawV1) {
-        const parsed = safeJsonParse(rawV1);
-        const t = unwrapTypographyPayload(parsed);
-        if (t) {
-            saveReaderTypography(t);
-            safeLocalStorageRemove(STORAGE_KEY_V1);
-            return t;
-        }
-    }
-
-    for (const k of LEGACY_KEYS) {
-        const raw = safeLocalStorageGet(k);
-        if (!raw) continue;
-        const parsed = safeJsonParse(raw);
-        const t = unwrapTypographyPayload(parsed);
-        if (t) {
-            saveReaderTypography(t);
-            safeLocalStorageRemove(k);
-            return t;
+    for (const key of LEGACY_KEYS) {
+        const migrated = tryKey(key);
+        if (migrated) {
+            saveReaderTypography(migrated);
+            safeLocalStorageRemove(key);
+            return migrated;
         }
     }
 
@@ -22401,42 +23950,47 @@ export function loadReaderTypography(): ReaderTypography | null {
 }
 
 export function saveReaderTypography(t: ReaderTypography): void {
-    // Keep raw shape for maximum backward compatibility (simple, readable).
-    safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(t));
+    const normalized = normalizeTypography(t);
+    safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(normalized));
+}
 
-    // If you ever want to switch to envelope, you can do:
-    // const env: TypographyEnvelopeV1 = { v: 1, t };
-    // safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(env));
+export function saveReaderTypographyEnvelope(t: ReaderTypography): void {
+    const normalized = normalizeTypography(t);
+    const env: TypographyEnvelopeV1 = { v: 1, t: normalized };
+    safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(env));
 }
 
 export function clearReaderTypography(): void {
     safeLocalStorageRemove(STORAGE_KEY_V2);
 }
 
-/**
- * Apply CSS vars to <html>.
- * NOTE: --bpScriptureFont is a *font-family value* (string), not an id.
- */
 export function applyReaderTypography(t: ReaderTypography | null): void {
-    if (typeof document === "undefined") return;
-    const root = document.documentElement;
+    const root = currentRoot();
+    if (!root) return;
 
     if (!t) {
-        root.style.removeProperty("--bpScriptureFont");
-        root.style.removeProperty("--bpScriptureSize");
-        root.style.removeProperty("--bpScriptureLeading");
-        root.style.removeProperty("--bpScriptureWeight");
-        root.style.removeProperty("--bpReaderMeasure");
+        if (!lastAppliedEnabled) return;
+        removeTypographyVars(root);
+        lastAppliedEnabled = false;
+        lastAppliedSignature = null;
         return;
     }
 
-    const fontCss = getFontCssFamily(t.font);
+    const normalized = normalizeTypography(t);
+    const sig = typographySignature(normalized);
 
-    root.style.setProperty("--bpScriptureFont", fontCss);
-    root.style.setProperty("--bpScriptureSize", `${t.sizePx}px`);
-    root.style.setProperty("--bpScriptureLeading", String(t.leading));
-    root.style.setProperty("--bpScriptureWeight", String(t.weight));
-    root.style.setProperty("--bpReaderMeasure", `${t.measurePx}px`);
+    if (lastAppliedEnabled && lastAppliedSignature === sig) {
+        return;
+    }
+
+    root.style.setProperty("--bpScriptureFont", getFontCssFamily(normalized.font));
+    root.style.setProperty("--bpScriptureSize", `${normalized.sizePx}px`);
+    root.style.setProperty("--bpScriptureLeading", String(normalized.leading));
+    root.style.setProperty("--bpScriptureWeight", String(normalized.weight));
+    root.style.setProperty("--bpReaderMeasure", `${normalized.measurePx}px`);
+
+    lastAppliedEnabled = true;
+    lastAppliedSignature = sig;
 }
 
 export function applyReaderTypographyFromStorage(): ReaderTypography | null {
@@ -22446,38 +24000,153 @@ export function applyReaderTypographyFromStorage(): ReaderTypography | null {
 }
 
 export function updateTypography(base: ReaderTypography, patch: Partial<ReaderTypography>): ReaderTypography {
-    return normalizeTypography({ ...base, ...patch });
+    return normalizeTypography({ ...normalizeTypography(base), ...patch });
 }
 
-/**
- * UI options (previews can use cssFamily to render different fonts in the picker).
- */
-export function fontOptions(): Array<{ id: TypographyFont; label: string; cssFamily: string }> {
-    return (Object.keys(FONT_PRESETS) as TypographyFont[]).map((k) => ({
-        id: k,
-        label: FONT_PRESETS[k].label,
-        cssFamily: FONT_PRESETS[k].css,
+export function fontOptions(): FontOption[] {
+    return (Object.keys(FONT_PRESETS) as TypographyFont[]).map((id) => ({
+        id,
+        label: FONT_PRESETS[id].label,
+        cssFamily: FONT_PRESETS[id].css,
+        category: FONT_PRESETS[id].category,
     }));
 }
 
+export function fontOptionsByCategory() {
+    const out: Record<FontOption["category"], FontOption[]> = {
+        sans: [],
+        serif: [],
+        rounded: [],
+        mono: [],
+        custom: [],
+    };
+
+    for (const option of fontOptions()) {
+        out[option.category].push(option);
+    }
+
+    return out;
+}
+
 /**
- * Optional: Wait for fonts to be ready after applying.
- * Useful if you notice measurement jitter with virtualizer when switching fonts.
+ * Best-effort font readiness wait.
+ * Useful after a font switch before measuring text / virtual rows / overlays.
  */
-export async function waitForFontsIfSupported(timeoutMs = 600): Promise<void> {
-    if (typeof document === "undefined") return;
-    const fonts: FontFaceSet | undefined = (document as any).fonts;
+export async function waitForFontsIfSupported(timeoutMs = 700): Promise<void> {
+    if (!isDocumentAvailable()) return;
+
+    const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
     if (!fonts || typeof fonts.ready?.then !== "function") return;
 
-    // race with timeout so we never hang
+    let timeoutId: number | null = null;
+
     await Promise.race([
-        fonts.ready.then(() => undefined),
+        fonts.ready.then(() => undefined).catch(() => undefined),
         new Promise<void>((resolve) => {
-            const id = window.setTimeout(() => resolve(), timeoutMs);
-            // best-effort cleanup is handled by resolve path
-            void id;
+            timeoutId = window.setTimeout(() => resolve(), timeoutMs);
         }),
     ]);
+
+    if (timeoutId != null) {
+        window.clearTimeout(timeoutId);
+    }
+}
+
+/**
+ * Stronger helper: apply, then wait for fonts.
+ * Useful when changing font from a picker and wanting calmer layout.
+ */
+export async function applyReaderTypographyAndWait(
+     t: ReaderTypography | null,
+     timeoutMs = 700,
+): Promise<void> {
+    applyReaderTypography(t);
+
+    if (!t || !isDocumentAvailable()) return;
+
+    const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
+    if (!fonts) {
+        await waitForFontsIfSupported(timeoutMs);
+        return;
+    }
+
+    try {
+        const normalized = normalizeTypography(t);
+        const probe = fontLoadProbe(normalized);
+
+        const loadPromise =
+             typeof fonts.load === "function"
+                  ? Promise.allSettled([
+                      fonts.load(probe, "The quick brown fox jumps over the lazy dog 0123456789"),
+                      fonts.ready,
+                  ]).then(() => undefined)
+                  : fonts.ready.then(() => undefined);
+
+        let timeoutId: number | null = null;
+
+        await Promise.race([
+            loadPromise,
+            new Promise<void>((resolve) => {
+                timeoutId = window.setTimeout(() => resolve(), timeoutMs);
+            }),
+        ]);
+
+        if (timeoutId != null) {
+            window.clearTimeout(timeoutId);
+        }
+    } catch {
+        await waitForFontsIfSupported(timeoutMs);
+    }
+}
+
+/**
+ * Useful for devtools / reset buttons / external normalization.
+ */
+export function coerceTypographyPatch(
+     patch: Partial<ReaderTypography> | null | undefined,
+): Partial<ReaderTypography> {
+    if (!patch) return {};
+
+    return {
+        ...(patch.font != null ? { font: normalizeFont(patch.font) } : null),
+        ...(patch.sizePx != null
+             ? {
+                 sizePx: clampInt(
+                      toNumber(patch.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx,
+                      LIMITS.sizePx.lo,
+                      LIMITS.sizePx.hi,
+                 ),
+             }
+             : null),
+        ...(patch.weight != null
+             ? {
+                 weight: clampInt(
+                      toNumber(patch.weight) ?? DEFAULT_TYPOGRAPHY.weight,
+                      LIMITS.weight.lo,
+                      LIMITS.weight.hi,
+                 ),
+             }
+             : null),
+        ...(patch.leading != null
+             ? {
+                 leading: clampFloat(
+                      toNumber(patch.leading) ?? DEFAULT_TYPOGRAPHY.leading,
+                      LIMITS.leading.lo,
+                      LIMITS.leading.hi,
+                      LIMITS.leading.digits,
+                 ),
+             }
+             : null),
+        ...(patch.measurePx != null
+             ? {
+                 measurePx: clampInt(
+                      toNumber(patch.measurePx) ?? DEFAULT_TYPOGRAPHY.measurePx,
+                      LIMITS.measurePx.lo,
+                      LIMITS.measurePx.hi,
+                 ),
+             }
+             : null),
+    };
 }
 ```
 
@@ -24193,17 +25862,17 @@ export default defineConfig({
 
 ### biblia.to-code-export.md
 
-> TRUNCATED: file was 1088834 bytes; showing first 48000 chars
+> TRUNCATED: file was 958335 bytes; showing first 48000 chars
 
 ```md
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-06T23:25:32.060Z
-Root: C:\Users\dannydekker\Desktop\Biblia-Populi
-Total files: 72
-Total raw bytes (all included files): 1968108
+Generated: 2026-03-07T23:21:34.783Z
+Root: /Users/dan/Desktop/Biblia-Populi
+Total files: 70
+Total raw bytes (all included files): 1844926
 Truncated/skipped files: 1
-Export time: 17ms
+Export time: 13ms
 
 ## Notes
 
@@ -24384,11 +26053,10 @@ vite.config.ts.timestamp-*
 ### apps/api/drizzle.config.ts
 
 ```ts
-// apps/api/drizzle.config.ts
 import type { Config } from "drizzle-kit";
 
 export default {
-    schema: ["./src/db/schema.ts", "./src/db/authSchema.ts"],
+    schema: "./src/db/schema.ts",
     out: "./drizzle",
     dialect: "sqlite",
     dbCredentials: {
@@ -24409,42 +26077,21 @@ export default {
     {
       "idx": 0,
       "version": "6",
-      "when": 1772236618451,
-      "tag": "0000_lazy_blue_blade",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "6",
-      "when": 1772414275083,
-      "tag": "0001_bizarre_next_avengers",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "6",
-      "when": 1772556186504,
-      "tag": "0002_romantic_prowler",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "6",
-      "when": 1772839421817,
-      "tag": "0003_sparkling_rumiko_fujikawa",
+      "when": 1772840253164,
+      "tag": "0000_sweet_triathlon",
       "breakpoints": true
     }
   ]
 }
 ```
 
-### apps/api/drizzle/meta/0001_snapshot.json
+### apps/api/drizzle/meta/0000_snapshot.json
 
 ```json
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "7bc98a87-3de5-4d07-9b7e-3689df2821aa",
+  "id": "67b2a2dd-86c7-4ec2-90ba-23ef9745aa94",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "bp_audit": {
@@ -24517,6 +26164,22 @@ export default {
             "created_at"
           ],
           "isUnique": false
+        },
+        "bp_audit_action_idx": {
+          "name": "bp_audit_action_idx",
+          "columns": [
+            "action",
+            "created_at"
+          ],
+          "isUnique": false
+        },
+        "bp_audit_source_idx": {
+          "name": "bp_audit_source_idx",
+          "columns": [
+            "source_id",
+            "created_at"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -24525,7 +26188,7 @@ export default {
       "checkConstraints": {
         "bp_audit_action_check": {
           "name": "bp_audit_action_check",
-          "value": "\"bp_audit\".\"action\" in ('INSERT','UPDATE','DELETE')"
+          "value": "\"bp_audit\".\"action\" in ('INSERT', 'UPDATE', 'DELETE')"
         }
       }
     },
@@ -24612,11 +26275,19 @@ export default {
         },
         "bp_book_testament_check": {
           "name": "bp_book_testament_check",
-          "value": "\"bp_book\".\"testament\" in ('OT','NT')"
+          "value": "\"bp_book\".\"testament\" in ('OT', 'NT')"
         },
         "bp_book_book_id_check": {
           "name": "bp_book_book_id_check",
           "value": "length(\"bp_book\".\"book_id\") between 2 and 8"
+        },
+        "bp_book_name_check": {
+          "name": "bp_book_name_check",
+          "value": "length(\"bp_book\".\"name\") > 0"
+        },
+        "bp_book_name_short_check": {
+          "name": "bp_book_name_short_check",
+          "value": "length(\"bp_book\".\"name_short\") > 0"
         }
       }
     },
@@ -24635,6 +26306,13 @@ export default {
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "chapter_ord": {
+          "name": "chapter_ord",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "start_verse_ord": {
@@ -24660,6 +26338,13 @@ export default {
         }
       },
       "indexes": {
+        "bp_chapter_chapter_ord_uniq": {
+          "name": "bp_chapter_chapter_ord_uniq",
+          "columns": [
+            "chapter_ord"
+          ],
+          "isUnique": true
+        },
         "bp_chapter_range_idx": {
           "name": "bp_chapter_range_idx",
           "columns": [
@@ -24685,6 +26370,10 @@ export default {
         "bp_chapter_chapter_check": {
           "name": "bp_chapter_chapter_check",
           "value": "\"bp_chapter\".\"chapter\" >= 1"
+        },
+        "bp_chapter_chapter_ord_check": {
+          "name": "bp_chapter_chapter_ord_check",
+          "value": "\"bp_chapter\".\"chapter_ord\" is null or \"bp_chapter\".\"chapter_ord\" >= 1"
         },
         "bp_chapter_verse_count_check": {
           "name": "bp_chapter_verse_count_check",
@@ -24740,20 +26429,36 @@ export default {
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "note_neutral": {
+          "name": "note_neutral",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
         "bp_crossref_from_idx": {
           "name": "bp_crossref_from_idx",
           "columns": [
-            "from_range_id"
+            "from_range_id",
+            "kind"
           ],
           "isUnique": false
         },
         "bp_crossref_to_idx": {
           "name": "bp_crossref_to_idx",
           "columns": [
-            "to_range_id"
+            "to_range_id",
+            "kind"
+          ],
+          "isUnique": false
+        },
+        "bp_crossref_kind_idx": {
+          "name": "bp_crossref_kind_idx",
+          "columns": [
+            "kind"
           ],
           "isUnique": false
         }
@@ -24764,11 +26469,15 @@ export default {
       "checkConstraints": {
         "bp_crossref_kind_check": {
           "name": "bp_crossref_kind_check",
-          "value": "\"bp_crossref\".\"kind\" in ('PARALLEL','QUOTE','ALLUSION','TOPICAL')"
+          "value": "\"bp_crossref\".\"kind\" in ('PARALLEL', 'QUOTE', 'ALLUSION', 'TOPICAL')"
         },
         "bp_crossref_conf_check": {
           "name": "bp_crossref_conf_check",
           "value": "\"bp_crossref\".\"confidence\" is null or (\"bp_crossref\".\"confidence\" >= 0 and \"bp_crossref\".\"confidence\" <= 1)"
+        },
+        "bp_crossref_not_self_check": {
+          "name": "bp_crossref_not_self_check",
+          "value": "not (\"bp_crossref\".\"from_range_id\" = \"bp_crossref\".\"to_range_id\" and \"bp_crossref\".\"kind\" = 'PARALLEL')"
         }
       }
     },
@@ -24816,6 +26525,20 @@ export default {
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "parent_unit_id": {
+          "name": "parent_unit_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
@@ -24823,6 +26546,20 @@ export default {
           "name": "bp_doc_unit_range_idx",
           "columns": [
             "range_id"
+          ],
+          "isUnique": false
+        },
+        "bp_doc_unit_ord_idx": {
+          "name": "bp_doc_unit_ord_idx",
+          "columns": [
+            "ordinal"
+          ],
+          "isUnique": false
+        },
+        "bp_doc_unit_parent_idx": {
+          "name": "bp_doc_unit_parent_idx",
+          "columns": [
+            "parent_unit_id"
           ],
           "isUnique": false
         }
@@ -24833,11 +26570,19 @@ export default {
       "checkConstraints": {
         "bp_doc_unit_kind_check": {
           "name": "bp_doc_unit_kind_check",
-          "value": "\"bp_doc_unit\".\"kind\" in ('SECTION','SPEECH','SONG','LETTER_PART','NARRATIVE_BLOCK')"
+          "value": "\"bp_doc_unit\".\"kind\" in ('SECTION', 'SPEECH', 'SONG', 'LETTER_PART', 'NARRATIVE_BLOCK')"
         },
         "bp_doc_unit_conf_check": {
           "name": "bp_doc_unit_conf_check",
           "value": "\"bp_doc_unit\".\"confidence\" is null or (\"bp_doc_unit\".\"confidence\" >= 0 and \"bp_doc_unit\".\"confidence\" <= 1)"
+        },
+        "bp_doc_unit_ordinal_check": {
+          "name": "bp_doc_unit_ordinal_check",
+          "value": "\"bp_doc_unit\".\"ordinal\" is null or \"bp_doc_unit\".\"ordinal\" >= 0"
+        },
+        "bp_doc_unit_not_self_check": {
+          "name": "bp_doc_unit_not_self_check",
+          "value": "\"bp_doc_unit\".\"parent_unit_id\" is null or \"bp_doc_unit\".\"parent_unit_id\" <> \"bp_doc_unit\".\"unit_id\""
         }
       }
     },
@@ -24893,6 +26638,14 @@ export default {
           "notNull": true,
           "autoincrement": false,
           "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
         }
       },
       "indexes": {
@@ -24902,6 +26655,20 @@ export default {
             "slug"
           ],
           "isUnique": true
+        },
+        "bp_entity_name_idx": {
+          "name": "bp_entity_name_idx",
+          "columns": [
+            "canonical_name"
+          ],
+          "isUnique": false
+        },
+        "bp_entity_kind_idx": {
+          "name": "bp_entity_kind_idx",
+          "columns": [
+            "kind"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -24910,7 +26677,7 @@ export default {
       "checkConstraints": {
         "bp_entity_kind_check": {
           "name": "bp_entity_kind_check",
-          "value": "\"bp_entity\".\"kind\" in ('PERSON','PLACE','GROUP','DYNASTY','EMPIRE','REGION','ARTIFACT','OFFICE')"
+          "value": "\"bp_entity\".\"kind\" in ('PERSON', 'PLACE', 'GROUP', 'DYNASTY', 'EMPIRE', 'REGION', 'ARTIFACT', 'OFFICE')"
         },
         "bp_entity_conf_check": {
           "name": "bp_entity_conf_check",
@@ -24919,6 +26686,10 @@ export default {
         "bp_entity_name_check": {
           "name": "bp_entity_name_check",
           "value": "length(\"bp_entity\".\"canonical_name\") > 0"
+        },
+        "bp_entity_slug_check": {
+          "name": "bp_entity_slug_check",
+          "value": "length(\"bp_entity\".\"slug\") > 0"
         }
       }
     },
@@ -24994,7 +26765,8 @@ export default {
         "bp_entity_name_entity_idx": {
           "name": "bp_entity_name_entity_idx",
           "columns": [
-            "entity_id"
+            "entity_id",
+            "is_primary"
           ],
           "isUnique": false
         }
@@ -25006,6 +26778,14 @@ export default {
         "bp_entity_name_conf_check": {
           "name": "bp_entity_name_conf_check",
           "value": "\"bp_entity_name\".\"confidence\" is null or (\"bp_entity_name\".\"confidence\" >= 0 and \"bp_entity_name\".\"confidence\" <= 1)"
+        },
+        "bp_entity_name_name_check": {
+          "name": "bp_entity_name_name_check",
+          "value": "length(\"bp_entity_name\".\"name\") > 0"
+        },
+        "bp_entity_name_name_norm_check": {
+          "name": "bp_entity_name_name_norm_check",
+          "value": "length(\"bp_entity_name\".\"name_norm\") >= 0"
         }
       }
     },
@@ -25073,14 +26853,16 @@ export default {
         "bp_entity_relation_from_idx": {
           "name": "bp_entity_relation_from_idx",
           "columns": [
-            "from_entity_id"
+            "from_entity_id",
+            "kind"
           ],
           "isUnique": false
         },
         "bp_entity_relation_to_idx": {
           "name": "bp_entity_relation_to_idx",
           "columns": [
-            "to_entity_id"
+            "to_entity_id",
+            "kind"
           ],
           "isUnique": false
         },
@@ -25098,7 +26880,7 @@ export default {
       "checkConstraints": {
         "bp_entity_relation_kind_check": {
           "name": "bp_entity_relation_kind_check",
-          "value": "\"bp_entity_relation\".\"kind\" in ('PARENT_OF','CHILD_OF','SPOUSE_OF','SIBLING_OF','RULES_OVER','MEMBER_OF','ALLY_OF','ENEMY_OF','SUCCEEDS')"
+          "value": "\"bp_entity_relation\".\"kind\" in ('PARENT_OF', 'CHILD_OF', 'SPOUSE_OF', 'SIBLING_OF', 'RULES_OVER', 'MEMBER_OF', 'ALLY_OF', 'ENEMY_OF', 'SUCCEEDS')"
         },
         "bp_entity_relation_not_self": {
           "name": "bp_entity_relation_not_self",
@@ -25168,13 +26950,41 @@ export default {
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "summary_neutral": {
+          "name": "summary_neutral",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
+        "bp_event_kind_idx": {
+          "name": "bp_event_kind_idx",
+          "columns": [
+            "kind"
+          ],
+          "isUnique": false
+        },
         "bp_event_range_idx": {
           "name": "bp_event_range_idx",
           "columns": [
             "primary_range_id"
+          ],
+          "isUnique": false
+        },
+        "bp_event_place_idx": {
+          "name": "bp_event_place_idx",
+          "columns": [
+            "primary_place_id"
+          ],
+          "isUnique": false
+        },
+        "bp_event_time_idx": {
+          "name": "bp_event_time_idx",
+          "columns": [
+            "time_span_id"
           ],
           "isUnique": false
         }
@@ -25185,11 +26995,15 @@ export default {
       "checkConstraints": {
         "bp_event_kind_check": {
           "name": "bp_event_kind_check",
-          "value": "\"bp_event\".\"kind\" in (\n    'BIRTH','DEATH','BATTLE','COVENANT','EXODUS','MIGRATION','SPEECH','MIRACLE','PROPHECY',\n        'CAPTIVITY','RETURN','CRUCIFIXION','RESURRECTION','MISSION_JOURNEY','COUNCIL','LETTER_WRITTEN','OTHER'\n)"
+          "value": "\"bp_event\".\"kind\" in ('BIRTH', 'DEATH', 'BATTLE', 'COVENANT', 'EXODUS', 'MIGRATION', 'SPEECH', 'MIRACLE', 'PROPHECY', 'CAPTIVITY', 'RETURN', 'CRUCIFIXION', 'RESURRECTION', 'MISSION_JOURNEY', 'COUNCIL', 'LETTER_WRITTEN', 'OTHER')"
         },
         "bp_event_conf_check": {
           "name": "bp_event_conf_check",
           "value": "\"bp_event\".\"confidence\" is null or (\"bp_event\".\"confidence\" >= 0 and \"bp_event\".\"confidence\" <= 1)"
+        },
+        "bp_event_title_check": {
+          "name": "bp_event_title_check",
+          "value": "length(\"bp_event\".\"canonical_title\") > 0"
         }
       }
     },
@@ -25246,6 +27060,13 @@ export default {
             "entity_id"
           ],
           "isUnique": false
+        },
+        "bp_event_participant_role_idx": {
+          "name": "bp_event_participant_role_idx",
+          "columns": [
+            "role"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -25254,7 +27075,7 @@ export default {
       "checkConstraints": {
         "bp_event_participant_role_check": {
           "name": "bp_event_participant_role_check",
-          "value": "\"bp_event_participant\".\"role\" in ('SUBJECT','AGENT','WITNESS','OPPONENT','RULER','PEOPLE','OTHER')"
+          "value": "\"bp_event_participant\".\"role\" in ('SUBJECT', 'AGENT', 'WITNESS', 'OPPONENT', 'RULER', 'PEOPLE', 'OTHER')"
         },
         "bp_event_participant_conf_check": {
           "name": "bp_event_participant_conf_check",
@@ -25327,7 +27148,8 @@ export default {
         "bp_link_range_idx": {
           "name": "bp_link_range_idx",
           "columns": [
-            "range_id"
+            "range_id",
+            "link_kind"
           ],
           "isUnique": false
         },
@@ -25353,11 +27175,11 @@ export default {
       "checkConstraints": {
         "bp_link_target_kind_check": {
           "name": "bp_link_target_kind_check",
-          "value": "\"bp_link\".\"target_kind\" in ('ENTITY','EVENT','ROUTE','PLACE_GEO')"
+          "value": "\"bp_link\".\"target_kind\" in ('ENTITY', 'EVENT', 'ROUTE', 'PLACE_GEO')"
         },
         "bp_link_link_kind_check": {
           "name": "bp_link_link_kind_check",
-          "value": "\"bp_link\".\"link_kind\" in (\n    'MENTIONS','PRIMARY_SUBJECT','LOCATION','SETTING','JOURNEY_STEP',\n        'PARALLEL_ACCOUNT','QUOTE_SOURCE','QUOTE_TARGET'\n)"
+          "value": "\"bp_link\".\"link_kind\" in ('MENTIONS', 'PRIMARY_SUBJECT', 'LOCATION', 'SETTING', 'JOURNEY_STEP', 'PARALLEL_ACCOUNT', 'QUOTE_SOURCE', 'QUOTE_TARGET')"
         },
         "bp_link_weight_check": {
           "name": "bp_link_weight_check",
@@ -25414,6 +27236,20 @@ export default {
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
+        },
+        "source_revision": {
+          "name": "source_revision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
@@ -25424,6 +27260,14 @@ export default {
             "range_id"
           ],
           "isUnique": false
+        },
+        "bp_paragraph_ord_idx": {
+          "name": "bp_paragraph_ord_idx",
+          "columns": [
+            "translation_id",
+            "ordinal"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -25432,11 +27276,15 @@ export default {
       "checkConstraints": {
         "bp_paragraph_style_check": {
           "name": "bp_paragraph_style_check",
-          "value": "\"bp_paragraph\".\"style\" in ('PROSE','POETRY','LIST','QUOTE','LETTER')"
+          "value": "\"bp_paragraph\".\"style\" in ('PROSE', 'POETRY', 'LIST', 'QUOTE', 'LETTER')"
         },
         "bp_paragraph_indent_check": {
           "name": "bp_paragraph_indent_check",
           "value": "\"bp_paragraph\".\"indent\" >= 0"
+        },
+        "bp_paragraph_ordinal_check": {
+          "name": "bp_paragraph_ordinal_check",
+          "value": "\"bp_paragraph\".\"ordinal\" is null or \"bp_paragraph\".\"ordinal\" >= 0"
         }
       }
     },
@@ -25491,13 +27339,21 @@ export default {
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "source_revision": {
+          "name": "source_revision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
         "bp_pericope_book_idx": {
           "name": "bp_pericope_book_idx",
           "columns": [
-            "book_id"
+            "book_id",
+            "rank"
           ],
           "isUnique": false
         },
@@ -25513,9 +27369,17 @@ export default {
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {
+        "bp_pericope_rank_check": {
+          "name": "bp_pericope_rank_check",
+          "value": "\"bp_pericope\".\"rank\" is null or \"bp_pericope\".\"rank\" >= 0"
+        },
         "bp_pericope_conf_check": {
           "name": "bp_pericope_conf_check",
           "value": "\"bp_pericope\".\"confidence\" is null or (\"bp_pericope\".\"confidence\" >= 0 and \"bp_pericope\".\"confidence\" <= 1)"
+        },
+        "bp_pericope_title_check": {
+          "name": "bp_pericope_title_check",
+          "value": "length(\"bp_pericope\".\"title\") > 0"
         }
       }
     },
@@ -25608,7 +27472,19 @@ export default {
       "checkConstraints": {
         "bp_place_geo_type_check": {
           "name": "bp_place_geo_type_check",
-          "value": "\"bp_place_geo\".\"geo_type\" in ('POINT','BBOX','REGION_POLYGON')"
+          "value": "\"bp_place_geo\".\"geo_type\" in ('POINT', 'BBOX', 'REGION_POLYGON')"
+        },
+        "bp_place_geo_lat_check": {
+          "name": "bp_place_geo_lat_check",
+          "value": "\"bp_place_geo\".\"lat\" is null or (\"bp_place_geo\".\"lat\" >= -90 and \"bp_place_geo\".\"lat\" <= 90)"
+        },
+        "bp_place_geo_lng_check": {
+          "name": "bp_place_geo_lng_check",
+          "value": "\"bp_place_geo\".\"lng\" is null or (\"bp_place_geo\".\"lng\" >= -180 and \"bp_place_geo\".\"lng\" <= 180)"
+        },
+        "bp_place_geo_precision_check": {
+          "name": "bp_place_geo_precision_check",
+          "value": "\"bp_place_geo\".\"precision_m\" is null or \"bp_place_geo\".\"precision_m\" >= 0"
         },
         "bp_place_geo_conf_check": {
           "name": "bp_place_geo_conf_check",
@@ -25661,6 +27537,20 @@ export default {
           "notNull": false,
           "autoincrement": false
         },
+        "verse_count": {
+          "name": "verse_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "chapter_count": {
+          "name": "chapter_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "text",
@@ -25678,6 +27568,14 @@ export default {
             "end_verse_ord"
           ],
           "isUnique": false
+        },
+        "bp_range_start_key_idx": {
+          "name": "bp_range_start_key_idx",
+          "columns": [
+            "start_verse_key",
+            "end_verse_key"
+          ],
+          "isUnique": false
         }
       },
       "foreignKeys": {},
@@ -25687,6 +27585,14 @@ export default {
         "bp_range_span_check": {
           "name": "bp_range_span_check",
           "value": "\"bp_range\".\"start_verse_ord\" <= \"bp_range\".\"end_verse_ord\""
+        },
+        "bp_range_verse_count_check": {
+          "name": "bp_range_verse_count_check",
+          "value": "\"bp_range\".\"verse_count\" is null or \"bp_range\".\"verse_count\" >= 1"
+        },
+        "bp_range_chapter_count_check": {
+          "name": "bp_range_chapter_count_check",
+          "value": "\"bp_range\".\"chapter_count\" is null or \"bp_range\".\"chapter_count\" >= 1"
         }
       }
     },
@@ -25745,288 +27651,7 @@ export default {
         "duration_ms": {
           "name": "duration_ms",
           "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
-        }
-      },
-      "indexes": {
-        "bp_reader_event_anon_idx": {
-          "name": "bp_reader_event_anon_idx",
-          "columns": [
-            "anon_id",
-            "created_at"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_reader_event_type_check": {
-          "name": "bp_reader_event_type_check",
-          "value": "\"bp_reader_event\".\"event_type\" in (\n    'VIEW_VERSE','VIEW_CHAPTER','SCROLL_BACK','COPY_TEXT','OPEN_ENTITY','OPEN_MAP','OPEN_TIMELINE','SEARCH'\n)"
-        },
-        "bp_reader_event_duration_check": {
-          "name": "bp_reader_event_duration_check",
-          "value": "\"bp_reader_event\".\"duration_ms\" is null or \"bp_reader_event\".\"duration_ms\" >= 0"
-        }
-      }
-    },
-    "bp_route": {
-      "name": "bp_route",
-      "columns": {
-        "route_id": {
-          "name": "route_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "title": {
-          "name": "title",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_route_conf_check": {
-          "name": "bp_route_conf_check",
-          "value": "\"bp_route\".\"confidence\" is null or (\"bp_route\".\"confidence\" >= 0 and \"bp_route\".\"confidence\" <= 1)"
-        }
-      }
-    },
-    "bp_route_step": {
-      "name": "bp_route_step",
-      "columns": {
-        "route_step_id": {
-          "name": "route_step_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "route_id": {
-          "name": "route_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "ordinal": {
-          "name": "ordinal",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "place_entity_id": {
-          "name": "place_entity_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "range_id": {
-          "name": "range_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "note_neutral": {
-          "name": "note_neutral",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "bp_route_step_ord_uniq": {
-          "name": "bp_route_step_ord_uniq",
-          "columns": [
-            "route_id",
-            "ordinal"
-          ],
-          "isUnique": true
-        },
-        "bp_route_step_route_idx": {
-          "name": "bp_route_step_route_idx",
-          "columns": [
-            "route_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_route_step_ord_check": {
-          "name": "bp_route_step_ord_check",
-          "value": "\"bp_route_step\".\"ordinal\" >= 1"
-        }
-      }
-    },
-    "bp_search_query_log": {
-      "name": "bp_search_query_log",
-      "columns": {
-        "query_id": {
-          "name": "query_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "anon_id": {
-          "name": "anon_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "query": {
-          "name": "query",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "query_norm": {
-          "name": "query_norm",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "translation_id": {
-          "name": "translation_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "hits": {
-          "name": "hits",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
-        }
-      },
-      "indexes": {
-        "bp_search_query_log_norm_idx": {
-          "name": "bp_search_query_log_norm_idx",
-          "columns": [
-            "query_norm"
-          ],
-          "isUnique": false
-        },
-        "bp_search_query_log_created_idx": {
-          "name": "bp_search_query_log_created_idx",
-          "columns": [
-            "created_at"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "bp_search_query_log_hits_check": {
-          "name": "bp_search_query_log_hits_check",
-          "value": "\"bp_search_query_log\".\"hits\" >= 0"
-        }
-      }
-    },
-    "bp_source": {
-      "name": "bp_source",
-      "columns": {
-        "source_id": {
-          "name": "source_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "name": {
-          "name": "name",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "kind": {
-          "name": "kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "version": {
-          "name": "version",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "url": {
-          "name": "url",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "license": {
-          "name": "license",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "notes": {
-          "name": "notes",
-          "type": "text",
+          "primaryKey": fal
 ```
 
 ### export-repo.ts

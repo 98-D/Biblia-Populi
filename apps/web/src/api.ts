@@ -1,23 +1,14 @@
 // apps/web/src/api.ts
-// Biblia Populi — tiny typed client (bp_* API)
+// Biblia.to — typed API client
 //
-// Upgraded (vNext):
-// - Robust base URL resolution (same-origin by default; supports absolute or path-base VITE_API_BASE)
-// - Translation selection: global + per-call override + reconciliation helpers (as before)
-// - Proper ETag/304 handling with in-memory response cache (fixes “freeze on 304”)
-// - Optional cache control knobs per request (no-store / bypass / ttl)
-// - GET + POST helpers with AbortSignal + timeout merge
-// - Safer JSON parsing (handles 204/304/empty body), clearer classification
-// - Better diagnostics: requestId, method, statusText, url, body snippet
-// - Credentials policy: same-origin by default; can override
-//
-// Philosophy:
-// - Calm, explicit, traceable
-// - Same-origin by default (Vite proxy / production reverse-proxy)
-// - Optional VITE_API_BASE override for remote API
-// - Consistent errors with codes
-// - Request timeouts + AbortSignal support
-// - Safe JSON parsing + better diagnostics
+// Hardened goals:
+// - same-origin by default, optional VITE_API_BASE
+// - stable translation selection + reconciliation
+// - GET envelope decoding with proper 204/304 handling
+// - in-memory ETag cache that cannot "freeze on 304"
+// - merged abort signals + timeout classification
+// - safer parsing / narrower envelope assumptions
+// - explicit diagnostics with request id + body snippet
 
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: { code: string; message: string } };
@@ -25,44 +16,25 @@ export type ApiRes<T> = ApiOk<T> | ApiErr;
 
 export type ApiCacheMode = "default" | "no-store" | "reload";
 
-/**
- * Request options:
- * - cacheMode:
- *   - "default": allow ETag caching (client-side in-memory) + normal fetch
- *   - "no-store": bypass client cache and send Cache-Control: no-store
- *   - "reload": bypass client cache and send Cache-Control: no-cache
- * - cacheTtlMs: client-side TTL for cached entries (default 30s). Set 0 to disable TTL expiry.
- */
 export type ApiRequestOptions = {
-    /** Abort after N ms (default 12s). Set 0 to disable timeout. */
     timeoutMs?: number;
-    /** Extra headers */
     headers?: Record<string, string>;
-    /** Optional caller-provided AbortSignal (merged with timeout) */
     signal?: AbortSignal;
-
-    /** Optional translationId override for this request. */
     translationId?: string | null;
-
-    /** Fetch credentials (default "same-origin") */
     credentials?: RequestCredentials;
-
-    /** Client cache mode (default "default") */
     cacheMode?: ApiCacheMode;
-
-    /** Client cache TTL (ms). Default 30s. */
     cacheTtlMs?: number;
 };
 
 export type ApiErrorCode =
-    | "TIMEOUT"
-    | "NETWORK"
-    | "HTTP_ERROR"
-    | "BAD_RESPONSE"
-    | "NOT_JSON"
-    | "API_ERROR"
-    | "ABORTED"
-    | "CACHE_MISS";
+     | "TIMEOUT"
+     | "NETWORK"
+     | "HTTP_ERROR"
+     | "BAD_RESPONSE"
+     | "NOT_JSON"
+     | "API_ERROR"
+     | "ABORTED"
+     | "CACHE_MISS";
 
 export class ApiError extends Error {
     readonly code: ApiErrorCode;
@@ -73,9 +45,15 @@ export class ApiError extends Error {
     readonly requestId?: string;
 
     constructor(
-        code: ApiErrorCode,
-        message: string,
-        init?: { status?: number; url?: string; method?: string; bodyText?: string; requestId?: string },
+         code: ApiErrorCode,
+         message: string,
+         init?: {
+             status?: number;
+             url?: string;
+             method?: string;
+             bodyText?: string;
+             requestId?: string;
+         },
     ) {
         super(`${code}: ${message}`);
         this.name = "ApiError";
@@ -124,7 +102,7 @@ export type BookRow = {
     nameShort: string;
     chapters: number;
     osised: string | null;
-    abbrs: string | null; // JSON string or null
+    abbrs: string | null;
 };
 
 export type ChaptersPayload = {
@@ -168,15 +146,15 @@ export type LinkRow = {
     targetKind: "ENTITY" | "EVENT" | "ROUTE" | "PLACE_GEO" | string;
     targetId: string;
     linkKind:
-        | "MENTIONS"
-        | "PRIMARY_SUBJECT"
-        | "LOCATION"
-        | "SETTING"
-        | "JOURNEY_STEP"
-        | "PARALLEL_ACCOUNT"
-        | "QUOTE_SOURCE"
-        | "QUOTE_TARGET"
-        | string;
+         | "MENTIONS"
+         | "PRIMARY_SUBJECT"
+         | "LOCATION"
+         | "SETTING"
+         | "JOURNEY_STEP"
+         | "PARALLEL_ACCOUNT"
+         | "QUOTE_SOURCE"
+         | "QUOTE_TARGET"
+         | string;
     weight: number;
     source: string;
     confidence: number | null;
@@ -196,13 +174,10 @@ export type ChapterPayload = {
     bookId: string;
     chapter: number;
     chapterBounds: ChapterBounds;
-
     verses: VerseRow[];
-
     ranges: RangeRow[];
     links: LinkRow[];
     crossrefs: CrossrefRow[];
-
     marks: unknown[];
     mentions: unknown[];
     footnotes: unknown[];
@@ -226,8 +201,8 @@ export type SearchPayload = {
 };
 
 export type PersonPayload =
-    | null
-    | {
+     | null
+     | {
     entity: {
         entityId: string;
         kind: "PERSON" | string;
@@ -270,8 +245,8 @@ export type PersonPayload =
 };
 
 export type PlacePayload =
-    | null
-    | {
+     | null
+     | {
     entity: {
         entityId: string;
         kind: "PLACE" | string;
@@ -303,8 +278,8 @@ export type PlacePayload =
 };
 
 export type EventPayload =
-    | null
-    | {
+     | null
+     | {
     event: {
         eventId: string;
         canonicalTitle: string;
@@ -344,8 +319,8 @@ export type SlicePayload = {
 };
 
 export type LocPayload =
-    | null
-    | {
+     | null
+     | {
     verseKey: string;
     verseOrd: number;
     bookId: string;
@@ -357,40 +332,47 @@ export type TranslationsPayload = {
     translations: TranslationMeta[];
 };
 
-/* --------------------------------- Base URL -------------------------------- */
+/* ------------------------------ Base URL --------------------------------- */
 
-// If VITE_API_BASE is set, use it. Otherwise same-origin (works with Vite proxy).
-const API_BASE = (import.meta.env?.VITE_API_BASE ?? "") as string;
+const RAW_API_BASE = String(import.meta.env?.VITE_API_BASE ?? "");
 
-function stripTrailingSlashes(s: string): string {
-    return s.replace(/\/+$/g, "");
+function stripTrailingSlashes(value: string): string {
+    return value.replace(/\/+$/g, "");
 }
 
-function isAbsoluteUrl(s: string): boolean {
-    return /^https?:\/\//i.test(s);
+function isAbsoluteUrl(value: string): boolean {
+    return /^https?:\/\//i.test(value);
 }
 
-function joinUrl(base: string, p: string): string {
-    const pathname = p.startsWith("/") ? p : `/${p}`;
-    if (!base) return pathname;
+function joinUrl(base: string, path: string): string {
+    const pathname = path.startsWith("/") ? path : `/${path}`;
+    const normalizedBase = stripTrailingSlashes(base.trim());
 
-    const b = stripTrailingSlashes(base);
+    if (!normalizedBase) return pathname;
 
-    // absolute base: https://example.com/api
-    if (isAbsoluteUrl(b)) return `${b}${pathname}`;
+    if (isAbsoluteUrl(normalizedBase)) {
+        return `${normalizedBase}${pathname}`;
+    }
 
-    // path-base: /api
-    const bb = b.startsWith("/") ? b : `/${b}`;
-    return `${stripTrailingSlashes(bb)}${pathname}`;
+    const pathBase = normalizedBase.startsWith("/") ? normalizedBase : `/${normalizedBase}`;
+    return `${stripTrailingSlashes(pathBase)}${pathname}`;
 }
 
-/* ------------------------- Translation selection (client) ------------------- */
+const API_BASE = joinUrl("", RAW_API_BASE);
+
+/* ------------------------ Translation selection -------------------------- */
 
 const TRANSLATION_STORAGE_KEY = "bp_translation_id_v2";
-let _translationIdMem: string | null = null;
+const LEGACY_TRANSLATION_STORAGE_KEY = "bp_translation_id_v1";
+
+let translationIdMem: string | null = null;
+
+function canUseLocalStorage(): boolean {
+    return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
+}
 
 function safeLocalStorageGet(key: string): string | null {
-    if (typeof window === "undefined") return null;
+    if (!canUseLocalStorage()) return null;
     try {
         return window.localStorage.getItem(key);
     } catch {
@@ -399,16 +381,16 @@ function safeLocalStorageGet(key: string): string | null {
 }
 
 function safeLocalStorageSet(key: string, value: string): void {
-    if (typeof window === "undefined") return;
+    if (!canUseLocalStorage()) return;
     try {
         window.localStorage.setItem(key, value);
     } catch {
-        // ignore
+        // ignore quota/privacy mode failures
     }
 }
 
 function safeLocalStorageRemove(key: string): void {
-    if (typeof window === "undefined") return;
+    if (!canUseLocalStorage()) return;
     try {
         window.localStorage.removeItem(key);
     } catch {
@@ -421,78 +403,96 @@ function normalizeTranslationId(id: string): string {
 }
 
 export function getTranslationId(): string | null {
-    if (_translationIdMem != null) return _translationIdMem;
+    if (translationIdMem !== null) return translationIdMem;
 
-    const v2 = safeLocalStorageGet(TRANSLATION_STORAGE_KEY);
-    if (v2 && v2.trim()) {
-        _translationIdMem = normalizeTranslationId(v2);
-        return _translationIdMem;
-    }
-    const v1 = safeLocalStorageGet("bp_translation_id_v1");
-    if (v1 && v1.trim()) {
-        _translationIdMem = normalizeTranslationId(v1);
-        safeLocalStorageSet(TRANSLATION_STORAGE_KEY, _translationIdMem);
-        safeLocalStorageRemove("bp_translation_id_v1");
-        return _translationIdMem;
+    const current = safeLocalStorageGet(TRANSLATION_STORAGE_KEY);
+    if (current && current.trim()) {
+        translationIdMem = normalizeTranslationId(current);
+        return translationIdMem;
     }
 
-    _translationIdMem = null;
+    const legacy = safeLocalStorageGet(LEGACY_TRANSLATION_STORAGE_KEY);
+    if (legacy && legacy.trim()) {
+        translationIdMem = normalizeTranslationId(legacy);
+        safeLocalStorageSet(TRANSLATION_STORAGE_KEY, translationIdMem);
+        safeLocalStorageRemove(LEGACY_TRANSLATION_STORAGE_KEY);
+        return translationIdMem;
+    }
+
     return null;
 }
 
 export function setTranslationId(id: string | null): void {
-    const v = id && id.trim() ? normalizeTranslationId(id) : null;
-    _translationIdMem = v;
+    const next = id && id.trim() ? normalizeTranslationId(id) : null;
+    translationIdMem = next;
 
-    if (!v) safeLocalStorageRemove(TRANSLATION_STORAGE_KEY);
-    else safeLocalStorageSet(TRANSLATION_STORAGE_KEY, v);
+    if (next === null) {
+        safeLocalStorageRemove(TRANSLATION_STORAGE_KEY);
+        return;
+    }
+
+    safeLocalStorageSet(TRANSLATION_STORAGE_KEY, next);
 }
 
-export function reconcileTranslationId(translations: TranslationMeta[] | undefined | null): string | null {
+export function reconcileTranslationId(
+     translations: TranslationMeta[] | undefined | null,
+): string | null {
     const list = translations ?? [];
     if (list.length === 0) return getTranslationId();
 
     const current = getTranslationId();
-    if (current && list.some((t) => t.translationId === current)) return current;
+    if (current && list.some((t) => t.translationId === current)) {
+        return current;
+    }
 
-    const def = list.find((t) => !!t.isDefault)?.translationId ?? null;
-    const next = def ?? list[0]!.translationId ?? null;
-    setTranslationId(next);
-    return next;
+    const defaultId =
+         list.find((t) => t.isDefault)?.translationId ??
+         list[0]?.translationId ??
+         null;
+
+    setTranslationId(defaultId);
+    return defaultId;
 }
 
 function withTranslation(path: string, opts?: ApiRequestOptions): string {
-    const t = (opts?.translationId ?? getTranslationId())?.trim() || "";
-    if (!t) return path;
+    const translationId = (opts?.translationId ?? getTranslationId())?.trim() ?? "";
+    if (!translationId) return path;
 
     if (/[?&](t|translationId)=/i.test(path)) return path;
 
     const sep = path.includes("?") ? "&" : "?";
-    return `${path}${sep}t=${encodeURIComponent(t)}`;
+    return `${path}${sep}t=${encodeURIComponent(translationId)}`;
 }
 
-/* ------------------------------ Query helpers ------------------------------ */
+/* ------------------------------ Query helpers ---------------------------- */
 
 type QueryValue = string | number | boolean | null | undefined;
 
 function addQuery(path: string, params: Record<string, QueryValue>): string {
     const url = new URL(path, "http://local");
-    for (const [k, v] of Object.entries(params)) {
-        if (v == null) continue;
-        url.searchParams.set(k, String(v));
+    for (const [key, value] of Object.entries(params)) {
+        if (value == null) continue;
+        url.searchParams.set(key, String(value));
     }
-    const q = url.search.toString();
-    if (!q) return url.pathname;
-    return `${url.pathname}${q}`;
+    return `${url.pathname}${url.search}`;
 }
 
-/* ------------------------------ JSON / Errors ------------------------------ */
+/* --------------------------- JSON / envelope ----------------------------- */
 
-function isObj(v: unknown): v is Record<string, unknown> {
-    return typeof v === "object" && v !== null;
+function isObj(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
 }
 
-function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false } {
+function hasOwn<K extends string>(
+     value: Record<string, unknown>,
+     key: K,
+): value is Record<K, unknown> {
+    return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function tryParseJson(
+     text: string,
+): { ok: true; value: unknown } | { ok: false } {
     if (!text) return { ok: true, value: null };
     try {
         return { ok: true, value: JSON.parse(text) as unknown };
@@ -501,47 +501,125 @@ function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false 
     }
 }
 
-function mergeSignals(a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined {
-    if (!a) return b;
-    if (!b) return a;
-
-    if (a.aborted) return a;
-    if (b.aborted) return b;
-
-    const ctrl = new AbortController();
-    const onAbort = () => ctrl.abort();
-
-    a.addEventListener("abort", onAbort, { once: true });
-    b.addEventListener("abort", onAbort, { once: true });
-
-    return ctrl.signal;
+function isApiErrEnvelope(value: unknown): value is ApiErr {
+    if (!isObj(value)) return false;
+    if (!hasOwn(value, "ok") || value.ok !== false) return false;
+    if (!hasOwn(value, "error") || !isObj(value.error)) return false;
+    return typeof value.error.code === "string" && typeof value.error.message === "string";
 }
 
-function classifyFetchError(e: unknown): ApiError {
-    if (e && typeof e === "object" && (e as any).name === "AbortError") {
-        return new ApiError("ABORTED", "Request aborted.");
-    }
-    if (e instanceof ApiError) return e;
-    const msg = e instanceof Error ? e.message : String(e);
-    return new ApiError("NETWORK", msg || "Network error.");
+function isApiOkEnvelope<T>(value: unknown): value is ApiOk<T> {
+    if (!isObj(value)) return false;
+    if (!hasOwn(value, "ok") || value.ok !== true) return false;
+    return hasOwn(value, "data");
 }
 
 function isLikelyJson(res: Response): boolean {
-    const ct = (res.headers.get("content-type") ?? "").toLowerCase();
-    return ct.includes("application/json") || ct.includes("+json");
+    const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+    return contentType.includes("application/json") || contentType.includes("+json");
 }
 
 function formatHttpMessage(res: Response): string {
-    const s = res.statusText?.trim();
-    return s ? s : `HTTP ${res.status}`;
+    const statusText = res.statusText.trim();
+    return statusText ? statusText : `HTTP ${res.status}`;
 }
 
 function getRequestId(res: Response): string | undefined {
-    const v = res.headers.get("x-request-id") ?? res.headers.get("cf-ray") ?? undefined;
-    return v ? v : undefined;
+    const id = res.headers.get("x-request-id") ?? res.headers.get("cf-ray");
+    return id?.trim() || undefined;
 }
 
-/* ----------------------------- ETag 304 cache ------------------------------ */
+function bodySnippet(text: string | undefined): string | undefined {
+    if (!text) return undefined;
+    const normalized = text.trim();
+    if (!normalized) return undefined;
+    return normalized.length > 320 ? `${normalized.slice(0, 320)}…` : normalized;
+}
+
+/* ---------------------------- Abort / timeout ---------------------------- */
+
+type MergedSignal = {
+    signal?: AbortSignal;
+    cleanup: () => void;
+    didTimeout: () => boolean;
+};
+
+function mergeSignalsWithTimeout(
+     externalSignal: AbortSignal | undefined,
+     timeoutMs: number,
+): MergedSignal {
+    const timeoutCtrl = new AbortController();
+    const mergedCtrl = new AbortController();
+
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const abortMerged = () => {
+        if (!mergedCtrl.signal.aborted) mergedCtrl.abort();
+    };
+
+    const onExternalAbort = () => {
+        abortMerged();
+    };
+
+    const onTimeoutAbort = () => {
+        timedOut = true;
+        abortMerged();
+    };
+
+    if (externalSignal?.aborted) {
+        abortMerged();
+    } else if (externalSignal) {
+        externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        timer = setTimeout(() => {
+            timeoutCtrl.abort();
+        }, timeoutMs);
+
+        if (timeoutCtrl.signal.aborted) {
+            onTimeoutAbort();
+        } else {
+            timeoutCtrl.signal.addEventListener("abort", onTimeoutAbort, { once: true });
+        }
+    }
+
+    return {
+        signal: mergedCtrl.signal,
+        cleanup: () => {
+            if (timer) clearTimeout(timer);
+            if (externalSignal) {
+                externalSignal.removeEventListener("abort", onExternalAbort);
+            }
+            timeoutCtrl.signal.removeEventListener("abort", onTimeoutAbort);
+        },
+        didTimeout: () => timedOut,
+    };
+}
+
+function classifyFetchError(
+     error: unknown,
+     method: string,
+     url: string,
+     didTimeout: boolean,
+): ApiError {
+    if (error instanceof ApiError) return error;
+
+    if (error && typeof error === "object" && "name" in error) {
+        const name = String((error as { name?: unknown }).name ?? "");
+        if (name === "AbortError") {
+            return didTimeout
+                 ? new ApiError("TIMEOUT", "Request took too long.", { method, url })
+                 : new ApiError("ABORTED", "Request aborted.", { method, url });
+        }
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    return new ApiError("NETWORK", message || "Network error.", { method, url });
+}
+
+/* ------------------------------ ETag cache ------------------------------- */
 
 type CacheEntry = Readonly<{
     at: number;
@@ -550,206 +628,202 @@ type CacheEntry = Readonly<{
 }>;
 
 const DEFAULT_CACHE_TTL_MS = 30_000;
-const _cache = new Map<string, CacheEntry>();
+const responseCache = new Map<string, CacheEntry>();
 
 function cacheKey(method: string, url: string): string {
-    // method is part of key (POST responses should not be cached by default)
-    return `${method} ${url}`;
+    return `${method.toUpperCase()} ${url}`;
 }
 
 function cacheGet(key: string, ttlMs: number): CacheEntry | null {
-    const hit = _cache.get(key);
+    const hit = responseCache.get(key);
     if (!hit) return null;
-    if (ttlMs <= 0) return hit;
-    if (Date.now() - hit.at > ttlMs) {
-        _cache.delete(key);
+
+    if (ttlMs > 0 && Date.now() - hit.at > ttlMs) {
+        responseCache.delete(key);
         return null;
     }
+
     return hit;
 }
 
 function cachePut(key: string, etag: string, data: unknown): void {
-    if (!etag) return;
-    _cache.set(key, Object.freeze({ at: Date.now(), etag, data }));
+    const cleanEtag = etag.trim();
+    if (!cleanEtag) return;
+
+    responseCache.set(
+         key,
+         Object.freeze({
+             at: Date.now(),
+             etag: cleanEtag,
+             data,
+         }),
+    );
 }
 
 function shouldCacheResponse(method: string, res: Response): boolean {
     if (method !== "GET") return false;
     if (res.status !== 200) return false;
-    const etag = (res.headers.get("etag") ?? "").trim();
-    return !!etag;
+    return Boolean((res.headers.get("etag") ?? "").trim());
 }
 
-/* ------------------------------- Request core ------------------------------ */
+/* ----------------------------- Request core ------------------------------ */
 
 async function requestJson<T>(
-    method: "GET" | "POST",
-    path: string,
-    body: unknown | undefined,
-    opts: ApiRequestOptions,
+     method: "GET" | "POST",
+     path: string,
+     body: unknown | undefined,
+     opts: ApiRequestOptions = {},
 ): Promise<T> {
-    const pathWithT = withTranslation(path, opts);
-    const url = joinUrl(API_BASE, pathWithT);
+    const pathWithTranslation = withTranslation(path, opts);
+    const url = joinUrl(API_BASE, pathWithTranslation);
 
     const timeoutMs = opts.timeoutMs ?? 12_000;
-    const timeoutCtrl = new AbortController();
-    const timeoutOn = Number.isFinite(timeoutMs) && timeoutMs > 0;
-    const timer = timeoutOn ? setTimeout(() => timeoutCtrl.abort(), timeoutMs) : null;
-
-    const signal = mergeSignals(opts.signal, timeoutCtrl.signal);
-
-    const cacheMode: ApiCacheMode = opts.cacheMode ?? "default";
+    const cacheMode = opts.cacheMode ?? "default";
     const cacheTtlMs = opts.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+    const credentials = opts.credentials ?? "same-origin";
+
+    const merged = mergeSignalsWithTimeout(opts.signal, timeoutMs);
 
     const headers: Record<string, string> = {
         Accept: "application/json",
         ...(opts.headers ?? {}),
     };
 
-    // Client-side cache control preferences
-    if (cacheMode === "no-store") headers["Cache-Control"] = headers["Cache-Control"] ?? "no-store";
-    if (cacheMode === "reload") headers["Cache-Control"] = headers["Cache-Control"] ?? "no-cache";
+    if (cacheMode === "no-store" && headers["Cache-Control"] == null) {
+        headers["Cache-Control"] = "no-store";
+    } else if (cacheMode === "reload" && headers["Cache-Control"] == null) {
+        headers["Cache-Control"] = "no-cache";
+    }
 
     const key = cacheKey(method, url);
     const prior = cacheMode === "default" ? cacheGet(key, cacheTtlMs) : null;
 
-    // If we have an ETag, send conditional request (unless caller forced bypass)
-    if (prior?.etag && cacheMode === "default") {
+    if (method === "GET" && cacheMode === "default" && prior?.etag) {
         headers["If-None-Match"] = prior.etag;
     }
 
     try {
-        let payload: string | undefined;
-        if (method === "POST") {
-            headers["Content-Type"] = headers["Content-Type"] ?? "application/json";
-            payload = body === undefined ? undefined : JSON.stringify(body);
+        const payload =
+             method === "POST" && body !== undefined ? JSON.stringify(body) : undefined;
+
+        if (method === "POST" && headers["Content-Type"] == null) {
+            headers["Content-Type"] = "application/json";
         }
 
         const res = await fetch(url, {
             method,
             headers,
             body: payload,
-            signal,
-            credentials: opts.credentials ?? "same-origin",
+            signal: merged.signal,
+            credentials,
         });
 
         const requestId = getRequestId(res);
 
-        // 304 => return cached data (must exist)
         if (res.status === 304) {
             if (!prior) {
-                throw new ApiError("CACHE_MISS", "Server returned 304 but client has no cached body.", {
-                    status: 304,
-                    url,
-                    method,
-                    requestId,
-                });
+                throw new ApiError(
+                     "CACHE_MISS",
+                     "Server returned 304 but client has no cached response body.",
+                     {
+                         status: 304,
+                         method,
+                         url,
+                         requestId,
+                     },
+                );
             }
             return prior.data as T;
         }
 
-        // 204 => no content (treat as null)
         if (res.status === 204) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            return null as any as T;
+            return null as T;
         }
 
-        const bodyText = await res.text();
-        const parsed = tryParseJson(bodyText);
+        const text = await res.text();
+        const parsed = tryParseJson(text);
 
         if (!res.ok) {
-            if (parsed.ok && isObj(parsed.value) && (parsed.value as any).ok === false) {
-                const v = parsed.value as ApiErr;
-                throw new ApiError("API_ERROR", v.error?.message ?? formatHttpMessage(res), {
+            if (parsed.ok && isApiErrEnvelope(parsed.value)) {
+                throw new ApiError("API_ERROR", parsed.value.error.message, {
                     status: res.status,
-                    url,
                     method,
-                    bodyText,
+                    url,
                     requestId,
+                    bodyText: bodySnippet(text),
                 });
             }
+
             throw new ApiError("HTTP_ERROR", formatHttpMessage(res), {
                 status: res.status,
-                url,
                 method,
-                bodyText,
+                url,
                 requestId,
+                bodyText: bodySnippet(text),
             });
         }
 
-        // If server says JSON but parse failed: treat as NOT_JSON with diagnostics
         if (!parsed.ok) {
-            const code: ApiErrorCode = isLikelyJson(res) ? "NOT_JSON" : "BAD_RESPONSE";
-            throw new ApiError(code, "Expected JSON response but got non-JSON.", {
+            throw new ApiError(
+                 isLikelyJson(res) ? "NOT_JSON" : "BAD_RESPONSE",
+                 "Expected JSON response but received non-JSON content.",
+                 {
+                     status: res.status,
+                     method,
+                     url,
+                     requestId,
+                     bodyText: bodySnippet(text),
+                 },
+            );
+        }
+
+        if (!isApiOkEnvelope<T>(parsed.value)) {
+            if (isApiErrEnvelope(parsed.value)) {
+                throw new ApiError("API_ERROR", parsed.value.error.message, {
+                    status: res.status,
+                    method,
+                    url,
+                    requestId,
+                    bodyText: bodySnippet(text),
+                });
+            }
+
+            throw new ApiError("BAD_RESPONSE", "Missing ok:true response envelope.", {
                 status: res.status,
-                url,
                 method,
-                bodyText,
+                url,
                 requestId,
+                bodyText: bodySnippet(text),
             });
         }
 
-        if (!isObj(parsed.value)) {
-            throw new ApiError("BAD_RESPONSE", "Expected JSON object envelope.", {
-                status: res.status,
-                url,
-                method,
-                bodyText,
-                requestId,
-            });
-        }
+        const data = parsed.value.data;
 
-        const env = parsed.value as ApiRes<T>;
-        if ((env as any).ok === false) {
-            const e = env as ApiErr;
-            throw new ApiError("API_ERROR", e.error?.message ?? "API error.", {
-                status: res.status,
-                url,
-                method,
-                bodyText,
-                requestId,
-            });
-        }
-
-        if ((env as any).ok !== true) {
-            throw new ApiError("BAD_RESPONSE", "Missing ok:true in response envelope.", {
-                status: res.status,
-                url,
-                method,
-                bodyText,
-                requestId,
-            });
-        }
-
-        const data = (env as ApiOk<T>).data as unknown;
-
-        // Cache successful GET responses with ETag
         if (shouldCacheResponse(method, res)) {
-            const etag = (res.headers.get("etag") ?? "").trim();
-            cachePut(key, etag, data);
+            cachePut(key, res.headers.get("etag") ?? "", data);
         }
 
-        return data as T;
-    } catch (e) {
-        if (e && typeof e === "object" && (e as any).name === "AbortError") {
-            if (timeoutOn) throw new ApiError("TIMEOUT", "Request took too long.", { url, method });
-            throw new ApiError("ABORTED", "Request aborted.", { url, method });
-        }
-        throw classifyFetchError(e);
+        return data;
+    } catch (error: unknown) {
+        throw classifyFetchError(error, method, url, merged.didTimeout());
     } finally {
-        if (timer) clearTimeout(timer);
+        merged.cleanup();
     }
 }
 
 async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T> {
-    return requestJson("GET", path, undefined, opts);
+    return requestJson<T>("GET", path, undefined, opts);
 }
 
-async function postJson<T>(path: string, body?: unknown, opts: ApiRequestOptions = {}): Promise<T> {
-    return requestJson("POST", path, body, opts);
+async function postJson<T>(
+     path: string,
+     body?: unknown,
+     opts: ApiRequestOptions = {},
+): Promise<T> {
+    return requestJson<T>("POST", path, body, opts);
 }
 
-/* -------------------------------- API ------------------------------------- */
+/* --------------------------------- API ---------------------------------- */
 
 export function apiGetMeta(opts?: ApiRequestOptions): Promise<MetaPayload> {
     return getJson("/meta", opts);
@@ -763,17 +837,30 @@ export function apiGetBooks(opts?: ApiRequestOptions): Promise<{ books: BookRow[
     return getJson("/books", opts);
 }
 
-export function apiGetChapters(bookId: string, opts?: ApiRequestOptions): Promise<ChaptersPayload> {
+export function apiGetChapters(
+     bookId: string,
+     opts?: ApiRequestOptions,
+): Promise<ChaptersPayload> {
     return getJson(`/chapters/${encodeURIComponent(bookId)}`, opts);
 }
 
-export function apiGetChapter(bookId: string, chapter: number, opts?: ApiRequestOptions): Promise<ChapterPayload> {
-    return getJson(`/chapter/${encodeURIComponent(bookId)}/${encodeURIComponent(String(chapter))}`, opts);
+export function apiGetChapter(
+     bookId: string,
+     chapter: number,
+     opts?: ApiRequestOptions,
+): Promise<ChapterPayload> {
+    return getJson(
+         `/chapter/${encodeURIComponent(bookId)}/${encodeURIComponent(String(chapter))}`,
+         opts,
+    );
 }
 
-export function apiSearch(q: string, limit = 30, opts?: ApiRequestOptions): Promise<SearchPayload> {
-    const path = addQuery("/search", { q, limit });
-    return getJson(path, opts);
+export function apiSearch(
+     q: string,
+     limit = 30,
+     opts?: ApiRequestOptions,
+): Promise<SearchPayload> {
+    return getJson(addQuery("/search", { q, limit }), opts);
 }
 
 export function apiGetPerson(id: string, opts?: ApiRequestOptions): Promise<PersonPayload> {
@@ -788,28 +875,33 @@ export function apiGetEvent(id: string, opts?: ApiRequestOptions): Promise<Event
     return getJson(`/events/${encodeURIComponent(id)}`, opts);
 }
 
-/* --------------------- Infinite-scroll (global spine) ---------------------- */
-
 export function apiGetSpine(opts?: ApiRequestOptions): Promise<SpineStats> {
-    return getJson(`/spine`, opts);
+    return getJson("/spine", opts);
 }
 
-export function apiGetSlice(fromOrd: number, limit = 240, opts?: ApiRequestOptions): Promise<SlicePayload> {
-    const path = addQuery("/slice", { fromOrd, limit });
-    return getJson(path, opts);
+export function apiGetSlice(
+     fromOrd: number,
+     limit = 240,
+     opts?: ApiRequestOptions,
+): Promise<SlicePayload> {
+    return getJson(addQuery("/slice", { fromOrd, limit }), opts);
 }
 
 export function apiResolveLoc(
-    bookId: string,
-    chapter: number,
-    verse: number | null,
-    opts?: ApiRequestOptions,
+     bookId: string,
+     chapter: number,
+     verse: number | null,
+     opts?: ApiRequestOptions,
 ): Promise<LocPayload> {
-    const path = addQuery("/loc", { bookId, chapter, ...(verse != null ? { verse } : {}) });
-    return getJson(path, opts);
+    return getJson(
+         addQuery("/loc", {
+             bookId,
+             chapter,
+             ...(verse != null ? { verse } : {}),
+         }),
+         opts,
+    );
 }
-
-/* ------------------------------ Auth endpoints ----------------------------- */
 
 export function apiAuthMe(opts?: ApiRequestOptions): Promise<{ user: unknown | null }> {
     return getJson("/auth/me", opts);
@@ -819,24 +911,25 @@ export function apiAuthLogout(opts?: ApiRequestOptions): Promise<{ redirect: str
     return postJson("/auth/logout", undefined, opts);
 }
 
-/* -------------------------- Convenience / Debug ----------------------------- */
+/* -------------------------- Convenience / debug -------------------------- */
 
-export function formatApiError(e: unknown): string {
-    if (!(e instanceof ApiError)) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return msg || "Unknown error.";
+export function formatApiError(error: unknown): string {
+    if (!(error instanceof ApiError)) {
+        const message = error instanceof Error ? error.message : String(error);
+        return message || "Unknown error.";
     }
-    const parts: string[] = [];
-    parts.push(e.code);
-    if (typeof e.status === "number") parts.push(String(e.status));
-    if (e.method) parts.push(e.method);
-    if (e.url) parts.push(e.url);
-    if (e.requestId) parts.push(`req:${e.requestId}`);
 
-    if (e.bodyText) {
-        const t = e.bodyText.trim();
-        if (t) parts.push(t.length > 240 ? `${t.slice(0, 240)}…` : t);
-    }
+    const parts: string[] = [error.code];
+
+    if (typeof error.status === "number") parts.push(String(error.status));
+    if (error.method) parts.push(error.method);
+    if (error.url) parts.push(error.url);
+    if (error.requestId) parts.push(`req:${error.requestId}`);
+    if (error.bodyText) parts.push(error.bodyText);
 
     return parts.join(" · ");
+}
+
+export function clearApiResponseCache(): void {
+    responseCache.clear();
 }

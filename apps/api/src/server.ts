@@ -65,12 +65,13 @@ import { bpUser, bpAuthAccount, bpSession } from "./db/authSchema";
 type ApiOk<T> = Readonly<{ ok: true; data: T }>;
 type ApiErr = Readonly<{ ok: false; error: { code: string; message: string } }>;
 
-type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500;
+type JsonStatus = 200 | 201 | 302 | 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500;
 type PortSource = "BP_API_PORT" | "PORT" | "default";
 
 function toJsonStatus(n: number): JsonStatus {
     if (n === 200) return 200;
     if (n === 201) return 201;
+    if (n === 302) return 302;
     if (n === 400) return 400;
     if (n === 401) return 401;
     if (n === 403) return 403;
@@ -81,7 +82,12 @@ function toJsonStatus(n: number): JsonStatus {
     return 500;
 }
 
-function jsonOk<T>(c: Context, data: T, extraHeaders?: Record<string, string>, status: 200 | 201 = 200) {
+function jsonOk<T>(
+     c: Context,
+     data: T,
+     extraHeaders?: Record<string, string>,
+     status: 200 | 201 = 200,
+) {
     if (extraHeaders) {
         for (const [k, v] of Object.entries(extraHeaders)) {
             c.header(k, v);
@@ -112,9 +118,9 @@ function nonEmptyOrUndefined(v: string | undefined): string | undefined {
 
 function splitCsv(s: string): string[] {
     return s
-        .split(",")
-        .map((v) => v.trim())
-        .filter(Boolean);
+         .split(",")
+         .map((v) => v.trim())
+         .filter(Boolean);
 }
 
 function parseEnvBool(v: string | undefined, fallback: boolean): boolean {
@@ -126,9 +132,9 @@ function parseEnvBool(v: string | undefined, fallback: boolean): boolean {
 }
 
 function parseEnvInt(
-    v: string | undefined,
-    fallback: number,
-    bounds?: { min?: number; max?: number },
+     v: string | undefined,
+     fallback: number,
+     bounds?: { min?: number; max?: number },
 ): number {
     const s = (v ?? "").trim();
     const n = Number(s);
@@ -145,8 +151,6 @@ function parsePortCandidate(raw: string | undefined): number | null {
 
     const n = Number(s);
     if (!Number.isInteger(n)) return null;
-
-    // Avoid low ports like 1 unless someone explicitly hardcodes via code.
     if (n < 1024 || n > 65535) return null;
 
     return n;
@@ -204,10 +208,10 @@ function qstr(c: Context, key: string): string | null {
 
 function b64url(bytes: Uint8Array): string {
     return Buffer.from(bytes)
-        .toString("base64")
-        .replace(/\+/g, "-")
-        .replace(/\//g, "_")
-        .replace(/=+$/g, "");
+         .toString("base64")
+         .replace(/\+/g, "-")
+         .replace(/\//g, "_")
+         .replace(/=+$/g, "");
 }
 
 function randId(bytes = 18): string {
@@ -227,9 +231,21 @@ function daysMs(days: number): number {
     return Math.max(1, Math.trunc(d)) * 24 * 60 * 60 * 1000;
 }
 
-function cookieOpts(
-    expiresAt?: Date,
-): CookieOptions {
+function appendVary(current: string | null | undefined, value: string): string {
+    const parts = new Set(
+         (current ?? "")
+              .split(",")
+              .map((v) => v.trim())
+              .filter(Boolean),
+    );
+    for (const part of value.split(",")) {
+        const clean = part.trim();
+        if (clean) parts.add(clean);
+    }
+    return Array.from(parts).join(", ");
+}
+
+function cookieOpts(expiresAt?: Date): CookieOptions {
     const base: CookieOptions = {
         httpOnly: true,
         sameSite: "Lax",
@@ -241,15 +257,56 @@ function cookieOpts(
     return base;
 }
 
-function getClientIp(c: Context): string {
-    const xff = c.req.header("x-forwarded-for");
-    if (xff) {
-        const first = xff.split(",")[0]?.trim();
-        if (first) return first;
+function normalizeOrigin(origin: string): string {
+    const u = new URL(origin);
+    return u.origin;
+}
+
+function isAllowedOrigin(origin: string): boolean {
+    if (CORS_WILDCARD) return true;
+    try {
+        const normalized = normalizeOrigin(origin);
+        return CORS_SET.has(normalized);
+    } catch {
+        return false;
     }
-    const xr = c.req.header("x-real-ip")?.trim();
-    if (xr) return xr;
+}
+
+function assertRedirectUrlAllowed(name: string, value: string): void {
+    assertAbsoluteHttpUrl(name, value);
+    if (!isAllowedOrigin(value)) {
+        throw new Error(`[api] ${name} origin must be one of the configured web origins`);
+    }
+}
+
+function getClientIp(c: Context): string {
+    if (TRUST_PROXY) {
+        const xff = c.req.header("x-forwarded-for");
+        if (xff) {
+            const first = xff.split(",")[0]?.trim();
+            if (first) return first;
+        }
+
+        const xr = c.req.header("x-real-ip")?.trim();
+        if (xr) return xr;
+    }
+
+    const cf = c.req.header("cf-connecting-ip")?.trim();
+    if (TRUST_PROXY && cf) return cf;
+
     return "unknown";
+}
+
+function escapeLike(input: string): string {
+    return input.replace(/[\\%_]/g, "\\$&");
+}
+
+function safeUrlEquals(a: string, b: string): boolean {
+    try {
+        return normalizeOrigin(a) === normalizeOrigin(b);
+    } catch {
+        return false;
+    }
 }
 
 /* --------------------------------- Config --------------------------------- */
@@ -260,6 +317,9 @@ const PORT = PORT_INFO.port;
 const NODE_ENV = (process.env.NODE_ENV ?? "development").trim().toLowerCase();
 const IS_PROD = NODE_ENV === "production";
 
+// Bun listen
+const LISTEN = parseEnvBool(process.env.BP_API_LISTEN, true);
+
 // Public URLs
 const BP_PUBLIC_URL = trimTrailingSlash(process.env.BP_PUBLIC_URL ?? `http://localhost:${PORT}`);
 const BP_WEB_ORIGIN_RAW = (process.env.BP_WEB_ORIGIN ?? process.env.BP_CORS_ORIGIN ?? "").trim();
@@ -268,8 +328,16 @@ const BP_WEB_ORIGIN_RAW = (process.env.BP_WEB_ORIGIN ?? process.env.BP_CORS_ORIG
 const ENV_TRANSLATION_ID = (process.env.BP_TRANSLATION_ID ?? "").trim();
 
 // CORS
-const CORS_LIST = splitCsv(BP_WEB_ORIGIN_RAW);
+const CORS_LIST = splitCsv(BP_WEB_ORIGIN_RAW).map(trimTrailingSlash);
 const CORS_WILDCARD = CORS_LIST.length === 0 || CORS_LIST.includes("*");
+const CORS_SET = new Set(
+     CORS_WILDCARD
+          ? []
+          : CORS_LIST.map((origin) => {
+              assertAbsoluteHttpUrl("BP_WEB_ORIGIN/BP_CORS_ORIGIN entry", origin);
+              return normalizeOrigin(origin);
+          }),
+);
 
 // Auth
 const AUTH_ENABLED = parseEnvBool(process.env.BP_AUTH_ENABLED, true);
@@ -278,36 +346,42 @@ const AUTH_COOKIE_DOMAIN = nonEmptyOrUndefined(process.env.BP_AUTH_COOKIE_DOMAIN
 const AUTH_COOKIE_PATH = nonEmptyOr(process.env.BP_AUTH_COOKIE_PATH, "/");
 const AUTH_COOKIE_SECURE = parseEnvBool(process.env.BP_AUTH_COOKIE_SECURE, IS_PROD);
 const AUTH_SESSION_DAYS = parseEnvInt(process.env.BP_AUTH_SESSION_DAYS, 30, { min: 1, max: 365 });
+const AUTH_SESSION_REFRESH_WINDOW_MS = parseEnvInt(
+     process.env.BP_AUTH_SESSION_REFRESH_WINDOW_MS,
+     7 * 24 * 60 * 60 * 1000,
+     { min: 60_000, max: 365 * 24 * 60 * 60 * 1000 },
+);
 
 // Cookie signing
 const AUTH_COOKIE_SECRET = (process.env.BP_AUTH_COOKIE_SECRET ?? "").trim();
 const AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE = parseEnvBool(
-    process.env.BP_AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE,
-    !IS_PROD,
+     process.env.BP_AUTH_ALLOW_LEGACY_UNSIGNED_COOKIE,
+     !IS_PROD,
 );
+
+// Proxy awareness
+const TRUST_PROXY = parseEnvBool(process.env.BP_TRUST_PROXY, IS_PROD);
 
 // Google OAuth
 const GOOGLE_CLIENT_ID = (process.env.BP_GOOGLE_CLIENT_ID ?? process.env.GOOGLE_CLIENT_ID ?? "").trim();
 const GOOGLE_CLIENT_SECRET = (process.env.BP_GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_CLIENT_SECRET ?? "").trim();
 const GOOGLE_REDIRECT_URI = (
-    process.env.BP_GOOGLE_REDIRECT_URI ??
-    process.env.GOOGLE_REDIRECT_URI ??
-    `${BP_PUBLIC_URL}/auth/google/callback`
+     process.env.BP_GOOGLE_REDIRECT_URI ??
+     process.env.GOOGLE_REDIRECT_URI ??
+     `${BP_PUBLIC_URL}/auth/google/callback`
 ).trim();
 const GOOGLE_SCOPES = ["openid", "email", "profile"] as const;
 
 // Redirects
+const DEFAULT_WEB_ORIGIN = !CORS_WILDCARD ? CORS_LIST[0]! : BP_PUBLIC_URL;
 const AUTH_AFTER_LOGIN_URL = (
-    process.env.BP_AUTH_AFTER_LOGIN_URL ??
-    (CORS_WILDCARD ? "" : `${CORS_LIST[0]}/reader`)
+     process.env.BP_AUTH_AFTER_LOGIN_URL ??
+     `${trimTrailingSlash(DEFAULT_WEB_ORIGIN)}/reader`
 ).trim();
 const AUTH_AFTER_LOGOUT_URL = (
-    process.env.BP_AUTH_AFTER_LOGOUT_URL ??
-    (CORS_WILDCARD ? "" : `${CORS_LIST[0]}/`)
+     process.env.BP_AUTH_AFTER_LOGOUT_URL ??
+     `${trimTrailingSlash(DEFAULT_WEB_ORIGIN)}/`
 ).trim();
-
-// Bun listen
-const LISTEN = parseEnvBool(process.env.BP_API_LISTEN, true);
 
 // Network timeouts
 const OAUTH_FETCH_TIMEOUT_MS = parseEnvInt(process.env.BP_OAUTH_FETCH_TIMEOUT_MS, 10_000, {
@@ -340,28 +414,32 @@ validateStartup();
 function validateStartup(): void {
     assertAbsoluteHttpUrl("BP_PUBLIC_URL", BP_PUBLIC_URL);
 
+    if (!AUTH_COOKIE.trim()) {
+        throw new Error("[api] BP_AUTH_COOKIE resolved empty.");
+    }
+
+    if (!AUTH_COOKIE_PATH.startsWith("/")) {
+        throw new Error("[api] BP_AUTH_COOKIE_PATH must start with '/'.");
+    }
+
     if (AUTH_ENABLED) {
         if (CORS_WILDCARD) {
             throw new Error(
-                "[api] Auth is enabled but BP_WEB_ORIGIN/BP_CORS_ORIGIN resolves to wildcard/empty. Cookies require a specific origin.",
+                 "[api] Auth is enabled but BP_WEB_ORIGIN/BP_CORS_ORIGIN resolves to wildcard/empty. Cookies require a specific origin.",
             );
         }
-
-        for (const origin of CORS_LIST) {
-            assertAbsoluteHttpUrl("BP_WEB_ORIGIN/BP_CORS_ORIGIN entry", origin);
-        }
-
-        assertAbsoluteHttpUrl("AUTH_AFTER_LOGIN_URL", AUTH_AFTER_LOGIN_URL);
-        assertAbsoluteHttpUrl("AUTH_AFTER_LOGOUT_URL", AUTH_AFTER_LOGOUT_URL);
 
         if (IS_PROD && !AUTH_COOKIE_SECRET) {
             throw new Error("[api] BP_AUTH_COOKIE_SECRET is required in production when auth is enabled.");
         }
 
-        if (!GOOGLE_REDIRECT_URI) {
-            throw new Error("[api] GOOGLE_REDIRECT_URI resolved empty.");
-        }
         assertAbsoluteHttpUrl("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI);
+        assertRedirectUrlAllowed("AUTH_AFTER_LOGIN_URL", AUTH_AFTER_LOGIN_URL);
+        assertRedirectUrlAllowed("AUTH_AFTER_LOGOUT_URL", AUTH_AFTER_LOGOUT_URL);
+
+        if (!safeUrlEquals(GOOGLE_REDIRECT_URI, `${BP_PUBLIC_URL}/auth/google/callback`)) {
+            assertAbsoluteHttpUrl("GOOGLE_REDIRECT_URI", GOOGLE_REDIRECT_URI);
+        }
     }
 }
 
@@ -390,8 +468,8 @@ function packCookieValue(value: string): string {
 }
 
 type UnpackCookieResult =
-    | { ok: true; value: string }
-    | { ok: false; reason: "empty" | "bad_sig" | "legacy_disallowed" };
+     | { ok: true; value: string }
+     | { ok: false; reason: "empty" | "bad_sig" | "legacy_disallowed" };
 
 function unpackCookieValue(packed: string): UnpackCookieResult {
     const s = packed.trim();
@@ -410,23 +488,26 @@ function unpackCookieValue(packed: string): UnpackCookieResult {
     const value = s.slice(0, dot);
     const sig = s.slice(dot + 1);
     const expected = hmacSig(value);
+
     if (!sig || !expected || !safeEqual(sig, expected)) {
         return { ok: false, reason: "bad_sig" };
     }
+
     return { ok: true, value };
 }
 
 /* --------------------------------- Schemas -------------------------------- */
 
-const RefBookIdSchema = z.string().min(2).max(8).regex(/^[A-Z0-9_]+$/);
+const RefBookIdSchema = z.string().trim().min(2).max(8).regex(/^[A-Z0-9_]+$/);
 const ChapterNumSchema = z.coerce.number().int().min(1).max(200);
-const VerseNumSchema = z.coerce.number().int().min(1).max(200);
+const VerseNumSchema = z.coerce.number().int().min(1).max(300);
 
 const SearchQuerySchema = z.string().trim().min(1).max(200);
 const SliceFromSchema = z.coerce.number().int().min(1).max(1_000_000);
 const SliceLimitSchema = z.coerce.number().int().min(1).max(2_000);
 
 const TranslationIdSchema = z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9._-]+$/);
+const EntityIdSchema = z.string().trim().min(1).max(128);
 
 /* ---------------------------- Translation metadata -------------------------- */
 
@@ -438,8 +519,14 @@ type TranslationRow = Readonly<{
     licenseKind: string | null;
     licenseText: string | null;
     sourceUrl: string | null;
+    publisher: string | null;
+    editionLabel: string | null;
+    abbreviation: string | null;
+    normalizationForm: string | null;
     isDefault: number;
+    isPublic: number;
     createdAt: string | null;
+    updatedAt: string | null;
 }>;
 
 type TranslationMeta = Readonly<{
@@ -450,8 +537,14 @@ type TranslationMeta = Readonly<{
     licenseKind: string | null;
     licenseText: string | null;
     sourceUrl: string | null;
+    publisher: string | null;
+    editionLabel: string | null;
+    abbreviation: string | null;
+    normalizationForm: string | null;
     isDefault: boolean;
+    isPublic: boolean;
     createdAt: string | null;
+    updatedAt: string | null;
 }>;
 
 function toTranslationMeta(r: TranslationRow): TranslationMeta {
@@ -463,8 +556,14 @@ function toTranslationMeta(r: TranslationRow): TranslationMeta {
         licenseKind: r.licenseKind,
         licenseText: r.licenseText,
         sourceUrl: r.sourceUrl,
+        publisher: r.publisher,
+        editionLabel: r.editionLabel,
+        abbreviation: r.abbreviation,
+        normalizationForm: r.normalizationForm,
         isDefault: !!r.isDefault,
+        isPublic: !!r.isPublic,
         createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
     };
 }
 
@@ -473,8 +572,8 @@ function toTranslationMeta(r: TranslationRow): TranslationMeta {
 const TRANSLATIONS_CACHE_MS = 30_000;
 
 let _translationsCache:
-    | null
-    | Readonly<{
+     | null
+     | Readonly<{
     at: number;
     rows: TranslationRow[];
     byId: Map<string, TranslationRow>;
@@ -483,23 +582,29 @@ let _translationsCache:
 
 function readTranslationsRaw(): TranslationRow[] {
     const rows = sqlite
-        .query(
-            `
+         .query(
+              `
                 SELECT
-                    translation_id AS translationId,
-                    name           AS name,
-                    language       AS language,
-                    derived_from   AS derivedFrom,
-                    license_kind   AS licenseKind,
-                    license_text   AS licenseText,
-                    source_url     AS sourceUrl,
-                    is_default     AS isDefault,
-                    created_at     AS createdAt
+                    translation_id      AS translationId,
+                    name                AS name,
+                    language            AS language,
+                    derived_from        AS derivedFrom,
+                    license_kind        AS licenseKind,
+                    license_text        AS licenseText,
+                    source_url          AS sourceUrl,
+                    publisher           AS publisher,
+                    edition_label       AS editionLabel,
+                    abbreviation        AS abbreviation,
+                    normalization_form  AS normalizationForm,
+                    is_default          AS isDefault,
+                    is_public           AS isPublic,
+                    created_at          AS createdAt,
+                    updated_at          AS updatedAt
                 FROM bp_translation
                 ORDER BY is_default DESC, name ASC, translation_id ASC;
             `,
-        )
-        .all() as TranslationRow[];
+         )
+         .all() as TranslationRow[];
 
     return rows ?? [];
 }
@@ -545,10 +650,10 @@ async function resolveDefaultTranslationId(): Promise<string | null> {
     }
 
     const rows = await db
-        .select({ translationId: bpTranslation.translationId })
-        .from(bpTranslation)
-        .where(eq(bpTranslation.isDefault, true))
-        .limit(1);
+         .select({ translationId: bpTranslation.translationId })
+         .from(bpTranslation)
+         .where(eq(bpTranslation.isDefault, true))
+         .limit(1);
 
     _resolvedTranslationId = rows[0]?.translationId ?? null;
     return _resolvedTranslationId;
@@ -577,10 +682,10 @@ async function pickTranslation(c: Context): Promise<PickedTranslation | Response
     const def = await resolveDefaultTranslationId();
     if (!def) {
         return jsonErr(
-            c,
-            404,
-            "NO_TRANSLATION",
-            "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
+             c,
+             404,
+             "NO_TRANSLATION",
+             "No translation configured. Seed bp_translation (is_default=1) or set BP_TRANSLATION_ID.",
         );
     }
 
@@ -599,8 +704,8 @@ function hasFts(): boolean {
     if (_hasFts != null) return _hasFts;
 
     const row = sqlite
-        .query(`SELECT 1 AS one FROM sqlite_master WHERE type='table' AND name='bp_verse_text_fts' LIMIT 1;`)
-        .get() as { one?: number } | undefined;
+         .query(`SELECT 1 AS one FROM sqlite_master WHERE type='table' AND name='bp_verse_text_fts' LIMIT 1;`)
+         .get() as { one?: number } | undefined;
 
     _hasFts = row != null;
     return _hasFts;
@@ -617,16 +722,16 @@ function getSpineStats(): SpineStats {
     if (_spineStats) return _spineStats;
 
     const row = sqlite
-        .query(
-            `
+         .query(
+              `
                 SELECT
                     MIN(verse_ord) AS mn,
                     MAX(verse_ord) AS mx,
                     COUNT(*)       AS c
                 FROM bp_verse;
             `,
-        )
-        .get() as { mn?: number; mx?: number; c?: number } | undefined;
+         )
+         .get() as { mn?: number; mx?: number; c?: number } | undefined;
 
     const mn = Number(row?.mn ?? 0);
     const mx = Number(row?.mx ?? 0);
@@ -650,14 +755,14 @@ type ChapterBounds = Readonly<{
 
 async function getChapterBounds(bookId: string, chapter: number): Promise<ChapterBounds | null> {
     const byChapter = await db
-        .select({
-            startVerseOrd: bpChapter.startVerseOrd,
-            endVerseOrd: bpChapter.endVerseOrd,
-            verseCount: bpChapter.verseCount,
-        })
-        .from(bpChapter)
-        .where(and(eq(bpChapter.bookId, bookId), eq(bpChapter.chapter, chapter)))
-        .limit(1);
+         .select({
+             startVerseOrd: bpChapter.startVerseOrd,
+             endVerseOrd: bpChapter.endVerseOrd,
+             verseCount: bpChapter.verseCount,
+         })
+         .from(bpChapter)
+         .where(and(eq(bpChapter.bookId, bookId), eq(bpChapter.chapter, chapter)))
+         .limit(1);
 
     if (byChapter[0]) {
         return {
@@ -669,14 +774,14 @@ async function getChapterBounds(bookId: string, chapter: number): Promise<Chapte
     }
 
     const agg = await db
-        .select({
-            startVerseOrd: dsql<number>`min(${bpVerse.verseOrd})`.as("start_verse_ord"),
-            endVerseOrd: dsql<number>`max(${bpVerse.verseOrd})`.as("end_verse_ord"),
-            verseCount: dsql<number>`count(*)`.as("verse_count"),
-        })
-        .from(bpVerse)
-        .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapter)))
-        .limit(1);
+         .select({
+             startVerseOrd: dsql<number>`min(${bpVerse.verseOrd})`.as("start_verse_ord"),
+             endVerseOrd: dsql<number>`max(${bpVerse.verseOrd})`.as("end_verse_ord"),
+             verseCount: dsql<number>`count(*)`.as("verse_count"),
+         })
+         .from(bpVerse)
+         .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapter)))
+         .limit(1);
 
     const row = agg[0];
     if (!row || row.startVerseOrd == null || row.endVerseOrd == null) return null;
@@ -689,35 +794,63 @@ async function getChapterBounds(bookId: string, chapter: number): Promise<Chapte
     };
 }
 
+async function fetchChaptersForBook(bookId: string) {
+    const fromChapter = await db
+         .select({
+             chapter: bpChapter.chapter,
+             startVerseOrd: bpChapter.startVerseOrd,
+             endVerseOrd: bpChapter.endVerseOrd,
+             verseCount: bpChapter.verseCount,
+         })
+         .from(bpChapter)
+         .where(eq(bpChapter.bookId, bookId))
+         .orderBy(asc(bpChapter.chapter));
+
+    if (fromChapter.length > 0) return fromChapter;
+
+    return await db
+         .select({
+             chapter: bpVerse.chapter,
+             startVerseOrd: dsql<number>`min(${bpVerse.verseOrd})`.as("start_verse_ord"),
+             endVerseOrd: dsql<number>`max(${bpVerse.verseOrd})`.as("end_verse_ord"),
+             verseCount: dsql<number>`count(*)`.as("verse_count"),
+         })
+         .from(bpVerse)
+         .where(eq(bpVerse.bookId, bookId))
+         .groupBy(bpVerse.chapter)
+         .orderBy(asc(bpVerse.chapter));
+}
+
 async function fetchEntityBase(kind: "PERSON" | "PLACE", id: string) {
     const ent = await db
-        .select({
-            entityId: bpEntity.entityId,
-            kind: bpEntity.kind,
-            canonicalName: bpEntity.canonicalName,
-            slug: bpEntity.slug,
-            summaryNeutral: bpEntity.summaryNeutral,
-            confidence: bpEntity.confidence,
-            createdAt: bpEntity.createdAt,
-        })
-        .from(bpEntity)
-        .where(and(eq(bpEntity.entityId, id), eq(bpEntity.kind, kind)))
-        .limit(1);
+         .select({
+             entityId: bpEntity.entityId,
+             kind: bpEntity.kind,
+             canonicalName: bpEntity.canonicalName,
+             slug: bpEntity.slug,
+             summaryNeutral: bpEntity.summaryNeutral,
+             confidence: bpEntity.confidence,
+             createdAt: bpEntity.createdAt,
+             updatedAt: bpEntity.updatedAt,
+         })
+         .from(bpEntity)
+         .where(and(eq(bpEntity.entityId, id), eq(bpEntity.kind, kind)))
+         .limit(1);
 
     if (!ent[0]) return null;
 
     const names = await db
-        .select({
-            entityNameId: bpEntityName.entityNameId,
-            name: bpEntityName.name,
-            language: bpEntityName.language,
-            isPrimary: bpEntityName.isPrimary,
-            source: bpEntityName.source,
-            confidence: bpEntityName.confidence,
-        })
-        .from(bpEntityName)
-        .where(eq(bpEntityName.entityId, id))
-        .orderBy(asc(bpEntityName.name));
+         .select({
+             entityNameId: bpEntityName.entityNameId,
+             name: bpEntityName.name,
+             language: bpEntityName.language,
+             isPrimary: bpEntityName.isPrimary,
+             source: bpEntityName.source,
+             confidence: bpEntityName.confidence,
+         })
+         .from(bpEntityName)
+         .where(eq(bpEntityName.entityId, id))
+         .orderBy(desc(bpEntityName.isPrimary), asc(bpEntityName.name));
 
     return { entity: ent[0], names };
 }
@@ -733,13 +866,13 @@ class MemoryRateLimiter {
     private readonly buckets = new Map<string, RateBucket>();
 
     constructor(
-        private readonly windowMs: number,
-        private readonly maxHits: number,
+         private readonly windowMs: number,
+         private readonly maxHits: number,
     ) {}
 
     hit(
-        key: string,
-        now = Date.now(),
+         key: string,
+         now = Date.now(),
     ): { ok: true; remaining: number; resetAt: number } | { ok: false; retryAfterSec: number; resetAt: number } {
         const cur = this.buckets.get(key);
         if (!cur || now >= cur.resetAt) {
@@ -794,7 +927,7 @@ function withRateLimit(name: "auth" | "search") {
     };
 }
 
-/* ------------------------------ Auth helpers -------------------------------- */
+/* ------------------------------ Auth helpers ------------------------------- */
 
 type AuthedUser = Readonly<{
     id: string;
@@ -809,23 +942,31 @@ type AppVars = {
     sessionId: string | null;
 };
 
+function authDisabledResponse(c: Context) {
+    cacheNoStore(c);
+    return jsonErr(c, 403, "AUTH_DISABLED", "Authentication is disabled.");
+}
+
 /* ------------------------------- Sessions ---------------------------------- */
 
-async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null> {
+async function loadUserFromSession(sessionId: string): Promise<{
+    user: AuthedUser | null;
+    sessionExpiresAt: number | null;
+}> {
     const now = nowMs();
 
     const sess = await db
-        .select({
-            id: bpSession.id,
-            userId: bpSession.userId,
-            expiresAt: bpSession.expiresAt,
-        })
-        .from(bpSession)
-        .where(eq(bpSession.id, sessionId))
-        .limit(1);
+         .select({
+             id: bpSession.id,
+             userId: bpSession.userId,
+             expiresAt: bpSession.expiresAt,
+         })
+         .from(bpSession)
+         .where(eq(bpSession.id, sessionId))
+         .limit(1);
 
     const s = sess[0];
-    if (!s) return null;
+    if (!s) return { user: null, sessionExpiresAt: null };
 
     if (Number(s.expiresAt) <= now) {
         try {
@@ -833,32 +974,47 @@ async function loadUserFromSession(sessionId: string): Promise<AuthedUser | null
         } catch {
             // ignore cleanup failure
         }
-        return null;
+        return { user: null, sessionExpiresAt: null };
     }
 
     const rows = await db
-        .select({
-            id: bpUser.id,
-            displayName: bpUser.displayName,
-            email: bpUser.email,
-            emailVerifiedAt: bpUser.emailVerifiedAt,
-            disabledAt: bpUser.disabledAt,
-        })
-        .from(bpUser)
-        .where(eq(bpUser.id, s.userId))
-        .limit(1);
+         .select({
+             id: bpUser.id,
+             displayName: bpUser.displayName,
+             email: bpUser.email,
+             emailVerifiedAt: bpUser.emailVerifiedAt,
+             disabledAt: bpUser.disabledAt,
+         })
+         .from(bpUser)
+         .where(eq(bpUser.id, s.userId))
+         .limit(1);
 
     const u = rows[0];
-    if (!u) return null;
-    if (u.disabledAt != null) return null;
+    if (!u) return { user: null, sessionExpiresAt: Number(s.expiresAt) };
+    if (u.disabledAt != null) return { user: null, sessionExpiresAt: Number(s.expiresAt) };
 
     return {
-        id: u.id,
-        displayName: u.displayName ?? null,
-        email: u.email ?? null,
-        emailVerifiedAt: u.emailVerifiedAt != null ? msToDate(Number(u.emailVerifiedAt)) : null,
-        disabledAt: u.disabledAt != null ? msToDate(Number(u.disabledAt)) : null,
+        user: {
+            id: u.id,
+            displayName: u.displayName ?? null,
+            email: u.email ?? null,
+            emailVerifiedAt: u.emailVerifiedAt != null ? msToDate(Number(u.emailVerifiedAt)) : null,
+            disabledAt: u.disabledAt != null ? msToDate(Number(u.disabledAt)) : null,
+        },
+        sessionExpiresAt: Number(s.expiresAt),
     };
+}
+
+async function refreshSessionCookie(c: Context, sessionId: string): Promise<void> {
+    const now = nowMs();
+    const nextExpiresAt = now + daysMs(AUTH_SESSION_DAYS);
+
+    await db
+         .update(bpSession)
+         .set({ expiresAt: nextExpiresAt })
+         .where(eq(bpSession.id, sessionId));
+
+    setCookie(c, AUTH_COOKIE, packCookieValue(sessionId), cookieOpts(msToDate(nextExpiresAt)));
 }
 
 async function createSessionForUser(c: Context, userId: string): Promise<string> {
@@ -924,6 +1080,7 @@ function googleAuthUrl(state: string, codeChallenge: string): string {
     u.searchParams.set("code_challenge", codeChallenge);
     u.searchParams.set("code_challenge_method", "S256");
     u.searchParams.set("access_type", "offline");
+    u.searchParams.set("prompt", "consent");
     return u.toString();
 }
 
@@ -953,13 +1110,13 @@ async function googleExchangeCode(code: string, codeVerifier: string): Promise<G
     form.set("code_verifier", codeVerifier);
 
     const res = await fetchWithTimeout(
-        "https://oauth2.googleapis.com/token",
-        {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: form.toString(),
-        },
-        OAUTH_FETCH_TIMEOUT_MS,
+         "https://oauth2.googleapis.com/token",
+         {
+             method: "POST",
+             headers: { "Content-Type": "application/x-www-form-urlencoded" },
+             body: form.toString(),
+         },
+         OAUTH_FETCH_TIMEOUT_MS,
     );
 
     if (!res.ok) {
@@ -979,11 +1136,11 @@ type GoogleUserInfo = {
 
 async function googleFetchUserInfo(accessToken: string): Promise<GoogleUserInfo> {
     const res = await fetchWithTimeout(
-        "https://openidconnect.googleapis.com/v1/userinfo",
-        {
-            headers: { Authorization: `Bearer ${accessToken}` },
-        },
-        OAUTH_FETCH_TIMEOUT_MS,
+         "https://openidconnect.googleapis.com/v1/userinfo",
+         {
+             headers: { Authorization: `Bearer ${accessToken}` },
+         },
+         OAUTH_FETCH_TIMEOUT_MS,
     );
 
     if (!res.ok) {
@@ -995,22 +1152,22 @@ async function googleFetchUserInfo(accessToken: string): Promise<GoogleUserInfo>
 }
 
 async function upsertGoogleUser(
-    info: GoogleUserInfo,
-    tokens: GoogleTokenResponse,
+     info: GoogleUserInfo,
+     tokens: GoogleTokenResponse,
 ): Promise<{ userId: string; displayName: string | null; email: string | null }> {
     const now = nowMs();
     const provider = "google";
     const providerUserId = info.sub;
 
     const existingAcc = await db
-        .select({ id: bpAuthAccount.id, userId: bpAuthAccount.userId })
-        .from(bpAuthAccount)
-        .where(and(eq(bpAuthAccount.provider, provider), eq(bpAuthAccount.providerUserId, providerUserId)))
-        .limit(1);
+         .select({ id: bpAuthAccount.id, userId: bpAuthAccount.userId })
+         .from(bpAuthAccount)
+         .where(and(eq(bpAuthAccount.provider, provider), eq(bpAuthAccount.providerUserId, providerUserId)))
+         .limit(1);
 
     let userId: string | null = existingAcc[0]?.userId ?? null;
 
-    const email = info.email?.trim() ? info.email.trim() : null;
+    const email = info.email?.trim() ? info.email.trim().toLowerCase() : null;
     const displayName = info.name?.trim() ? info.name.trim() : null;
     const emailVerifiedAt: number | null = info.email_verified ? now : null;
 
@@ -1035,52 +1192,53 @@ async function upsertGoogleUser(
         ]);
     } else {
         await db
-            .update(bpUser)
-            .set({
-                updatedAt: now,
-                displayName: displayName ?? null,
-                email: email ?? null,
-                emailVerifiedAt: emailVerifiedAt ?? null,
-            })
-            .where(eq(bpUser.id, userId));
+             .update(bpUser)
+             .set({
+                 updatedAt: now,
+                 displayName: displayName ?? null,
+                 email: email ?? null,
+                 emailVerifiedAt: emailVerifiedAt ?? null,
+             })
+             .where(eq(bpUser.id, userId));
     }
 
     const accId = existingAcc[0]?.id ?? randId(18);
     const accessTokenExpiresAt: number | null = tokens.expires_in ? now + tokens.expires_in * 1000 : null;
 
     await db
-        .insert(bpAuthAccount)
-        .values([
-            {
-                id: accId,
-                createdAt: now,
-                updatedAt: now,
-                userId,
-                provider,
-                providerUserId,
-                accessToken: tokens.access_token ?? null,
-                refreshToken: tokens.refresh_token ?? null,
-                accessTokenExpiresAt,
-                scope: tokens.scope ?? null,
-            },
-        ])
-        .onConflictDoUpdate({
-            target: [bpAuthAccount.provider, bpAuthAccount.providerUserId],
-            set: {
-                updatedAt: now,
-                userId,
-                accessToken: tokens.access_token ?? null,
-                refreshToken: tokens.refresh_token ?? null,
-                accessTokenExpiresAt,
-                scope: tokens.scope ?? null,
-            },
-        });
+         .insert(bpAuthAccount)
+         .values([
+             {
+                 id: accId,
+                 createdAt: now,
+                 updatedAt: now,
+                 userId,
+                 provider,
+                 providerUserId,
+                 accessToken: tokens.access_token ?? null,
+                 refreshToken: tokens.refresh_token ?? null,
+                 accessTokenExpiresAt,
+                 scope: tokens.scope ?? null,
+             },
+         ])
+         .onConflictDoUpdate({
+             target: [bpAuthAccount.provider, bpAuthAccount.providerUserId],
+             set: {
+                 updatedAt: now,
+                 userId,
+                 accessToken: tokens.access_token ?? null,
+                 refreshToken: tokens.refresh_token ?? null,
+                 accessTokenExpiresAt,
+                 scope: tokens.scope ?? null,
+             },
+         });
 
     return { userId, displayName, email };
 }
 
 function authMisconfigured(): boolean {
-    return !!(AUTH_ENABLED && (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI));
+    if (!AUTH_ENABLED) return false;
+    return !GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI;
 }
 
 /* ----------------------------------- App ---------------------------------- */
@@ -1088,7 +1246,7 @@ function authMisconfigured(): boolean {
 const app = new Hono<{ Variables: AppVars }>();
 
 app.use("*", async (c, next) => {
-    c.header("Vary", "Origin, Accept-Encoding");
+    c.header("Vary", appendVary(c.res.headers.get("Vary"), "Origin, Accept-Encoding"));
     c.header("X-Content-Type-Options", "nosniff");
     c.header("Referrer-Policy", "no-referrer");
     c.header("X-Frame-Options", "DENY");
@@ -1104,19 +1262,24 @@ app.use("*", compress());
 app.use("*", etag());
 
 app.use(
-    "*",
-    cors({
-        origin: CORS_WILDCARD
-            ? "*"
-            : (origin: string) => {
-                if (!origin) return null;
-                return CORS_LIST.includes(origin) ? origin : null;
-            },
-        allowHeaders: ["Content-Type", "Authorization"],
-        allowMethods: ["GET", "POST", "OPTIONS"],
-        credentials: !CORS_WILDCARD,
-        maxAge: 600,
-    }),
+     "*",
+     cors({
+         origin: CORS_WILDCARD
+              ? "*"
+              : (origin: string) => {
+                  if (!origin) return null;
+                  try {
+                      const normalized = normalizeOrigin(origin);
+                      return CORS_SET.has(normalized) ? normalized : null;
+                  } catch {
+                      return null;
+                  }
+              },
+         allowHeaders: ["Content-Type", "Authorization"],
+         allowMethods: ["GET", "POST", "OPTIONS"],
+         credentials: !CORS_WILDCARD,
+         maxAge: 600,
+     }),
 );
 
 app.use("*", async (c, next) => {
@@ -1143,14 +1306,23 @@ app.use("*", async (c, next) => {
 
     try {
         const sid = unpacked.value;
-        const u = await loadUserFromSession(sid);
+        const loaded = await loadUserFromSession(sid);
+        const u = loaded.user;
+
         c.set("user", u);
         c.set("sessionId", u ? sid : null);
 
         if (!u) {
             deleteCookie(c, AUTH_COOKIE, cookieOpts());
-        } else if (AUTH_COOKIE_SECRET && raw !== packCookieValue(sid)) {
-            setCookie(c, AUTH_COOKIE, packCookieValue(sid), cookieOpts());
+        } else {
+            if (AUTH_COOKIE_SECRET && raw !== packCookieValue(sid)) {
+                setCookie(c, AUTH_COOKIE, packCookieValue(sid), cookieOpts());
+            }
+
+            const expiresAt = loaded.sessionExpiresAt ?? 0;
+            if (expiresAt - nowMs() <= AUTH_SESSION_REFRESH_WINDOW_MS) {
+                await refreshSessionCookie(c, sid);
+            }
         }
     } catch {
         deleteCookie(c, AUTH_COOKIE, cookieOpts());
@@ -1187,12 +1359,14 @@ app.get("/auth/me", (c) => {
 app.get("/auth/google/start", withRateLimit("auth"), (c) => {
     cacheNoStore(c);
 
+    if (!AUTH_ENABLED) return authDisabledResponse(c);
+
     if (authMisconfigured()) {
         return jsonErr(
-            c,
-            500,
-            "AUTH_MISCONFIGURED",
-            "Google OAuth is not configured. Set BP_GOOGLE_CLIENT_ID/BP_GOOGLE_CLIENT_SECRET (and BP_PUBLIC_URL or BP_GOOGLE_REDIRECT_URI) and enable auth.",
+             c,
+             500,
+             "AUTH_MISCONFIGURED",
+             "Google OAuth is not configured. Set BP_GOOGLE_CLIENT_ID/BP_GOOGLE_CLIENT_SECRET (and BP_PUBLIC_URL or BP_GOOGLE_REDIRECT_URI) and enable auth.",
         );
     }
 
@@ -1209,12 +1383,14 @@ app.get("/auth/google/start", withRateLimit("auth"), (c) => {
 app.get("/auth/google/callback", withRateLimit("auth"), async (c) => {
     cacheNoStore(c);
 
+    if (!AUTH_ENABLED) return authDisabledResponse(c);
+
     if (authMisconfigured()) {
         return jsonErr(
-            c,
-            500,
-            "AUTH_MISCONFIGURED",
-            "Google OAuth is not configured. Set BP_GOOGLE_CLIENT_ID/BP_GOOGLE_CLIENT_SECRET (and BP_PUBLIC_URL or BP_GOOGLE_REDIRECT_URI) and enable auth.",
+             c,
+             500,
+             "AUTH_MISCONFIGURED",
+             "Google OAuth is not configured. Set BP_GOOGLE_CLIENT_ID/BP_GOOGLE_CLIENT_SECRET (and BP_PUBLIC_URL or BP_GOOGLE_REDIRECT_URI) and enable auth.",
         );
     }
 
@@ -1237,7 +1413,7 @@ app.get("/auth/google/callback", withRateLimit("auth"), async (c) => {
     const stateCookie = stateCookieRes.ok ? stateCookieRes.value : null;
     const verifierCookie = verifierCookieRes.ok ? verifierCookieRes.value : null;
 
-    if (!stateCookie || stateCookie !== state || !verifierCookie) {
+    if (!stateCookie || !safeEqual(stateCookie, state) || !verifierCookie) {
         return jsonErr(c, 401, "OAUTH_STATE_MISMATCH", "Invalid OAuth state.");
     }
 
@@ -1262,6 +1438,9 @@ app.get("/auth/google/callback", withRateLimit("auth"), async (c) => {
 
 app.post("/auth/logout", withRateLimit("auth"), async (c) => {
     cacheNoStore(c);
+
+    if (!AUTH_ENABLED) return authDisabledResponse(c);
+
     const sid = c.get("sessionId");
     await destroySession(c, sid);
     return jsonOk(c, { redirect: AUTH_AFTER_LOGOUT_URL });
@@ -1332,8 +1511,8 @@ app.get("/slice", async (c) => {
     const limit = clamp(limitP.data, 1, 2000);
 
     const verses = sqlite
-        .query(
-            `
+         .query(
+              `
                 SELECT
                     v.verse_key  AS verseKey,
                     v.verse_ord  AS verseOrd,
@@ -1350,8 +1529,8 @@ app.get("/slice", async (c) => {
                 ORDER BY v.verse_ord
                 LIMIT ?;
             `,
-        )
-        .all(translationId, fromOrd, limit) as Array<{
+         )
+         .all(translationId, fromOrd, limit) as Array<{
         verseKey: string;
         verseOrd: number;
         bookId: string;
@@ -1388,8 +1567,8 @@ app.get("/loc", async (c) => {
         const verse = verseP.data;
 
         const row = sqlite
-            .query(
-                `
+             .query(
+                  `
                     SELECT
                         verse_key AS verseKey,
                         verse_ord AS verseOrd,
@@ -1402,17 +1581,17 @@ app.get("/loc", async (c) => {
                       AND verse = ?
                     LIMIT 1;
                 `,
-            )
-            .get(bookId, chapter, verse) as
-            | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
-            | undefined;
+             )
+             .get(bookId, chapter, verse) as
+             | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
+             | undefined;
 
         return jsonOk(c, row ?? null);
     }
 
     const first = sqlite
-        .query(
-            `
+         .query(
+              `
                 SELECT
                     verse_key AS verseKey,
                     verse_ord AS verseOrd,
@@ -1425,10 +1604,10 @@ app.get("/loc", async (c) => {
                 ORDER BY verse
                 LIMIT 1;
             `,
-        )
-        .get(bookId, chapter) as
-        | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
-        | undefined;
+         )
+         .get(bookId, chapter) as
+         | { verseKey: string; verseOrd: number; bookId: string; chapter: number; verse: number }
+         | undefined;
 
     return jsonOk(c, first ?? null);
 });
@@ -1437,18 +1616,18 @@ app.get("/books", async (c) => {
     cachePublic(c, 60);
 
     const books = await db
-        .select({
-            bookId: bpBook.bookId,
-            ordinal: bpBook.ordinal,
-            testament: bpBook.testament,
-            name: bpBook.name,
-            nameShort: bpBook.nameShort,
-            chapters: bpBook.chapters,
-            osised: bpBook.osised,
-            abbrs: bpBook.abbrs,
-        })
-        .from(bpBook)
-        .orderBy(asc(bpBook.ordinal));
+         .select({
+             bookId: bpBook.bookId,
+             ordinal: bpBook.ordinal,
+             testament: bpBook.testament,
+             name: bpBook.name,
+             nameShort: bpBook.nameShort,
+             chapters: bpBook.chapters,
+             osised: bpBook.osised,
+             abbrs: bpBook.abbrs,
+         })
+         .from(bpBook)
+         .orderBy(asc(bpBook.ordinal));
 
     return jsonOk(c, { books });
 });
@@ -1460,19 +1639,9 @@ app.get("/chapters/:bookId", async (c) => {
     if (!bookIdP.success) return jsonErr(c, 400, "BAD_BOOK", "Invalid bookId.");
 
     const bookId = bookIdP.data;
+    const chapters = await fetchChaptersForBook(bookId);
 
-    const rows = await db
-        .select({
-            chapter: bpChapter.chapter,
-            startVerseOrd: bpChapter.startVerseOrd,
-            endVerseOrd: bpChapter.endVerseOrd,
-            verseCount: bpChapter.verseCount,
-        })
-        .from(bpChapter)
-        .where(eq(bpChapter.bookId, bookId))
-        .orderBy(asc(bpChapter.chapter));
-
-    return jsonOk(c, { bookId, chapters: rows });
+    return jsonOk(c, { bookId, chapters });
 });
 
 app.get("/chapter/:bookId/:chapter", async (c) => {
@@ -1495,75 +1664,79 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
     if (!bounds) return jsonErr(c, 404, "CHAPTER_NOT_FOUND", "Chapter not found in bp_verse.");
 
     const verses = await db
-        .select({
-            verseKey: bpVerse.verseKey,
-            verseOrd: bpVerse.verseOrd,
-            chapter: bpVerse.chapter,
-            verse: bpVerse.verse,
-            text: bpVerseText.text,
-            updatedAt: bpVerseText.updatedAt,
-        })
-        .from(bpVerse)
-        .leftJoin(
-            bpVerseText,
-            and(eq(bpVerseText.verseKey, bpVerse.verseKey), eq(bpVerseText.translationId, translationId)),
-        )
-        .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapterNum)))
-        .orderBy(asc(bpVerse.verse));
+         .select({
+             verseKey: bpVerse.verseKey,
+             verseOrd: bpVerse.verseOrd,
+             chapter: bpVerse.chapter,
+             verse: bpVerse.verse,
+             text: bpVerseText.text,
+             updatedAt: bpVerseText.updatedAt,
+         })
+         .from(bpVerse)
+         .leftJoin(
+              bpVerseText,
+              and(eq(bpVerseText.verseKey, bpVerse.verseKey), eq(bpVerseText.translationId, translationId)),
+         )
+         .where(and(eq(bpVerse.bookId, bookId), eq(bpVerse.chapter, chapterNum)))
+         .orderBy(asc(bpVerse.verse));
 
     const ranges = await db
-        .select({
-            rangeId: bpRange.rangeId,
-            startVerseOrd: bpRange.startVerseOrd,
-            endVerseOrd: bpRange.endVerseOrd,
-            startVerseKey: bpRange.startVerseKey,
-            endVerseKey: bpRange.endVerseKey,
-            label: bpRange.label,
-        })
-        .from(bpRange)
-        .where(
-            and(
-                dsql`${bpRange.startVerseOrd} <= ${bounds.endVerseOrd}`,
-                dsql`${bpRange.endVerseOrd} >= ${bounds.startVerseOrd}`,
-            ),
-        )
-        .orderBy(asc(bpRange.startVerseOrd), asc(bpRange.endVerseOrd));
+         .select({
+             rangeId: bpRange.rangeId,
+             startVerseOrd: bpRange.startVerseOrd,
+             endVerseOrd: bpRange.endVerseOrd,
+             startVerseKey: bpRange.startVerseKey,
+             endVerseKey: bpRange.endVerseKey,
+             label: bpRange.label,
+             verseCount: bpRange.verseCount,
+             chapterCount: bpRange.chapterCount,
+             createdAt: bpRange.createdAt,
+         })
+         .from(bpRange)
+         .where(
+              and(
+                   dsql`${bpRange.startVerseOrd} <= ${bounds.endVerseOrd}`,
+                   dsql`${bpRange.endVerseOrd} >= ${bounds.startVerseOrd}`,
+              ),
+         )
+         .orderBy(asc(bpRange.startVerseOrd), asc(bpRange.endVerseOrd));
 
     const rangeIds = ranges.map((r) => r.rangeId);
 
     const links =
-        rangeIds.length === 0
-            ? []
-            : await db
-                .select({
-                    linkId: bpLink.linkId,
-                    rangeId: bpLink.rangeId,
-                    targetKind: bpLink.targetKind,
-                    targetId: bpLink.targetId,
-                    linkKind: bpLink.linkKind,
-                    weight: bpLink.weight,
-                    source: bpLink.source,
-                    confidence: bpLink.confidence,
-                })
-                .from(bpLink)
-                .where(inArray(bpLink.rangeId, rangeIds))
-                .orderBy(asc(bpLink.rangeId), asc(bpLink.linkKind));
+         rangeIds.length === 0
+              ? []
+              : await db
+                   .select({
+                       linkId: bpLink.linkId,
+                       rangeId: bpLink.rangeId,
+                       targetKind: bpLink.targetKind,
+                       targetId: bpLink.targetId,
+                       linkKind: bpLink.linkKind,
+                       weight: bpLink.weight,
+                       source: bpLink.source,
+                       confidence: bpLink.confidence,
+                   })
+                   .from(bpLink)
+                   .where(inArray(bpLink.rangeId, rangeIds))
+                   .orderBy(asc(bpLink.rangeId), asc(bpLink.linkKind));
 
     const crossrefs =
-        rangeIds.length === 0
-            ? []
-            : await db
-                .select({
-                    crossrefId: bpCrossref.crossrefId,
-                    fromRangeId: bpCrossref.fromRangeId,
-                    toRangeId: bpCrossref.toRangeId,
-                    kind: bpCrossref.kind,
-                    source: bpCrossref.source,
-                    confidence: bpCrossref.confidence,
-                })
-                .from(bpCrossref)
-                .where(inArray(bpCrossref.fromRangeId, rangeIds))
-                .orderBy(asc(bpCrossref.fromRangeId));
+         rangeIds.length === 0
+              ? []
+              : await db
+                   .select({
+                       crossrefId: bpCrossref.crossrefId,
+                       fromRangeId: bpCrossref.fromRangeId,
+                       toRangeId: bpCrossref.toRangeId,
+                       kind: bpCrossref.kind,
+                       source: bpCrossref.source,
+                       confidence: bpCrossref.confidence,
+                       noteNeutral: bpCrossref.noteNeutral,
+                   })
+                   .from(bpCrossref)
+                   .where(inArray(bpCrossref.fromRangeId, rangeIds))
+                   .orderBy(asc(bpCrossref.fromRangeId));
 
     return jsonOk(c, {
         translationId,
@@ -1582,97 +1755,108 @@ app.get("/chapter/:bookId/:chapter", async (c) => {
 
 app.get("/people/:id", async (c) => {
     cachePublic(c, 60);
-    const id = c.req.param("id");
 
+    const idP = EntityIdSchema.safeParse(c.req.param("id"));
+    if (!idP.success) return jsonErr(c, 400, "BAD_ID", "Invalid id.");
+
+    const id = idP.data;
     const base = await fetchEntityBase("PERSON", id);
     if (!base) return jsonOk(c, null);
 
     const relFrom = await db
-        .select({
-            relationId: bpEntityRelation.relationId,
-            fromEntityId: bpEntityRelation.fromEntityId,
-            toEntityId: bpEntityRelation.toEntityId,
-            kind: bpEntityRelation.kind,
-            timeSpanId: bpEntityRelation.timeSpanId,
-            source: bpEntityRelation.source,
-            confidence: bpEntityRelation.confidence,
-            noteNeutral: bpEntityRelation.noteNeutral,
-        })
-        .from(bpEntityRelation)
-        .where(eq(bpEntityRelation.fromEntityId, id));
+         .select({
+             relationId: bpEntityRelation.relationId,
+             fromEntityId: bpEntityRelation.fromEntityId,
+             toEntityId: bpEntityRelation.toEntityId,
+             kind: bpEntityRelation.kind,
+             timeSpanId: bpEntityRelation.timeSpanId,
+             source: bpEntityRelation.source,
+             confidence: bpEntityRelation.confidence,
+             noteNeutral: bpEntityRelation.noteNeutral,
+         })
+         .from(bpEntityRelation)
+         .where(eq(bpEntityRelation.fromEntityId, id));
 
     const relTo = await db
-        .select({
-            relationId: bpEntityRelation.relationId,
-            fromEntityId: bpEntityRelation.fromEntityId,
-            toEntityId: bpEntityRelation.toEntityId,
-            kind: bpEntityRelation.kind,
-            timeSpanId: bpEntityRelation.timeSpanId,
-            source: bpEntityRelation.source,
-            confidence: bpEntityRelation.confidence,
-            noteNeutral: bpEntityRelation.noteNeutral,
-        })
-        .from(bpEntityRelation)
-        .where(eq(bpEntityRelation.toEntityId, id));
+         .select({
+             relationId: bpEntityRelation.relationId,
+             fromEntityId: bpEntityRelation.fromEntityId,
+             toEntityId: bpEntityRelation.toEntityId,
+             kind: bpEntityRelation.kind,
+             timeSpanId: bpEntityRelation.timeSpanId,
+             source: bpEntityRelation.source,
+             confidence: bpEntityRelation.confidence,
+             noteNeutral: bpEntityRelation.noteNeutral,
+         })
+         .from(bpEntityRelation)
+         .where(eq(bpEntityRelation.toEntityId, id));
 
     return jsonOk(c, { ...base, relations: { from: relFrom, to: relTo } });
 });
 
 app.get("/places/:id", async (c) => {
     cachePublic(c, 60);
-    const id = c.req.param("id");
 
+    const idP = EntityIdSchema.safeParse(c.req.param("id"));
+    if (!idP.success) return jsonErr(c, 400, "BAD_ID", "Invalid id.");
+
+    const id = idP.data;
     const base = await fetchEntityBase("PLACE", id);
     if (!base) return jsonOk(c, null);
 
     const geos = await db
-        .select({
-            placeGeoId: bpPlaceGeo.placeGeoId,
-            geoType: bpPlaceGeo.geoType,
-            lat: bpPlaceGeo.lat,
-            lng: bpPlaceGeo.lng,
-            bbox: bpPlaceGeo.bbox,
-            polygon: bpPlaceGeo.polygon,
-            precisionM: bpPlaceGeo.precisionM,
-            source: bpPlaceGeo.source,
-            confidence: bpPlaceGeo.confidence,
-        })
-        .from(bpPlaceGeo)
-        .where(eq(bpPlaceGeo.entityId, id));
+         .select({
+             placeGeoId: bpPlaceGeo.placeGeoId,
+             geoType: bpPlaceGeo.geoType,
+             lat: bpPlaceGeo.lat,
+             lng: bpPlaceGeo.lng,
+             bbox: bpPlaceGeo.bbox,
+             polygon: bpPlaceGeo.polygon,
+             precisionM: bpPlaceGeo.precisionM,
+             source: bpPlaceGeo.source,
+             confidence: bpPlaceGeo.confidence,
+         })
+         .from(bpPlaceGeo)
+         .where(eq(bpPlaceGeo.entityId, id));
 
     return jsonOk(c, { ...base, geos });
 });
 
 app.get("/events/:id", async (c) => {
     cachePublic(c, 60);
-    const id = c.req.param("id");
+
+    const idP = EntityIdSchema.safeParse(c.req.param("id"));
+    if (!idP.success) return jsonErr(c, 400, "BAD_ID", "Invalid id.");
+
+    const id = idP.data;
 
     const ev = await db
-        .select({
-            eventId: bpEvent.eventId,
-            canonicalTitle: bpEvent.canonicalTitle,
-            kind: bpEvent.kind,
-            primaryRangeId: bpEvent.primaryRangeId,
-            timeSpanId: bpEvent.timeSpanId,
-            primaryPlaceId: bpEvent.primaryPlaceId,
-            source: bpEvent.source,
-            confidence: bpEvent.confidence,
-        })
-        .from(bpEvent)
-        .where(eq(bpEvent.eventId, id))
-        .limit(1);
+         .select({
+             eventId: bpEvent.eventId,
+             canonicalTitle: bpEvent.canonicalTitle,
+             kind: bpEvent.kind,
+             primaryRangeId: bpEvent.primaryRangeId,
+             timeSpanId: bpEvent.timeSpanId,
+             primaryPlaceId: bpEvent.primaryPlaceId,
+             source: bpEvent.source,
+             confidence: bpEvent.confidence,
+             summaryNeutral: bpEvent.summaryNeutral,
+         })
+         .from(bpEvent)
+         .where(eq(bpEvent.eventId, id))
+         .limit(1);
 
     if (!ev[0]) return jsonOk(c, null);
 
     const participants = await db
-        .select({
-            eventParticipantId: bpEventParticipant.eventParticipantId,
-            entityId: bpEventParticipant.entityId,
-            role: bpEventParticipant.role,
-            confidence: bpEventParticipant.confidence,
-        })
-        .from(bpEventParticipant)
-        .where(eq(bpEventParticipant.eventId, id));
+         .select({
+             eventParticipantId: bpEventParticipant.eventParticipantId,
+             entityId: bpEventParticipant.entityId,
+             role: bpEventParticipant.role,
+             confidence: bpEventParticipant.confidence,
+         })
+         .from(bpEventParticipant)
+         .where(eq(bpEventParticipant.eventId, id));
 
     return jsonOk(c, { event: ev[0], participants });
 });
@@ -1692,52 +1876,56 @@ app.get("/search", withRateLimit("search"), async (c) => {
     const translationId = picked.translationId;
 
     if (hasFts()) {
-        const rows = sqlite
-            .query(
-                `
-                    SELECT
-                        v.book_id    AS bookId,
-                        v.chapter    AS chapter,
-                        v.verse      AS verse,
-                        v.verse_key  AS verseKey,
-                        v.verse_ord  AS verseOrd,
-                        snippet(bp_verse_text_fts, 2, '‹', '›', '…', 24) AS snippet
-                    FROM bp_verse_text_fts
-                    JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
-                    JOIN bp_verse v      ON v.verse_key = t.verse_key
-                    WHERE bp_verse_text_fts MATCH ?
-                      AND t.translation_id = ?
-                    ORDER BY bm25(bp_verse_text_fts)
-                    LIMIT ?;
-                `,
-            )
-            .all(q, translationId, limit) as Array<{
-            bookId: string;
-            chapter: number;
-            verse: number;
-            verseKey: string;
-            verseOrd: number;
-            snippet: string;
-        }>;
+        try {
+            const rows = sqlite
+                 .query(
+                      `
+                        SELECT
+                            v.book_id    AS bookId,
+                            v.chapter    AS chapter,
+                            v.verse      AS verse,
+                            v.verse_key  AS verseKey,
+                            v.verse_ord  AS verseOrd,
+                            snippet(bp_verse_text_fts, 2, '‹', '›', '…', 24) AS snippet
+                        FROM bp_verse_text_fts
+                        JOIN bp_verse_text t ON t.rowid = bp_verse_text_fts.rowid
+                        JOIN bp_verse v      ON v.verse_key = t.verse_key
+                        WHERE bp_verse_text_fts MATCH ?
+                          AND t.translation_id = ?
+                        ORDER BY bm25(bp_verse_text_fts)
+                        LIMIT ?;
+                    `,
+                 )
+                 .all(q, translationId, limit) as Array<{
+                bookId: string;
+                chapter: number;
+                verse: number;
+                verseKey: string;
+                verseOrd: number;
+                snippet: string;
+            }>;
 
-        return jsonOk(c, { q, mode: "fts" as const, results: rows });
+            return jsonOk(c, { q, mode: "fts" as const, results: rows });
+        } catch {
+            // fall through to LIKE for malformed FTS query syntax
+        }
     }
 
-    const likeQ = `%${q}%`;
+    const likeQ = `%${escapeLike(q)}%`;
     const rows = await db
-        .select({
-            verseKey: bpVerse.verseKey,
-            bookId: bpVerse.bookId,
-            chapter: bpVerse.chapter,
-            verse: bpVerse.verse,
-            verseOrd: bpVerse.verseOrd,
-            text: bpVerseText.text,
-        })
-        .from(bpVerseText)
-        .innerJoin(bpVerse, eq(bpVerse.verseKey, bpVerseText.verseKey))
-        .where(and(eq(bpVerseText.translationId, translationId), like(bpVerseText.text, likeQ)))
-        .orderBy(desc(bpVerse.verseOrd))
-        .limit(limit);
+         .select({
+             verseKey: bpVerse.verseKey,
+             bookId: bpVerse.bookId,
+             chapter: bpVerse.chapter,
+             verse: bpVerse.verse,
+             verseOrd: bpVerse.verseOrd,
+             text: bpVerseText.text,
+         })
+         .from(bpVerseText)
+         .innerJoin(bpVerse, eq(bpVerse.verseKey, bpVerseText.verseKey))
+         .where(and(eq(bpVerseText.translationId, translationId), like(bpVerseText.text, likeQ)))
+         .orderBy(desc(bpVerse.verseOrd))
+         .limit(limit);
 
     const results = rows.map((r) => {
         const text = r.text ?? "";
@@ -1768,16 +1956,16 @@ if (LISTEN) {
 
     // eslint-disable-next-line no-console
     console.log(
-        `[api] listening on http://localhost:${server.port} (source=${PORT_INFO.source}${
-            PORT_INFO.raw ? ` raw=${JSON.stringify(PORT_INFO.raw)}` : ""
-        })`,
+         `[api] listening on http://localhost:${server.port} (source=${PORT_INFO.source}${
+              PORT_INFO.raw ? ` raw=${JSON.stringify(PORT_INFO.raw)}` : ""
+         })`,
     );
 
     // eslint-disable-next-line no-console
     console.log(
-        `[api] translation=${ENV_TRANSLATION_ID || cachedTranslations.defaultId || "(none)"} fts=${
-            hasFts() ? "on" : "off"
-        } verses=${spine.verseCount} ordMax=${spine.verseOrdMax} auth=${AUTH_ENABLED ? "on" : "off"} env=${NODE_ENV}`,
+         `[api] translation=${ENV_TRANSLATION_ID || cachedTranslations.defaultId || "(none)"} fts=${
+              hasFts() ? "on" : "off"
+         } verses=${spine.verseCount} ordMax=${spine.verseOrdMax} auth=${AUTH_ENABLED ? "on" : "off"} env=${NODE_ENV}`,
     );
 
     let shuttingDown = false;
@@ -1811,4 +1999,5 @@ export const __internal = {
     hasFts,
     getSpineStats,
     getTranslationsCached,
+    escapeLike,
 };

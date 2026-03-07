@@ -8,7 +8,7 @@ import {
     getReaderAnnotationStore,
     type ReaderAnnotationStore,
 } from "./annotationStore";
-import { ReaderDomSelectionResolver } from "./selectionResolver";
+import { ReaderDomSelectionResolver } from "./ReaderDomSelectionResolver";
 
 export type ReaderAnnotationsApi = {
     store: ReaderAnnotationStore;

@@ -9,39 +9,17 @@ import React, {
     useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { LogIn, LogOut, RefreshCcw, UserRound, ChevronDown } from "lucide-react";
+import { ChevronDown, LogIn, LogOut, RefreshCcw, UserRound } from "lucide-react";
 import { useAuth } from "./useAuth";
 
 type Size = "sm" | "md";
 
 export type Props = {
     size?: Size;
-
-    /**
-     * Default: false (toolbar mode) — icon-only trigger.
-     * If true, shows a compact label next to the avatar when signed in.
-     */
     showLabelWhenSignedIn?: boolean;
-
     align?: "left" | "right";
     style?: React.CSSProperties;
 };
-
-// Safe layout effect for SSR compatibility
-const useIsomorphicLayoutEffect =
-    typeof window !== "undefined" ? useLayoutEffect : useEffect;
-
-function initials(nameOrEmail: string): string {
-    const s = String(nameOrEmail ?? "").trim();
-    if (!s) return "U";
-    const parts = s.split(/\s+/g).filter(Boolean);
-    if (parts.length >= 2) return (parts[0]![0] + parts[1]![0]).toUpperCase();
-    return s.slice(0, 2).toUpperCase();
-}
-
-function clamp(n: number, lo: number, hi: number): number {
-    return Math.max(lo, Math.min(hi, n));
-}
 
 type PopPos = {
     top: number;
@@ -51,10 +29,21 @@ type PopPos = {
     transformOrigin: string;
 };
 
-function safeFocus(el: HTMLElement | null | undefined) {
+type MenuActionState = "idle" | "refreshing" | "signing_out" | "signing_in";
+
+const MENU_WIDTH = 264;
+
+const useIsomorphicLayoutEffect =
+     typeof window !== "undefined" ? useLayoutEffect : useEffect;
+
+function clamp(n: number, lo: number, hi: number): number {
+    return Math.max(lo, Math.min(hi, n));
+}
+
+function safeFocus(el: HTMLElement | null | undefined): void {
     if (!el) return;
     try {
-        el.focus({ preventScroll: true } as FocusOptions);
+        el.focus({ preventScroll: true });
     } catch {
         el.focus();
     }
@@ -67,6 +56,31 @@ function prefersReducedMotion(): boolean {
     } catch {
         return false;
     }
+}
+
+function formatUserLabel(user: { displayName: string | null; email: string | null } | null): string {
+    return user?.displayName?.trim() || user?.email?.trim() || "User";
+}
+
+function formatTriggerTitle(user: { displayName: string | null; email: string | null } | null): string {
+    if (!user) return "Sign in";
+    return user.displayName?.trim() || user.email?.trim() || "Account";
+}
+
+function initialsFromUser(user: { displayName: string | null; email: string | null } | null): string {
+    const base = formatUserLabel(user);
+    const s = base.trim();
+    if (!s) return "U";
+
+    const emailName = s.includes("@") ? s.split("@")[0] ?? s : s;
+    const normalized = emailName.replace(/[._-]+/g, " ").trim();
+    const parts = normalized.split(/\s+/g).filter(Boolean);
+
+    if (parts.length >= 2) {
+        return `${parts[0]![0] ?? ""}${parts[1]![0] ?? ""}`.toUpperCase();
+    }
+
+    return normalized.slice(0, 2).toUpperCase() || "U";
 }
 
 function usePopoverPosition(args: {
@@ -92,9 +106,9 @@ function usePopoverPosition(args: {
         const mh = menuRef.current?.getBoundingClientRect().height ?? 0;
 
         const left =
-            align === "right"
-                ? clamp(r.right - mw, margin, window.innerWidth - mw - margin)
-                : clamp(r.left, margin, window.innerWidth - mw - margin);
+             align === "right"
+                  ? clamp(r.right - mw, margin, window.innerWidth - mw - margin)
+                  : clamp(r.left, margin, window.innerWidth - mw - margin);
 
         const belowTop = r.bottom + gap;
         const aboveTop = r.top - gap - mh;
@@ -103,12 +117,10 @@ function usePopoverPosition(args: {
         const canFitAbove = aboveTop >= margin;
 
         const placement: PopPos["placement"] =
-            !canFitBelow && canFitAbove ? "top" : "bottom";
+             !canFitBelow && canFitAbove ? "top" : "bottom";
 
-        const top =
-            placement === "top"
-                ? aboveTop
-                : clamp(belowTop, margin, window.innerHeight - margin);
+        const unclampedTop = placement === "top" ? aboveTop : belowTop;
+        const top = clamp(unclampedTop, margin, Math.max(margin, window.innerHeight - mh - margin));
 
         const originX = align === "right" ? "right" : "left";
         const originY = placement === "top" ? "bottom" : "top";
@@ -125,6 +137,7 @@ function usePopoverPosition(args: {
     const schedule = useCallback(() => {
         if (typeof window === "undefined") return;
         if (rafRef.current != null) return;
+
         rafRef.current = window.requestAnimationFrame(() => {
             rafRef.current = null;
             compute();
@@ -139,6 +152,8 @@ function usePopoverPosition(args: {
 
         compute();
 
+        if (typeof window === "undefined") return;
+
         const onScroll = () => schedule();
         const onResize = () => schedule();
 
@@ -148,100 +163,81 @@ function usePopoverPosition(args: {
         const t = window.setTimeout(() => schedule(), 0);
 
         let ro: ResizeObserver | null = null;
-        if (typeof ResizeObserver !== "undefined" && menuRef.current) {
+        if (typeof ResizeObserver !== "undefined") {
             ro = new ResizeObserver(() => schedule());
-            ro.observe(menuRef.current);
+            if (menuRef.current) ro.observe(menuRef.current);
+            if (anchorRef.current) ro.observe(anchorRef.current);
         }
 
         return () => {
             window.clearTimeout(t);
             window.removeEventListener("resize", onResize);
             window.removeEventListener("scroll", onScroll, true);
+
             if (rafRef.current != null) {
                 window.cancelAnimationFrame(rafRef.current);
                 rafRef.current = null;
             }
+
             if (ro) ro.disconnect();
         };
-    }, [open, compute, schedule, menuRef]);
+    }, [open, compute, schedule, menuRef, anchorRef]);
 
     return pos;
 }
 
-/* --------------------------------- UI bits -------------------------------- */
-
 function AvatarCircle(props: {
-    userLabel: string;
-    pictureUrl?: string | null;
+    user: { displayName: string | null; email: string | null } | null;
     sizePx: number;
     signedIn: boolean;
 }) {
-    const { userLabel, pictureUrl, sizePx, signedIn } = props;
-    const [imgError, setImgError] = useState(false);
+    const { user, sizePx, signedIn } = props;
 
     const ring = "0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent)";
     const bg =
-        "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))";
-
-    if (pictureUrl && !imgError) {
-        return (
-            <img
-                src={pictureUrl}
-                alt={`${userLabel}'s avatar`}
-                draggable={false}
-                onError={() => setImgError(true)}
-                style={{
-                    width: sizePx,
-                    height: sizePx,
-                    borderRadius: 999,
-                    objectFit: "cover",
-                    boxShadow: ring,
-                    userSelect: "none",
-                    display: "block",
-                }}
-            />
-        );
-    }
+         "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))";
 
     if (!signedIn) {
         return (
-            <div
-                aria-hidden="true"
-                style={{
-                    width: sizePx,
-                    height: sizePx,
-                    borderRadius: 999,
-                    display: "grid",
-                    placeItems: "center",
-                    background: bg,
-                    boxShadow: ring,
-                }}
-            >
-                <UserRound size={Math.max(16, Math.floor(sizePx * 0.62))} />
-            </div>
+             <div
+                  aria-hidden="true"
+                  style={{
+                      width: sizePx,
+                      height: sizePx,
+                      borderRadius: 999,
+                      display: "grid",
+                      placeItems: "center",
+                      background: bg,
+                      boxShadow: ring,
+                      flex: "0 0 auto",
+                  }}
+             >
+                 <UserRound size={Math.max(16, Math.floor(sizePx * 0.62))} />
+             </div>
         );
     }
 
     return (
-        <div
-            aria-hidden="true"
-            style={{
-                width: sizePx,
-                height: sizePx,
-                borderRadius: 999,
-                display: "grid",
-                placeItems: "center",
-                fontSize: Math.max(11, Math.floor(sizePx * 0.46)),
-                fontWeight: 800,
-                letterSpacing: "0.04em",
-                color: "var(--fg)",
-                background: bg,
-                boxShadow: ring,
-                userSelect: "none",
-            }}
-        >
-            {initials(userLabel)}
-        </div>
+         <div
+              aria-hidden="true"
+              style={{
+                  width: sizePx,
+                  height: sizePx,
+                  borderRadius: 999,
+                  display: "grid",
+                  placeItems: "center",
+                  fontSize: Math.max(11, Math.floor(sizePx * 0.46)),
+                  fontWeight: 800,
+                  letterSpacing: "0.04em",
+                  color: "var(--fg)",
+                  background: bg,
+                  boxShadow: ring,
+                  userSelect: "none",
+                  flex: "0 0 auto",
+              }}
+         >
+             {initialsFromUser(user)}
+         </div>
     );
 }
 
@@ -253,8 +249,12 @@ function RowButton(props: {
     disabled?: boolean;
     autoFocus?: boolean;
     danger?: boolean;
+    busy?: boolean;
 }) {
+    const { label, hint, icon, onClick, disabled, autoFocus, danger, busy } = props;
     const [hover, setHover] = useState(false);
+
+    const isDisabled = !!disabled || !!busy;
 
     const base: React.CSSProperties = {
         width: "100%",
@@ -265,66 +265,66 @@ function RowButton(props: {
         borderRadius: 12,
         border: "1px solid transparent",
         background: "transparent",
-        color: props.danger ? "color-mix(in srgb, var(--fg) 82%, #b00020)" : "var(--fg)",
-        cursor: props.disabled ? "default" : "pointer",
+        color: danger ? "color-mix(in srgb, var(--fg) 82%, #b00020)" : "var(--fg)",
+        cursor: isDisabled ? "default" : "pointer",
         textAlign: "left",
         fontSize: 13,
         lineHeight: 1.2,
-        opacity: props.disabled ? 0.55 : 1,
+        opacity: isDisabled ? 0.58 : 1,
         userSelect: "none",
         WebkitTapHighlightColor: "transparent",
         outline: "none",
         transition: "all 0.15s cubic-bezier(0.16, 1, 0.3, 1)",
     };
 
-    const hoverStyle: React.CSSProperties = props.disabled
-        ? {}
-        : {
-            background: "color-mix(in srgb, var(--activeBg) 70%, transparent)",
-            borderColor: "color-mix(in srgb, var(--border) 60%, transparent)",
-        };
+    const hoverStyle: React.CSSProperties = isDisabled
+         ? {}
+         : {
+             background: "color-mix(in srgb, var(--activeBg) 70%, transparent)",
+             borderColor: "color-mix(in srgb, var(--border) 60%, transparent)",
+         };
 
     return (
-        <button
-            type="button"
-            role="menuitem"
-            disabled={props.disabled}
-            autoFocus={props.autoFocus}
-            onClick={() => {
-                if (props.disabled) return;
-                void props.onClick();
-            }}
-            onPointerEnter={() => setHover(true)}
-            onPointerLeave={() => setHover(false)}
-            onFocus={() => setHover(true)}
-            onBlur={() => setHover(false)}
-            style={{ ...base, ...(hover ? hoverStyle : null) }}
-        >
-            {props.icon ? (
-                <span
-                    aria-hidden="true"
-                    style={{
-                        width: 18,
-                        display: "grid",
-                        placeItems: "center",
-                        opacity: 0.95,
-                    }}
-                >
-          {props.icon}
-        </span>
-            ) : null}
+         <button
+              type="button"
+              role="menuitem"
+              disabled={isDisabled}
+              autoFocus={autoFocus}
+              aria-busy={busy || undefined}
+              onClick={() => {
+                  if (isDisabled) return;
+                  void onClick();
+              }}
+              onPointerEnter={() => setHover(true)}
+              onPointerLeave={() => setHover(false)}
+              onFocus={() => setHover(true)}
+              onBlur={() => setHover(false)}
+              style={{ ...base, ...(hover ? hoverStyle : null) }}
+         >
+             {icon ? (
+                  <span
+                       aria-hidden="true"
+                       style={{
+                           width: 18,
+                           display: "grid",
+                           placeItems: "center",
+                           opacity: 0.95,
+                           flex: "0 0 auto",
+                       }}
+                  >
+                    {icon}
+                </span>
+             ) : null}
 
-            <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ fontWeight: 780 }}>{props.label}</div>
-                {props.hint ? (
-                    <div style={{ fontSize: 12, opacity: 0.78, marginTop: 2 }}>{props.hint}</div>
-                ) : null}
-            </div>
-        </button>
+             <div style={{ minWidth: 0, flex: 1 }}>
+                 <div style={{ fontWeight: 780 }}>{label}</div>
+                 {hint ? (
+                      <div style={{ fontSize: 12, opacity: 0.78, marginTop: 2 }}>{hint}</div>
+                 ) : null}
+             </div>
+         </button>
     );
 }
-
-/* --------------------------------- Component -------------------------------- */
 
 export function AccountMenu({
                                 size = "sm",
@@ -336,22 +336,37 @@ export function AccountMenu({
 
     const btnRef = useRef<HTMLButtonElement | null>(null);
     const menuRef = useRef<HTMLDivElement | null>(null);
-    const wasOpen = useRef(false);
+    const wasOpenRef = useRef(false);
+    const mountedRef = useRef(true);
 
     const [open, setOpen] = useState(false);
     const [pressed, setPressed] = useState(false);
+    const [actionState, setActionState] = useState<MenuActionState>("idle");
 
     const reactId = useId();
     const triggerId = `acct-trigger-${reactId}`;
     const menuId = `acct-menu-${reactId}`;
 
+    const reducedMotion = useMemo(() => prefersReducedMotion(), []);
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+        };
+    }, []);
+
     const dims = useMemo(() => {
-        if (size === "md") return { btn: 38, avatar: 28, labelMax: 220, chevron: 16 };
+        if (size === "md") {
+            return { btn: 38, avatar: 28, labelMax: 220, chevron: 16 };
+        }
         return { btn: 32, avatar: 24, labelMax: 160, chevron: 14 };
     }, [size]);
 
     const signedIn = !!user;
-    const userLabel = user?.name || user?.email || "User";
+    const userLabel = formatUserLabel(user);
+    const triggerTitle = formatTriggerTitle(user);
+    const showLabel = signedIn && showLabelWhenSignedIn;
 
     const close = useCallback(() => setOpen(false), []);
     const openMenu = useCallback(() => setOpen(true), []);
@@ -363,11 +378,10 @@ export function AccountMenu({
         const shadowIdle = "0 8px 18px color-mix(in srgb, black 12%, transparent)";
         const shadowOpen = "0 14px 34px color-mix(in srgb, black 18%, transparent)";
 
-        const showLabel = showLabelWhenSignedIn && signedIn;
-
         return {
             height: dims.btn,
             minWidth: dims.btn,
+            maxWidth: showLabel ? dims.labelMax + dims.avatar + 30 : dims.btn,
             display: "inline-flex",
             alignItems: "center",
             justifyContent: "center",
@@ -382,41 +396,42 @@ export function AccountMenu({
             userSelect: "none",
             WebkitTapHighlightColor: "transparent",
             transition:
-                "box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.08s ease-out, background 0.15s ease-out",
+                 "box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.08s ease-out, background 0.15s ease-out",
             touchAction: "manipulation",
             transform: pressed ? "scale(0.965)" : "scale(1)",
             backgroundImage: open
-                ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 62%, transparent), transparent)"
-                : "none",
+                 ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 62%, transparent), transparent)"
+                 : "none",
             ...style,
         };
-    }, [dims.btn, open, pressed, showLabelWhenSignedIn, signedIn, style]);
+    }, [dims, open, pressed, showLabel, style]);
 
     const pos = usePopoverPosition({
         open,
         align,
-        menuWidth: 264,
+        menuWidth: MENU_WIDTH,
         anchorRef: btnRef,
         menuRef,
     });
 
-    const focusFirstItem = useCallback(() => {
-        const items = Array.from(
-            menuRef.current?.querySelectorAll('[role="menuitem"]:not([disabled])') || [],
-        ) as HTMLElement[];
-        safeFocus(items[0] ?? null);
+    const focusableItems = useCallback((): HTMLElement[] => {
+        return Array.from(
+             menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])') ?? [],
+        );
     }, []);
+
+    const focusFirstItem = useCallback(() => {
+        const items = focusableItems();
+        safeFocus(items[0] ?? null);
+    }, [focusableItems]);
 
     const focusLastItem = useCallback(() => {
-        const items = Array.from(
-            menuRef.current?.querySelectorAll('[role="menuitem"]:not([disabled])') || [],
-        ) as HTMLElement[];
+        const items = focusableItems();
         safeFocus(items[items.length - 1] ?? null);
-    }, []);
+    }, [focusableItems]);
 
-    // Close on outside click / escape / focus leaving
     useEffect(() => {
-        if (!open) return;
+        if (!open || typeof window === "undefined") return;
 
         const onKeyDown = (e: KeyboardEvent) => {
             if (e.key === "Escape") {
@@ -426,20 +441,20 @@ export function AccountMenu({
         };
 
         const onPointerDownCapture = (e: PointerEvent) => {
-            const t = e.target as Node | null;
-            if (!t || !btnRef.current || !menuRef.current) return;
+            const target = e.target as Node | null;
+            if (!target) return;
 
-            const inBtn = btnRef.current.contains(t);
-            const inMenu = menuRef.current.contains(t);
+            const inBtn = btnRef.current?.contains(target) ?? false;
+            const inMenu = menuRef.current?.contains(target) ?? false;
             if (!inBtn && !inMenu) close();
         };
 
         const onFocusInCapture = (e: FocusEvent) => {
-            const t = e.target as Node | null;
-            if (!t || !btnRef.current || !menuRef.current) return;
+            const target = e.target as Node | null;
+            if (!target) return;
 
-            const inBtn = btnRef.current.contains(t);
-            const inMenu = menuRef.current.contains(t);
+            const inBtn = btnRef.current?.contains(target) ?? false;
+            const inMenu = menuRef.current?.contains(target) ?? false;
             if (!inBtn && !inMenu) close();
         };
 
@@ -454,305 +469,349 @@ export function AccountMenu({
         };
     }, [open, close]);
 
-    // Return focus to trigger on close
     useEffect(() => {
-        if (wasOpen.current && !open) safeFocus(btnRef.current);
-        wasOpen.current = open;
+        if (wasOpenRef.current && !open) {
+            safeFocus(btnRef.current);
+        }
+        wasOpenRef.current = open;
     }, [open]);
 
-    // When opening, nudge focus into the menu after it's mounted
     useEffect(() => {
-        if (!open) return;
+        if (!open || typeof window === "undefined") return;
         const t = window.setTimeout(() => focusFirstItem(), 0);
         return () => window.clearTimeout(t);
     }, [open, focusFirstItem]);
 
-    // Keyboard navigation inside the menu (roving focus + wrap)
-    const handleMenuKeyDown = (e: React.KeyboardEvent) => {
-        if (e.key === "Tab") {
-            const items = Array.from(
-                menuRef.current?.querySelectorAll('[role="menuitem"]:not([disabled])') || [],
-            ) as HTMLElement[];
-            if (!items.length) return;
+    const handleMenuKeyDown = useCallback(
+         (e: React.KeyboardEvent) => {
+             const items = focusableItems();
 
-            const first = items[0]!;
-            const last = items[items.length - 1]!;
-            const active = document.activeElement as HTMLElement | null;
+             if (e.key === "Tab") {
+                 if (!items.length) return;
 
-            if (e.shiftKey) {
-                if (active === first || !menuRef.current?.contains(active)) {
-                    e.preventDefault();
-                    safeFocus(last);
-                }
-            } else {
-                if (active === last) {
-                    e.preventDefault();
-                    safeFocus(first);
-                }
+                 const first = items[0]!;
+                 const last = items[items.length - 1]!;
+                 const active = document.activeElement as HTMLElement | null;
+
+                 if (e.shiftKey) {
+                     if (active === first || !menuRef.current?.contains(active)) {
+                         e.preventDefault();
+                         safeFocus(last);
+                     }
+                 } else if (active === last) {
+                     e.preventDefault();
+                     safeFocus(first);
+                 }
+                 return;
+             }
+
+             if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                 e.preventDefault();
+                 if (!items.length) return;
+
+                 const active = document.activeElement as HTMLElement | null;
+                 const index = items.indexOf(active ?? items[0]!);
+                 let nextIndex = e.key === "ArrowDown" ? index + 1 : index - 1;
+
+                 if (nextIndex >= items.length) nextIndex = 0;
+                 if (nextIndex < 0) nextIndex = items.length - 1;
+
+                 safeFocus(items[nextIndex] ?? null);
+                 return;
+             }
+
+             if (e.key === "Home") {
+                 e.preventDefault();
+                 focusFirstItem();
+                 return;
+             }
+
+             if (e.key === "End") {
+                 e.preventDefault();
+                 focusLastItem();
+             }
+         },
+         [focusableItems, focusFirstItem, focusLastItem],
+    );
+
+    const onTriggerKeyDown = useCallback(
+         (e: React.KeyboardEvent) => {
+             if (e.key === "ArrowDown") {
+                 e.preventDefault();
+                 if (!open) openMenu();
+                 else focusFirstItem();
+                 return;
+             }
+
+             if (e.key === "ArrowUp") {
+                 e.preventDefault();
+                 if (!open) openMenu();
+                 else focusLastItem();
+                 return;
+             }
+
+             if (e.key === "Enter" || e.key === " ") {
+                 e.preventDefault();
+                 toggle();
+                 return;
+             }
+
+             if (e.key === "Escape" && open) {
+                 e.preventDefault();
+                 close();
+             }
+         },
+         [open, openMenu, toggle, close, focusFirstItem, focusLastItem],
+    );
+
+    const busy = loading || actionState !== "idle";
+
+    const handleRefresh = useCallback(async () => {
+        setActionState("refreshing");
+        try {
+            await refresh();
+        } finally {
+            if (mountedRef.current) {
+                setActionState("idle");
+                close();
             }
-            return;
         }
+    }, [refresh, close]);
 
-        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-            e.preventDefault();
-            const items = Array.from(
-                menuRef.current?.querySelectorAll('[role="menuitem"]:not([disabled])') || [],
-            ) as HTMLElement[];
-            if (!items.length) return;
-
-            const index = items.indexOf(document.activeElement as HTMLElement);
-            let nextIndex = e.key === "ArrowDown" ? index + 1 : index - 1;
-            if (nextIndex >= items.length) nextIndex = 0;
-            if (nextIndex < 0) nextIndex = items.length - 1;
-            safeFocus(items[nextIndex]);
-            return;
+    const handleSignOut = useCallback(async () => {
+        setActionState("signing_out");
+        try {
+            await signOut();
+        } finally {
+            if (mountedRef.current) {
+                setActionState("idle");
+                close();
+            }
         }
+    }, [signOut, close]);
 
-        if (e.key === "Home") {
-            e.preventDefault();
-            focusFirstItem();
-            return;
+    const handleSignIn = useCallback(() => {
+        setActionState("signing_in");
+        close();
+        try {
+            const returnTo =
+                 typeof window !== "undefined" ? window.location.href : undefined;
+            signInWithGoogle({ returnTo });
+        } catch {
+            if (mountedRef.current) {
+                setActionState("idle");
+            }
         }
+    }, [signInWithGoogle, close]);
 
-        if (e.key === "End") {
-            e.preventDefault();
-            focusLastItem();
-            return;
-        }
-    };
+    const menuStatusTitle = loading
+         ? "Checking…"
+         : signedIn
+              ? user?.displayName?.trim() || "Signed in"
+              : "Not signed in";
 
-    const onTriggerKeyDown = (e: React.KeyboardEvent) => {
-        if (e.key === "ArrowDown") {
-            e.preventDefault();
-            if (!open) openMenu();
-            return;
-        }
-        if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            toggle();
-            return;
-        }
-        if (e.key === "Escape" && open) {
-            e.preventDefault();
-            close();
-            return;
-        }
-    };
+    const menuStatusSubline = loading
+         ? "—"
+         : signedIn
+              ? user?.email?.trim() || "—"
+              : "Sign in to sync";
 
-    const reducedMotion = useMemo(() => prefersReducedMotion(), []);
+    const triggerText = loading ? "…" : triggerTitle;
 
-    const Menu =
-        open && pos
-            ? createPortal(
-                <>
-                    {/* Keep keyframes injected once per mount; respects reduced motion */}
-                    <style>{`
+    const menu =
+         open && pos && typeof document !== "undefined"
+              ? createPortal(
+                   <>
+                       <style>{`
               @keyframes acctScaleFadeIn {
                 from { opacity: 0; transform: translateY(-2px) scale(0.985); }
                 to { opacity: 1; transform: translateY(0) scale(1); }
               }
             `}</style>
 
-                    <div
-                        ref={menuRef}
-                        id={menuId}
-                        role="menu"
-                        aria-labelledby={triggerId}
-                        aria-label="Account menu"
-                        onKeyDown={handleMenuKeyDown}
-                        style={{
-                            position: "fixed",
-                            top: pos.top,
-                            left: pos.left,
-                            width: pos.width,
-                            zIndex: 100,
-                            borderRadius: 14,
-                            border: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
-                            background:
-                                "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))",
-                            boxShadow: "0 18px 60px color-mix(in srgb, black 22%, transparent)",
-                            backdropFilter: "blur(10px)",
-                            WebkitBackdropFilter: "blur(10px)",
-                            padding: 10,
-                            transformOrigin: pos.transformOrigin,
-                            animation: reducedMotion
-                                ? undefined
-                                : "acctScaleFadeIn 0.14s cubic-bezier(0.16, 1, 0.3, 1) forwards",
-                        }}
-                    >
-                        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 6px 8px 6px" }}>
-                            <AvatarCircle
-                                userLabel={userLabel}
-                                pictureUrl={user?.pictureUrl}
-                                sizePx={dims.avatar}
-                                signedIn={signedIn}
-                            />
-
-                            <div style={{ minWidth: 0, flex: 1 }}>
-                                <div
-                                    style={{
-                                        fontWeight: 820,
-                                        fontSize: 13,
-                                        whiteSpace: "nowrap",
-                                        overflow: "hidden",
-                                        textOverflow: "ellipsis",
-                                        opacity: loading ? 0.75 : 1,
-                                    }}
-                                >
-                                    {loading ? "Checking…" : signedIn ? user?.name || "Signed in" : "Not signed in"}
-                                </div>
-
-                                <div
-                                    style={{
-                                        fontSize: 12,
-                                        opacity: 0.78,
-                                        whiteSpace: "nowrap",
-                                        overflow: "hidden",
-                                        textOverflow: "ellipsis",
-                                    }}
-                                >
-                                    {loading ? "—" : signedIn ? user?.email || "—" : "Sign in to sync"}
-                                </div>
-                            </div>
-                        </div>
-
-                        {error ? (
-                            <div
-                                role="alert"
-                                style={{
-                                    margin: "0 6px 8px",
-                                    padding: "7px 9px",
-                                    borderRadius: 12,
-                                    border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
-                                    background: "color-mix(in srgb, var(--activeBg) 50%, transparent)",
-                                    fontSize: 12,
-                                    opacity: 0.9,
-                                }}
-                            >
-                                {error}
-                            </div>
-                        ) : null}
-
-                        <div
+                       <div
+                            ref={menuRef}
+                            id={menuId}
+                            role="menu"
+                            aria-labelledby={triggerId}
+                            aria-label="Account menu"
+                            onKeyDown={handleMenuKeyDown}
                             style={{
-                                height: 1,
-                                background: "color-mix(in srgb, var(--border) 70%, transparent)",
-                                margin: "6px 0 8px",
+                                position: "fixed",
+                                top: pos.top,
+                                left: pos.left,
+                                width: pos.width,
+                                zIndex: 100,
+                                borderRadius: 14,
+                                border: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
+                                background:
+                                     "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))",
+                                boxShadow: "0 18px 60px color-mix(in srgb, black 22%, transparent)",
+                                backdropFilter: "blur(10px)",
+                                WebkitBackdropFilter: "blur(10px)",
+                                padding: 10,
+                                transformOrigin: pos.transformOrigin,
+                                animation: reducedMotion
+                                     ? undefined
+                                     : "acctScaleFadeIn 0.14s cubic-bezier(0.16, 1, 0.3, 1) forwards",
                             }}
-                        />
-
-                        {!signedIn ? (
-                            <RowButton
-                                autoFocus
-                                label="Continue with Google"
-                                hint="Secure sign-in"
-                                disabled={loading}
-                                icon={<LogIn size={16} />}
-                                onClick={() => {
-                                    close();
-                                    // Always fire-and-forget; OAuth will navigate away.
-                                    try {
-                                        signInWithGoogle({ returnTo: window.location.href });
-                                    } catch {
-                                        /* no-op */
-                                    }
+                       >
+                           <div
+                                style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 10,
+                                    padding: "6px 6px 8px 6px",
                                 }}
-                            />
-                        ) : (
-                            <>
-                                <RowButton
-                                    autoFocus
-                                    label="Refresh session"
-                                    hint="Re-check login state"
-                                    disabled={loading}
-                                    icon={<RefreshCcw size={16} />}
-                                    onClick={async () => {
-                                        try {
-                                            await refresh();
-                                        } finally {
-                                            close();
-                                        }
-                                    }}
-                                />
+                           >
+                               <AvatarCircle user={user} sizePx={dims.avatar} signedIn={signedIn} />
 
-                                <RowButton
-                                    label="Sign out"
-                                    hint="End this session"
-                                    disabled={loading}
-                                    danger
-                                    icon={<LogOut size={16} />}
-                                    onClick={async () => {
-                                        try {
-                                            await signOut();
-                                        } finally {
-                                            close();
-                                        }
-                                    }}
-                                />
-                            </>
-                        )}
-                    </div>
-                </>,
-                document.body,
-            )
-            : null;
+                               <div style={{ minWidth: 0, flex: 1 }}>
+                                   <div
+                                        style={{
+                                            fontWeight: 820,
+                                            fontSize: 13,
+                                            whiteSpace: "nowrap",
+                                            overflow: "hidden",
+                                            textOverflow: "ellipsis",
+                                            opacity: loading ? 0.75 : 1,
+                                        }}
+                                   >
+                                       {menuStatusTitle}
+                                   </div>
 
-    const showLabel = signedIn && showLabelWhenSignedIn;
+                                   <div
+                                        style={{
+                                            fontSize: 12,
+                                            opacity: 0.78,
+                                            whiteSpace: "nowrap",
+                                            overflow: "hidden",
+                                            textOverflow: "ellipsis",
+                                        }}
+                                   >
+                                       {menuStatusSubline}
+                                   </div>
+                               </div>
+                           </div>
+
+                           {error ? (
+                                <div
+                                     role="alert"
+                                     style={{
+                                         margin: "0 6px 8px",
+                                         padding: "7px 9px",
+                                         borderRadius: 12,
+                                         border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
+                                         background: "color-mix(in srgb, var(--activeBg) 50%, transparent)",
+                                         fontSize: 12,
+                                         opacity: 0.9,
+                                     }}
+                                >
+                                    {error}
+                                </div>
+                           ) : null}
+
+                           <div
+                                style={{
+                                    height: 1,
+                                    background: "color-mix(in srgb, var(--border) 70%, transparent)",
+                                    margin: "6px 0 8px",
+                                }}
+                           />
+
+                           {!signedIn ? (
+                                <RowButton
+                                     autoFocus
+                                     label="Continue with Google"
+                                     hint="Secure sign-in"
+                                     disabled={loading}
+                                     busy={actionState === "signing_in"}
+                                     icon={<LogIn size={16} />}
+                                     onClick={handleSignIn}
+                                />
+                           ) : (
+                                <>
+                                    <RowButton
+                                         autoFocus
+                                         label="Refresh session"
+                                         hint="Re-check login state"
+                                         disabled={loading}
+                                         busy={actionState === "refreshing"}
+                                         icon={<RefreshCcw size={16} />}
+                                         onClick={handleRefresh}
+                                    />
+
+                                    <RowButton
+                                         label="Sign out"
+                                         hint="End this session"
+                                         disabled={loading}
+                                         busy={actionState === "signing_out"}
+                                         danger
+                                         icon={<LogOut size={16} />}
+                                         onClick={handleSignOut}
+                                    />
+                                </>
+                           )}
+                       </div>
+                   </>,
+                   document.body,
+              )
+              : null;
 
     return (
-        <>
-            <button
-                ref={btnRef}
-                id={triggerId}
-                type="button"
-                aria-haspopup="menu"
-                aria-controls={open ? menuId : undefined}
-                aria-expanded={open}
-                title={signedIn ? user?.name || user?.email || "Account" : "Sign in"}
-                onKeyDown={onTriggerKeyDown}
-                onClick={toggle}
-                onPointerDown={() => setPressed(true)}
-                onPointerUp={() => setPressed(false)}
-                onPointerCancel={() => setPressed(false)}
-                onPointerLeave={() => setPressed(false)}
-                style={anchorStyle}
-            >
-                <AvatarCircle userLabel={userLabel} pictureUrl={user?.pictureUrl} sizePx={dims.avatar} signedIn={signedIn} />
+         <>
+             <button
+                  ref={btnRef}
+                  id={triggerId}
+                  type="button"
+                  aria-haspopup="menu"
+                  aria-controls={open ? menuId : undefined}
+                  aria-expanded={open}
+                  title={triggerTitle}
+                  onKeyDown={onTriggerKeyDown}
+                  onClick={toggle}
+                  onPointerDown={() => setPressed(true)}
+                  onPointerUp={() => setPressed(false)}
+                  onPointerCancel={() => setPressed(false)}
+                  onPointerLeave={() => setPressed(false)}
+                  style={anchorStyle}
+             >
+                 <AvatarCircle user={user} sizePx={dims.avatar} signedIn={signedIn} />
 
-                {showLabel ? (
-                    <>
-            <span
-                style={{
-                    fontSize: 13,
-                    fontWeight: 780,
-                    whiteSpace: "nowrap",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    maxWidth: dims.labelMax,
-                    opacity: loading ? 0.7 : 1,
-                    paddingRight: 0,
-                }}
-            >
-              {loading ? "…" : user?.name || user?.email || "Account"}
-            </span>
-
-                        {/* tiny chevron gives “menu” affordance without clutter */}
+                 {showLabel ? (
+                      <>
                         <span
-                            aria-hidden="true"
-                            style={{
-                                display: "grid",
-                                placeItems: "center",
-                                opacity: 0.7,
-                                marginLeft: -2,
-                            }}
+                             style={{
+                                 fontSize: 13,
+                                 fontWeight: 780,
+                                 whiteSpace: "nowrap",
+                                 overflow: "hidden",
+                                 textOverflow: "ellipsis",
+                                 maxWidth: dims.labelMax,
+                                 opacity: loading ? 0.7 : 1,
+                                 paddingRight: 0,
+                             }}
                         >
-              <ChevronDown size={dims.chevron} />
-            </span>
-                    </>
-                ) : null}
-            </button>
+                            {triggerText}
+                        </span>
 
-            {Menu}
-        </>
+                          <span
+                               aria-hidden="true"
+                               style={{
+                                   display: "grid",
+                                   placeItems: "center",
+                                   opacity: 0.7,
+                                   marginLeft: -2,
+                                   flex: "0 0 auto",
+                               }}
+                          >
+                            <ChevronDown size={dims.chevron} />
+                        </span>
+                      </>
+                 ) : null}
+             </button>
+
+             {menu}
+         </>
     );
 }

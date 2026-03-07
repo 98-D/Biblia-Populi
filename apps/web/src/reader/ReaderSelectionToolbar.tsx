@@ -1,376 +1,395 @@
-import React, { memo, useMemo, useState } from "react";
+// apps/web/src/reader/ReaderSelectionToolbar.tsx
+import React, { memo, useMemo } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { SelectionAnchorInput } from "@biblia/annotation";
-import {
-    Bookmark,
-    Highlighter,
-    NotebookPen,
-    Sparkles,
-    X,
-} from "lucide-react";
+import { Bookmark, Highlighter, NotebookPen, Sparkles, X } from "lucide-react";
 
 type Props = {
-    selection: SelectionAnchorInput | null;
-    onHighlight: () => void;
-    onBookmark: () => void;
-    onNote: () => void;
-    onClear?: () => void;
-    className?: string;
+     selection: SelectionAnchorInput | null;
+     onHighlight: () => void;
+     onBookmark: () => void;
+     onNote: () => void;
+     onClear?: () => void;
+     className?: string;
 };
 
 type ActionTone = "gold" | "blue" | "violet";
 
+type ActionSpec = {
+     key: "highlight" | "bookmark" | "note";
+     label: string;
+     title: string;
+     onClick: () => void;
+     icon: ReactNode;
+     tone: ActionTone;
+};
+
 type ActionButtonProps = {
-    label: string;
-    title: string;
-    onClick: () => void;
-    icon: React.ReactNode;
-    tone: ActionTone;
+     label: string;
+     title: string;
+     onClick: () => void;
+     icon: ReactNode;
+     tone: ActionTone;
+};
+
+type ToneStyles = {
+     color: string;
+     background: string;
+     backgroundHover: string;
+     borderColor: string;
+     shadow: string;
+};
+
+const STICKY_TOP = 8;
+const PANEL_MAX_WIDTH = 720;
+
+const TOOLBAR_WRAP_STYLE: CSSProperties = {
+     position: "sticky",
+     top: STICKY_TOP,
+     zIndex: 60,
+     width: "100%",
+     display: "flex",
+     justifyContent: "center",
+     padding: "8px 12px 12px",
+     pointerEvents: "none",
+};
+
+const PANEL_STYLE: CSSProperties = {
+     pointerEvents: "auto",
+     width: "min(100%, 720px)",
+     maxWidth: PANEL_MAX_WIDTH,
+     borderRadius: 18,
+     border: "1px solid color-mix(in oklab, var(--hairline) 90%, transparent)",
+     background:
+          "linear-gradient(180deg, color-mix(in oklab, var(--panel) 94%, var(--bg)) 0%, color-mix(in oklab, var(--panel) 98%, var(--bg)) 100%)",
+     boxShadow: "0 12px 30px rgba(0,0,0,0.10), 0 2px 8px rgba(0,0,0,0.05)",
+     overflow: "hidden",
+     backdropFilter: "blur(14px)",
+     WebkitBackdropFilter: "blur(14px)",
+};
+
+const PANEL_INNER_STYLE: CSSProperties = {
+     display: "grid",
+     gridTemplateColumns: "minmax(0, 1fr) auto",
+     alignItems: "center",
+     gap: 12,
+     padding: "10px 12px",
+};
+
+const META_STYLE: CSSProperties = {
+     minWidth: 0,
+     display: "flex",
+     alignItems: "center",
+     gap: 10,
+};
+
+const BADGE_STYLE: CSSProperties = {
+     width: 22,
+     height: 22,
+     borderRadius: 999,
+     display: "inline-flex",
+     alignItems: "center",
+     justifyContent: "center",
+     flex: "0 0 auto",
+     background: "color-mix(in oklab, var(--fg) 6%, transparent)",
+     color: "color-mix(in oklab, var(--fg) 74%, transparent)",
+};
+
+const TEXT_WRAP_STYLE: CSSProperties = {
+     minWidth: 0,
+     display: "flex",
+     flexDirection: "column",
+     gap: 2,
+};
+
+const LABEL_STYLE: CSSProperties = {
+     minWidth: 0,
+     fontSize: 13,
+     fontWeight: 760,
+     letterSpacing: "-0.02em",
+     lineHeight: 1.15,
+     color: "var(--fg)",
+     overflow: "hidden",
+     textOverflow: "ellipsis",
+     whiteSpace: "nowrap",
+};
+
+const DETAIL_STYLE: CSSProperties = {
+     minWidth: 0,
+     fontSize: 12,
+     lineHeight: 1.25,
+     color: "color-mix(in oklab, var(--fg) 62%, transparent)",
+     overflow: "hidden",
+     textOverflow: "ellipsis",
+     whiteSpace: "nowrap",
+};
+
+const ACTIONS_STYLE: CSSProperties = {
+     display: "flex",
+     alignItems: "center",
+     justifyContent: "flex-end",
+     gap: 8,
+     flexWrap: "nowrap",
+     minWidth: 0,
 };
 
 function cleanText(value: string): string {
-    return value.replace(/\s+/g, " ").trim();
+     return value.replace(/\s+/g, " ").trim();
 }
 
-function clampText(value: string, max = 132): string {
-    const text = cleanText(value);
-    if (text.length <= max) return text;
-    return `${text.slice(0, max - 1).trimEnd()}…`;
+function clampText(value: string, max = 88): string {
+     const text = cleanText(value);
+     if (text.length <= max) return text;
+     return `${text.slice(0, max - 1).trimEnd()}…`;
 }
 
 function getSelectionLabel(selection: SelectionAnchorInput | null): string | null {
-    if (!selection) return null;
+     if (!selection) return null;
 
-    const start = cleanText(selection.start.verseKey);
-    const end = cleanText(selection.end.verseKey);
+     const start = cleanText(selection.start.verseKey);
+     const end = cleanText(selection.end.verseKey);
 
-    if (!start) return null;
-    if (start === end) return start;
-    return `${start} — ${end}`;
+     if (!start) return null;
+     if (!end || start === end) return start;
+     return `${start} — ${end}`;
 }
 
 function getSelectionDetail(selection: SelectionAnchorInput | null): string | null {
-    if (!selection) return null;
+     if (!selection) return null;
 
-    const text = selection.text ? cleanText(selection.text) : "";
-    if (text.length > 0) return clampText(text);
+     const text = selection.text ? clampText(selection.text, 88) : "";
+     if (text) return text;
 
-    const translationId = selection.translationId ? cleanText(selection.translationId) : "";
-    if (translationId.length > 0) return `Selection in ${translationId}`;
+     const translationId = selection.translationId ? cleanText(selection.translationId) : "";
+     if (translationId) return translationId;
 
-    return "Text selection";
+     return "Text selection";
 }
 
-function getPanelBorder(): string {
-    return "1px solid color-mix(in oklab, var(--reader-border, var(--border, rgba(127,127,127,0.24))) 86%, transparent)";
-}
-
-function getPanelBackground(): string {
-    return `
-        linear-gradient(
-            180deg,
-            color-mix(in oklab, var(--reader-card, var(--card, rgba(255,255,255,0.96))) 96%, white) 0%,
-            color-mix(in oklab, var(--reader-card, var(--card, rgba(255,255,255,0.96))) 100%, transparent) 100%
-        )
-    `;
-}
-
-function getPanelShadow(): string {
-    return "0 14px 34px rgba(0,0,0,0.10), 0 2px 10px rgba(0,0,0,0.05)";
-}
-
-function getToneStyles(tone: ActionTone): {
-    color: string;
-    background: string;
-    border: string;
-    shadow: string;
-    hoverBackground: string;
-} {
-    switch (tone) {
-        case "gold":
-            return {
-                color: "color-mix(in oklab, var(--text, #111) 76%, #8a6400)",
-                background: "color-mix(in oklab, #efcf73 16%, var(--card, white))",
-                border: "1px solid color-mix(in oklab, #ddb54c 40%, transparent)",
-                shadow: "0 6px 16px color-mix(in oklab, #ddb54c 12%, transparent)",
-                hoverBackground: "color-mix(in oklab, #efcf73 22%, var(--card, white))",
-            };
-        case "blue":
-            return {
-                color: "color-mix(in oklab, var(--text, #111) 76%, #295ed8)",
-                background: "color-mix(in oklab, #7ba9ff 14%, var(--card, white))",
-                border: "1px solid color-mix(in oklab, #6d9fff 38%, transparent)",
-                shadow: "0 6px 16px color-mix(in oklab, #6d9fff 11%, transparent)",
-                hoverBackground: "color-mix(in oklab, #7ba9ff 20%, var(--card, white))",
-            };
-        case "violet":
-            return {
-                color: "color-mix(in oklab, var(--text, #111) 76%, #6b47d8)",
-                background: "color-mix(in oklab, #b191ff 14%, var(--card, white))",
-                border: "1px solid color-mix(in oklab, #a884ff 38%, transparent)",
-                shadow: "0 6px 16px color-mix(in oklab, #a884ff 11%, transparent)",
-                hoverBackground: "color-mix(in oklab, #b191ff 20%, var(--card, white))",
-            };
-    }
+function getToneStyles(tone: ActionTone): ToneStyles {
+     switch (tone) {
+          case "gold":
+               return {
+                    color: "color-mix(in oklab, var(--fg) 78%, #8d6800)",
+                    background: "color-mix(in oklab, #efcf73 14%, var(--panel))",
+                    backgroundHover: "color-mix(in oklab, #efcf73 20%, var(--panel))",
+                    borderColor: "color-mix(in oklab, #ddb54c 34%, transparent)",
+                    shadow: "0 4px 12px color-mix(in oklab, #ddb54c 10%, transparent)",
+               };
+          case "blue":
+               return {
+                    color: "color-mix(in oklab, var(--fg) 78%, #295ed8)",
+                    background: "color-mix(in oklab, #7ba9ff 13%, var(--panel))",
+                    backgroundHover: "color-mix(in oklab, #7ba9ff 18%, var(--panel))",
+                    borderColor: "color-mix(in oklab, #6d9fff 34%, transparent)",
+                    shadow: "0 4px 12px color-mix(in oklab, #6d9fff 10%, transparent)",
+               };
+          case "violet":
+               return {
+                    color: "color-mix(in oklab, var(--fg) 78%, #6b47d8)",
+                    background: "color-mix(in oklab, #b191ff 13%, var(--panel))",
+                    backgroundHover: "color-mix(in oklab, #b191ff 18%, var(--panel))",
+                    borderColor: "color-mix(in oklab, #a884ff 34%, transparent)",
+                    shadow: "0 4px 12px color-mix(in oklab, #a884ff 10%, transparent)",
+               };
+     }
 }
 
 const ActionButton = memo(function ActionButton(props: ActionButtonProps) {
-    const { label, title, onClick, icon, tone } = props;
-    const toneStyles = getToneStyles(tone);
-    const [hovered, setHovered] = useState(false);
+     const { label, title, onClick, icon, tone } = props;
+     const toneStyles = getToneStyles(tone);
 
-    return (
-        <button
-            type="button"
-            title={title}
-            aria-label={title}
-            onClick={onClick}
-            onMouseDown={(event) => {
-                event.preventDefault();
-            }}
-            onMouseEnter={() => {
-                setHovered(true);
-            }}
-            onMouseLeave={() => {
-                setHovered(false);
-            }}
-            style={{
-                appearance: "none",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 8,
-                height: 38,
-                padding: "0 14px",
-                borderRadius: 999,
-                border: toneStyles.border,
-                background: hovered ? toneStyles.hoverBackground : toneStyles.background,
-                color: toneStyles.color,
-                boxShadow: toneStyles.shadow,
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-                fontSize: 13,
-                fontWeight: 700,
-                lineHeight: 1,
-                letterSpacing: "-0.01em",
-                transform: hovered ? "translateY(-1px)" : "translateY(0)",
-                transition:
-                    "transform 120ms ease, background 120ms ease, border-color 120ms ease, box-shadow 120ms ease, color 120ms ease",
-                WebkitTapHighlightColor: "transparent",
-            }}
-        >
-            <span
-                aria-hidden="true"
-                style={{
-                    width: 16,
-                    height: 16,
+     return (
+          <button
+               type="button"
+               title={title}
+               aria-label={title}
+               onClick={onClick}
+               onMouseDown={(event) => {
+                    event.preventDefault();
+               }}
+               style={{
+                    appearance: "none",
+                    WebkitAppearance: "none",
                     display: "inline-flex",
                     alignItems: "center",
                     justifyContent: "center",
-                    flex: "0 0 auto",
-                }}
+                    gap: 7,
+                    height: 34,
+                    padding: "0 11px",
+                    borderRadius: 999,
+                    border: `1px solid ${toneStyles.borderColor}`,
+                    background: toneStyles.background,
+                    color: toneStyles.color,
+                    boxShadow: toneStyles.shadow,
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                    fontSize: 12,
+                    fontWeight: 720,
+                    lineHeight: 1,
+                    letterSpacing: "-0.01em",
+                    transition:
+                         "transform 120ms ease, background 120ms ease, border-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease",
+                    WebkitTapHighlightColor: "transparent",
+               }}
+               onMouseEnter={(event) => {
+                    event.currentTarget.style.background = toneStyles.backgroundHover;
+                    event.currentTarget.style.transform = "translateY(-1px)";
+               }}
+               onMouseLeave={(event) => {
+                    event.currentTarget.style.background = toneStyles.background;
+                    event.currentTarget.style.transform = "translateY(0)";
+               }}
+               onMouseUp={(event) => {
+                    event.currentTarget.style.transform = "translateY(0)";
+               }}
+          >
+            <span
+                 aria-hidden="true"
+                 style={{
+                      width: 15,
+                      height: 15,
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      flex: "0 0 auto",
+                 }}
             >
                 {icon}
             </span>
-            <span>{label}</span>
-        </button>
-    );
+               <span>{label}</span>
+          </button>
+     );
 });
 
 const ClearButton = memo(function ClearButton(props: { onClick: () => void }) {
-    const [hovered, setHovered] = useState(false);
-
-    return (
-        <button
-            type="button"
-            title="Clear selection"
-            aria-label="Clear selection"
-            onClick={props.onClick}
-            onMouseDown={(event) => {
-                event.preventDefault();
-            }}
-            onMouseEnter={() => {
-                setHovered(true);
-            }}
-            onMouseLeave={() => {
-                setHovered(false);
-            }}
-            style={{
-                appearance: "none",
-                width: 38,
-                height: 38,
-                borderRadius: 999,
-                border: "1px solid color-mix(in oklab, var(--border, rgba(127,127,127,0.24)) 86%, transparent)",
-                background: hovered
-                    ? "color-mix(in oklab, var(--text, #111) 5%, transparent)"
-                    : "transparent",
-                color: "color-mix(in oklab, var(--text, #111) 70%, transparent)",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                cursor: "pointer",
-                flex: "0 0 auto",
-                transform: hovered ? "translateY(-1px)" : "translateY(0)",
-                transition: "background 120ms ease, transform 120ms ease, border-color 120ms ease",
-                WebkitTapHighlightColor: "transparent",
-            }}
-        >
-            <X size={17} strokeWidth={2.1} />
-        </button>
-    );
+     return (
+          <button
+               type="button"
+               title="Clear selection"
+               aria-label="Clear selection"
+               onClick={props.onClick}
+               onMouseDown={(event) => {
+                    event.preventDefault();
+               }}
+               style={{
+                    appearance: "none",
+                    WebkitAppearance: "none",
+                    width: 34,
+                    height: 34,
+                    borderRadius: 999,
+                    border: "1px solid color-mix(in oklab, var(--hairline) 88%, transparent)",
+                    background: "transparent",
+                    color: "color-mix(in oklab, var(--fg) 70%, transparent)",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    cursor: "pointer",
+                    flex: "0 0 auto",
+                    transition: "background 120ms ease, transform 120ms ease, border-color 120ms ease",
+                    WebkitTapHighlightColor: "transparent",
+               }}
+               onMouseEnter={(event) => {
+                    event.currentTarget.style.background =
+                         "color-mix(in oklab, var(--fg) 5%, transparent)";
+                    event.currentTarget.style.transform = "translateY(-1px)";
+               }}
+               onMouseLeave={(event) => {
+                    event.currentTarget.style.background = "transparent";
+                    event.currentTarget.style.transform = "translateY(0)";
+               }}
+               onMouseUp={(event) => {
+                    event.currentTarget.style.transform = "translateY(0)";
+               }}
+          >
+               <X size={15} strokeWidth={2.1} />
+          </button>
+     );
 });
 
 export const ReaderSelectionToolbar = memo(function ReaderSelectionToolbar(props: Props) {
-    const { selection, onHighlight, onBookmark, onNote, onClear, className } = props;
+     const { selection, onHighlight, onBookmark, onNote, onClear, className } = props;
 
-    const label = useMemo(() => getSelectionLabel(selection), [selection]);
-    const detail = useMemo(() => getSelectionDetail(selection), [selection]);
+     const label = useMemo(() => getSelectionLabel(selection), [selection]);
+     const detail = useMemo(() => getSelectionDetail(selection), [selection]);
 
-    if (!selection) return null;
+     const actions = useMemo<ActionSpec[]>(
+          () => [
+               {
+                    key: "highlight",
+                    label: "Highlight",
+                    title: "Create highlight",
+                    onClick: onHighlight,
+                    icon: <Highlighter size={15} strokeWidth={2.1} />,
+                    tone: "gold",
+               },
+               {
+                    key: "bookmark",
+                    label: "Bookmark",
+                    title: "Create bookmark",
+                    onClick: onBookmark,
+                    icon: <Bookmark size={15} strokeWidth={2.1} />,
+                    tone: "blue",
+               },
+               {
+                    key: "note",
+                    label: "Note",
+                    title: "Create note",
+                    onClick: onNote,
+                    icon: <NotebookPen size={15} strokeWidth={2.1} />,
+                    tone: "violet",
+               },
+          ],
+          [onBookmark, onHighlight, onNote],
+     );
 
-    return (
-        <div
-            className={className}
-            role="toolbar"
-            aria-label="Selection actions"
-            style={{
-                position: "sticky",
-                top: 8,
-                zIndex: 60,
-                width: "100%",
-                display: "flex",
-                justifyContent: "center",
-                padding: "8px 12px 14px",
-                pointerEvents: "none",
-            }}
-        >
-            <div
-                style={{
-                    pointerEvents: "auto",
-                    width: "min(940px, 100%)",
-                    borderRadius: 22,
-                    border: getPanelBorder(),
-                    background: getPanelBackground(),
-                    boxShadow: getPanelShadow(),
-                    overflow: "hidden",
-                }}
-            >
-                <div
-                    style={{
-                        display: "grid",
-                        gridTemplateColumns: "minmax(0, 1fr) auto",
-                        gap: 12,
-                        alignItems: "center",
-                        padding: "12px 14px",
-                    }}
-                >
-                    <div
-                        style={{
-                            minWidth: 0,
-                            display: "flex",
-                            flexDirection: "column",
-                            gap: 4,
-                        }}
-                    >
-                        <div
-                            style={{
-                                display: "flex",
-                                alignItems: "center",
-                                gap: 8,
-                                minWidth: 0,
-                                flexWrap: "wrap",
-                            }}
-                        >
-                            <div
-                                aria-hidden="true"
-                                style={{
-                                    width: 24,
-                                    height: 24,
-                                    borderRadius: 999,
-                                    display: "inline-flex",
-                                    alignItems: "center",
-                                    justifyContent: "center",
-                                    background: "color-mix(in oklab, var(--text, #111) 6%, transparent)",
-                                    color: "color-mix(in oklab, var(--text, #111) 76%, transparent)",
-                                    flex: "0 0 auto",
-                                }}
-                            >
-                                <Sparkles size={13} strokeWidth={2.2} />
-                            </div>
+     if (!selection) return null;
 
-                            {label ? (
-                                <div
-                                    style={{
-                                        minWidth: 0,
-                                        fontSize: 14,
-                                        fontWeight: 800,
-                                        letterSpacing: "-0.02em",
-                                        color: "var(--text, inherit)",
-                                        overflow: "hidden",
-                                        textOverflow: "ellipsis",
-                                        whiteSpace: "nowrap",
-                                    }}
-                                    title={label}
-                                >
-                                    {label}
-                                </div>
-                            ) : null}
-                        </div>
+     return (
+          <div
+               className={className}
+               role="toolbar"
+               aria-label="Selection actions"
+               style={TOOLBAR_WRAP_STYLE}
+          >
+               <div style={PANEL_STYLE}>
+                    <div style={PANEL_INNER_STYLE}>
+                         <div style={META_STYLE}>
+                              <div aria-hidden="true" style={BADGE_STYLE}>
+                                   <Sparkles size={12} strokeWidth={2.2} />
+                              </div>
 
-                        {detail ? (
-                            <div
-                                style={{
-                                    minWidth: 0,
-                                    fontSize: 13,
-                                    lineHeight: 1.35,
-                                    color: "color-mix(in oklab, var(--text, #111) 66%, transparent)",
-                                    overflow: "hidden",
-                                    textOverflow: "ellipsis",
-                                    whiteSpace: "nowrap",
-                                }}
-                                title={detail}
-                            >
-                                {detail}
-                            </div>
-                        ) : null}
+                              <div style={TEXT_WRAP_STYLE}>
+                                   {label ? (
+                                        <div style={LABEL_STYLE} title={label}>
+                                             {label}
+                                        </div>
+                                   ) : null}
+
+                                   {detail ? (
+                                        <div style={DETAIL_STYLE} title={detail}>
+                                             {detail}
+                                        </div>
+                                   ) : null}
+                              </div>
+                         </div>
+
+                         <div style={ACTIONS_STYLE}>
+                              {actions.map((action) => (
+                                   <ActionButton
+                                        key={action.key}
+                                        label={action.label}
+                                        title={action.title}
+                                        onClick={action.onClick}
+                                        icon={action.icon}
+                                        tone={action.tone}
+                                   />
+                              ))}
+
+                              {onClear ? <ClearButton onClick={onClear} /> : null}
+                         </div>
                     </div>
-
-                    <div
-                        style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "flex-end",
-                            gap: 8,
-                            flexWrap: "wrap",
-                        }}
-                    >
-                        <ActionButton
-                            label="Highlight"
-                            title="Create highlight"
-                            onClick={onHighlight}
-                            icon={<Highlighter size={16} strokeWidth={2.1} />}
-                            tone="gold"
-                        />
-
-                        <ActionButton
-                            label="Bookmark"
-                            title="Create bookmark"
-                            onClick={onBookmark}
-                            icon={<Bookmark size={16} strokeWidth={2.1} />}
-                            tone="blue"
-                        />
-
-                        <ActionButton
-                            label="Note"
-                            title="Create note"
-                            onClick={onNote}
-                            icon={<NotebookPen size={16} strokeWidth={2.1} />}
-                            tone="violet"
-                        />
-
-                        {onClear ? <ClearButton onClick={onClear} /> : null}
-                    </div>
-                </div>
-            </div>
-        </div>
-    );
+               </div>
+          </div>
+     );
 });

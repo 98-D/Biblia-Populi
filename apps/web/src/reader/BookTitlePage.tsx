@@ -1,48 +1,191 @@
 // apps/web/src/reader/BookTitlePage.tsx
-import React, { useMemo } from "react";
+import React, { memo, useMemo } from "react";
+import type { CSSProperties } from "react";
 import type { BookRow } from "../api";
 
 /**
- * Biblia.to — Book Title Page (premium + virtualizer-safe)
+ * Biblia.to — Book Title Page
  *
- * Design goals:
- * - Predictable height + wrapping (TanStack Virtual friendly)
- * - No huge shadows/filters that explode paint cost
- * - Uses your actual font tokens (base.css): --font-serif / --font-sans
- * - Clean, “luxury card” with subtle ink + hairlines
- *
- * Notes:
- * - All text is short and wraps; no long unbroken runs.
- * - Uses color-mix tokens already present elsewhere in your app.
+ * Hardened goals:
+ * - smaller / calmer surface
+ * - deterministic sizing for virtualization
+ * - no expensive paint effects
+ * - no `any`
+ * - resilient against odd book/testament values
  */
 
-function formatTestament(t: unknown): string {
-    const v = String(t ?? "").trim().toUpperCase();
-    if (v === "NT" || v === "NEW" || v.includes("NEW")) return "THE NEW TESTAMENT";
-    if (v === "OT" || v === "OLD" || v.includes("OLD")) return "THE OLD TESTAMENT";
+type TitleParts = {
+    prefix: string;
+    main: string;
+    subtitle?: string;
+};
+
+const WRAP_STYLE: CSSProperties = {
+    padding: "16px 8px 12px",
+    display: "flex",
+    justifyContent: "center",
+    background: "transparent",
+};
+
+const CARD_STYLE: CSSProperties = {
+    width: "100%",
+    maxWidth: 680,
+    borderRadius: 16,
+    padding: "14px 14px 12px",
+    background: "color-mix(in oklab, var(--panel) 94%, var(--bg))",
+    border: "1px solid color-mix(in oklab, var(--hairline) 90%, transparent)",
+    boxShadow: "0 8px 24px rgba(0,0,0,0.06)",
+    overflow: "hidden",
+    boxSizing: "border-box",
+};
+
+const HAIRLINE_TOP_STYLE: CSSProperties = {
+    height: 1,
+    marginBottom: 10,
+    background:
+         "linear-gradient(to right, transparent, color-mix(in oklab, var(--hairline) 94%, transparent), transparent)",
+    opacity: 0.9,
+};
+
+const HAIRLINE_BOTTOM_STYLE: CSSProperties = {
+    height: 1,
+    marginTop: 12,
+    background:
+         "linear-gradient(to right, transparent, color-mix(in oklab, var(--hairline) 88%, transparent), transparent)",
+    opacity: 0.7,
+};
+
+const KICKER_STYLE: CSSProperties = {
+    marginBottom: 10,
+    fontFamily: "var(--font-sans)",
+    fontSize: 10,
+    letterSpacing: "0.24em",
+    textTransform: "uppercase",
+    color: "var(--muted)",
+    textAlign: "center",
+    userSelect: "none",
+};
+
+const TITLE_BLOCK_STYLE: CSSProperties = {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 6,
+    padding: "2px 0",
+};
+
+const PREFIX_STYLE: CSSProperties = {
+    maxWidth: 520,
+    padding: "0 6px",
+    fontFamily: "var(--font-sans)",
+    fontSize: 11,
+    letterSpacing: "0.16em",
+    textTransform: "uppercase",
+    color: "color-mix(in oklab, var(--fg) 74%, var(--muted))",
+    textAlign: "center",
+    lineHeight: 1.25,
+    userSelect: "none",
+    textWrap: "balance",
+};
+
+const MAIN_STYLE: CSSProperties = {
+    margin: 0,
+    maxWidth: 600,
+    padding: "0 6px",
+    fontFamily: "var(--font-serif)",
+    fontWeight: 720,
+    fontSize: 28,
+    letterSpacing: "0.03em",
+    textTransform: "uppercase",
+    textAlign: "center",
+    color: "var(--fg)",
+    lineHeight: 1.05,
+    userSelect: "none",
+    overflowWrap: "anywhere",
+    textWrap: "balance",
+};
+
+const SUBTITLE_STYLE: CSSProperties = {
+    maxWidth: 600,
+    padding: "0 8px",
+    fontFamily: "var(--font-serif)",
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: "0.12em",
+    textTransform: "uppercase",
+    color: "color-mix(in oklab, var(--fg) 78%, var(--muted))",
+    textAlign: "center",
+    lineHeight: 1.15,
+    userSelect: "none",
+    overflowWrap: "anywhere",
+    textWrap: "balance",
+};
+
+const RULE_STYLE: CSSProperties = {
+    width: "min(320px, 70%)",
+    height: 1,
+    marginTop: 2,
+    background: "color-mix(in oklab, var(--hairline) 92%, transparent)",
+    opacity: 0.9,
+};
+
+const MOTTO_STYLE: CSSProperties = {
+    marginTop: 6,
+    maxWidth: 520,
+    padding: "0 8px",
+    fontFamily: "var(--font-sans)",
+    fontSize: 10,
+    letterSpacing: "0.14em",
+    textTransform: "uppercase",
+    color: "color-mix(in oklab, var(--fg) 60%, var(--muted))",
+    textAlign: "center",
+    lineHeight: 1.25,
+    userSelect: "none",
+};
+
+function readTestament(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const v = value.trim().toUpperCase();
+    if (!v) return null;
+    return v;
+}
+
+function formatTestament(testament: unknown): string {
+    const value = readTestament(testament);
+    if (!value) return "HOLY SCRIPTURE";
+    if (value === "NT" || value === "NEW" || value.includes("NEW")) {
+        return "THE NEW TESTAMENT";
+    }
+    if (value === "OT" || value === "OLD" || value.includes("OLD")) {
+        return "THE OLD TESTAMENT";
+    }
     return "HOLY SCRIPTURE";
 }
 
+function normalizeWhitespace(value: string): string {
+    return value.trim().replace(/\s+/g, " ");
+}
+
 function normalizeBookName(book: BookRow | null, bookId: string): string {
-    const raw = (book?.name ?? bookId).toString().trim();
-    return raw || bookId;
+    const fromBook =
+         book && typeof book.name === "string" ? normalizeWhitespace(book.name) : "";
+    const fromId = normalizeWhitespace(bookId);
+    return fromBook || fromId || "UNKNOWN";
 }
 
-function upperWords(s: string): string {
-    return s
-        .trim()
-        .replace(/\s+/g, " ")
-        .toUpperCase();
+function upperWords(value: string): string {
+    return normalizeWhitespace(value).toUpperCase();
 }
 
-function getBookTitleParts(book: BookRow | null, bookId: string): { prefix: string; main: string; subtitle?: string } {
+function getBookTitleParts(book: BookRow | null, bookId: string): TitleParts {
     const raw = upperWords(normalizeBookName(book, bookId));
 
-    if (raw === "PSALMS") return { prefix: "", main: "PSALMS" };
-    if (raw === "PROVERBS") return { prefix: "THE BOOK OF", main: "PROVERBS" };
+    if (raw === "PSALMS") {
+        return { prefix: "", main: "PSALMS" };
+    }
 
-    if (["MATTHEW", "MARK", "LUKE", "JOHN"].includes(raw)) {
-        return { prefix: "THE GOSPEL ACCORDING TO", main: raw };
+    if (raw === "PROVERBS") {
+        return { prefix: "THE BOOK OF", main: "PROVERBS" };
     }
 
     if (raw === "ACTS" || raw === "ACTS OF THE APOSTLES") {
@@ -53,7 +196,14 @@ function getBookTitleParts(book: BookRow | null, bookId: string): { prefix: stri
         return { prefix: "THE REVELATION OF", main: "JOHN" };
     }
 
-    // Epistles styling (optional flourish)
+    if (raw === "SONG OF SOLOMON" || raw === "SONG OF SONGS") {
+        return { prefix: "THE SONG OF", main: "SOLOMON" };
+    }
+
+    if (raw === "MATTHEW" || raw === "MARK" || raw === "LUKE" || raw === "JOHN") {
+        return { prefix: "THE GOSPEL ACCORDING TO", main: raw };
+    }
+
     if (raw.startsWith("1 ") || raw.startsWith("2 ") || raw.startsWith("3 ")) {
         return { prefix: "THE EPISTLE OF", main: raw };
     }
@@ -61,160 +211,47 @@ function getBookTitleParts(book: BookRow | null, bookId: string): { prefix: stri
     return { prefix: "THE BOOK OF", main: raw };
 }
 
-export const BookTitlePage = React.memo(function BookTitlePage(props: { book: BookRow | null; bookId: string }) {
+function getBookTestament(book: BookRow | null): unknown {
+    if (!book) return null;
+    const record = book as unknown as Record<string, unknown>;
+    return record.testament ?? null;
+}
+
+export const BookTitlePage = memo(function BookTitlePage(props: {
+    book: BookRow | null;
+    bookId: string;
+}) {
     const { book, bookId } = props;
 
     const displayName = useMemo(() => normalizeBookName(book, bookId), [book, bookId]);
-    const testament = useMemo(() => formatTestament((book as any)?.testament), [book]);
-    const { prefix, main, subtitle } = useMemo(() => getBookTitleParts(book, bookId), [book, bookId]);
+    const testament = useMemo(
+         () => formatTestament(getBookTestament(book)),
+         [book],
+    );
+    const parts = useMemo(() => getBookTitleParts(book, bookId), [book, bookId]);
 
     return (
-        <section style={s.wrap} aria-label={`Book: ${displayName}`}>
-            <div style={s.card}>
-                {/* Top hairline */}
-                <div style={s.hairlineTop} aria-hidden="true" />
+         <section style={WRAP_STYLE} aria-label={`Book: ${displayName}`}>
+             <div style={CARD_STYLE}>
+                 <div style={HAIRLINE_TOP_STYLE} aria-hidden="true" />
 
-                {/* Kicker */}
-                <div style={s.kicker}>{testament}</div>
+                 <div style={KICKER_STYLE}>{testament}</div>
 
-                {/* Title */}
-                <div style={s.titleBlock}>
-                    {prefix ? <div style={s.prefix}>{prefix}</div> : null}
+                 <div style={TITLE_BLOCK_STYLE}>
+                     {parts.prefix ? <div style={PREFIX_STYLE}>{parts.prefix}</div> : null}
 
-                    <h1 style={s.main}>{main}</h1>
+                     <h1 style={MAIN_STYLE}>{parts.main}</h1>
 
-                    {subtitle ? <div style={s.subtitle}>{subtitle}</div> : null}
+                     {parts.subtitle ? (
+                          <div style={SUBTITLE_STYLE}>{parts.subtitle}</div>
+                     ) : null}
 
-                    <div style={s.rule} aria-hidden="true" />
+                     <div style={RULE_STYLE} aria-hidden="true" />
+                     <div style={MOTTO_STYLE}>VERBUM DOMINI MANET IN AETERNUM</div>
+                 </div>
 
-                    <div style={s.motto}>VERBUM DOMINI MANET IN AETERNUM</div>
-                </div>
-
-                {/* Bottom hairline */}
-                <div style={s.hairlineBot} aria-hidden="true" />
-            </div>
-        </section>
+                 <div style={HAIRLINE_BOTTOM_STYLE} aria-hidden="true" />
+             </div>
+         </section>
     );
 });
-
-const s: Record<string, React.CSSProperties> = {
-    wrap: {
-        padding: "24px 12px 18px",
-        display: "flex",
-        justifyContent: "center",
-        background: "transparent",
-    },
-
-    card: {
-        width: "100%",
-        maxWidth: 760,
-        borderRadius: 20,
-        padding: "18px 16px",
-        background: "color-mix(in oklab, var(--card) 92%, var(--bg) 8%)",
-        border: "1px solid color-mix(in oklab, var(--border) 78%, transparent)",
-        boxShadow: "0 16px 44px color-mix(in oklab, black 14%, transparent), inset 0 1px 0 rgba(255,255,255,0.16)",
-        overflow: "hidden",
-        contain: "paint",
-    },
-
-    hairlineTop: {
-        height: 1,
-        background:
-            "linear-gradient(to right, transparent, color-mix(in oklab, var(--border) 78%, transparent), transparent)",
-        opacity: 0.95,
-        marginBottom: 12,
-    },
-    hairlineBot: {
-        height: 1,
-        background:
-            "linear-gradient(to right, transparent, color-mix(in oklab, var(--border) 72%, transparent), transparent)",
-        opacity: 0.75,
-        marginTop: 14,
-    },
-
-    kicker: {
-        fontFamily: "var(--font-sans)",
-        fontSize: 12,
-        letterSpacing: "0.22em",
-        textTransform: "uppercase",
-        color: "color-mix(in oklab, var(--fg) 70%, var(--muted) 30%)",
-        textAlign: "center",
-        marginBottom: 12,
-        userSelect: "none",
-    },
-
-    titleBlock: {
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        gap: 8,
-        padding: "4px 0 2px",
-    },
-
-    prefix: {
-        fontFamily: "var(--font-sans)",
-        fontSize: 12.5,
-        letterSpacing: "0.18em",
-        textTransform: "uppercase",
-        color: "color-mix(in oklab, var(--fg) 72%, var(--muted) 28%)",
-        textAlign: "center",
-        userSelect: "none",
-        maxWidth: 560,
-        lineHeight: 1.25,
-        padding: "0 6px",
-    },
-
-    main: {
-        margin: 0,
-        fontFamily: "var(--font-serif)",
-        fontWeight: 760,
-        fontSize: 34,
-        letterSpacing: "0.05em",
-        textTransform: "uppercase",
-        textAlign: "center",
-        color: "color-mix(in oklab, var(--fg) 92%, var(--muted) 8%)",
-        lineHeight: 1.06,
-        userSelect: "none",
-        maxWidth: 660,
-        padding: "0 6px",
-        overflowWrap: "anywhere",
-        textWrap: "balance",
-    },
-
-    subtitle: {
-        fontFamily: "var(--font-serif)",
-        fontSize: 16,
-        fontWeight: 620,
-        letterSpacing: "0.14em",
-        textTransform: "uppercase",
-        color: "color-mix(in oklab, var(--fg) 78%, var(--muted) 22%)",
-        textAlign: "center",
-        userSelect: "none",
-        maxWidth: 660,
-        lineHeight: 1.12,
-        padding: "0 8px",
-        overflowWrap: "anywhere",
-    },
-
-    rule: {
-        width: "min(520px, 86%)",
-        height: 1,
-        background: "color-mix(in oklab, var(--border) 75%, transparent)",
-        opacity: 0.9,
-        marginTop: 2,
-    },
-
-    motto: {
-        marginTop: 8,
-        fontFamily: "var(--font-sans)",
-        fontSize: 11.5,
-        letterSpacing: "0.16em",
-        textTransform: "uppercase",
-        color: "color-mix(in oklab, var(--fg) 62%, var(--muted) 38%)",
-        textAlign: "center",
-        userSelect: "none",
-        maxWidth: 620,
-        lineHeight: 1.25,
-        padding: "0 8px",
-    },
-};

@@ -1,42 +1,114 @@
 // apps/web/src/auth/authApi.ts
-// Biblia Populi — auth client (cookie session + Google OAuth redirect)
+// Biblia.to — auth client (cookie session + Google OAuth redirect)
+//
+// Aligned with current API envelope:
+//   { ok: true, data: ... }
+//   { ok: false, error: { code, message } }
+//
 // Goals:
-// - Never "fetch" an OAuth start URL (must be a top-level navigation)
-// - Robust JSON parsing (handles non-JSON + empty bodies)
-// - Standardized {ok:false,error} shape on transport failures
+// - Never fetch OAuth start URL; only top-level navigation
+// - Robust JSON parsing for empty / non-JSON / malformed responses
+// - Normalize transport/server failures into a stable ApiError
+// - Keep UI-facing auth types stable even if API internals evolve
+// - Align with current server.ts auth payloads
 
-export type ApiError = { code: string; message: string };
+export type ApiError = Readonly<{
+    code: string;
+    message: string;
+}>;
 
-export type AuthUser = {
+export type AuthUser = Readonly<{
     id: string;
     email: string | null;
-    name: string | null;
-    pictureUrl: string | null;
-};
+    displayName: string | null;
+    emailVerifiedAt: string | null;
+}>;
 
 export type AuthMePayload =
-    | { ok: true; user: AuthUser | null }
-    | { ok: false; error: ApiError };
+     | Readonly<{ ok: true; user: AuthUser | null }>
+     | Readonly<{ ok: false; error: ApiError }>;
 
-export type AuthOkPayload =
-    | { ok: true }
-    | { ok: false; error: ApiError };
+export type AuthLogoutPayload =
+     | Readonly<{ ok: true; redirect: string | null }>
+     | Readonly<{ ok: false; error: ApiError }>;
+
+type ApiEnvelopeOk<T> = Readonly<{ ok: true; data: T }>;
+type ApiEnvelopeErr = Readonly<{ ok: false; error: ApiError }>;
+type ApiEnvelope<T> = ApiEnvelopeOk<T> | ApiEnvelopeErr;
+
+type AuthMeResponseData = Readonly<{
+    user: {
+        id: string;
+        email: string | null;
+        displayName: string | null;
+        emailVerifiedAt: string | Date | null;
+        disabledAt?: string | Date | null;
+    } | null;
+}>;
+
+type AuthLogoutResponseData = Readonly<{
+    redirect?: string | null;
+}>;
 
 function trimSlash(s: string): string {
     return s.replace(/\/+$/, "");
 }
 
-export function apiBase(): string {
-    // Prefer Vite env, fallback to localhost API.
-    const v = (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_API_BASE;
-    if (typeof v === "string" && v.trim()) return trimSlash(v.trim());
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asStringOrNull(value: unknown): string | null {
+    return typeof value === "string" ? value : null;
+}
+
+function toIsoOrNull(value: unknown): string | null {
+    if (value == null) return null;
+    if (typeof value === "string") {
+        const t = value.trim();
+        return t.length > 0 ? t : null;
+    }
+    if (value instanceof Date && Number.isFinite(value.getTime())) {
+        return value.toISOString();
+    }
+    return null;
+}
+
+function normalizeAuthUser(input: unknown): AuthUser | null {
+    if (input == null) return null;
+    if (!isRecord(input)) return null;
+
+    const id = input.id;
+    if (typeof id !== "string" || id.trim().length === 0) return null;
+
+    return {
+        id: id.trim(),
+        email: asStringOrNull(input.email),
+        displayName: asStringOrNull(input.displayName),
+        emailVerifiedAt: toIsoOrNull(input.emailVerifiedAt),
+    };
+}
+
+function asApiError(code: string, message: string): ApiError {
+    const c = code.trim() || "unknown_error";
+    const m = message.trim() || c;
+    return { code: c, message: m };
+}
+
+function apiBase(): string {
+    const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
+    const explicit = env?.VITE_API_BASE;
+    if (typeof explicit === "string" && explicit.trim()) {
+        return trimSlash(explicit.trim());
+    }
     return "http://localhost:3000";
 }
+
+export { apiBase };
 
 function buildUrl(path: string): string {
     const base = apiBase();
     const p = path.startsWith("/") ? path : `/${path}`;
-    // Use URL to normalize any weirdness.
     return new URL(p, `${trimSlash(base)}/`).toString();
 }
 
@@ -46,26 +118,48 @@ function isJsonContentType(ct: string | null): boolean {
     return v.includes("application/json") || v.includes("+json");
 }
 
-function asApiError(code: string, message: string): ApiError {
-    return { code, message: message || code };
+function mergeHeaders(
+     base: Record<string, string>,
+     extra?: HeadersInit,
+): Headers {
+    const out = new Headers(base);
+    if (!extra) return out;
+
+    if (extra instanceof Headers) {
+        extra.forEach((value, key) => out.set(key, value));
+        return out;
+    }
+
+    if (Array.isArray(extra)) {
+        for (const [key, value] of extra) out.set(key, value);
+        return out;
+    }
+
+    for (const [key, value] of Object.entries(extra)) {
+        if (typeof value !== "undefined") out.set(key, String(value));
+    }
+    return out;
 }
 
-type FetchJsonOpts<T> = {
-    // When the server returns 204/empty body, return this value instead of erroring.
-    empty: T;
-};
+type FetchEnvelopeOptions<T> = Readonly<{
+    emptyOkData: T;
+}>;
 
-async function apiFetchJson<T>(path: string, init?: RequestInit, opts?: FetchJsonOpts<T>): Promise<T> {
+async function apiFetchEnvelope<T>(
+     path: string,
+     init: RequestInit,
+     opts: FetchEnvelopeOptions<T>,
+): Promise<ApiEnvelope<T>> {
     const url = buildUrl(path);
+    const hasBody = typeof init.body !== "undefined" && init.body !== null;
 
-    // NOTE: Do NOT force Content-Type for GET; it can trigger preflight.
-    // We send Accept and only send Content-Type when there is a body.
-    const hasBody = typeof init?.body !== "undefined" && init?.body !== null;
-    const headers: Record<string, string> = {
-        Accept: "application/json",
-        ...(hasBody ? { "Content-Type": "application/json" } : {}),
-        ...(init?.headers as Record<string, string> | undefined),
-    };
+    const headers = mergeHeaders(
+         {
+             Accept: "application/json",
+             ...(hasBody ? { "Content-Type": "application/json" } : {}),
+         },
+         init.headers,
+    );
 
     let res: Response;
     try {
@@ -75,71 +169,142 @@ async function apiFetchJson<T>(path: string, init?: RequestInit, opts?: FetchJso
             mode: "cors",
             headers,
         });
-    } catch (e) {
+    } catch (error) {
         return {
             ok: false,
-            error: asApiError("network_error", e instanceof Error ? e.message : "Network error"),
-        } as unknown as T;
+            error: asApiError(
+                 "network_error",
+                 error instanceof Error ? error.message : "Network error",
+            ),
+        };
     }
 
-    // Empty body (204 or no content)
-    if (res.status === 204) return opts?.empty ?? ({} as T);
+    if (res.status === 204) {
+        return { ok: true, data: opts.emptyOkData };
+    }
 
     const ct = res.headers.get("content-type");
     const text = await res.text();
-    const emptyBody = !text || !text.trim();
+    const trimmed = text.trim();
 
-    if (emptyBody) {
-        // Some servers will reply 200 with empty body on logout etc.
-        return opts?.empty ?? ((res.ok ? ({ ok: true } as unknown) : ({ ok: false } as unknown)) as T);
+    if (!trimmed) {
+        if (res.ok) {
+            return { ok: true, data: opts.emptyOkData };
+        }
+        return {
+            ok: false,
+            error: asApiError("empty_error_response", `HTTP ${res.status}`),
+        };
     }
 
-    if (isJsonContentType(ct)) {
-        try {
-            return JSON.parse(text) as T;
-        } catch {
+    if (!isJsonContentType(ct)) {
+        const msg = trimmed.length > 500 ? `${trimmed.slice(0, 500)}…` : trimmed;
+        return {
+            ok: false,
+            error: asApiError("non_json", msg || `HTTP ${res.status}`),
+        };
+    }
+
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(trimmed);
+    } catch {
+        return {
+            ok: false,
+            error: asApiError("bad_json", `Malformed JSON response (HTTP ${res.status})`),
+        };
+    }
+
+    if (!isRecord(parsed)) {
+        return {
+            ok: false,
+            error: asApiError("bad_payload", "Response payload is not an object"),
+        };
+    }
+
+    const ok = parsed.ok;
+    if (ok === false) {
+        const rawError = parsed.error;
+        if (isRecord(rawError)) {
             return {
                 ok: false,
-                error: asApiError("bad_json", text || `HTTP ${res.status}`),
-            } as unknown as T;
+                error: asApiError(
+                     typeof rawError.code === "string" ? rawError.code : "api_error",
+                     typeof rawError.message === "string" ? rawError.message : `HTTP ${res.status}`,
+                ),
+            };
         }
+        return {
+            ok: false,
+            error: asApiError("api_error", `HTTP ${res.status}`),
+        };
     }
 
-    // Non-JSON response: standardize into an API error shape.
-    // Keep the message short-ish; preserve status info.
-    const msg = text.length > 400 ? `${text.slice(0, 400)}…` : text;
+    if (ok === true) {
+        return {
+            ok: true,
+            data: ("data" in parsed ? (parsed.data as T) : opts.emptyOkData),
+        };
+    }
+
+    if (!res.ok) {
+        return {
+            ok: false,
+            error: asApiError("http_error", `HTTP ${res.status}`),
+        };
+    }
+
     return {
         ok: false,
-        error: asApiError("non_json", msg || `HTTP ${res.status}`),
-    } as unknown as T;
+        error: asApiError("bad_payload", "Missing ok field in API response"),
+    };
 }
 
 export async function apiAuthMe(signal?: AbortSignal): Promise<AuthMePayload> {
-    // If empty body: treat as signed out.
-    return apiFetchJson<AuthMePayload>("/auth/me", { method: "GET", signal }, { empty: { ok: true, user: null } });
+    const res = await apiFetchEnvelope<AuthMeResponseData>(
+         "/auth/me",
+         { method: "GET", signal },
+         { emptyOkData: { user: null } },
+    );
+
+    if (!res.ok) {
+        return res;
+    }
+
+    const user = normalizeAuthUser(res.data.user);
+    return { ok: true, user };
 }
 
-export async function apiAuthLogout(signal?: AbortSignal): Promise<AuthOkPayload> {
-    // If empty body: treat as ok.
-    return apiFetchJson<AuthOkPayload>("/auth/logout", { method: "POST", signal }, { empty: { ok: true } });
+export async function apiAuthLogout(signal?: AbortSignal): Promise<AuthLogoutPayload> {
+    const res = await apiFetchEnvelope<AuthLogoutResponseData>(
+         "/auth/logout",
+         { method: "POST", signal },
+         { emptyOkData: { redirect: null } },
+    );
+
+    if (!res.ok) {
+        return res;
+    }
+
+    return {
+        ok: true,
+        redirect: typeof res.data.redirect === "string" && res.data.redirect.trim()
+             ? res.data.redirect
+             : null,
+    };
 }
 
-export function googleStartUrl(returnTo?: string): string {
-    const base = buildUrl("/auth/google/start");
-    if (!returnTo) return base;
-
-    const u = new URL(base);
-    u.searchParams.set("returnTo", returnTo);
-    return u.toString();
+export function googleStartUrl(_returnTo?: string): string {
+    // Server currently owns redirect targets; ignore returnTo until explicitly supported server-side.
+    return buildUrl("/auth/google/start");
 }
 
 /**
- * IMPORTANT: OAuth start MUST be a top-level navigation, not fetch().
- * This helper exists so UI code can’t accidentally fetch it.
+ * IMPORTANT:
+ * OAuth start MUST be a top-level navigation, never fetch().
  */
 export function navigateToGoogleStart(returnTo?: string): void {
-    const rt = returnTo ?? (typeof window !== "undefined" ? window.location.href : "");
-    const url = googleStartUrl(rt);
-    // assign() preserves history semantics appropriately for login redirects
+    if (typeof window === "undefined") return;
+    const url = googleStartUrl(returnTo ?? window.location.href);
     window.location.assign(url);
 }
