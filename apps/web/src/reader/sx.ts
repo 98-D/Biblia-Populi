@@ -10,6 +10,7 @@ import type { CSSProperties } from "react";
  * - true shrinkable center header column
  * - calm, premium row states
  * - no invalid / non-portable inline style tokens
+ * - explicit row wrapper surface for verse containers
  *
  * Notes:
  * - layout-critical surfaces stay simple and deterministic
@@ -255,6 +256,14 @@ export const sx = {
     },
 
     /* ---------- Verse rows ---------- */
+    verseRowWrap: {
+        padding: 0,
+        margin: 0,
+        minWidth: 0,
+        width: "100%",
+        boxSizing: "border-box",
+    },
+
     verseRow: {
         display: "grid",
         gridTemplateColumns: "34px minmax(0, 1fr)",
@@ -267,6 +276,9 @@ export const sx = {
         transition: "background 140ms ease, transform 140ms ease, box-shadow 140ms ease",
         WebkitTapHighlightColor: "transparent",
         scrollMarginTop: `calc(72px + ${SAFE_TOP})`,
+        width: "100%",
+        minWidth: 0,
+        outline: "none",
     },
 
     verseRowHover: {
@@ -292,6 +304,7 @@ export const sx = {
         fontVariantNumeric: "tabular-nums",
         userSelect: "none",
         opacity: 0.9,
+        minWidth: 0,
     },
 
     verseText: {
@@ -310,6 +323,8 @@ export const sx = {
         padding: "9px 6px",
         boxSizing: "border-box",
         opacity: 0.55,
+        width: "100%",
+        minWidth: 0,
     },
 
     skelText: {

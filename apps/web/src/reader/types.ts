@@ -7,16 +7,16 @@ import type { TypographyFont } from "./typography";
  *
  * Design goals:
  * - JSON-safe, transport-friendly
- * - Canon anchored (verseKey + verseOrd are immutable anchors)
- * - Token-ready selection + annotation
- * - Overlay-ready with deterministic anchoring
- * - Local-first + sync-friendly
+ * - canon anchored (verseKey + verseOrd are immutable anchors)
+ * - token-ready selection + annotation
+ * - overlay-ready with deterministic anchoring
+ * - local-first + sync-friendly
  *
  * Principles:
- * - Layout is ephemeral
- * - Anchors are semantic
- * - Pixel geometry is a projection cache only
- * - Runtime code may derive richer projections, but these types stay transport-safe
+ * - layout is ephemeral
+ * - anchors are semantic
+ * - pixel geometry is a projection cache only
+ * - runtime code may derive richer projections, but these types stay transport-safe
  */
 
 /* =============================================================================
@@ -67,7 +67,16 @@ export type TokenizerRef = Readonly<{
     version?: string | null;
 }>;
 
-export type SliceVerseToken = Readonly<{
+/**
+ * Canonical token shape for the reader slice payload.
+ *
+ * Notes:
+ * - Keep this flat and transport-safe.
+ * - Supports both semantic anchoring and DOM projection.
+ * - `token` is the rendered token text exactly as emitted by the tokenizer.
+ * - char offsets are local to the verse text payload.
+ */
+export type SliceToken = Readonly<{
     tokenIndex: number;
     token: string;
     tokenNorm?: string | null;
@@ -76,6 +85,12 @@ export type SliceVerseToken = Readonly<{
     charEnd?: number | null;
     tokenTag?: string | null;
 }>;
+
+/**
+ * Backward-compatible alias.
+ * Older code may still import `SliceVerseToken`.
+ */
+export type SliceVerseToken = SliceToken;
 
 export type SliceVerse = Readonly<{
     verseKey: VerseKey;
@@ -89,9 +104,9 @@ export type SliceVerse = Readonly<{
 
     translation?: TranslationRef | null;
     tokenizer?: TokenizerRef | null;
-    tokens?: ReadonlyArray<SliceVerseToken> | null;
+    tokens?: ReadonlyArray<SliceToken> | null;
 
-    updatedAt: string | null;
+    updatedAt: IsoDateTimeString | null;
 }>;
 
 export type ReaderPosition = Readonly<{

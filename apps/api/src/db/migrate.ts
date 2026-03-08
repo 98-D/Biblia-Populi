@@ -1,28 +1,31 @@
 // apps/api/src/db/migrate.ts
-// Biblia.to — Production migrations runner (Bun + Drizzle + bun:sqlite)
+// Biblia.to — hardened production migrations runner (Bun + Drizzle + bun:sqlite)
 //
 // Responsibilities:
-// 1) Opens Bun SQLite via openDb()
+// 1) Opens SQLite via openDb()
 // 2) Runs Drizzle migrations from apps/api/drizzle
-// 3) Applies idempotent "extras" SQL (FTS5 + triggers) with hash stamping
-// 4) Verifies key canon + auth infra tables exist
-// 5) Performs post-migration sanity checks and WAL checkpoint best-effort
+// 3) Applies idempotent extras SQL (FTS5 + triggers) with hash stamping
+// 4) Verifies canon + auth infra surfaces
+// 5) Performs integrity checks and best-effort WAL checkpoint
 //
 // Notes:
-// - This file does NOT generate migrations. It only applies them.
-// - This runner expects a writable DB. It will refuse readonly mode.
-// - Extras are hash-locked by key. If SQL changes incompatibly, bump the extras key.
-// - Auth tables are expected unless BP_AUTH_OPTIONAL=1.
+// - This file does NOT generate migrations.
+// - This runner requires a writable DB.
+// - Extras are hash-locked by key. If SQL changes incompatibly, bump the key.
+// - Auth tables are required unless BP_AUTH_OPTIONAL=1.
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 
 import { openDb } from "./client";
 import { FTS_MIGRATION_SQL } from "./schema";
 
-/* -------------------------------- Utilities -------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Logging                                                                     */
+/* -------------------------------------------------------------------------- */
 
 function log(...args: unknown[]): void {
     // eslint-disable-next-line no-console
@@ -38,8 +41,11 @@ function fatal(...args: unknown[]): never {
     // eslint-disable-next-line no-console
     console.error("[db:migrate]", ...args);
     process.exit(1);
-    throw new Error("unreachable");
 }
+
+/* -------------------------------------------------------------------------- */
+/* Utilities                                                                   */
+/* -------------------------------------------------------------------------- */
 
 function ensureDir(dir: string): void {
     fs.mkdirSync(dir, { recursive: true });
@@ -54,89 +60,132 @@ function fileExists(p: string): boolean {
 }
 
 function isMemoryDb(p: string): boolean {
-    const s = p.trim();
-    return s === ":memory:" || s.startsWith("file::memory:") || s.startsWith("file:memdb");
-}
-
-function envBool(name: string, fallback = false): boolean {
-    const v = process.env[name]?.trim().toLowerCase();
-    if (!v) return fallback;
-    return v === "1" || v === "true" || v === "yes" || v === "on";
-}
-
-function envChoice<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
-    const raw = process.env[name]?.trim();
-    if (!raw) return fallback;
-    const v = raw.toUpperCase();
-    return (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
-}
-
-function isLikelyApiRoot(dir: string): boolean {
+    const s = p.trim().toLowerCase();
     return (
-        fileExists(path.join(dir, "src")) &&
-        (fileExists(path.join(dir, "drizzle")) || fileExists(path.join(dir, "drizzle.config.ts")))
+         s === ":memory:" ||
+         s.startsWith("file::memory:") ||
+         s.startsWith("file:memdb") ||
+         (s.startsWith("file:") && s.includes("mode=memory"))
     );
 }
 
-/**
- * Find apps/api directory without using import.meta.
- */
-function findApiRootFromCwd(): string {
-    const cwd = process.cwd();
+function envBool(name: string, fallback = false): boolean {
+    const raw = process.env[name]?.trim().toLowerCase();
+    if (!raw) return fallback;
+    return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
 
-    let cur = cwd;
-    for (let i = 0; i < 12; i += 1) {
-        const direct = cur;
+function envChoice<T extends string>(
+     name: string,
+     allowed: readonly T[],
+     fallback: T,
+): T {
+    const raw = process.env[name]?.trim();
+    if (!raw) return fallback;
+    const value = raw.toUpperCase();
+    return (allowed as readonly string[]).includes(value) ? (value as T) : fallback;
+}
+
+function sha256(text: string): string {
+    return crypto.createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+function formatUnknownError(error: unknown): string {
+    if (error instanceof Error && error.message.trim()) return error.message.trim();
+    if (typeof error === "string" && error.trim()) return error.trim();
+    return String(error);
+}
+
+/* -------------------------------------------------------------------------- */
+/* API root / migrations dir resolution                                        */
+/* -------------------------------------------------------------------------- */
+
+function isLikelyApiRoot(dir: string): boolean {
+    return (
+         fileExists(path.join(dir, "package.json")) &&
+         fileExists(path.join(dir, "src")) &&
+         (fileExists(path.join(dir, "drizzle")) ||
+              fileExists(path.join(dir, "drizzle.config.ts")) ||
+              fileExists(path.join(dir, "drizzle.config.js")) ||
+              fileExists(path.join(dir, "drizzle.config.mjs")))
+    );
+}
+
+function apiRootFromModule(): string | null {
+    try {
+        const here = path.dirname(fileURLToPath(import.meta.url)); // apps/api/src/db
+        const candidate = path.resolve(here, "..", ".."); // apps/api
+        return isLikelyApiRoot(candidate) ? candidate : null;
+    } catch {
+        return null;
+    }
+}
+
+function apiRootFromCwd(): string | null {
+    let cur = process.cwd();
+
+    for (let i = 0; i < 16; i += 1) {
+        if (isLikelyApiRoot(cur)) return cur;
+
         const nested = path.join(cur, "apps", "api");
-
-        if (isLikelyApiRoot(direct)) {
-            return direct;
-        }
-
-        if (isLikelyApiRoot(nested)) {
-            return nested;
-        }
+        if (isLikelyApiRoot(nested)) return nested;
 
         const parent = path.dirname(cur);
         if (parent === cur) break;
         cur = parent;
     }
 
-    return path.join(cwd, "apps", "api");
+    return null;
+}
+
+function findApiRoot(): string {
+    return apiRootFromModule() ?? apiRootFromCwd() ?? path.resolve(process.cwd(), "apps", "api");
 }
 
 function migrationsDir(): string {
-    return path.join(findApiRootFromCwd(), "drizzle");
+    return path.join(findApiRoot(), "drizzle");
 }
 
 function requirePathExists(p: string, label: string): void {
-    if (!fileExists(p)) fatal(`${label} missing: ${p}`);
+    if (!fileExists(p)) {
+        fatal(`${label} missing: ${p}`);
+    }
 }
 
 function requireDirectoryHasMigrationFiles(dir: string): void {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
-    const hasSomeFile = entries.some((e) => e.isFile());
+    const hasSomeFile = entries.some((entry) => entry.isFile());
     if (!hasSomeFile) {
         warn("migrations folder exists but appears empty:", dir);
     }
 }
 
-/* ------------------------------- SQLite shape ------------------------------ */
+/* -------------------------------------------------------------------------- */
+/* SQLite protocol                                                              */
+/* -------------------------------------------------------------------------- */
+
+type SqliteRow = Record<string, unknown>;
+
+type SqliteStatement = {
+    get: (...args: unknown[]) => unknown;
+    run: (...args: unknown[]) => unknown;
+    all?: (...args: unknown[]) => unknown[];
+};
+
+type SqliteQuery = {
+    get?: (...args: unknown[]) => unknown;
+    all?: (...args: unknown[]) => unknown[];
+};
 
 type SqliteLike = {
     exec: (sql: string) => void;
-    prepare: (sql: string) => {
-        get: (...args: any[]) => any;
-        run: (...args: any[]) => any;
-        all?: (...args: any[]) => any[];
-    };
-    query?: (sql: string) => {
-        get?: (...args: any[]) => any;
-        all?: (...args: any[]) => any[];
-    };
+    prepare: (sql: string) => SqliteStatement;
+    query?: (sql: string) => SqliteQuery;
 };
 
-/* ------------------------------- Extras stamp ------------------------------ */
+/* -------------------------------------------------------------------------- */
+/* Migration metadata / extras tables                                          */
+/* -------------------------------------------------------------------------- */
 
 const EXTRAS_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS __bp_extras (
@@ -154,47 +203,99 @@ CREATE TABLE IF NOT EXISTS __bp_migration_meta (
 );
 `.trim();
 
-function shaLike(s: string): string {
-    return crypto.createHash("sha256").update(s, "utf8").digest("hex");
+/* -------------------------------------------------------------------------- */
+/* Scalar helpers                                                               */
+/* -------------------------------------------------------------------------- */
+
+function getPreparedRow(
+     sqlite: SqliteLike,
+     sqlText: string,
+     args: readonly unknown[] = [],
+): SqliteRow | null {
+    const row = sqlite.prepare(sqlText).get(...args) as SqliteRow | undefined;
+    return row ?? null;
 }
 
-function getScalarText(sqlite: SqliteLike, q: string, args: any[] = []): string | null {
-    const row = sqlite.prepare(q).get(...args) as Record<string, unknown> | undefined;
+function getScalar(
+     sqlite: SqliteLike,
+     sqlText: string,
+     args: readonly unknown[] = [],
+): unknown {
+    const row = getPreparedRow(sqlite, sqlText, args);
     if (!row) return null;
-    const k = Object.keys(row)[0];
-    if (!k) return null;
-    const v = row[k];
-    return v == null ? null : String(v);
+
+    const firstKey = Object.keys(row)[0];
+    if (!firstKey) return null;
+
+    return row[firstKey] ?? null;
 }
 
-function getScalarInt(sqlite: SqliteLike, q: string, args: any[] = []): number {
-    const s = getScalarText(sqlite, q, args);
-    const n = s == null ? NaN : Number(s);
+function getScalarText(
+     sqlite: SqliteLike,
+     sqlText: string,
+     args: readonly unknown[] = [],
+): string | null {
+    const value = getScalar(sqlite, sqlText, args);
+    return value == null ? null : String(value);
+}
+
+function getScalarInt(
+     sqlite: SqliteLike,
+     sqlText: string,
+     args: readonly unknown[] = [],
+): number {
+    const value = getScalar(sqlite, sqlText, args);
+    const n =
+         typeof value === "bigint"
+              ? Number(value)
+              : value == null
+                   ? Number.NaN
+                   : Number(value);
+
     return Number.isFinite(n) ? Math.trunc(n) : 0;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Transaction helper                                                           */
+/* -------------------------------------------------------------------------- */
 
 function runTx(sqlite: SqliteLike, fn: () => void): void {
     sqlite.exec("BEGIN;");
     try {
         fn();
         sqlite.exec("COMMIT;");
-    } catch (e) {
+    } catch (error) {
         try {
             sqlite.exec("ROLLBACK;");
         } catch {
             // ignore rollback failure
         }
-        throw e;
+        throw error;
     }
 }
 
-function getExtra(sqlite: SqliteLike, key: string): string | null {
-    return getScalarText(sqlite, `SELECT sha AS v FROM __bp_extras WHERE key = ?`, [key]);
+/* -------------------------------------------------------------------------- */
+/* Extras                                                                       */
+/* -------------------------------------------------------------------------- */
+
+type ExtrasPlan = Readonly<{
+    key: string;
+    sql: string;
+    mode: "apply-once" | "hash-locked";
+    description: string;
+}>;
+
+function getExtraSha(sqlite: SqliteLike, key: string): string | null {
+    return getScalarText(
+         sqlite,
+         `SELECT sha AS v FROM __bp_extras WHERE key = ?`,
+         [key],
+    );
 }
 
-function setExtra(sqlite: SqliteLike, key: string, sha: string): void {
+function setExtraSha(sqlite: SqliteLike, key: string, sha: string): void {
     sqlite.prepare(
-        `
+         `
         INSERT INTO __bp_extras(key, sha)
         VALUES(?, ?)
         ON CONFLICT(key) DO UPDATE SET
@@ -206,7 +307,7 @@ function setExtra(sqlite: SqliteLike, key: string, sha: string): void {
 
 function setMeta(sqlite: SqliteLike, key: string, value: string): void {
     sqlite.prepare(
-        `
+         `
         INSERT INTO __bp_migration_meta(key, value)
         VALUES(?, ?)
         ON CONFLICT(key) DO UPDATE SET
@@ -216,17 +317,10 @@ function setMeta(sqlite: SqliteLike, key: string, value: string): void {
     ).run(key, value);
 }
 
-type ExtrasPlan = Readonly<{
-    key: string;
-    sql: string;
-    mode: "apply-once" | "hash-locked";
-    description: string;
-}>;
-
 function planExtras(): ExtrasPlan[] {
     const plans: ExtrasPlan[] = [];
-
     const ftsSql = (FTS_MIGRATION_SQL ?? "").trim();
+
     if (ftsSql.length > 0) {
         plans.push({
             key: "fts_bp_verse_text_v1",
@@ -248,57 +342,86 @@ function applyExtras(sqlite: SqliteLike): void {
         return;
     }
 
-    for (const p of plans) {
-        const hash = shaLike(p.sql);
-        const existing = getExtra(sqlite, p.key);
+    for (const plan of plans) {
+        const hash = sha256(plan.sql);
+        const existing = getExtraSha(sqlite, plan.key);
 
         if (existing === null) {
-            log("extras: applying", JSON.stringify({ key: p.key, sha: hash, desc: p.description }));
+            log(
+                 "extras: applying",
+                 JSON.stringify({
+                     key: plan.key,
+                     sha: hash,
+                     desc: plan.description,
+                 }),
+            );
+
             runTx(sqlite, () => {
-                sqlite.exec(p.sql);
-                setExtra(sqlite, p.key, hash);
+                sqlite.exec(plan.sql);
+                setExtraSha(sqlite, plan.key, hash);
             });
-            log("extras: applied", p.key);
+
+            log("extras: applied", plan.key);
             continue;
         }
 
-        if (p.mode === "apply-once") {
-            log("extras: already present", p.key);
+        if (plan.mode === "apply-once") {
+            log("extras: already present", plan.key);
             continue;
         }
 
         if (existing !== hash) {
             warn("extras: present but hash differs");
-            warn(" - key :", p.key);
+            warn(" - key :", plan.key);
             warn(" - db  :", existing);
             warn(" - code:", hash);
-            warn(" - desc:", p.description);
-            warn("Not reapplying automatically. Bump the extras key (e.g. v2) or add a manual migration.");
+            warn(" - desc:", plan.description);
+            warn("Not reapplying automatically. Bump the extras key or add a manual migration.");
             continue;
         }
 
-        log("extras: already present", p.key);
+        log("extras: already present", plan.key);
     }
 }
 
-/* ------------------------------ Sanity checks ------------------------------ */
+/* -------------------------------------------------------------------------- */
+/* Sanity checks                                                                */
+/* -------------------------------------------------------------------------- */
 
 function tableExists(sqlite: SqliteLike, name: string): boolean {
-    const n = getScalarInt(
-        sqlite,
-        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='table' AND name = ?`,
-        [name],
+    return (
+         getScalarInt(
+              sqlite,
+              `SELECT COUNT(*) AS v
+             FROM sqlite_master
+             WHERE type='table' AND name = ?`,
+              [name],
+         ) === 1
     );
-    return n === 1;
 }
 
 function indexExists(sqlite: SqliteLike, name: string): boolean {
-    const n = getScalarInt(
-        sqlite,
-        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='index' AND name = ?`,
-        [name],
+    return (
+         getScalarInt(
+              sqlite,
+              `SELECT COUNT(*) AS v
+             FROM sqlite_master
+             WHERE type='index' AND name = ?`,
+              [name],
+         ) === 1
     );
-    return n === 1;
+}
+
+function viewExists(sqlite: SqliteLike, name: string): boolean {
+    return (
+         getScalarInt(
+              sqlite,
+              `SELECT COUNT(*) AS v
+             FROM sqlite_master
+             WHERE type='view' AND name = ?`,
+              [name],
+         ) === 1
+    );
 }
 
 function verifyCanonTablesExist(sqlite: SqliteLike): void {
@@ -311,7 +434,7 @@ function verifyCanonTablesExist(sqlite: SqliteLike): void {
         "bp_link",
     ] as const;
 
-    const missing = required.filter((t) => !tableExists(sqlite, t));
+    const missing = required.filter((table) => !tableExists(sqlite, table));
     if (missing.length > 0) {
         fatal("canon tables missing after migrations:", JSON.stringify({ missing }));
     }
@@ -319,10 +442,9 @@ function verifyCanonTablesExist(sqlite: SqliteLike): void {
 
 function verifyAuthTablesExist(sqlite: SqliteLike): void {
     const optional = envBool("BP_AUTH_OPTIONAL", false);
-
     const required = ["bp_user", "bp_auth_account", "bp_session"] as const;
-    const missing = required.filter((t) => !tableExists(sqlite, t));
 
+    const missing = required.filter((table) => !tableExists(sqlite, table));
     if (missing.length === 0) return;
 
     if (optional) {
@@ -331,19 +453,20 @@ function verifyAuthTablesExist(sqlite: SqliteLike): void {
     }
 
     fatal(
-        "auth tables missing after migrations (expected with OAuth/identity enabled):",
-        JSON.stringify({
-            missing,
-            hint: "Did you generate/apply drizzle migrations after adding authSchema.ts?",
-        }),
+         "auth tables missing after migrations:",
+         JSON.stringify({
+             missing,
+             hint: "Generate/apply Drizzle migrations after adding auth schema surfaces, or set BP_AUTH_OPTIONAL=1.",
+         }),
     );
 }
 
 function verifyDrizzleMetaTables(sqlite: SqliteLike): void {
-    const metaCandidates = ["__drizzle_migrations", "__drizzle_migrations__"] as const;
-    const found = metaCandidates.some((t) => tableExists(sqlite, t));
+    const candidates = ["__drizzle_migrations", "__drizzle_migrations__"] as const;
+    const found = candidates.some((name) => tableExists(sqlite, name));
+
     if (!found) {
-        warn("drizzle metadata table not found after migrations; verify your migrator/version expectations.");
+        warn("drizzle metadata table not found after migrations; verify migrator/version expectations.");
     }
 }
 
@@ -351,10 +474,21 @@ function verifyFtsArtifactsIfConfigured(sqlite: SqliteLike): void {
     const ftsSql = (FTS_MIGRATION_SQL ?? "").trim();
     if (!ftsSql) return;
 
-    const expectedTables = ["bp_verse_text_fts"] as const;
-    const missing = expectedTables.filter((t) => !tableExists(sqlite, t));
+    const requiredTables = ["bp_verse_text_fts"] as const;
+    const missing = requiredTables.filter((table) => !tableExists(sqlite, table) && !viewExists(sqlite, table));
+
     if (missing.length > 0) {
-        fatal("FTS extras configured but expected FTS artifacts are missing:", JSON.stringify({ missing }));
+        fatal(
+             "FTS extras configured but expected artifacts are missing:",
+             JSON.stringify({ missing }),
+        );
+    }
+}
+
+function verifyForeignKeysEnabled(sqlite: SqliteLike): void {
+    const enabled = getScalarInt(sqlite, `PRAGMA foreign_keys;`);
+    if (enabled !== 1) {
+        fatal("PRAGMA foreign_keys is not enabled after openDb()");
     }
 }
 
@@ -363,20 +497,21 @@ function verifyCoreRowCounts(sqlite: SqliteLike): void {
     const verseCount = getScalarInt(sqlite, `SELECT COUNT(*) AS v FROM bp_verse`);
     const translationCount = getScalarInt(sqlite, `SELECT COUNT(*) AS v FROM bp_translation`);
 
-    if (bookCount <= 0) {
-        warn("bp_book has no rows");
-    }
-    if (verseCount <= 0) {
-        warn("bp_verse has no rows");
-    }
-    if (translationCount <= 0) {
-        warn("bp_translation has no rows");
-    }
+    if (bookCount <= 0) warn("bp_book has no rows");
+    if (verseCount <= 0) warn("bp_verse has no rows");
+    if (translationCount <= 0) warn("bp_translation has no rows");
 
-    log("row-counts:", JSON.stringify({ bp_book: bookCount, bp_verse: verseCount, bp_translation: translationCount }));
+    log(
+         "row-counts:",
+         JSON.stringify({
+             bp_book: bookCount,
+             bp_verse: verseCount,
+             bp_translation: translationCount,
+         }),
+    );
 }
 
-function verifyOptionalIndexes(sqlite: SqliteLike): void {
+function verifyInterestingArtifacts(sqlite: SqliteLike): void {
     const interesting = [
         "bp_verse_text_translation_id_verse_key_idx",
         "bp_verse_text_fts",
@@ -384,19 +519,12 @@ function verifyOptionalIndexes(sqlite: SqliteLike): void {
 
     const found: string[] = [];
     for (const name of interesting) {
-        if (tableExists(sqlite, name) || indexExists(sqlite, name)) {
+        if (tableExists(sqlite, name) || indexExists(sqlite, name) || viewExists(sqlite, name)) {
             found.push(name);
         }
     }
 
     log("artifacts:", JSON.stringify({ found }));
-}
-
-function verifyForeignKeysEnabled(sqlite: SqliteLike): void {
-    const fk = getScalarInt(sqlite, `PRAGMA foreign_keys;`);
-    if (fk !== 1) {
-        fatal("PRAGMA foreign_keys is not enabled after openDb()");
-    }
 }
 
 function verifyIntegrity(sqlite: SqliteLike): void {
@@ -406,39 +534,50 @@ function verifyIntegrity(sqlite: SqliteLike): void {
     }
 }
 
-/* --------------------------- Maintenance / post-run ------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Post-run maintenance                                                         */
+/* -------------------------------------------------------------------------- */
 
 function checkpointWalBestEffort(sqlite: SqliteLike): void {
     try {
         const mode = String(getScalarText(sqlite, `PRAGMA journal_mode;`) ?? "").toUpperCase();
-        if (mode === "WAL") {
-            sqlite.prepare(`PRAGMA wal_checkpoint(PASSIVE);`).run();
-            log("wal checkpoint: PASSIVE complete");
-        }
-    } catch (e) {
-        warn("wal checkpoint failed (non-fatal):", e);
+        if (mode !== "WAL") return;
+
+        sqlite.prepare(`PRAGMA wal_checkpoint(PASSIVE);`).run();
+        log("wal checkpoint: PASSIVE complete");
+    } catch (error) {
+        warn("wal checkpoint failed (non-fatal):", formatUnknownError(error));
     }
 }
 
-function stampRunMeta(sqlite: SqliteLike, dbPath: string, migrationsFolder: string): void {
+function stampRunMeta(
+     sqlite: SqliteLike,
+     dbPath: string,
+     migrationsFolder: string,
+): void {
     sqlite.exec(MIGRATION_RUN_META_SQL);
 
-    const extrasPlans = planExtras();
-    const extrasHash = shaLike(
-        extrasPlans
-            .map((p) => `${p.key}:${shaLike(p.sql)}`)
-            .sort()
-            .join("\n"),
+    const extrasHash = sha256(
+         planExtras()
+              .map((plan) => `${plan.key}:${sha256(plan.sql)}`)
+              .sort()
+              .join("\n"),
     );
 
     setMeta(sqlite, "last_db_path", dbPath);
     setMeta(sqlite, "last_migrations_folder", migrationsFolder);
     setMeta(sqlite, "last_auth_optional", envBool("BP_AUTH_OPTIONAL", false) ? "1" : "0");
     setMeta(sqlite, "last_extras_hash", extrasHash);
-    setMeta(sqlite, "last_journal_mode", envChoice("BP_DB_JOURNAL_MODE", ["WAL", "DELETE"] as const, "WAL"));
+    setMeta(
+         sqlite,
+         "last_journal_mode",
+         envChoice("BP_DB_JOURNAL_MODE", ["WAL", "DELETE"] as const, "WAL"),
+    );
 }
 
-/* ---------------------------------- Main ----------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Main                                                                         */
+/* -------------------------------------------------------------------------- */
 
 async function main(): Promise<void> {
     const handle = openDb();
@@ -446,11 +585,11 @@ async function main(): Promise<void> {
 
     if (readonly) {
         fatal(
-            "migrate runner opened DB in readonly mode.",
-            JSON.stringify({
-                dbPath,
-                hint: "Unset BP_DB_READONLY or set BP_DB_READONLY=0 before running migrations.",
-            }),
+             "migrate runner opened DB in readonly mode.",
+             JSON.stringify({
+                 dbPath,
+                 hint: "Unset BP_DB_READONLY or set BP_DB_READONLY=0 before running migrations.",
+             }),
         );
     }
 
@@ -465,27 +604,27 @@ async function main(): Promise<void> {
     log("migrations:", migrationsFolder);
 
     try {
-        verifyForeignKeysEnabled(sqlite as unknown as SqliteLike);
+        const sqliteLike = sqlite as unknown as SqliteLike;
+
+        verifyForeignKeysEnabled(sqliteLike);
 
         log("running drizzle migrations...");
         await migrate(db, { migrationsFolder });
         log("drizzle migrations complete.");
 
-        const s = sqlite as unknown as SqliteLike;
+        verifyDrizzleMetaTables(sqliteLike);
+        verifyCanonTablesExist(sqliteLike);
+        verifyAuthTablesExist(sqliteLike);
 
-        verifyDrizzleMetaTables(s);
-        verifyCanonTablesExist(s);
-        verifyAuthTablesExist(s);
+        applyExtras(sqliteLike);
+        verifyFtsArtifactsIfConfigured(sqliteLike);
 
-        applyExtras(s);
-        verifyFtsArtifactsIfConfigured(s);
+        verifyCoreRowCounts(sqliteLike);
+        verifyInterestingArtifacts(sqliteLike);
+        verifyIntegrity(sqliteLike);
 
-        verifyCoreRowCounts(s);
-        verifyOptionalIndexes(s);
-
-        verifyIntegrity(s);
-        stampRunMeta(s, dbPath, migrationsFolder);
-        checkpointWalBestEffort(s);
+        stampRunMeta(sqliteLike, dbPath, migrationsFolder);
+        checkpointWalBestEffort(sqliteLike);
 
         if (!isMemoryDb(dbPath)) {
             requirePathExists(dbPath, "db file");
@@ -497,4 +636,6 @@ async function main(): Promise<void> {
     }
 }
 
-main().catch((err) => fatal(err));
+main().catch((error: unknown) => {
+    fatal(formatUnknownError(error));
+});

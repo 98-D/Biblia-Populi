@@ -2,28 +2,17 @@
 <project version="4">
   <component name="ChangeListManager">
     <list default="true" id="863dbbc5-a460-463c-a9a4-554e9c98377b" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/api/scripts/import-osis.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/scripts/import-osis.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/api/scripts/reset-db.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/scripts/reset-db.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/api/scripts/verify-db.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/scripts/verify-db.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/api/src/server.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/src/server.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/api.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/api.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/auth/AccountMenu.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/auth/AccountMenu.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/auth/authApi.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/auth/authApi.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/auth/useAuth.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/auth/useAuth.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/BookTitlePage.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/BookTitlePage.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/ReaderSelectionToolbar.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/ReaderSelectionToolbar.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/ReaderShell.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/ReaderShell.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/ReaderViewport.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/ReaderViewport.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/annotationStore.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/annotationStore.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/prefs/ReaderPrefsProvider.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/prefs/ReaderPrefsProvider.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/selectionResolver.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/ReaderDomSelectionResolver.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite-shm" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite-shm" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite-wal" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite-wal" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/api/src/db/client.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/src/db/client.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/api/src/db/migrate.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/src/db/migrate.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/VerseRow.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/VerseRow.tsx" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/apps/web/src/reader/sx.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/sx.ts" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/apps/web/src/reader/types.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/types.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/typography.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/typography.ts" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/apps/web/src/reader/useReaderAnnotations.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/useReaderAnnotations.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/biblia.to-code-export.md" beforeDir="false" afterPath="$PROJECT_DIR$/biblia.to-code-export.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/scripts/dev.ts" beforeDir="false" afterPath="$PROJECT_DIR$/scripts/dev.ts" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -33,18 +22,18 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
-  "lastFilter": {
-    "state": "OPEN",
-    "assignee": "98-D"
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;98-D&quot;
   }
-}]]></component>
-  <component name="GithubPullRequestsUISettings"><![CDATA[{
-  "selectedUrlAndAccountId": {
-    "url": "https://github.com/98-D/Biblia-Populi.git",
-    "accountId": "b712c432-02ac-4d0f-a1e5-c23e25735fb8"
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/98-D/Biblia-Populi.git&quot;,
+    &quot;accountId&quot;: &quot;b712c432-02ac-4d0f-a1e5-c23e25735fb8&quot;
   }
-}]]></component>
+}</component>
   <component name="PackageJsonUpdateNotifier">
     <dismissed value="$PROJECT_DIR$/apps/api/package.json" />
   </component>
@@ -59,22 +48,22 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
-    "SHARE_PROJECT_CONFIGURATION_FILES": "true",
-    "javascript.preferred.runtime.type.id": "bun",
-    "kotlin-language-version-configured": "true",
-    "last_opened_file_path": "C:/Users/dannydekker/Desktop/Biblia-Populi",
-    "nodejs_package_manager_path": "npm",
-    "settings.editor.selected.configurable": "preferences.pluginManager",
-    "ts.external.directory.path": "/Users/dan/Desktop/Biblia-Populi/apps/api/node_modules/typescript/lib"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.typescript.service.memoryLimit.init&quot;: &quot;true&quot;,
+    &quot;SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
+    &quot;javascript.preferred.runtime.type.id&quot;: &quot;bun&quot;,
+    &quot;kotlin-language-version-configured&quot;: &quot;true&quot;,
+    &quot;last_opened_file_path&quot;: &quot;C:/Users/dannydekker/Desktop/Biblia-Populi&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;preferences.pluginManager&quot;,
+    &quot;ts.external.directory.path&quot;: &quot;/Users/dan/Desktop/Biblia-Populi/apps/api/node_modules/typescript/lib&quot;
   }
-}]]></component>
+}</component>
   <component name="RecentsManager">
     <key name="MoveFile.RECENT_KEYS">
       <recent name="C:\Users\dannydekker\Desktop\Biblia-Populi" />
@@ -116,6 +105,8 @@
       <workItem from="1772833137577" duration="7893000" />
       <workItem from="1772841155834" duration="324000" />
       <workItem from="1772923937647" duration="3885000" />
+      <workItem from="1772931421686" duration="1016000" />
+      <workItem from="1772932882812" duration="294000" />
     </task>
     <servers />
   </component>
