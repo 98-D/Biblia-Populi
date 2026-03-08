@@ -1,4 +1,4 @@
-// apps/web/src/auth/AccountMenu.tsx
+// cspell:words oklab
 import React, {
     useCallback,
     useEffect,
@@ -9,7 +9,14 @@ import React, {
     useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, LogIn, LogOut, RefreshCcw, UserRound } from "lucide-react";
+import {
+    ChevronDown,
+    LogIn,
+    LogOut,
+    RefreshCcw,
+    Settings2,
+    UserRound,
+} from "lucide-react";
 import { useAuth } from "./useAuth";
 
 type Size = "sm" | "md";
@@ -29,14 +36,24 @@ type PopPos = {
     transformOrigin: string;
 };
 
-type MenuActionState = "idle" | "refreshing" | "signing_out" | "signing_in";
+type MenuActionState =
+     | "idle"
+     | "refreshing"
+     | "signing_out"
+     | "signing_in"
+     | "opening_account";
 
-const MENU_WIDTH = 264;
+const MENU_WIDTH = 272;
+const MENU_GAP = 8;
+const VIEWPORT_MARGIN = 12;
+const MENU_Z_INDEX = 300;
+const POINTER_DOWN_FOCUS_RESTORE_DELAY_MS = 0;
 
 const useIsomorphicLayoutEffect =
      typeof window !== "undefined" ? useLayoutEffect : useEffect;
 
 function clamp(n: number, lo: number, hi: number): number {
+    if (!Number.isFinite(n)) return lo;
     return Math.max(lo, Math.min(hi, n));
 }
 
@@ -49,13 +66,26 @@ function safeFocus(el: HTMLElement | null | undefined): void {
     }
 }
 
-function prefersReducedMotion(): boolean {
-    if (typeof window === "undefined") return false;
-    try {
-        return window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false;
-    } catch {
-        return false;
-    }
+function usePrefersReducedMotion(): boolean {
+    const [reduced, setReduced] = useState(false);
+
+    useEffect(() => {
+        if (typeof window === "undefined" || !window.matchMedia) return;
+
+        const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+        const onChange = (event: MediaQueryListEvent) => {
+            setReduced(event.matches);
+        };
+
+        setReduced(mq.matches);
+        mq.addEventListener("change", onChange);
+
+        return () => {
+            mq.removeEventListener("change", onChange);
+        };
+    }, []);
+
+    return reduced;
 }
 
 function formatUserLabel(user: { displayName: string | null; email: string | null } | null): string {
@@ -68,19 +98,41 @@ function formatTriggerTitle(user: { displayName: string | null; email: string | 
 }
 
 function initialsFromUser(user: { displayName: string | null; email: string | null } | null): string {
-    const base = formatUserLabel(user);
-    const s = base.trim();
-    if (!s) return "U";
+    const base = formatUserLabel(user).trim();
+    if (!base) return "U";
 
-    const emailName = s.includes("@") ? s.split("@")[0] ?? s : s;
+    const emailName = base.includes("@") ? base.split("@")[0] ?? base : base;
     const normalized = emailName.replace(/[._-]+/g, " ").trim();
     const parts = normalized.split(/\s+/g).filter(Boolean);
 
     if (parts.length >= 2) {
-        return `${parts[0]![0] ?? ""}${parts[1]![0] ?? ""}`.toUpperCase();
+        return `${parts[0]?.[0] ?? ""}${parts[1]?.[0] ?? ""}`.toUpperCase();
     }
 
     return normalized.slice(0, 2).toUpperCase() || "U";
+}
+
+function eventComposedPath(e: Event): EventTarget[] | null {
+    const maybe = e as Event & { composedPath?: () => EventTarget[] };
+    return typeof maybe.composedPath === "function" ? maybe.composedPath() : null;
+}
+
+function pathIncludesNode(path: EventTarget[] | null, node: Node | null): boolean {
+    if (!path || !node) return false;
+    for (const entry of path) {
+        if (entry === node) return true;
+    }
+    return false;
+}
+
+function isWithin(
+     target: Node | null,
+     path: EventTarget[] | null,
+     container: HTMLElement | null | undefined,
+): boolean {
+    if (!container) return false;
+    if (target && container.contains(target)) return true;
+    return pathIncludesNode(path, container);
 }
 
 function usePopoverPosition(args: {
@@ -91,6 +143,7 @@ function usePopoverPosition(args: {
     menuRef: React.RefObject<HTMLElement | null>;
 }) {
     const { open, align, menuWidth, anchorRef, menuRef } = args;
+
     const [pos, setPos] = useState<PopPos | null>(null);
     const rafRef = useRef<number | null>(null);
 
@@ -99,28 +152,27 @@ function usePopoverPosition(args: {
         if (!anchor || typeof window === "undefined") return;
 
         const r = anchor.getBoundingClientRect();
-        const gap = 8;
-        const margin = 12;
-
         const mw = menuWidth;
         const mh = menuRef.current?.getBoundingClientRect().height ?? 0;
 
         const left =
              align === "right"
-                  ? clamp(r.right - mw, margin, window.innerWidth - mw - margin)
-                  : clamp(r.left, margin, window.innerWidth - mw - margin);
+                  ? clamp(r.right - mw, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN)
+                  : clamp(r.left, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN);
 
-        const belowTop = r.bottom + gap;
-        const aboveTop = r.top - gap - mh;
+        const belowTop = r.bottom + MENU_GAP;
+        const aboveTop = r.top - MENU_GAP - mh;
 
-        const canFitBelow = belowTop + mh <= window.innerHeight - margin;
-        const canFitAbove = aboveTop >= margin;
+        const canFitBelow = belowTop + mh <= window.innerHeight - VIEWPORT_MARGIN;
+        const canFitAbove = aboveTop >= VIEWPORT_MARGIN;
 
-        const placement: PopPos["placement"] =
-             !canFitBelow && canFitAbove ? "top" : "bottom";
-
+        const placement: PopPos["placement"] = !canFitBelow && canFitAbove ? "top" : "bottom";
         const unclampedTop = placement === "top" ? aboveTop : belowTop;
-        const top = clamp(unclampedTop, margin, Math.max(margin, window.innerHeight - mh - margin));
+        const top = clamp(
+             unclampedTop,
+             VIEWPORT_MARGIN,
+             Math.max(VIEWPORT_MARGIN, window.innerHeight - mh - VIEWPORT_MARGIN),
+        );
 
         const originX = align === "right" ? "right" : "left";
         const originY = placement === "top" ? "bottom" : "top";
@@ -130,7 +182,7 @@ function usePopoverPosition(args: {
             left,
             width: mw,
             placement,
-            transformOrigin: `${originY} ${originX}`,
+            transformOrigin: `${originX} ${originY}`,
         });
     }, [align, menuWidth, anchorRef, menuRef]);
 
@@ -179,7 +231,7 @@ function usePopoverPosition(args: {
                 rafRef.current = null;
             }
 
-            if (ro) ro.disconnect();
+            ro?.disconnect();
         };
     }, [open, compute, schedule, menuRef, anchorRef]);
 
@@ -318,9 +370,7 @@ function RowButton(props: {
 
              <div style={{ minWidth: 0, flex: 1 }}>
                  <div style={{ fontWeight: 780 }}>{label}</div>
-                 {hint ? (
-                      <div style={{ fontSize: 12, opacity: 0.78, marginTop: 2 }}>{hint}</div>
-                 ) : null}
+                 {hint ? <div style={{ fontSize: 12, opacity: 0.78, marginTop: 2 }}>{hint}</div> : null}
              </div>
          </button>
     );
@@ -332,12 +382,21 @@ export function AccountMenu({
                                 showLabelWhenSignedIn = false,
                                 style,
                             }: Props) {
-    const { loading, user, error, refresh, signInWithGoogle, signOut } = useAuth();
+    const {
+        loading,
+        user,
+        error,
+        signedIn,
+        refresh,
+        signInWithGoogle,
+        signOut,
+        openAccountPage,
+    } = useAuth();
 
     const btnRef = useRef<HTMLButtonElement | null>(null);
     const menuRef = useRef<HTMLDivElement | null>(null);
-    const wasOpenRef = useRef(false);
     const mountedRef = useRef(true);
+    const restoreFocusOnCloseRef = useRef(true);
 
     const [open, setOpen] = useState(false);
     const [pressed, setPressed] = useState(false);
@@ -347,7 +406,7 @@ export function AccountMenu({
     const triggerId = `acct-trigger-${reactId}`;
     const menuId = `acct-menu-${reactId}`;
 
-    const reducedMotion = useMemo(() => prefersReducedMotion(), []);
+    const reducedMotion = usePrefersReducedMotion();
 
     useEffect(() => {
         mountedRef.current = true;
@@ -356,6 +415,12 @@ export function AccountMenu({
         };
     }, []);
 
+    useEffect(() => {
+        if (!signedIn && open) {
+            setOpen(false);
+        }
+    }, [signedIn, open]);
+
     const dims = useMemo(() => {
         if (size === "md") {
             return { btn: 38, avatar: 28, labelMax: 220, chevron: 16 };
@@ -363,14 +428,22 @@ export function AccountMenu({
         return { btn: 32, avatar: 24, labelMax: 160, chevron: 14 };
     }, [size]);
 
-    const signedIn = !!user;
-    const userLabel = formatUserLabel(user);
     const triggerTitle = formatTriggerTitle(user);
     const showLabel = signedIn && showLabelWhenSignedIn;
 
-    const close = useCallback(() => setOpen(false), []);
-    const openMenu = useCallback(() => setOpen(true), []);
-    const toggle = useCallback(() => setOpen((v) => !v), []);
+    const close = useCallback((opts?: { restoreFocus?: boolean }) => {
+        restoreFocusOnCloseRef.current = opts?.restoreFocus ?? true;
+        setOpen(false);
+    }, []);
+
+    const openMenu = useCallback(() => {
+        setOpen(true);
+    }, []);
+
+    const toggle = useCallback(() => {
+        restoreFocusOnCloseRef.current = true;
+        setOpen((v) => !v);
+    }, []);
 
     const anchorStyle = useMemo<React.CSSProperties>(() => {
         const ringIdle = "0 0 0 1px color-mix(in srgb, var(--border) 62%, transparent)";
@@ -442,20 +515,26 @@ export function AccountMenu({
 
         const onPointerDownCapture = (e: PointerEvent) => {
             const target = e.target as Node | null;
-            if (!target) return;
+            const path = eventComposedPath(e);
 
-            const inBtn = btnRef.current?.contains(target) ?? false;
-            const inMenu = menuRef.current?.contains(target) ?? false;
-            if (!inBtn && !inMenu) close();
+            const inBtn = isWithin(target, path, btnRef.current);
+            const inMenu = isWithin(target, path, menuRef.current);
+
+            if (!inBtn && !inMenu) {
+                close({ restoreFocus: false });
+            }
         };
 
         const onFocusInCapture = (e: FocusEvent) => {
             const target = e.target as Node | null;
-            if (!target) return;
+            const path = eventComposedPath(e);
 
-            const inBtn = btnRef.current?.contains(target) ?? false;
-            const inMenu = menuRef.current?.contains(target) ?? false;
-            if (!inBtn && !inMenu) close();
+            const inBtn = isWithin(target, path, btnRef.current);
+            const inMenu = isWithin(target, path, menuRef.current);
+
+            if (!inBtn && !inMenu) {
+                close({ restoreFocus: false });
+            }
         };
 
         window.addEventListener("keydown", onKeyDown);
@@ -470,17 +549,22 @@ export function AccountMenu({
     }, [open, close]);
 
     useEffect(() => {
-        if (wasOpenRef.current && !open) {
-            safeFocus(btnRef.current);
-        }
-        wasOpenRef.current = open;
-    }, [open]);
-
-    useEffect(() => {
         if (!open || typeof window === "undefined") return;
-        const t = window.setTimeout(() => focusFirstItem(), 0);
+        const t = window.setTimeout(() => {
+            focusFirstItem();
+        }, 0);
         return () => window.clearTimeout(t);
     }, [open, focusFirstItem]);
+
+    useEffect(() => {
+        if (!open && restoreFocusOnCloseRef.current) {
+            const t = window.setTimeout(() => {
+                safeFocus(btnRef.current);
+            }, POINTER_DOWN_FOCUS_RESTORE_DELAY_MS);
+            return () => window.clearTimeout(t);
+        }
+        return;
+    }, [open]);
 
     const handleMenuKeyDown = useCallback(
          (e: React.KeyboardEvent) => {
@@ -510,8 +594,9 @@ export function AccountMenu({
                  if (!items.length) return;
 
                  const active = document.activeElement as HTMLElement | null;
-                 const index = items.indexOf(active ?? items[0]!);
-                 let nextIndex = e.key === "ArrowDown" ? index + 1 : index - 1;
+                 const currentIndex = active ? items.indexOf(active) : -1;
+                 const startIndex = currentIndex >= 0 ? currentIndex : 0;
+                 let nextIndex = e.key === "ArrowDown" ? startIndex + 1 : startIndex - 1;
 
                  if (nextIndex >= items.length) nextIndex = 0;
                  if (nextIndex < 0) nextIndex = items.length - 1;
@@ -538,15 +623,21 @@ export function AccountMenu({
          (e: React.KeyboardEvent) => {
              if (e.key === "ArrowDown") {
                  e.preventDefault();
-                 if (!open) openMenu();
-                 else focusFirstItem();
+                 if (!open) {
+                     openMenu();
+                 } else {
+                     focusFirstItem();
+                 }
                  return;
              }
 
              if (e.key === "ArrowUp") {
                  e.preventDefault();
-                 if (!open) openMenu();
-                 else focusLastItem();
+                 if (!open) {
+                     openMenu();
+                 } else {
+                     focusLastItem();
+                 }
                  return;
              }
 
@@ -564,8 +655,6 @@ export function AccountMenu({
          [open, openMenu, toggle, close, focusFirstItem, focusLastItem],
     );
 
-    const busy = loading || actionState !== "idle";
-
     const handleRefresh = useCallback(async () => {
         setActionState("refreshing");
         try {
@@ -577,6 +666,18 @@ export function AccountMenu({
             }
         }
     }, [refresh, close]);
+
+    const handleOpenAccount = useCallback(async () => {
+        setActionState("opening_account");
+        try {
+            openAccountPage();
+        } finally {
+            if (mountedRef.current) {
+                setActionState("idle");
+                close({ restoreFocus: false });
+            }
+        }
+    }, [openAccountPage, close]);
 
     const handleSignOut = useCallback(async () => {
         setActionState("signing_out");
@@ -592,10 +693,10 @@ export function AccountMenu({
 
     const handleSignIn = useCallback(() => {
         setActionState("signing_in");
-        close();
+        close({ restoreFocus: false });
+
         try {
-            const returnTo =
-                 typeof window !== "undefined" ? window.location.href : undefined;
+            const returnTo = typeof window !== "undefined" ? window.location.href : undefined;
             signInWithGoogle({ returnTo });
         } catch {
             if (mountedRef.current) {
@@ -641,7 +742,7 @@ export function AccountMenu({
                                 top: pos.top,
                                 left: pos.left,
                                 width: pos.width,
-                                zIndex: 100,
+                                zIndex: MENU_Z_INDEX,
                                 borderRadius: 14,
                                 border: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
                                 background:
@@ -702,7 +803,8 @@ export function AccountMenu({
                                          padding: "7px 9px",
                                          borderRadius: 12,
                                          border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
-                                         background: "color-mix(in srgb, var(--activeBg) 50%, transparent)",
+                                         background:
+                                              "color-mix(in srgb, var(--activeBg) 50%, transparent)",
                                          fontSize: 12,
                                          opacity: 0.9,
                                      }}
@@ -733,6 +835,15 @@ export function AccountMenu({
                                 <>
                                     <RowButton
                                          autoFocus
+                                         label="Account"
+                                         hint="Manage your session"
+                                         disabled={loading}
+                                         busy={actionState === "opening_account"}
+                                         icon={<Settings2 size={16} />}
+                                         onClick={handleOpenAccount}
+                                    />
+
+                                    <RowButton
                                          label="Refresh session"
                                          hint="Re-check login state"
                                          disabled={loading}
@@ -803,6 +914,8 @@ export function AccountMenu({
                                    opacity: 0.7,
                                    marginLeft: -2,
                                    flex: "0 0 auto",
+                                   transform: open ? "rotate(180deg)" : "rotate(0deg)",
+                                   transition: reducedMotion ? undefined : "transform 0.16s ease",
                                }}
                           >
                             <ChevronDown size={dims.chevron} />

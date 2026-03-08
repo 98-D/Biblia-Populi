@@ -134,10 +134,17 @@ function resolveOffsetWithinNode(node: Node, offset: number): number {
         return clampInt(offset, 0, getNodeTextLength(node));
     }
 
-    const maxOffset = node.childNodes.length;
-    return clampInt(offset, 0, maxOffset);
+    return clampInt(offset, 0, node.childNodes.length);
 }
 
+/**
+ * Best-effort local offset inside a token.
+ *
+ * Important:
+ * - We keep this conservative and deterministic.
+ * - We do NOT try to fully reconstruct nested DOM text layout here.
+ * - For text nodes inside token elements, raw text offset is already the calmest signal.
+ */
 function resolveTokenRelativeOffset(node: Node, offset: number, tokenEl: HTMLElement): number {
     const tokenTextLen = getNodeTextLength(tokenEl);
 
@@ -146,8 +153,7 @@ function resolveTokenRelativeOffset(node: Node, offset: number, tokenEl: HTMLEle
     }
 
     if (node === tokenEl) {
-        const structuralOffset = resolveOffsetWithinNode(node, offset);
-        return clampInt(structuralOffset, 0, tokenTextLen);
+        return clampInt(resolveOffsetWithinNode(node, offset), 0, tokenTextLen);
     }
 
     return clampInt(offset, 0, tokenTextLen);
@@ -174,7 +180,7 @@ function resolveCharOffset(node: Node, offset: number, tokenEl: HTMLElement | nu
     if (tokenStart != null && tokenEnd != null) {
         const lo = Math.min(tokenStart, tokenEnd);
         const hi = Math.max(tokenStart, tokenEnd);
-        const width = hi - lo;
+        const width = Math.max(0, hi - lo);
         const local = resolveTokenRelativeOffset(node, offset, tokenEl);
         return lo + clampInt(local, 0, width);
     }
@@ -217,7 +223,6 @@ export class ReaderDomSelectionResolver implements DomSelectionResolver {
         if (!verseEl) return null;
 
         const tokenEl = findClosestAttrElement(node, ATTR_TOKEN_INDEX);
-
         return buildLocator(verseEl, tokenEl, node, offset);
     }
 

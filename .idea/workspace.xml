@@ -2,17 +2,36 @@
 <project version="4">
   <component name="ChangeListManager">
     <list default="true" id="863dbbc5-a460-463c-a9a4-554e9c98377b" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/apps/web/src/auth/AccountPage.tsx" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite-shm" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite-shm" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite-wal" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/apps/api/data/biblia.sqlite-wal" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/api/data/biblia.sqlite" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/data/biblia.sqlite" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/api/data/biblia.sqlite-shm" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/data/biblia.sqlite-shm" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/api/data/biblia.sqlite-wal" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/data/biblia.sqlite-wal" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/apps/api/src/db/client.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/src/db/client.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/api/src/db/migrate.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/api/src/db/migrate.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/index.html" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/index.html" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/App.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/App.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/LearnMorePage.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/LearnMorePage.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/PositionPill.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/PositionPill.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/Reader.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/Reader.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/Search.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/Search.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/auth/AccountMenu.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/auth/AccountMenu.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/auth/authApi.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/auth/authApi.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/auth/useAuth.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/auth/useAuth.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/base.css" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/base.css" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/main.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/main.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/ReaderAnnotationOverlay.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/ReaderAnnotationOverlay.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/ReaderDomSelectionResolver.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/ReaderDomSelectionResolver.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/ReaderHeader.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/ReaderHeader.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/ReaderHeaderSearch.tsx" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/ReaderSelectionToolbar.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/ReaderSelectionToolbar.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/ReaderShell.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/ReaderShell.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/ReaderTypographyControl.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/ReaderTypographyControl.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/ReaderViewport.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/ReaderViewport.tsx" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/apps/web/src/reader/VerseRow.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/VerseRow.tsx" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/apps/web/src/reader/sx.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/sx.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/types.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/types.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/useReaderAnnotations.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/useReaderAnnotations.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/scripts/dev.ts" beforeDir="false" afterPath="$PROJECT_DIR$/scripts/dev.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/reader/typography.ts" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/reader/typography.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/apps/web/src/theme.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/apps/web/src/theme.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/biblia.to-code-export.md" beforeDir="false" afterPath="$PROJECT_DIR$/biblia.to-code-export.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -106,7 +125,7 @@
       <workItem from="1772841155834" duration="324000" />
       <workItem from="1772923937647" duration="3885000" />
       <workItem from="1772931421686" duration="1016000" />
-      <workItem from="1772932882812" duration="294000" />
+      <workItem from="1772932882812" duration="6813000" />
     </task>
     <servers />
   </component>

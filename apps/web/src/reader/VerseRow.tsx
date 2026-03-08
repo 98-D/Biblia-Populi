@@ -13,6 +13,14 @@ type Props = Readonly<{
     annotations?: readonly Annotation[];
 }>;
 
+type TokenMeta = Readonly<{
+    tokenIndex: number;
+    tokenKind?: string;
+    charStart?: number;
+    charEnd?: number;
+    text: string;
+}>;
+
 function readMaybeString(value: unknown): string | null {
     if (typeof value !== "string") return null;
     const trimmed = value.trim();
@@ -25,25 +33,17 @@ function readMaybeNumber(value: unknown): number | null {
 }
 
 function getRecord(value: unknown): Record<string, unknown> {
-    return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+    return value != null && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
 function getRowTranslationId(row: SliceVerse): string | null {
     const record = getRecord(row);
-    return (
-         readMaybeString(record.translationId) ??
-         readMaybeString(record.translation_id) ??
-         null
-    );
+    return readMaybeString(record.translationId) ?? readMaybeString(record.translation_id) ?? null;
 }
 
 function getRowVerseOrd(row: SliceVerse): number {
     const record = getRecord(row);
-    return (
-         readMaybeNumber(record.verseOrd) ??
-         readMaybeNumber(record.verse_ord) ??
-         0
-    );
+    return readMaybeNumber(record.verseOrd) ?? readMaybeNumber(record.verse_ord) ?? 0;
 }
 
 function getRowVerseKey(row: SliceVerse): string {
@@ -57,55 +57,54 @@ function getRowVerseKey(row: SliceVerse): string {
 
 function getTokenIndex(token: SliceToken, fallback: number): number {
     const record = getRecord(token);
-    return (
-         readMaybeNumber(record.tokenIndex) ??
-         readMaybeNumber(record.token_index) ??
-         fallback
-    );
+    return readMaybeNumber(record.tokenIndex) ?? readMaybeNumber(record.token_index) ?? fallback;
 }
 
 function getTokenKind(token: SliceToken): string | undefined {
     const record = getRecord(token);
-    return (
-         readMaybeString(record.tokenKind) ??
-         readMaybeString(record.token_kind) ??
-         undefined
-    );
+    return readMaybeString(record.tokenKind) ?? readMaybeString(record.token_kind) ?? undefined;
 }
 
 function getTokenCharStart(token: SliceToken): number | undefined {
     const record = getRecord(token);
-    return (
-         readMaybeNumber(record.charStart) ??
-         readMaybeNumber(record.char_start) ??
-         undefined
-    );
+    return readMaybeNumber(record.charStart) ?? readMaybeNumber(record.char_start) ?? undefined;
 }
 
 function getTokenCharEnd(token: SliceToken): number | undefined {
     const record = getRecord(token);
-    return (
-         readMaybeNumber(record.charEnd) ??
-         readMaybeNumber(record.char_end) ??
-         undefined
-    );
+    return readMaybeNumber(record.charEnd) ?? readMaybeNumber(record.char_end) ?? undefined;
 }
 
 function getTokenText(token: SliceToken): string {
     const record = getRecord(token);
-    return (
-         readMaybeString(record.token) ??
-         readMaybeString(record.text) ??
-         ""
-    );
+    return readMaybeString(record.token) ?? readMaybeString(record.text) ?? "";
 }
 
-function buildVerseAriaLabel(
-     bookLabel: string,
-     chapter: number,
-     verse: number,
-): string {
+function buildVerseAriaLabel(bookLabel: string, chapter: number, verse: number): string {
     return `${bookLabel} ${chapter}:${verse}`;
+}
+
+function buildVerseTextPlain(row: SliceVerse, tokens: readonly TokenMeta[] | null): string {
+    if (tokens && tokens.length > 0) {
+        return tokens.map((token) => token.text).join("");
+    }
+    return row.text ?? "";
+}
+
+function normalizeTokens(row: SliceVerse): readonly TokenMeta[] | null {
+    if (!Array.isArray(row.tokens) || row.tokens.length === 0) return null;
+
+    return row.tokens.map((token, index) => ({
+        tokenIndex: getTokenIndex(token, index),
+        tokenKind: getTokenKind(token),
+        charStart: getTokenCharStart(token),
+        charEnd: getTokenCharEnd(token),
+        text: getTokenText(token),
+    }));
+}
+
+function shouldHideTokenFromAT(tokenKind: string | undefined): boolean {
+    return tokenKind === "SPACE" || tokenKind === "LINEBREAK";
 }
 
 export const VerseRow = React.memo(function VerseRow(props: Props) {
@@ -114,38 +113,44 @@ export const VerseRow = React.memo(function VerseRow(props: Props) {
     const [hovered, setHovered] = useState(false);
     const [focused, setFocused] = useState(false);
 
-    const verseOrd = getRowVerseOrd(row);
-    const verseKey = getRowVerseKey(row);
-    const translationId = getRowTranslationId(row);
-    const tokens = Array.isArray(row.tokens) ? row.tokens : null;
+    const verseOrd = useMemo(() => getRowVerseOrd(row), [row]);
+    const verseKey = useMemo(() => getRowVerseKey(row), [row]);
+    const translationId = useMemo(() => getRowTranslationId(row), [row]);
+
+    const normalizedTokens = useMemo(() => normalizeTokens(row), [row]);
+    const hasTokens = !!normalizedTokens && normalizedTokens.length > 0;
+    const hasAnnotations = annotations.length > 0;
 
     const isBookStart = row.chapter === 1 && row.verse === 1;
     const isChapterStart = row.verse === 1;
-    const hasTokens = !!tokens && tokens.length > 0;
-    const hasAnnotations = annotations.length > 0;
 
     const rootId = verseOrd > 0 ? `ord-${verseOrd}` : `verse-${verseKey}`;
     const verseTextId = `${rootId}-text`;
 
-    const bookLabel = useMemo(
-         () => readMaybeString(book?.name) ?? row.bookId,
-         [book?.name, row.bookId],
-    );
+    const bookLabel = useMemo(() => readMaybeString(book?.name) ?? row.bookId, [book?.name, row.bookId]);
 
     const ariaLabel = useMemo(
          () => buildVerseAriaLabel(bookLabel, row.chapter, row.verse),
          [bookLabel, row.chapter, row.verse],
     );
 
+    const plainVerseText = useMemo(
+         () => buildVerseTextPlain(row, normalizedTokens),
+         [normalizedTokens, row],
+    );
+
     const rowStyle = useMemo<React.CSSProperties>(() => {
+        const isSelected = hasAnnotations;
         return {
             ...sx.verseRow,
             ...(hovered ? sx.verseRowHover : {}),
             ...(focused ? sx.verseRowFocus : {}),
+            ...(isSelected ? sx.verseRowSelected : {}),
             position: "relative",
             isolation: "isolate",
+            cursor: "text",
         };
-    }, [focused, hovered]);
+    }, [focused, hasAnnotations, hovered]);
 
     const onPointerEnter = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
         if (event.pointerType === "touch") return;
@@ -165,35 +170,52 @@ export const VerseRow = React.memo(function VerseRow(props: Props) {
         setFocused(false);
     }, []);
 
+    const onMouseDown = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+        if (event.defaultPrevented) return;
+        if (event.button !== 0) return;
+        if (event.detail > 1) return;
+
+        const target = event.target as HTMLElement | null;
+        if (!target) return;
+
+        const interactive = target.closest(
+             "button, a, input, textarea, select, summary, [role='button'], [contenteditable='true']",
+        );
+        if (interactive) return;
+
+        event.currentTarget.focus({ preventScroll: true });
+    }, []);
+
     const verseBody = useMemo(() => {
-        if (!hasTokens || !tokens) {
+        if (!hasTokens || !normalizedTokens) {
             return row.text ?? "";
         }
 
         return (
              <>
-                 {tokens.map((token, index) => {
-                     const tokenIndex = getTokenIndex(token, index);
-                     const tokenKind = getTokenKind(token);
-                     const charStart = getTokenCharStart(token);
-                     const charEnd = getTokenCharEnd(token);
-                     const tokenText = getTokenText(token);
+                 {normalizedTokens.map((token, index) => {
+                     const isWhitespaceOnly =
+                          token.tokenKind === "SPACE" ||
+                          token.tokenKind === "LINEBREAK" ||
+                          token.text.trim().length === 0;
 
                      return (
                           <span
-                               key={`${verseOrd}:${tokenIndex}:${index}`}
-                               data-token-index={tokenIndex}
-                               data-token-kind={tokenKind}
-                               data-token-char-start={charStart}
-                               data-token-char-end={charEnd}
+                               key={`${verseOrd}:${token.tokenIndex}:${index}`}
+                               data-token-index={token.tokenIndex}
+                               data-token-kind={token.tokenKind}
+                               data-token-char-start={token.charStart}
+                               data-token-char-end={token.charEnd}
+                               aria-hidden={shouldHideTokenFromAT(token.tokenKind) ? true : undefined}
+                               style={isWhitespaceOnly ? undefined : tokenSpanStyle}
                           >
-                            {tokenText}
+                            {token.text}
                         </span>
                      );
                  })}
              </>
         );
-    }, [hasTokens, row.text, tokens, verseOrd]);
+    }, [hasTokens, normalizedTokens, row.text, verseOrd]);
 
     return (
          <div
@@ -206,7 +228,7 @@ export const VerseRow = React.memo(function VerseRow(props: Props) {
               data-verse={row.verse}
               data-translation-id={translationId ?? undefined}
               data-has-tokens={hasTokens ? "1" : "0"}
-              style={sx.verseRowWrap ?? { padding: 0 }}
+              style={sx.verseRowWrap}
          >
              {isBookStart ? <BookTitlePage book={book} bookId={row.bookId} /> : null}
 
@@ -230,7 +252,9 @@ export const VerseRow = React.memo(function VerseRow(props: Props) {
                   onPointerLeave={onPointerLeave}
                   onFocus={onFocus}
                   onBlur={onBlur}
+                  onMouseDown={onMouseDown}
                   data-has-annotations={hasAnnotations ? "1" : "0"}
+                  data-selected={hasAnnotations ? "1" : "0"}
              >
                  <ReaderAnnotationOverlay annotations={annotations} />
 
@@ -245,6 +269,7 @@ export const VerseRow = React.memo(function VerseRow(props: Props) {
                       data-verse-ord={verseOrd || undefined}
                       data-verse-key={verseKey}
                       data-translation-id={translationId ?? undefined}
+                      aria-label={plainVerseText}
                  >
                      {verseBody}
                  </div>
@@ -252,3 +277,7 @@ export const VerseRow = React.memo(function VerseRow(props: Props) {
          </div>
     );
 });
+
+const tokenSpanStyle: React.CSSProperties = {
+    whiteSpace: "pre-wrap",
+};

@@ -7,6 +7,7 @@
 // - safe readonly handling
 // - deterministic singleton export surface
 // - clear diagnostics without hidden mutation
+// - hot-reload-safe singleton reuse under Bun watch/dev
 //
 // Notes:
 // - This file does NOT run migrations.
@@ -15,7 +16,6 @@
 // - Relative BP_DB_PATH / arg paths are resolved against process.cwd() intentionally.
 // - Memory DBs support :memory: and file:...memory... URIs.
 // - Readonly mode avoids write-only pragmas.
-//
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -27,9 +27,12 @@ import { schema } from "./schema";
 
 export type DbClient = BunSQLiteDatabase<typeof schema>;
 
+export type DbJournalMode = "WAL" | "DELETE";
+export type DbSynchronous = "NORMAL" | "FULL" | "OFF";
+
 export type DbPragmas = Readonly<{
-    journalMode: "WAL" | "DELETE";
-    synchronous: "NORMAL" | "FULL" | "OFF";
+    journalMode: DbJournalMode;
+    synchronous: DbSynchronous;
     foreignKeys: true;
     tempStore: "MEMORY";
     busyTimeoutMs: number;
@@ -46,6 +49,11 @@ export type DbHandle = Readonly<{
     pragmas: DbPragmas;
     readonly: boolean;
     isMemory: boolean;
+}>;
+
+export type OpenDbOptions = Readonly<{
+    dbPath?: string;
+    readonly?: boolean;
 }>;
 
 const ENV = {
@@ -68,6 +76,18 @@ const DEFAULTS = {
     MAX_BUSY_TIMEOUT_MS: 300_000,
     MAX_WAL_AUTOCHECKPOINT: 1_000_000,
 } as const;
+
+const GLOBAL_SINGLETON_KEY = "__bp_db_singleton_v2__" as const;
+
+type GlobalDbSingleton = {
+    handle: DbHandle;
+    signature: string;
+};
+
+declare global {
+    // eslint-disable-next-line no-var
+    var __bp_db_singleton_v2__: GlobalDbSingleton | undefined;
+}
 
 /* -------------------------------------------------------------------------- */
 /* Utilities                                                                   */
@@ -98,7 +118,21 @@ function isMemoryDb(input: string): boolean {
 function envBool(name: string, fallback = false): boolean {
     const raw = process.env[name]?.trim().toLowerCase();
     if (!raw) return fallback;
-    return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+
+    switch (raw) {
+        case "1":
+        case "true":
+        case "yes":
+        case "on":
+            return true;
+        case "0":
+        case "false":
+        case "no":
+        case "off":
+            return false;
+        default:
+            return fallback;
+    }
 }
 
 function envInt(name: string): number | null {
@@ -115,6 +149,7 @@ function envChoice<T extends string>(
 ): T {
     const raw = process.env[name]?.trim();
     if (!raw) return fallback;
+
     const value = raw.toUpperCase();
     return (allowed as readonly string[]).includes(value) ? (value as T) : fallback;
 }
@@ -183,10 +218,12 @@ function isLikelyApiRoot(dir: string): boolean {
     return (
          fileExists(path.join(dir, "package.json")) &&
          fileExists(path.join(dir, "src")) &&
-         (fileExists(path.join(dir, "drizzle")) ||
+         (
+              fileExists(path.join(dir, "drizzle")) ||
               fileExists(path.join(dir, "drizzle.config.ts")) ||
               fileExists(path.join(dir, "drizzle.config.js")) ||
-              fileExists(path.join(dir, "drizzle.config.mjs")))
+              fileExists(path.join(dir, "drizzle.config.mjs"))
+         )
     );
 }
 
@@ -201,8 +238,7 @@ function apiRootFromModule(): string | null {
 }
 
 function apiRootFromCwd(): string | null {
-    const start = process.cwd();
-    let cur = start;
+    let cur = process.cwd();
 
     for (let i = 0; i < 16; i += 1) {
         if (isLikelyApiRoot(cur)) return cur;
@@ -225,7 +261,6 @@ function findApiRoot(): string {
     const fromCwd = apiRootFromCwd();
     if (fromCwd) return fromCwd;
 
-    // Last-resort fallback. Keep it explicit.
     return path.resolve(process.cwd(), "apps", "api");
 }
 
@@ -255,7 +290,7 @@ function resolveDbPath(input?: string): string {
     }
 
     if (isMemoryDb(raw)) return raw;
-    return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(raw);
+    return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(process.cwd(), raw);
 }
 
 function validateResolvedPath(
@@ -295,10 +330,6 @@ function formatOpenError(finalPath: string, error: unknown): Error {
 /* SQLite helpers                                                              */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Bun's sqlite typings still route pragma batches through exec().
- * Keep it isolated here.
- */
 function execSql(sqlite: Database, sqlText: string): void {
     // eslint-disable-next-line @typescript-eslint/no-deprecated
     sqlite.exec(sqlText);
@@ -310,6 +341,7 @@ function querySingleValue(
 ): string | number | bigint | null {
     const row = sqlite.query(sqlText).get() as Record<string, unknown> | undefined;
     if (!row) return null;
+
     const first = Object.values(row)[0];
     if (
          typeof first === "string" ||
@@ -318,6 +350,7 @@ function querySingleValue(
     ) {
         return first;
     }
+
     return null;
 }
 
@@ -368,7 +401,9 @@ function verifyCriticalPragmas(
 
     const tempStore = queryPragmaString(sqlite, "PRAGMA temp_store;");
     if (tempStore !== "2") {
-        throw new Error(`[bp/db] failed to apply PRAGMA temp_store=MEMORY (got ${tempStore || "empty"})`);
+        throw new Error(
+             `[bp/db] failed to apply PRAGMA temp_store=MEMORY (got ${tempStore || "empty"})`,
+        );
     }
 
     const busyTimeout = queryPragmaNumber(sqlite, "PRAGMA busy_timeout;");
@@ -385,14 +420,14 @@ function verifyCriticalPragmas(
         );
     }
 
-    const synchronous = queryPragmaNumber(sqlite, "PRAGMA synchronous;");
-    if (!Number.isFinite(synchronous)) {
-        throw new Error("[bp/db] failed to read PRAGMA synchronous");
-    }
-
     const walAutoCheckpoint = queryPragmaNumber(sqlite, "PRAGMA wal_autocheckpoint;");
     if (!Number.isFinite(walAutoCheckpoint) || walAutoCheckpoint < 1) {
         throw new Error("[bp/db] failed to apply PRAGMA wal_autocheckpoint");
+    }
+
+    const synchronous = queryPragmaNumber(sqlite, "PRAGMA synchronous;");
+    if (!Number.isFinite(synchronous)) {
+        throw new Error("[bp/db] failed to read PRAGMA synchronous");
     }
 }
 
@@ -407,40 +442,39 @@ function applyPragmas(
 
 function safeClose(sqlite: Database): void {
     try {
-        sqlite.close();
+        sqlite.close(false);
     } catch {
         // ignore during shutdown / partial init failure
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* Public API                                                                  */
-/* -------------------------------------------------------------------------- */
+function makeHandleSignature(
+     finalPath: string,
+     readonly: boolean,
+     pragmas: DbPragmas,
+): string {
+    return JSON.stringify({
+        finalPath,
+        readonly,
+        pragmas,
+    });
+}
 
-/**
- * Opens a Bun SQLite DB and returns a typed Drizzle client.
- *
- * Env:
- * - BP_DB_PATH
- * - BP_DB_READONLY=1
- * - BP_DB_JOURNAL_MODE=WAL|DELETE
- * - BP_DB_SYNCHRONOUS=NORMAL|FULL|OFF
- * - BP_DB_BUSY_TIMEOUT_MS=5000
- * - BP_DB_WAL_AUTOCHECKPOINT=1000
- * - BP_DB_CACHE_SIZE_KIB
- * - BP_DB_MMAP_SIZE_BYTES
- */
-export function openDb(dbPath?: string): DbHandle {
-    const finalPath = resolveDbPath(dbPath);
+function createDbHandle(options?: string | OpenDbOptions): DbHandle {
+    const dbPathInput = typeof options === "string" ? options : options?.dbPath;
+    const finalPath = resolveDbPath(dbPathInput);
     const isMem = isMemoryDb(finalPath);
-    const readonly = !isMem && envBool(ENV.DB_READONLY, false);
+    const readonly =
+         typeof options === "object" && typeof options.readonly === "boolean"
+              ? options.readonly
+              : (!isMem && envBool(ENV.DB_READONLY, false));
 
     validateResolvedPath(finalPath, readonly, isMem);
 
     let sqlite: Database;
     try {
         sqlite = readonly
-             ? new Database(finalPath, { readonly: true })
+             ? new Database(finalPath, { readonly: true, create: false })
              : new Database(finalPath);
     } catch (error) {
         throw formatOpenError(finalPath, error);
@@ -453,6 +487,10 @@ export function openDb(dbPath?: string): DbHandle {
 
         const db = drizzle(sqlite, { schema });
         const close = (): void => {
+            const singleton = globalThis[GLOBAL_SINGLETON_KEY];
+            if (singleton?.handle.sqlite === sqlite) {
+                globalThis[GLOBAL_SINGLETON_KEY] = undefined;
+            }
             safeClose(sqlite);
         };
 
@@ -474,10 +512,75 @@ export function openDb(dbPath?: string): DbHandle {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Public API                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Opens a Bun SQLite DB and returns a typed Drizzle client.
+ *
+ * Env:
+ * - BP_DB_PATH
+ * - BP_DB_READONLY=1
+ * - BP_DB_JOURNAL_MODE=WAL|DELETE
+ * - BP_DB_SYNCHRONOUS=NORMAL|FULL|OFF
+ * - BP_DB_BUSY_TIMEOUT_MS=5000
+ * - BP_DB_WAL_AUTOCHECKPOINT=1000
+ * - BP_DB_CACHE_SIZE_KIB
+ * - BP_DB_MMAP_SIZE_BYTES
+ *
+ * Behavior:
+ * - For the module default singleton exports, we reuse a global handle under Bun watch/hot reload.
+ * - Direct calls to openDb(...) always return a fresh independent handle.
+ */
+export function openDb(): DbHandle;
+export function openDb(dbPath: string): DbHandle;
+export function openDb(options: OpenDbOptions): DbHandle;
+export function openDb(arg?: string | OpenDbOptions): DbHandle {
+    return createDbHandle(arg);
+}
+
+/**
+ * Returns a stable process-global singleton handle.
+ * Used by module-level exports below to avoid duplicate connections in dev/watch.
+ */
+export function getDbSingleton(options?: string | OpenDbOptions): DbHandle {
+    const dbPathInput = typeof options === "string" ? options : options?.dbPath;
+    const finalPath = resolveDbPath(dbPathInput);
+    const isMem = isMemoryDb(finalPath);
+    const readonly =
+         typeof options === "object" && typeof options.readonly === "boolean"
+              ? options.readonly
+              : (!isMem && envBool(ENV.DB_READONLY, false));
+    const pragmas = parseDbPragmasFromEnv();
+    const signature = makeHandleSignature(finalPath, readonly, pragmas);
+
+    const existing = globalThis[GLOBAL_SINGLETON_KEY];
+    if (existing && existing.signature === signature) {
+        return existing.handle;
+    }
+
+    if (existing) {
+        try {
+            existing.handle.close();
+        } catch {
+            // ignore
+        }
+    }
+
+    const handle = createDbHandle(options);
+    globalThis[GLOBAL_SINGLETON_KEY] = {
+        handle,
+        signature,
+    };
+
+    return handle;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Default singleton exports                                                   */
 /* -------------------------------------------------------------------------- */
 
-const handle = openDb();
+const handle = getDbSingleton();
 
 export const sqlite = handle.sqlite;
 export const db = handle.db;

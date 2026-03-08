@@ -1,11 +1,11 @@
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-07T23:43:54.466Z
+Generated: 2026-03-08T03:13:39.054Z
 Root: /Users/dan/Desktop/Biblia-Populi
 Total files: 70
-Total raw bytes (all included files): 1888192
+Total raw bytes (all included files): 2098385
 Truncated/skipped files: 1
-Export time: 12ms
+Export time: 7ms
 
 ## Notes
 
@@ -8479,27 +8479,27 @@ export const authSchema = {
 
 ```ts
 // apps/api/src/db/client.ts
-// Biblia.to — DB bootstrap (Drizzle + Bun native SQLite)
+// Biblia.to — hardened DB bootstrap (Drizzle + Bun native SQLite)
 //
-// Uses:
-// - bun:sqlite (built-in, fast)
-// - drizzle-orm/bun-sqlite driver
-//
-// Exports:
-// - openDb(dbPath?): { sqlite, db, dbPath, close, pragmas, readonly, isMemory }
-// - default singleton: sqlite, db, dbPath, closeDb, pragmas, dbReadonly, dbIsMemory
+// Goals:
+// - stable DB path resolution across repo-root / apps/api / arbitrary cwd
+// - explicit, conservative pragma profile
+// - safe readonly handling
+// - deterministic singleton export surface
+// - clear diagnostics without hidden mutation
+// - hot-reload-safe singleton reuse under Bun watch/dev
 //
 // Notes:
-// - This file does NOT run migrations. Keep migrations separate.
-// - For production, set BP_DB_PATH to control where the sqlite file lives.
-// - IMPORTANT: defaults are resolved relative to the *apps/api* folder (not process.cwd()).
-// - Determinism: we apply a conservative pragma profile; env can override only explicitly.
-// - Readonly mode avoids mutating pragmas that require write access.
-// - WAL is recommended for normal read/write operation; readonly DBs may open against an
-//   existing -wal / -shm pair depending on SQLite state and filesystem behavior.
+// - This file does NOT run migrations.
+// - Prefer setting BP_DB_PATH in production.
+// - Default file path is anchored to apps/api/data/biblia.sqlite.
+// - Relative BP_DB_PATH / arg paths are resolved against process.cwd() intentionally.
+// - Memory DBs support :memory: and file:...memory... URIs.
+// - Readonly mode avoids write-only pragmas.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Database, type SQLiteError } from "bun:sqlite";
 import { drizzle, type BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 
@@ -8507,9 +8507,12 @@ import { schema } from "./schema";
 
 export type DbClient = BunSQLiteDatabase<typeof schema>;
 
+export type DbJournalMode = "WAL" | "DELETE";
+export type DbSynchronous = "NORMAL" | "FULL" | "OFF";
+
 export type DbPragmas = Readonly<{
-    journalMode: "WAL" | "DELETE";
-    synchronous: "NORMAL" | "FULL" | "OFF";
+    journalMode: DbJournalMode;
+    synchronous: DbSynchronous;
     foreignKeys: true;
     tempStore: "MEMORY";
     busyTimeoutMs: number;
@@ -8528,7 +8531,10 @@ export type DbHandle = Readonly<{
     isMemory: boolean;
 }>;
 
-/* -------------------------------- Constants -------------------------------- */
+export type OpenDbOptions = Readonly<{
+    dbPath?: string;
+    readonly?: boolean;
+}>;
 
 const ENV = {
     DB_PATH: "BP_DB_PATH",
@@ -8544,80 +8550,28 @@ const ENV = {
 const DEFAULTS = {
     JOURNAL_MODE: "WAL" as const,
     SYNCHRONOUS: "NORMAL" as const,
-    BUSY_TIMEOUT_MS: 5000,
-    WAL_AUTOCHECKPOINT: 1000,
+    BUSY_TIMEOUT_MS: 5_000,
+    WAL_AUTOCHECKPOINT: 1_000,
     DEFAULT_FILENAME: "biblia.sqlite",
+    MAX_BUSY_TIMEOUT_MS: 300_000,
+    MAX_WAL_AUTOCHECKPOINT: 1_000_000,
 } as const;
 
-/* -------------------------------- Utilities -------------------------------- */
+const GLOBAL_SINGLETON_KEY = "__bp_db_singleton_v2__" as const;
 
-function ensureDir(dir: string): void {
-    fs.mkdirSync(dir, { recursive: true });
+type GlobalDbSingleton = {
+    handle: DbHandle;
+    signature: string;
+};
+
+declare global {
+    // eslint-disable-next-line no-var
+    var __bp_db_singleton_v2__: GlobalDbSingleton | undefined;
 }
 
-function isMemoryDb(p: string): boolean {
-    const s = p.trim();
-    return s === ":memory:" || s.startsWith("file::memory:") || s.startsWith("file:memdb");
-}
-
-function envBool(name: string, fallback = false): boolean {
-    const v = process.env[name]?.trim().toLowerCase();
-    if (!v) return fallback;
-    return v === "1" || v === "true" || v === "yes" || v === "on";
-}
-
-function envInt(name: string): number | null {
-    const v = process.env[name]?.trim();
-    if (!v) return null;
-    const n = Number(v);
-    return Number.isFinite(n) ? Math.trunc(n) : null;
-}
-
-function envChoice<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
-    const raw = process.env[name]?.trim();
-    if (!raw) return fallback;
-    const v = raw.toUpperCase();
-    return (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
-}
-
-function clampInt(n: number, lo: number, hi: number): number {
-    return Math.max(lo, Math.min(hi, Math.trunc(n)));
-}
-
-function maybePositiveInt(n: number | null): number | undefined {
-    if (n == null) return undefined;
-    if (!Number.isFinite(n)) return undefined;
-    const v = Math.trunc(n);
-    return v > 0 ? v : undefined;
-}
-
-function parseDbPragmasFromEnv(): DbPragmas {
-    const busyTimeoutMs = clampInt(
-        envInt(ENV.DB_BUSY_TIMEOUT_MS) ?? DEFAULTS.BUSY_TIMEOUT_MS,
-        0,
-        300_000,
-    );
-
-    const walAutoCheckpoint = clampInt(
-        envInt(ENV.DB_WAL_AUTOCHECKPOINT) ?? DEFAULTS.WAL_AUTOCHECKPOINT,
-        1,
-        1_000_000,
-    );
-
-    const cacheSizeKiB = maybePositiveInt(envInt(ENV.DB_CACHE_SIZE_KIB));
-    const mmapSizeBytes = maybePositiveInt(envInt(ENV.DB_MMAP_SIZE_BYTES));
-
-    return Object.freeze({
-        journalMode: envChoice(ENV.DB_JOURNAL_MODE, ["WAL", "DELETE"] as const, DEFAULTS.JOURNAL_MODE),
-        synchronous: envChoice(ENV.DB_SYNCHRONOUS, ["NORMAL", "FULL", "OFF"] as const, DEFAULTS.SYNCHRONOUS),
-        foreignKeys: true as const,
-        tempStore: "MEMORY" as const,
-        busyTimeoutMs,
-        walAutoCheckpoint,
-        cacheSizeKiB,
-        mmapSizeBytes,
-    });
-}
+/* -------------------------------------------------------------------------- */
+/* Utilities                                                                   */
+/* -------------------------------------------------------------------------- */
 
 function fileExists(p: string): boolean {
     try {
@@ -8627,192 +8581,419 @@ function fileExists(p: string): boolean {
     }
 }
 
-function isLikelyApiRoot(dir: string): boolean {
+function ensureDir(dir: string): void {
+    fs.mkdirSync(dir, { recursive: true });
+}
+
+function isMemoryDb(input: string): boolean {
+    const s = input.trim().toLowerCase();
     return (
-        fileExists(path.join(dir, "src")) &&
-        fileExists(path.join(dir, "package.json")) &&
-        (fileExists(path.join(dir, "drizzle")) || fileExists(path.join(dir, "drizzle.config.ts")))
+         s === ":memory:" ||
+         s.startsWith("file::memory:") ||
+         s.startsWith("file:memdb") ||
+         (s.startsWith("file:") && s.includes("mode=memory"))
     );
 }
 
-/**
- * Find apps/api directory without using import.meta (works with older TS module settings).
- *
- * Supports running from:
- * - repo root
- * - apps/api
- * - anywhere inside apps/api (as long as cwd is within it)
- */
-function findApiRootFromCwd(): string {
-    const cwd = process.cwd();
+function envBool(name: string, fallback = false): boolean {
+    const raw = process.env[name]?.trim().toLowerCase();
+    if (!raw) return fallback;
 
-    let cur = cwd;
-    for (let i = 0; i < 12; i += 1) {
-        const direct = cur;
+    switch (raw) {
+        case "1":
+        case "true":
+        case "yes":
+        case "on":
+            return true;
+        case "0":
+        case "false":
+        case "no":
+        case "off":
+            return false;
+        default:
+            return fallback;
+    }
+}
+
+function envInt(name: string): number | null {
+    const raw = process.env[name]?.trim();
+    if (!raw) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
+function envChoice<T extends string>(
+     name: string,
+     allowed: readonly T[],
+     fallback: T,
+): T {
+    const raw = process.env[name]?.trim();
+    if (!raw) return fallback;
+
+    const value = raw.toUpperCase();
+    return (allowed as readonly string[]).includes(value) ? (value as T) : fallback;
+}
+
+function clampInt(n: number, lo: number, hi: number): number {
+    return Math.max(lo, Math.min(hi, Math.trunc(n)));
+}
+
+function maybePositiveInt(n: number | null): number | undefined {
+    if (n == null || !Number.isFinite(n)) return undefined;
+    const v = Math.trunc(n);
+    return v > 0 ? v : undefined;
+}
+
+function normalizePathForLogs(p: string): string {
+    return isMemoryDb(p) ? p : path.normalize(p);
+}
+
+function formatUnknownError(error: unknown): string {
+    if (error instanceof Error && error.message.trim()) return error.message.trim();
+    if (typeof error === "string" && error.trim()) return error.trim();
+    return String(error);
+}
+
+function parseDbPragmasFromEnv(): DbPragmas {
+    const busyTimeoutMs = clampInt(
+         envInt(ENV.DB_BUSY_TIMEOUT_MS) ?? DEFAULTS.BUSY_TIMEOUT_MS,
+         0,
+         DEFAULTS.MAX_BUSY_TIMEOUT_MS,
+    );
+
+    const walAutoCheckpoint = clampInt(
+         envInt(ENV.DB_WAL_AUTOCHECKPOINT) ?? DEFAULTS.WAL_AUTOCHECKPOINT,
+         1,
+         DEFAULTS.MAX_WAL_AUTOCHECKPOINT,
+    );
+
+    const cacheSizeKiB = maybePositiveInt(envInt(ENV.DB_CACHE_SIZE_KIB));
+    const mmapSizeBytes = maybePositiveInt(envInt(ENV.DB_MMAP_SIZE_BYTES));
+
+    return Object.freeze({
+        journalMode: envChoice(
+             ENV.DB_JOURNAL_MODE,
+             ["WAL", "DELETE"] as const,
+             DEFAULTS.JOURNAL_MODE,
+        ),
+        synchronous: envChoice(
+             ENV.DB_SYNCHRONOUS,
+             ["NORMAL", "FULL", "OFF"] as const,
+             DEFAULTS.SYNCHRONOUS,
+        ),
+        foreignKeys: true as const,
+        tempStore: "MEMORY" as const,
+        busyTimeoutMs,
+        walAutoCheckpoint,
+        cacheSizeKiB,
+        mmapSizeBytes,
+    });
+}
+
+/* -------------------------------------------------------------------------- */
+/* API root / path resolution                                                  */
+/* -------------------------------------------------------------------------- */
+
+function isLikelyApiRoot(dir: string): boolean {
+    return (
+         fileExists(path.join(dir, "package.json")) &&
+         fileExists(path.join(dir, "src")) &&
+         (
+              fileExists(path.join(dir, "drizzle")) ||
+              fileExists(path.join(dir, "drizzle.config.ts")) ||
+              fileExists(path.join(dir, "drizzle.config.js")) ||
+              fileExists(path.join(dir, "drizzle.config.mjs"))
+         )
+    );
+}
+
+function apiRootFromModule(): string | null {
+    try {
+        const here = path.dirname(fileURLToPath(import.meta.url)); // apps/api/src/db
+        const candidate = path.resolve(here, "..", ".."); // apps/api
+        return isLikelyApiRoot(candidate) ? candidate : null;
+    } catch {
+        return null;
+    }
+}
+
+function apiRootFromCwd(): string | null {
+    let cur = process.cwd();
+
+    for (let i = 0; i < 16; i += 1) {
+        if (isLikelyApiRoot(cur)) return cur;
+
         const nested = path.join(cur, "apps", "api");
-
-        if (isLikelyApiRoot(direct)) {
-            return direct;
-        }
-
-        if (isLikelyApiRoot(nested)) {
-            return nested;
-        }
+        if (isLikelyApiRoot(nested)) return nested;
 
         const parent = path.dirname(cur);
         if (parent === cur) break;
         cur = parent;
     }
 
-    return path.join(cwd, "apps", "api");
+    return null;
+}
+
+function findApiRoot(): string {
+    const fromModule = apiRootFromModule();
+    if (fromModule) return fromModule;
+
+    const fromCwd = apiRootFromCwd();
+    if (fromCwd) return fromCwd;
+
+    return path.resolve(process.cwd(), "apps", "api");
 }
 
 function defaultDbPath(): string {
-    return path.join(findApiRootFromCwd(), "data", DEFAULTS.DEFAULT_FILENAME);
+    return path.join(findApiRoot(), "data", DEFAULTS.DEFAULT_FILENAME);
 }
 
 /**
- * Resolve DB path in a way that stays stable no matter what cwd the process runs with.
+ * Resolve DB path.
  *
  * Priority:
  * 1) explicit arg
- * 2) BP_DB_PATH env var
- * 3) apps/api/data/biblia.sqlite (absolute, based on directory discovery)
+ * 2) BP_DB_PATH
+ * 3) default apps/api/data/biblia.sqlite
  *
  * Rules:
- * - Absolute paths are used as-is.
- * - Relative paths from arg/env are resolved against process.cwd() intentionally.
- * - ":memory:" and file::memory: URIs are supported.
+ * - memory DB URIs are preserved as-is
+ * - absolute file paths are preserved
+ * - relative arg/env paths resolve against process.cwd()
  */
 function resolveDbPath(input?: string): string {
     const envPath = process.env[ENV.DB_PATH]?.trim();
     const raw = (input?.trim() || envPath || defaultDbPath()).trim();
 
-    if (isMemoryDb(raw)) return raw;
-    return path.isAbsolute(raw) ? raw : path.resolve(raw);
-}
-
-function validateResolvedPath(finalPath: string, readonly: boolean, isMem: boolean): void {
-    if (isMem) return;
-
-    if (!finalPath) {
+    if (!raw) {
         throw new Error("[bp/db] resolved DB path is empty");
     }
 
-    if (readonly && !fileExists(finalPath)) {
-        throw new Error(`[bp/db] readonly DB does not exist: ${finalPath}`);
+    if (isMemoryDb(raw)) return raw;
+    return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(process.cwd(), raw);
+}
+
+function validateResolvedPath(
+     finalPath: string,
+     readonly: boolean,
+     isMem: boolean,
+): void {
+    if (isMem) return;
+
+    if (!finalPath.trim()) {
+        throw new Error("[bp/db] resolved DB path is empty");
+    }
+
+    if (readonly) {
+        if (!fileExists(finalPath)) {
+            throw new Error(`[bp/db] readonly DB does not exist: ${finalPath}`);
+        }
+        return;
+    }
+
+    ensureDir(path.dirname(finalPath));
+}
+
+function formatOpenError(finalPath: string, error: unknown): Error {
+    const err = error as SQLiteError | Error | undefined;
+    const code =
+         err && typeof err === "object" && "code" in err && typeof err.code === "string"
+              ? ` code=${err.code}`
+              : "";
+
+    return new Error(
+         `[bp/db] failed to open DB at ${normalizePathForLogs(finalPath)}:${code} ${formatUnknownError(error)}`,
+    );
+}
+
+/* -------------------------------------------------------------------------- */
+/* SQLite helpers                                                              */
+/* -------------------------------------------------------------------------- */
+
+function execSql(sqlite: Database, sqlText: string): void {
+    // eslint-disable-next-line @typescript-eslint/no-deprecated
+    sqlite.exec(sqlText);
+}
+
+function querySingleValue(
+     sqlite: Database,
+     sqlText: string,
+): string | number | bigint | null {
+    const row = sqlite.query(sqlText).get() as Record<string, unknown> | undefined;
+    if (!row) return null;
+
+    const first = Object.values(row)[0];
+    if (
+         typeof first === "string" ||
+         typeof first === "number" ||
+         typeof first === "bigint"
+    ) {
+        return first;
+    }
+
+    return null;
+}
+
+function queryPragmaString(sqlite: Database, sqlText: string): string {
+    const value = querySingleValue(sqlite, sqlText);
+    return typeof value === "string" ? value : String(value ?? "");
+}
+
+function queryPragmaNumber(sqlite: Database, sqlText: string): number {
+    const value = querySingleValue(sqlite, sqlText);
+    const n = Number(value);
+    return Number.isFinite(n) ? n : Number.NaN;
+}
+
+function pragmaSql(opts: DbPragmas, readonly: boolean): string {
+    const lines: string[] = [
+        "PRAGMA foreign_keys = ON;",
+        "PRAGMA temp_store = MEMORY;",
+        `PRAGMA busy_timeout = ${opts.busyTimeoutMs};`,
+    ];
+
+    if (typeof opts.cacheSizeKiB === "number") {
+        lines.push(`PRAGMA cache_size = -${Math.abs(Math.trunc(opts.cacheSizeKiB))};`);
+    }
+
+    if (typeof opts.mmapSizeBytes === "number") {
+        lines.push(`PRAGMA mmap_size = ${Math.max(0, Math.trunc(opts.mmapSizeBytes))};`);
     }
 
     if (!readonly) {
-        ensureDir(path.dirname(finalPath));
+        lines.push(`PRAGMA journal_mode = ${opts.journalMode};`);
+        lines.push(`PRAGMA synchronous = ${opts.synchronous};`);
+        lines.push(`PRAGMA wal_autocheckpoint = ${opts.walAutoCheckpoint};`);
     }
+
+    return lines.join("\n");
 }
 
-function formatOpenError(finalPath: string, e: unknown): Error {
-    const err = e as SQLiteError | Error | undefined;
-    const msg =
-        typeof err?.message === "string" && err.message.trim()
-            ? err.message.trim()
-            : String(e);
-
-    return new Error(`[bp/db] failed to open DB at ${finalPath}: ${msg}`);
-}
-
-/* -------------------------------- Pragmas ---------------------------------- */
-
-/**
- * Bun's sqlite typings may mark exec() deprecated due to overload signatures.
- * In practice, this is still the correct API for PRAGMA batches.
- * We isolate it here so any future replacement is localized.
- */
-function execSql(sqlite: Database, text: string): void {
-    // eslint-disable-next-line @typescript-eslint/no-deprecated
-    sqlite.exec(text);
-}
-
-function querySingleValue(sqlite: Database, sqlText: string): string | number | null {
-    const row = sqlite.query(sqlText).get() as Record<string, unknown> | undefined;
-    if (!row) return null;
-    const first = Object.values(row)[0];
-    return typeof first === "string" || typeof first === "number" ? first : null;
-}
-
-function setConnectionPragmas(sqlite: Database, opts: DbPragmas): void {
-    const cacheStmt =
-        typeof opts.cacheSizeKiB === "number" ? `PRAGMA cache_size = -${Math.abs(opts.cacheSizeKiB)};` : "";
-
-    const mmapStmt =
-        typeof opts.mmapSizeBytes === "number" ? `PRAGMA mmap_size = ${Math.max(0, Math.trunc(opts.mmapSizeBytes))};` : "";
-
-    execSql(
-        sqlite,
-        `
-PRAGMA foreign_keys = ON;
-PRAGMA temp_store = MEMORY;
-PRAGMA busy_timeout = ${opts.busyTimeoutMs};
-${cacheStmt}
-${mmapStmt}
-`.trim(),
-    );
-}
-
-function setWritablePragmas(sqlite: Database, opts: DbPragmas): void {
-    execSql(
-        sqlite,
-        `
-PRAGMA journal_mode = ${opts.journalMode};
-PRAGMA synchronous = ${opts.synchronous};
-PRAGMA wal_autocheckpoint = ${opts.walAutoCheckpoint};
-`.trim(),
-    );
-}
-
-function verifyCriticalPragmas(sqlite: Database, opts: DbPragmas, readonly: boolean): void {
-    const foreignKeys = String(querySingleValue(sqlite, "PRAGMA foreign_keys;") ?? "");
+function verifyCriticalPragmas(
+     sqlite: Database,
+     opts: DbPragmas,
+     readonly: boolean,
+): void {
+    const foreignKeys = queryPragmaString(sqlite, "PRAGMA foreign_keys;");
     if (foreignKeys !== "1") {
         throw new Error("[bp/db] failed to enable PRAGMA foreign_keys=ON");
     }
 
-    const busyTimeout = Number(querySingleValue(sqlite, "PRAGMA busy_timeout;") ?? NaN);
+    const tempStore = queryPragmaString(sqlite, "PRAGMA temp_store;");
+    if (tempStore !== "2") {
+        throw new Error(
+             `[bp/db] failed to apply PRAGMA temp_store=MEMORY (got ${tempStore || "empty"})`,
+        );
+    }
+
+    const busyTimeout = queryPragmaNumber(sqlite, "PRAGMA busy_timeout;");
     if (!Number.isFinite(busyTimeout) || busyTimeout < 0) {
         throw new Error("[bp/db] failed to apply PRAGMA busy_timeout");
     }
 
-    if (!readonly) {
-        const journalMode = String(querySingleValue(sqlite, "PRAGMA journal_mode;") ?? "").toUpperCase();
-        if (opts.journalMode === "WAL" && journalMode !== "WAL") {
-            throw new Error(`[bp/db] requested journal_mode=WAL but got '${journalMode || "(empty)"}'`);
-        }
-        if (opts.journalMode === "DELETE" && journalMode !== "DELETE") {
-            throw new Error(`[bp/db] requested journal_mode=DELETE but got '${journalMode || "(empty)"}'`);
-        }
+    if (readonly) return;
 
-        const synchronous = Number(querySingleValue(sqlite, "PRAGMA synchronous;") ?? NaN);
-        if (!Number.isFinite(synchronous)) {
-            throw new Error("[bp/db] failed to read PRAGMA synchronous");
-        }
+    const journalMode = queryPragmaString(sqlite, "PRAGMA journal_mode;").toUpperCase();
+    if (opts.journalMode !== journalMode) {
+        throw new Error(
+             `[bp/db] requested journal_mode=${opts.journalMode} but got '${journalMode || "(empty)"}'`,
+        );
+    }
+
+    const walAutoCheckpoint = queryPragmaNumber(sqlite, "PRAGMA wal_autocheckpoint;");
+    if (!Number.isFinite(walAutoCheckpoint) || walAutoCheckpoint < 1) {
+        throw new Error("[bp/db] failed to apply PRAGMA wal_autocheckpoint");
+    }
+
+    const synchronous = queryPragmaNumber(sqlite, "PRAGMA synchronous;");
+    if (!Number.isFinite(synchronous)) {
+        throw new Error("[bp/db] failed to read PRAGMA synchronous");
     }
 }
 
-function applyPragmas(sqlite: Database, opts: DbPragmas, readonly: boolean): void {
-    setConnectionPragmas(sqlite, opts);
-
-    if (!readonly) {
-        setWritablePragmas(sqlite, opts);
-    }
-
+function applyPragmas(
+     sqlite: Database,
+     opts: DbPragmas,
+     readonly: boolean,
+): void {
+    execSql(sqlite, pragmaSql(opts, readonly));
     verifyCriticalPragmas(sqlite, opts, readonly);
 }
 
 function safeClose(sqlite: Database): void {
     try {
-        sqlite.close();
+        sqlite.close(false);
     } catch {
-        // ignore on shutdown
+        // ignore during shutdown / partial init failure
     }
 }
 
-/* ---------------------------------- API ----------------------------------- */
+function makeHandleSignature(
+     finalPath: string,
+     readonly: boolean,
+     pragmas: DbPragmas,
+): string {
+    return JSON.stringify({
+        finalPath,
+        readonly,
+        pragmas,
+    });
+}
+
+function createDbHandle(options?: string | OpenDbOptions): DbHandle {
+    const dbPathInput = typeof options === "string" ? options : options?.dbPath;
+    const finalPath = resolveDbPath(dbPathInput);
+    const isMem = isMemoryDb(finalPath);
+    const readonly =
+         typeof options === "object" && typeof options.readonly === "boolean"
+              ? options.readonly
+              : (!isMem && envBool(ENV.DB_READONLY, false));
+
+    validateResolvedPath(finalPath, readonly, isMem);
+
+    let sqlite: Database;
+    try {
+        sqlite = readonly
+             ? new Database(finalPath, { readonly: true, create: false })
+             : new Database(finalPath);
+    } catch (error) {
+        throw formatOpenError(finalPath, error);
+    }
+
+    const pragmas = parseDbPragmasFromEnv();
+
+    try {
+        applyPragmas(sqlite, pragmas, readonly);
+
+        const db = drizzle(sqlite, { schema });
+        const close = (): void => {
+            const singleton = globalThis[GLOBAL_SINGLETON_KEY];
+            if (singleton?.handle.sqlite === sqlite) {
+                globalThis[GLOBAL_SINGLETON_KEY] = undefined;
+            }
+            safeClose(sqlite);
+        };
+
+        return Object.freeze({
+            sqlite,
+            db,
+            dbPath: finalPath,
+            close,
+            pragmas,
+            readonly,
+            isMemory: isMem,
+        });
+    } catch (error) {
+        safeClose(sqlite);
+        throw new Error(
+             `[bp/db] failed during DB initialization for ${normalizePathForLogs(finalPath)}: ${formatUnknownError(error)}`,
+        );
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Public API                                                                  */
+/* -------------------------------------------------------------------------- */
 
 /**
  * Opens a Bun SQLite DB and returns a typed Drizzle client.
@@ -8826,89 +9007,101 @@ function safeClose(sqlite: Database): void {
  * - BP_DB_WAL_AUTOCHECKPOINT=1000
  * - BP_DB_CACHE_SIZE_KIB
  * - BP_DB_MMAP_SIZE_BYTES
+ *
+ * Behavior:
+ * - For the module default singleton exports, we reuse a global handle under Bun watch/hot reload.
+ * - Direct calls to openDb(...) always return a fresh independent handle.
  */
-export function openDb(dbPath?: string): DbHandle {
-    const finalPath = resolveDbPath(dbPath);
-    const isMem = isMemoryDb(finalPath);
-    const readonly = !isMem && envBool(ENV.DB_READONLY, false);
-
-    validateResolvedPath(finalPath, readonly, isMem);
-
-    let sqlite: Database;
-    try {
-        sqlite = readonly ? new Database(finalPath, { readonly: true }) : new Database(finalPath);
-    } catch (e) {
-        throw formatOpenError(finalPath, e);
-    }
-
-    const pragmas = parseDbPragmasFromEnv();
-
-    try {
-        applyPragmas(sqlite, pragmas, readonly);
-        const db = drizzle(sqlite, { schema });
-        const close = (): void => safeClose(sqlite);
-
-        return Object.freeze({
-            sqlite,
-            db,
-            dbPath: finalPath,
-            close,
-            pragmas,
-            readonly,
-            isMemory: isMem,
-        });
-    } catch (e) {
-        safeClose(sqlite);
-        const err = e as Error | undefined;
-        throw new Error(`[bp/db] failed during DB initialization for ${finalPath}: ${err?.message ?? String(e)}`);
-    }
+export function openDb(): DbHandle;
+export function openDb(dbPath: string): DbHandle;
+export function openDb(options: OpenDbOptions): DbHandle;
+export function openDb(arg?: string | OpenDbOptions): DbHandle {
+    return createDbHandle(arg);
 }
 
-/* ------------------------ Default singleton exports ------------------------ */
 /**
- * Most of the API server wants a single DB handle.
- * Import from "./db/client":
- *   import { db, sqlite } from "./db/client";
+ * Returns a stable process-global singleton handle.
+ * Used by module-level exports below to avoid duplicate connections in dev/watch.
  */
-const _handle = openDb();
+export function getDbSingleton(options?: string | OpenDbOptions): DbHandle {
+    const dbPathInput = typeof options === "string" ? options : options?.dbPath;
+    const finalPath = resolveDbPath(dbPathInput);
+    const isMem = isMemoryDb(finalPath);
+    const readonly =
+         typeof options === "object" && typeof options.readonly === "boolean"
+              ? options.readonly
+              : (!isMem && envBool(ENV.DB_READONLY, false));
+    const pragmas = parseDbPragmasFromEnv();
+    const signature = makeHandleSignature(finalPath, readonly, pragmas);
 
-export const sqlite = _handle.sqlite;
-export const db = _handle.db;
-export const dbPath = _handle.dbPath;
-export const pragmas = _handle.pragmas;
-export const dbReadonly = _handle.readonly;
-export const dbIsMemory = _handle.isMemory;
-export const closeDb = _handle.close;
+    const existing = globalThis[GLOBAL_SINGLETON_KEY];
+    if (existing && existing.signature === signature) {
+        return existing.handle;
+    }
+
+    if (existing) {
+        try {
+            existing.handle.close();
+        } catch {
+            // ignore
+        }
+    }
+
+    const handle = createDbHandle(options);
+    globalThis[GLOBAL_SINGLETON_KEY] = {
+        handle,
+        signature,
+    };
+
+    return handle;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Default singleton exports                                                   */
+/* -------------------------------------------------------------------------- */
+
+const handle = getDbSingleton();
+
+export const sqlite = handle.sqlite;
+export const db = handle.db;
+export const dbPath = handle.dbPath;
+export const pragmas = handle.pragmas;
+export const dbReadonly = handle.readonly;
+export const dbIsMemory = handle.isMemory;
+export const closeDb = handle.close;
 ```
 
 ### apps/api/src/db/migrate.ts
 
 ```ts
 // apps/api/src/db/migrate.ts
-// Biblia.to — Production migrations runner (Bun + Drizzle + bun:sqlite)
+// Biblia.to — hardened production migrations runner (Bun + Drizzle + bun:sqlite)
 //
 // Responsibilities:
-// 1) Opens Bun SQLite via openDb()
+// 1) Opens SQLite via openDb()
 // 2) Runs Drizzle migrations from apps/api/drizzle
-// 3) Applies idempotent "extras" SQL (FTS5 + triggers) with hash stamping
-// 4) Verifies key canon + auth infra tables exist
-// 5) Performs post-migration sanity checks and WAL checkpoint best-effort
+// 3) Applies idempotent extras SQL (FTS5 + triggers) with hash stamping
+// 4) Verifies canon + auth infra surfaces
+// 5) Performs integrity checks and best-effort WAL checkpoint
 //
 // Notes:
-// - This file does NOT generate migrations. It only applies them.
-// - This runner expects a writable DB. It will refuse readonly mode.
-// - Extras are hash-locked by key. If SQL changes incompatibly, bump the extras key.
-// - Auth tables are expected unless BP_AUTH_OPTIONAL=1.
+// - This file does NOT generate migrations.
+// - This runner requires a writable DB.
+// - Extras are hash-locked by key. If SQL changes incompatibly, bump the key.
+// - Auth tables are required unless BP_AUTH_OPTIONAL=1.
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 
 import { openDb } from "./client";
 import { FTS_MIGRATION_SQL } from "./schema";
 
-/* -------------------------------- Utilities -------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Logging                                                                     */
+/* -------------------------------------------------------------------------- */
 
 function log(...args: unknown[]): void {
     // eslint-disable-next-line no-console
@@ -8924,8 +9117,11 @@ function fatal(...args: unknown[]): never {
     // eslint-disable-next-line no-console
     console.error("[db:migrate]", ...args);
     process.exit(1);
-    throw new Error("unreachable");
 }
+
+/* -------------------------------------------------------------------------- */
+/* Utilities                                                                   */
+/* -------------------------------------------------------------------------- */
 
 function ensureDir(dir: string): void {
     fs.mkdirSync(dir, { recursive: true });
@@ -8940,89 +9136,132 @@ function fileExists(p: string): boolean {
 }
 
 function isMemoryDb(p: string): boolean {
-    const s = p.trim();
-    return s === ":memory:" || s.startsWith("file::memory:") || s.startsWith("file:memdb");
-}
-
-function envBool(name: string, fallback = false): boolean {
-    const v = process.env[name]?.trim().toLowerCase();
-    if (!v) return fallback;
-    return v === "1" || v === "true" || v === "yes" || v === "on";
-}
-
-function envChoice<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
-    const raw = process.env[name]?.trim();
-    if (!raw) return fallback;
-    const v = raw.toUpperCase();
-    return (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
-}
-
-function isLikelyApiRoot(dir: string): boolean {
+    const s = p.trim().toLowerCase();
     return (
-        fileExists(path.join(dir, "src")) &&
-        (fileExists(path.join(dir, "drizzle")) || fileExists(path.join(dir, "drizzle.config.ts")))
+         s === ":memory:" ||
+         s.startsWith("file::memory:") ||
+         s.startsWith("file:memdb") ||
+         (s.startsWith("file:") && s.includes("mode=memory"))
     );
 }
 
-/**
- * Find apps/api directory without using import.meta.
- */
-function findApiRootFromCwd(): string {
-    const cwd = process.cwd();
+function envBool(name: string, fallback = false): boolean {
+    const raw = process.env[name]?.trim().toLowerCase();
+    if (!raw) return fallback;
+    return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
 
-    let cur = cwd;
-    for (let i = 0; i < 12; i += 1) {
-        const direct = cur;
+function envChoice<T extends string>(
+     name: string,
+     allowed: readonly T[],
+     fallback: T,
+): T {
+    const raw = process.env[name]?.trim();
+    if (!raw) return fallback;
+    const value = raw.toUpperCase();
+    return (allowed as readonly string[]).includes(value) ? (value as T) : fallback;
+}
+
+function sha256(text: string): string {
+    return crypto.createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+function formatUnknownError(error: unknown): string {
+    if (error instanceof Error && error.message.trim()) return error.message.trim();
+    if (typeof error === "string" && error.trim()) return error.trim();
+    return String(error);
+}
+
+/* -------------------------------------------------------------------------- */
+/* API root / migrations dir resolution                                        */
+/* -------------------------------------------------------------------------- */
+
+function isLikelyApiRoot(dir: string): boolean {
+    return (
+         fileExists(path.join(dir, "package.json")) &&
+         fileExists(path.join(dir, "src")) &&
+         (fileExists(path.join(dir, "drizzle")) ||
+              fileExists(path.join(dir, "drizzle.config.ts")) ||
+              fileExists(path.join(dir, "drizzle.config.js")) ||
+              fileExists(path.join(dir, "drizzle.config.mjs")))
+    );
+}
+
+function apiRootFromModule(): string | null {
+    try {
+        const here = path.dirname(fileURLToPath(import.meta.url)); // apps/api/src/db
+        const candidate = path.resolve(here, "..", ".."); // apps/api
+        return isLikelyApiRoot(candidate) ? candidate : null;
+    } catch {
+        return null;
+    }
+}
+
+function apiRootFromCwd(): string | null {
+    let cur = process.cwd();
+
+    for (let i = 0; i < 16; i += 1) {
+        if (isLikelyApiRoot(cur)) return cur;
+
         const nested = path.join(cur, "apps", "api");
-
-        if (isLikelyApiRoot(direct)) {
-            return direct;
-        }
-
-        if (isLikelyApiRoot(nested)) {
-            return nested;
-        }
+        if (isLikelyApiRoot(nested)) return nested;
 
         const parent = path.dirname(cur);
         if (parent === cur) break;
         cur = parent;
     }
 
-    return path.join(cwd, "apps", "api");
+    return null;
+}
+
+function findApiRoot(): string {
+    return apiRootFromModule() ?? apiRootFromCwd() ?? path.resolve(process.cwd(), "apps", "api");
 }
 
 function migrationsDir(): string {
-    return path.join(findApiRootFromCwd(), "drizzle");
+    return path.join(findApiRoot(), "drizzle");
 }
 
 function requirePathExists(p: string, label: string): void {
-    if (!fileExists(p)) fatal(`${label} missing: ${p}`);
+    if (!fileExists(p)) {
+        fatal(`${label} missing: ${p}`);
+    }
 }
 
 function requireDirectoryHasMigrationFiles(dir: string): void {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
-    const hasSomeFile = entries.some((e) => e.isFile());
+    const hasSomeFile = entries.some((entry) => entry.isFile());
     if (!hasSomeFile) {
         warn("migrations folder exists but appears empty:", dir);
     }
 }
 
-/* ------------------------------- SQLite shape ------------------------------ */
+/* -------------------------------------------------------------------------- */
+/* SQLite protocol                                                              */
+/* -------------------------------------------------------------------------- */
+
+type SqliteRow = Record<string, unknown>;
+
+type SqliteStatement = {
+    get: (...args: unknown[]) => unknown;
+    run: (...args: unknown[]) => unknown;
+    all?: (...args: unknown[]) => unknown[];
+};
+
+type SqliteQuery = {
+    get?: (...args: unknown[]) => unknown;
+    all?: (...args: unknown[]) => unknown[];
+};
 
 type SqliteLike = {
     exec: (sql: string) => void;
-    prepare: (sql: string) => {
-        get: (...args: any[]) => any;
-        run: (...args: any[]) => any;
-        all?: (...args: any[]) => any[];
-    };
-    query?: (sql: string) => {
-        get?: (...args: any[]) => any;
-        all?: (...args: any[]) => any[];
-    };
+    prepare: (sql: string) => SqliteStatement;
+    query?: (sql: string) => SqliteQuery;
 };
 
-/* ------------------------------- Extras stamp ------------------------------ */
+/* -------------------------------------------------------------------------- */
+/* Migration metadata / extras tables                                          */
+/* -------------------------------------------------------------------------- */
 
 const EXTRAS_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS __bp_extras (
@@ -9040,47 +9279,99 @@ CREATE TABLE IF NOT EXISTS __bp_migration_meta (
 );
 `.trim();
 
-function shaLike(s: string): string {
-    return crypto.createHash("sha256").update(s, "utf8").digest("hex");
+/* -------------------------------------------------------------------------- */
+/* Scalar helpers                                                               */
+/* -------------------------------------------------------------------------- */
+
+function getPreparedRow(
+     sqlite: SqliteLike,
+     sqlText: string,
+     args: readonly unknown[] = [],
+): SqliteRow | null {
+    const row = sqlite.prepare(sqlText).get(...args) as SqliteRow | undefined;
+    return row ?? null;
 }
 
-function getScalarText(sqlite: SqliteLike, q: string, args: any[] = []): string | null {
-    const row = sqlite.prepare(q).get(...args) as Record<string, unknown> | undefined;
+function getScalar(
+     sqlite: SqliteLike,
+     sqlText: string,
+     args: readonly unknown[] = [],
+): unknown {
+    const row = getPreparedRow(sqlite, sqlText, args);
     if (!row) return null;
-    const k = Object.keys(row)[0];
-    if (!k) return null;
-    const v = row[k];
-    return v == null ? null : String(v);
+
+    const firstKey = Object.keys(row)[0];
+    if (!firstKey) return null;
+
+    return row[firstKey] ?? null;
 }
 
-function getScalarInt(sqlite: SqliteLike, q: string, args: any[] = []): number {
-    const s = getScalarText(sqlite, q, args);
-    const n = s == null ? NaN : Number(s);
+function getScalarText(
+     sqlite: SqliteLike,
+     sqlText: string,
+     args: readonly unknown[] = [],
+): string | null {
+    const value = getScalar(sqlite, sqlText, args);
+    return value == null ? null : String(value);
+}
+
+function getScalarInt(
+     sqlite: SqliteLike,
+     sqlText: string,
+     args: readonly unknown[] = [],
+): number {
+    const value = getScalar(sqlite, sqlText, args);
+    const n =
+         typeof value === "bigint"
+              ? Number(value)
+              : value == null
+                   ? Number.NaN
+                   : Number(value);
+
     return Number.isFinite(n) ? Math.trunc(n) : 0;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Transaction helper                                                           */
+/* -------------------------------------------------------------------------- */
 
 function runTx(sqlite: SqliteLike, fn: () => void): void {
     sqlite.exec("BEGIN;");
     try {
         fn();
         sqlite.exec("COMMIT;");
-    } catch (e) {
+    } catch (error) {
         try {
             sqlite.exec("ROLLBACK;");
         } catch {
             // ignore rollback failure
         }
-        throw e;
+        throw error;
     }
 }
 
-function getExtra(sqlite: SqliteLike, key: string): string | null {
-    return getScalarText(sqlite, `SELECT sha AS v FROM __bp_extras WHERE key = ?`, [key]);
+/* -------------------------------------------------------------------------- */
+/* Extras                                                                       */
+/* -------------------------------------------------------------------------- */
+
+type ExtrasPlan = Readonly<{
+    key: string;
+    sql: string;
+    mode: "apply-once" | "hash-locked";
+    description: string;
+}>;
+
+function getExtraSha(sqlite: SqliteLike, key: string): string | null {
+    return getScalarText(
+         sqlite,
+         `SELECT sha AS v FROM __bp_extras WHERE key = ?`,
+         [key],
+    );
 }
 
-function setExtra(sqlite: SqliteLike, key: string, sha: string): void {
+function setExtraSha(sqlite: SqliteLike, key: string, sha: string): void {
     sqlite.prepare(
-        `
+         `
         INSERT INTO __bp_extras(key, sha)
         VALUES(?, ?)
         ON CONFLICT(key) DO UPDATE SET
@@ -9092,7 +9383,7 @@ function setExtra(sqlite: SqliteLike, key: string, sha: string): void {
 
 function setMeta(sqlite: SqliteLike, key: string, value: string): void {
     sqlite.prepare(
-        `
+         `
         INSERT INTO __bp_migration_meta(key, value)
         VALUES(?, ?)
         ON CONFLICT(key) DO UPDATE SET
@@ -9102,17 +9393,10 @@ function setMeta(sqlite: SqliteLike, key: string, value: string): void {
     ).run(key, value);
 }
 
-type ExtrasPlan = Readonly<{
-    key: string;
-    sql: string;
-    mode: "apply-once" | "hash-locked";
-    description: string;
-}>;
-
 function planExtras(): ExtrasPlan[] {
     const plans: ExtrasPlan[] = [];
-
     const ftsSql = (FTS_MIGRATION_SQL ?? "").trim();
+
     if (ftsSql.length > 0) {
         plans.push({
             key: "fts_bp_verse_text_v1",
@@ -9134,57 +9418,86 @@ function applyExtras(sqlite: SqliteLike): void {
         return;
     }
 
-    for (const p of plans) {
-        const hash = shaLike(p.sql);
-        const existing = getExtra(sqlite, p.key);
+    for (const plan of plans) {
+        const hash = sha256(plan.sql);
+        const existing = getExtraSha(sqlite, plan.key);
 
         if (existing === null) {
-            log("extras: applying", JSON.stringify({ key: p.key, sha: hash, desc: p.description }));
+            log(
+                 "extras: applying",
+                 JSON.stringify({
+                     key: plan.key,
+                     sha: hash,
+                     desc: plan.description,
+                 }),
+            );
+
             runTx(sqlite, () => {
-                sqlite.exec(p.sql);
-                setExtra(sqlite, p.key, hash);
+                sqlite.exec(plan.sql);
+                setExtraSha(sqlite, plan.key, hash);
             });
-            log("extras: applied", p.key);
+
+            log("extras: applied", plan.key);
             continue;
         }
 
-        if (p.mode === "apply-once") {
-            log("extras: already present", p.key);
+        if (plan.mode === "apply-once") {
+            log("extras: already present", plan.key);
             continue;
         }
 
         if (existing !== hash) {
             warn("extras: present but hash differs");
-            warn(" - key :", p.key);
+            warn(" - key :", plan.key);
             warn(" - db  :", existing);
             warn(" - code:", hash);
-            warn(" - desc:", p.description);
-            warn("Not reapplying automatically. Bump the extras key (e.g. v2) or add a manual migration.");
+            warn(" - desc:", plan.description);
+            warn("Not reapplying automatically. Bump the extras key or add a manual migration.");
             continue;
         }
 
-        log("extras: already present", p.key);
+        log("extras: already present", plan.key);
     }
 }
 
-/* ------------------------------ Sanity checks ------------------------------ */
+/* -------------------------------------------------------------------------- */
+/* Sanity checks                                                                */
+/* -------------------------------------------------------------------------- */
 
 function tableExists(sqlite: SqliteLike, name: string): boolean {
-    const n = getScalarInt(
-        sqlite,
-        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='table' AND name = ?`,
-        [name],
+    return (
+         getScalarInt(
+              sqlite,
+              `SELECT COUNT(*) AS v
+             FROM sqlite_master
+             WHERE type='table' AND name = ?`,
+              [name],
+         ) === 1
     );
-    return n === 1;
 }
 
 function indexExists(sqlite: SqliteLike, name: string): boolean {
-    const n = getScalarInt(
-        sqlite,
-        `SELECT COUNT(*) AS v FROM sqlite_master WHERE type='index' AND name = ?`,
-        [name],
+    return (
+         getScalarInt(
+              sqlite,
+              `SELECT COUNT(*) AS v
+             FROM sqlite_master
+             WHERE type='index' AND name = ?`,
+              [name],
+         ) === 1
     );
-    return n === 1;
+}
+
+function viewExists(sqlite: SqliteLike, name: string): boolean {
+    return (
+         getScalarInt(
+              sqlite,
+              `SELECT COUNT(*) AS v
+             FROM sqlite_master
+             WHERE type='view' AND name = ?`,
+              [name],
+         ) === 1
+    );
 }
 
 function verifyCanonTablesExist(sqlite: SqliteLike): void {
@@ -9197,7 +9510,7 @@ function verifyCanonTablesExist(sqlite: SqliteLike): void {
         "bp_link",
     ] as const;
 
-    const missing = required.filter((t) => !tableExists(sqlite, t));
+    const missing = required.filter((table) => !tableExists(sqlite, table));
     if (missing.length > 0) {
         fatal("canon tables missing after migrations:", JSON.stringify({ missing }));
     }
@@ -9205,10 +9518,9 @@ function verifyCanonTablesExist(sqlite: SqliteLike): void {
 
 function verifyAuthTablesExist(sqlite: SqliteLike): void {
     const optional = envBool("BP_AUTH_OPTIONAL", false);
-
     const required = ["bp_user", "bp_auth_account", "bp_session"] as const;
-    const missing = required.filter((t) => !tableExists(sqlite, t));
 
+    const missing = required.filter((table) => !tableExists(sqlite, table));
     if (missing.length === 0) return;
 
     if (optional) {
@@ -9217,19 +9529,20 @@ function verifyAuthTablesExist(sqlite: SqliteLike): void {
     }
 
     fatal(
-        "auth tables missing after migrations (expected with OAuth/identity enabled):",
-        JSON.stringify({
-            missing,
-            hint: "Did you generate/apply drizzle migrations after adding authSchema.ts?",
-        }),
+         "auth tables missing after migrations:",
+         JSON.stringify({
+             missing,
+             hint: "Generate/apply Drizzle migrations after adding auth schema surfaces, or set BP_AUTH_OPTIONAL=1.",
+         }),
     );
 }
 
 function verifyDrizzleMetaTables(sqlite: SqliteLike): void {
-    const metaCandidates = ["__drizzle_migrations", "__drizzle_migrations__"] as const;
-    const found = metaCandidates.some((t) => tableExists(sqlite, t));
+    const candidates = ["__drizzle_migrations", "__drizzle_migrations__"] as const;
+    const found = candidates.some((name) => tableExists(sqlite, name));
+
     if (!found) {
-        warn("drizzle metadata table not found after migrations; verify your migrator/version expectations.");
+        warn("drizzle metadata table not found after migrations; verify migrator/version expectations.");
     }
 }
 
@@ -9237,10 +9550,21 @@ function verifyFtsArtifactsIfConfigured(sqlite: SqliteLike): void {
     const ftsSql = (FTS_MIGRATION_SQL ?? "").trim();
     if (!ftsSql) return;
 
-    const expectedTables = ["bp_verse_text_fts"] as const;
-    const missing = expectedTables.filter((t) => !tableExists(sqlite, t));
+    const requiredTables = ["bp_verse_text_fts"] as const;
+    const missing = requiredTables.filter((table) => !tableExists(sqlite, table) && !viewExists(sqlite, table));
+
     if (missing.length > 0) {
-        fatal("FTS extras configured but expected FTS artifacts are missing:", JSON.stringify({ missing }));
+        fatal(
+             "FTS extras configured but expected artifacts are missing:",
+             JSON.stringify({ missing }),
+        );
+    }
+}
+
+function verifyForeignKeysEnabled(sqlite: SqliteLike): void {
+    const enabled = getScalarInt(sqlite, `PRAGMA foreign_keys;`);
+    if (enabled !== 1) {
+        fatal("PRAGMA foreign_keys is not enabled after openDb()");
     }
 }
 
@@ -9249,20 +9573,21 @@ function verifyCoreRowCounts(sqlite: SqliteLike): void {
     const verseCount = getScalarInt(sqlite, `SELECT COUNT(*) AS v FROM bp_verse`);
     const translationCount = getScalarInt(sqlite, `SELECT COUNT(*) AS v FROM bp_translation`);
 
-    if (bookCount <= 0) {
-        warn("bp_book has no rows");
-    }
-    if (verseCount <= 0) {
-        warn("bp_verse has no rows");
-    }
-    if (translationCount <= 0) {
-        warn("bp_translation has no rows");
-    }
+    if (bookCount <= 0) warn("bp_book has no rows");
+    if (verseCount <= 0) warn("bp_verse has no rows");
+    if (translationCount <= 0) warn("bp_translation has no rows");
 
-    log("row-counts:", JSON.stringify({ bp_book: bookCount, bp_verse: verseCount, bp_translation: translationCount }));
+    log(
+         "row-counts:",
+         JSON.stringify({
+             bp_book: bookCount,
+             bp_verse: verseCount,
+             bp_translation: translationCount,
+         }),
+    );
 }
 
-function verifyOptionalIndexes(sqlite: SqliteLike): void {
+function verifyInterestingArtifacts(sqlite: SqliteLike): void {
     const interesting = [
         "bp_verse_text_translation_id_verse_key_idx",
         "bp_verse_text_fts",
@@ -9270,19 +9595,12 @@ function verifyOptionalIndexes(sqlite: SqliteLike): void {
 
     const found: string[] = [];
     for (const name of interesting) {
-        if (tableExists(sqlite, name) || indexExists(sqlite, name)) {
+        if (tableExists(sqlite, name) || indexExists(sqlite, name) || viewExists(sqlite, name)) {
             found.push(name);
         }
     }
 
     log("artifacts:", JSON.stringify({ found }));
-}
-
-function verifyForeignKeysEnabled(sqlite: SqliteLike): void {
-    const fk = getScalarInt(sqlite, `PRAGMA foreign_keys;`);
-    if (fk !== 1) {
-        fatal("PRAGMA foreign_keys is not enabled after openDb()");
-    }
 }
 
 function verifyIntegrity(sqlite: SqliteLike): void {
@@ -9292,39 +9610,50 @@ function verifyIntegrity(sqlite: SqliteLike): void {
     }
 }
 
-/* --------------------------- Maintenance / post-run ------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Post-run maintenance                                                         */
+/* -------------------------------------------------------------------------- */
 
 function checkpointWalBestEffort(sqlite: SqliteLike): void {
     try {
         const mode = String(getScalarText(sqlite, `PRAGMA journal_mode;`) ?? "").toUpperCase();
-        if (mode === "WAL") {
-            sqlite.prepare(`PRAGMA wal_checkpoint(PASSIVE);`).run();
-            log("wal checkpoint: PASSIVE complete");
-        }
-    } catch (e) {
-        warn("wal checkpoint failed (non-fatal):", e);
+        if (mode !== "WAL") return;
+
+        sqlite.prepare(`PRAGMA wal_checkpoint(PASSIVE);`).run();
+        log("wal checkpoint: PASSIVE complete");
+    } catch (error) {
+        warn("wal checkpoint failed (non-fatal):", formatUnknownError(error));
     }
 }
 
-function stampRunMeta(sqlite: SqliteLike, dbPath: string, migrationsFolder: string): void {
+function stampRunMeta(
+     sqlite: SqliteLike,
+     dbPath: string,
+     migrationsFolder: string,
+): void {
     sqlite.exec(MIGRATION_RUN_META_SQL);
 
-    const extrasPlans = planExtras();
-    const extrasHash = shaLike(
-        extrasPlans
-            .map((p) => `${p.key}:${shaLike(p.sql)}`)
-            .sort()
-            .join("\n"),
+    const extrasHash = sha256(
+         planExtras()
+              .map((plan) => `${plan.key}:${sha256(plan.sql)}`)
+              .sort()
+              .join("\n"),
     );
 
     setMeta(sqlite, "last_db_path", dbPath);
     setMeta(sqlite, "last_migrations_folder", migrationsFolder);
     setMeta(sqlite, "last_auth_optional", envBool("BP_AUTH_OPTIONAL", false) ? "1" : "0");
     setMeta(sqlite, "last_extras_hash", extrasHash);
-    setMeta(sqlite, "last_journal_mode", envChoice("BP_DB_JOURNAL_MODE", ["WAL", "DELETE"] as const, "WAL"));
+    setMeta(
+         sqlite,
+         "last_journal_mode",
+         envChoice("BP_DB_JOURNAL_MODE", ["WAL", "DELETE"] as const, "WAL"),
+    );
 }
 
-/* ---------------------------------- Main ----------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Main                                                                         */
+/* -------------------------------------------------------------------------- */
 
 async function main(): Promise<void> {
     const handle = openDb();
@@ -9332,11 +9661,11 @@ async function main(): Promise<void> {
 
     if (readonly) {
         fatal(
-            "migrate runner opened DB in readonly mode.",
-            JSON.stringify({
-                dbPath,
-                hint: "Unset BP_DB_READONLY or set BP_DB_READONLY=0 before running migrations.",
-            }),
+             "migrate runner opened DB in readonly mode.",
+             JSON.stringify({
+                 dbPath,
+                 hint: "Unset BP_DB_READONLY or set BP_DB_READONLY=0 before running migrations.",
+             }),
         );
     }
 
@@ -9351,27 +9680,27 @@ async function main(): Promise<void> {
     log("migrations:", migrationsFolder);
 
     try {
-        verifyForeignKeysEnabled(sqlite as unknown as SqliteLike);
+        const sqliteLike = sqlite as unknown as SqliteLike;
+
+        verifyForeignKeysEnabled(sqliteLike);
 
         log("running drizzle migrations...");
         await migrate(db, { migrationsFolder });
         log("drizzle migrations complete.");
 
-        const s = sqlite as unknown as SqliteLike;
+        verifyDrizzleMetaTables(sqliteLike);
+        verifyCanonTablesExist(sqliteLike);
+        verifyAuthTablesExist(sqliteLike);
 
-        verifyDrizzleMetaTables(s);
-        verifyCanonTablesExist(s);
-        verifyAuthTablesExist(s);
+        applyExtras(sqliteLike);
+        verifyFtsArtifactsIfConfigured(sqliteLike);
 
-        applyExtras(s);
-        verifyFtsArtifactsIfConfigured(s);
+        verifyCoreRowCounts(sqliteLike);
+        verifyInterestingArtifacts(sqliteLike);
+        verifyIntegrity(sqliteLike);
 
-        verifyCoreRowCounts(s);
-        verifyOptionalIndexes(s);
-
-        verifyIntegrity(s);
-        stampRunMeta(s, dbPath, migrationsFolder);
-        checkpointWalBestEffort(s);
+        stampRunMeta(sqliteLike, dbPath, migrationsFolder);
+        checkpointWalBestEffort(sqliteLike);
 
         if (!isMemoryDb(dbPath)) {
             requirePathExists(dbPath, "db file");
@@ -9383,7 +9712,9 @@ async function main(): Promise<void> {
     }
 }
 
-main().catch((err) => fatal(err));
+main().catch((error: unknown) => {
+    fatal(formatUnknownError(error));
+});
 ```
 
 ### apps/api/src/db/schema.ts
@@ -13031,26 +13362,47 @@ export default defineConfig([
 <head>
   <!-- Basics -->
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta
+          name="viewport"
+          content="width=device-width, initial-scale=1, viewport-fit=cover"
+  />
   <meta name="color-scheme" content="light dark" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
 
+  <!-- Primary -->
   <title>Biblia.to</title>
   <meta
           name="description"
           content="Biblia.to — The Word of God, open to all. Centered on Jesus Christ, crucified and risen."
   />
+  <meta name="application-name" content="Biblia.to" />
+  <meta name="apple-mobile-web-app-title" content="Biblia.to" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="format-detection" content="telephone=no, date=no, email=no, address=no" />
+  <meta name="referrer" content="strict-origin-when-cross-origin" />
+  <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1,max-video-preview:-1" />
 
-  <!-- Canonical (set your real URL when ready) -->
+  <!-- Canonical -->
   <link rel="canonical" href="https://biblia.to/" />
 
-  <!-- Theme color (pairs well with color-scheme; browsers pick appropriate one) -->
-  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f3ea" />
+  <!-- Theme colors -->
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f6f4f0" />
   <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0b0b0c" />
 
-  <!-- Robots (safe default; change to index,follow when public) -->
-  <meta name="robots" content="index,follow" />
+  <!-- Favicons -->
+  <link rel="icon" href="/favicon.ico" sizes="any" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="/icon-16.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+  <link rel="mask-icon" href="/safari-pinned-tab.svg" color="#7a1f1f" />
 
-  <!-- Open Graph -->
+  <!-- Manifest -->
+  <link rel="manifest" href="/site.webmanifest" />
+
+  <!-- Social -->
+  <meta property="og:locale" content="en_US" />
   <meta property="og:site_name" content="Biblia.to" />
   <meta property="og:title" content="Biblia.to" />
   <meta
@@ -13059,57 +13411,164 @@ export default defineConfig([
   />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://biblia.to/" />
-  <!-- Provide these files in /public when you have them -->
-  <meta property="og:image" content="/og.png" />
+  <meta property="og:image" content="https://biblia.to/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
   <meta property="og:image:alt" content="Biblia.to" />
 
-  <!-- Twitter -->
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="Biblia.to" />
   <meta
           name="twitter:description"
           content="The Word of God, open to all. Centered on Jesus Christ, crucified and risen."
   />
-  <meta name="twitter:image" content="/og.png" />
+  <meta name="twitter:image" content="https://biblia.to/og.png" />
+  <meta name="twitter:image:alt" content="Biblia.to" />
 
-  <!-- Favicons -->
-  <link rel="icon" href="/favicon.ico" />
-  <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png" />
-  <link rel="icon" type="image/png" sizes="16x16" href="/icon-16.png" />
-  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
-
-  <!-- PWA-ish (optional, safe even without service worker) -->
-  <meta name="application-name" content="Biblia.to" />
-  <meta name="apple-mobile-web-app-title" content="Biblia.to" />
-  <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="format-detection" content="telephone=no" />
-
-  <!-- Performance -->
+  <!-- Perf / networking -->
+  <link rel="dns-prefetch" href="//fonts.googleapis.com" />
+  <link rel="dns-prefetch" href="//fonts.gstatic.com" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 
-  <!-- If you use these fonts, keep; otherwise delete -->
-  <!-- <link rel="preload" href="/fonts/Inter-Variable.woff2" as="font" type="font/woff2" crossorigin /> -->
-  <!-- <link rel="preload" href="/fonts/Literata-Variable.woff2" as="font" type="font/woff2" crossorigin /> -->
+  <!-- Optional self-hosted fonts -->
+  <!--
+  <link
+    rel="preload"
+    href="/fonts/Inter-Variable.woff2"
+    as="font"
+    type="font/woff2"
+    crossorigin
+  />
+  <link
+    rel="preload"
+    href="/fonts/Literata-Variable.woff2"
+    as="font"
+    type="font/woff2"
+    crossorigin
+  />
+  -->
 
-  <!-- Tiny inline base to prevent flash + keep background correct before React loads -->
+  <!-- Early theme bootstrap: prevents flash and keeps UA chrome aligned -->
+  <script>
+    (() => {
+      const THEME_KEY = "bt_theme_v1";
+      const LEGACY_THEME_KEY = "bp_theme_v1";
+      const root = document.documentElement;
+
+      const safeGet = (key) => {
+        try {
+          return localStorage.getItem(key);
+        } catch {
+          return null;
+        }
+      };
+
+      const isTheme = (value) => value === "light" || value === "dark";
+
+      const saved = safeGet(THEME_KEY) || safeGet(LEGACY_THEME_KEY);
+      const prefersDark =
+              typeof window !== "undefined" &&
+              typeof window.matchMedia === "function" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches;
+
+      const theme = isTheme(saved) ? saved : prefersDark ? "dark" : "light";
+      root.setAttribute("data-theme", theme);
+      root.style.colorScheme = theme;
+    })();
+  </script>
+
+  <!-- Tiny inline base: safe background / text before app hydrates -->
   <style>
-    :root { color-scheme: light dark; }
-    html, body { height: 100%; }
+    :root {
+      color-scheme: light dark;
+      --boot-bg-light: #f6f4f0;
+      --boot-fg-light: #101012;
+      --boot-bg-dark: #0b0b0c;
+      --boot-fg-dark: #f4f3f1;
+    }
+
+    html {
+      height: 100%;
+      background: var(--boot-bg-light);
+      color: var(--boot-fg-light);
+      text-size-adjust: 100%;
+      -webkit-text-size-adjust: 100%;
+    }
+
+    html[data-theme="dark"] {
+      background: var(--boot-bg-dark);
+      color: var(--boot-fg-dark);
+    }
+
     body {
+      min-height: 100%;
       margin: 0;
-      background: var(--bg, #0b0b0c);
-      color: var(--fg, #f2f2f2);
+      background: inherit;
+      color: inherit;
       -webkit-font-smoothing: antialiased;
       -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+      font-family:
+              Inter,
+              ui-sans-serif,
+              system-ui,
+              -apple-system,
+              BlinkMacSystemFont,
+              "Segoe UI",
+              Roboto,
+              Arial,
+              sans-serif;
     }
-    #root { min-height: 100%; }
+
+    #root {
+      min-height: 100vh;
+      min-height: 100dvh;
+      isolation: isolate;
+    }
+
+    @supports (min-height: 100svh) {
+      #root {
+        min-height: 100svh;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      *,
+      *::before,
+      *::after {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
   </style>
+
+  <!-- Structured data -->
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebSite",
+      "name": "Biblia.to",
+      "url": "https://biblia.to/",
+      "description": "The Word of God, open to all. Centered on Jesus Christ, crucified and risen."
+    }
+  </script>
 </head>
 
 <body>
 <noscript>
-  <div style="padding:16px; font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Arial; color:#fff; background:#0b0b0c;">
+  <div
+          style="
+        padding: 16px;
+        font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+        color: #f4f3f1;
+        background: #0b0b0c;
+      "
+  >
     Biblia.to needs JavaScript enabled to run.
   </div>
 </noscript>
@@ -13254,25 +13713,16 @@ export default defineConfig([
 
 ```ts
 // apps/web/src/api.ts
-// Biblia Populi — tiny typed client (bp_* API)
+// Biblia.to — typed API client
 //
-// Upgraded (vNext):
-// - Robust base URL resolution (same-origin by default; supports absolute or path-base VITE_API_BASE)
-// - Translation selection: global + per-call override + reconciliation helpers (as before)
-// - Proper ETag/304 handling with in-memory response cache (fixes “freeze on 304”)
-// - Optional cache control knobs per request (no-store / bypass / ttl)
-// - GET + POST helpers with AbortSignal + timeout merge
-// - Safer JSON parsing (handles 204/304/empty body), clearer classification
-// - Better diagnostics: requestId, method, statusText, url, body snippet
-// - Credentials policy: same-origin by default; can override
-//
-// Philosophy:
-// - Calm, explicit, traceable
-// - Same-origin by default (Vite proxy / production reverse-proxy)
-// - Optional VITE_API_BASE override for remote API
-// - Consistent errors with codes
-// - Request timeouts + AbortSignal support
-// - Safe JSON parsing + better diagnostics
+// Hardened goals:
+// - same-origin by default, optional VITE_API_BASE
+// - stable translation selection + reconciliation
+// - GET envelope decoding with proper 204/304 handling
+// - in-memory ETag cache that cannot "freeze on 304"
+// - merged abort signals + timeout classification
+// - safer parsing / narrower envelope assumptions
+// - explicit diagnostics with request id + body snippet
 
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: { code: string; message: string } };
@@ -13280,44 +13730,25 @@ export type ApiRes<T> = ApiOk<T> | ApiErr;
 
 export type ApiCacheMode = "default" | "no-store" | "reload";
 
-/**
- * Request options:
- * - cacheMode:
- *   - "default": allow ETag caching (client-side in-memory) + normal fetch
- *   - "no-store": bypass client cache and send Cache-Control: no-store
- *   - "reload": bypass client cache and send Cache-Control: no-cache
- * - cacheTtlMs: client-side TTL for cached entries (default 30s). Set 0 to disable TTL expiry.
- */
 export type ApiRequestOptions = {
-    /** Abort after N ms (default 12s). Set 0 to disable timeout. */
     timeoutMs?: number;
-    /** Extra headers */
     headers?: Record<string, string>;
-    /** Optional caller-provided AbortSignal (merged with timeout) */
     signal?: AbortSignal;
-
-    /** Optional translationId override for this request. */
     translationId?: string | null;
-
-    /** Fetch credentials (default "same-origin") */
     credentials?: RequestCredentials;
-
-    /** Client cache mode (default "default") */
     cacheMode?: ApiCacheMode;
-
-    /** Client cache TTL (ms). Default 30s. */
     cacheTtlMs?: number;
 };
 
 export type ApiErrorCode =
-    | "TIMEOUT"
-    | "NETWORK"
-    | "HTTP_ERROR"
-    | "BAD_RESPONSE"
-    | "NOT_JSON"
-    | "API_ERROR"
-    | "ABORTED"
-    | "CACHE_MISS";
+     | "TIMEOUT"
+     | "NETWORK"
+     | "HTTP_ERROR"
+     | "BAD_RESPONSE"
+     | "NOT_JSON"
+     | "API_ERROR"
+     | "ABORTED"
+     | "CACHE_MISS";
 
 export class ApiError extends Error {
     readonly code: ApiErrorCode;
@@ -13328,9 +13759,15 @@ export class ApiError extends Error {
     readonly requestId?: string;
 
     constructor(
-        code: ApiErrorCode,
-        message: string,
-        init?: { status?: number; url?: string; method?: string; bodyText?: string; requestId?: string },
+         code: ApiErrorCode,
+         message: string,
+         init?: {
+             status?: number;
+             url?: string;
+             method?: string;
+             bodyText?: string;
+             requestId?: string;
+         },
     ) {
         super(`${code}: ${message}`);
         this.name = "ApiError";
@@ -13379,7 +13816,7 @@ export type BookRow = {
     nameShort: string;
     chapters: number;
     osised: string | null;
-    abbrs: string | null; // JSON string or null
+    abbrs: string | null;
 };
 
 export type ChaptersPayload = {
@@ -13423,15 +13860,15 @@ export type LinkRow = {
     targetKind: "ENTITY" | "EVENT" | "ROUTE" | "PLACE_GEO" | string;
     targetId: string;
     linkKind:
-        | "MENTIONS"
-        | "PRIMARY_SUBJECT"
-        | "LOCATION"
-        | "SETTING"
-        | "JOURNEY_STEP"
-        | "PARALLEL_ACCOUNT"
-        | "QUOTE_SOURCE"
-        | "QUOTE_TARGET"
-        | string;
+         | "MENTIONS"
+         | "PRIMARY_SUBJECT"
+         | "LOCATION"
+         | "SETTING"
+         | "JOURNEY_STEP"
+         | "PARALLEL_ACCOUNT"
+         | "QUOTE_SOURCE"
+         | "QUOTE_TARGET"
+         | string;
     weight: number;
     source: string;
     confidence: number | null;
@@ -13451,13 +13888,10 @@ export type ChapterPayload = {
     bookId: string;
     chapter: number;
     chapterBounds: ChapterBounds;
-
     verses: VerseRow[];
-
     ranges: RangeRow[];
     links: LinkRow[];
     crossrefs: CrossrefRow[];
-
     marks: unknown[];
     mentions: unknown[];
     footnotes: unknown[];
@@ -13481,8 +13915,8 @@ export type SearchPayload = {
 };
 
 export type PersonPayload =
-    | null
-    | {
+     | null
+     | {
     entity: {
         entityId: string;
         kind: "PERSON" | string;
@@ -13525,8 +13959,8 @@ export type PersonPayload =
 };
 
 export type PlacePayload =
-    | null
-    | {
+     | null
+     | {
     entity: {
         entityId: string;
         kind: "PLACE" | string;
@@ -13558,8 +13992,8 @@ export type PlacePayload =
 };
 
 export type EventPayload =
-    | null
-    | {
+     | null
+     | {
     event: {
         eventId: string;
         canonicalTitle: string;
@@ -13599,8 +14033,8 @@ export type SlicePayload = {
 };
 
 export type LocPayload =
-    | null
-    | {
+     | null
+     | {
     verseKey: string;
     verseOrd: number;
     bookId: string;
@@ -13612,40 +14046,47 @@ export type TranslationsPayload = {
     translations: TranslationMeta[];
 };
 
-/* --------------------------------- Base URL -------------------------------- */
+/* ------------------------------ Base URL --------------------------------- */
 
-// If VITE_API_BASE is set, use it. Otherwise same-origin (works with Vite proxy).
-const API_BASE = (import.meta.env?.VITE_API_BASE ?? "") as string;
+const RAW_API_BASE = String(import.meta.env?.VITE_API_BASE ?? "");
 
-function stripTrailingSlashes(s: string): string {
-    return s.replace(/\/+$/g, "");
+function stripTrailingSlashes(value: string): string {
+    return value.replace(/\/+$/g, "");
 }
 
-function isAbsoluteUrl(s: string): boolean {
-    return /^https?:\/\//i.test(s);
+function isAbsoluteUrl(value: string): boolean {
+    return /^https?:\/\//i.test(value);
 }
 
-function joinUrl(base: string, p: string): string {
-    const pathname = p.startsWith("/") ? p : `/${p}`;
-    if (!base) return pathname;
+function joinUrl(base: string, path: string): string {
+    const pathname = path.startsWith("/") ? path : `/${path}`;
+    const normalizedBase = stripTrailingSlashes(base.trim());
 
-    const b = stripTrailingSlashes(base);
+    if (!normalizedBase) return pathname;
 
-    // absolute base: https://example.com/api
-    if (isAbsoluteUrl(b)) return `${b}${pathname}`;
+    if (isAbsoluteUrl(normalizedBase)) {
+        return `${normalizedBase}${pathname}`;
+    }
 
-    // path-base: /api
-    const bb = b.startsWith("/") ? b : `/${b}`;
-    return `${stripTrailingSlashes(bb)}${pathname}`;
+    const pathBase = normalizedBase.startsWith("/") ? normalizedBase : `/${normalizedBase}`;
+    return `${stripTrailingSlashes(pathBase)}${pathname}`;
 }
 
-/* ------------------------- Translation selection (client) ------------------- */
+const API_BASE = joinUrl("", RAW_API_BASE);
+
+/* ------------------------ Translation selection -------------------------- */
 
 const TRANSLATION_STORAGE_KEY = "bp_translation_id_v2";
-let _translationIdMem: string | null = null;
+const LEGACY_TRANSLATION_STORAGE_KEY = "bp_translation_id_v1";
+
+let translationIdMem: string | null = null;
+
+function canUseLocalStorage(): boolean {
+    return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
+}
 
 function safeLocalStorageGet(key: string): string | null {
-    if (typeof window === "undefined") return null;
+    if (!canUseLocalStorage()) return null;
     try {
         return window.localStorage.getItem(key);
     } catch {
@@ -13654,16 +14095,16 @@ function safeLocalStorageGet(key: string): string | null {
 }
 
 function safeLocalStorageSet(key: string, value: string): void {
-    if (typeof window === "undefined") return;
+    if (!canUseLocalStorage()) return;
     try {
         window.localStorage.setItem(key, value);
     } catch {
-        // ignore
+        // ignore quota/privacy mode failures
     }
 }
 
 function safeLocalStorageRemove(key: string): void {
-    if (typeof window === "undefined") return;
+    if (!canUseLocalStorage()) return;
     try {
         window.localStorage.removeItem(key);
     } catch {
@@ -13676,78 +14117,96 @@ function normalizeTranslationId(id: string): string {
 }
 
 export function getTranslationId(): string | null {
-    if (_translationIdMem != null) return _translationIdMem;
+    if (translationIdMem !== null) return translationIdMem;
 
-    const v2 = safeLocalStorageGet(TRANSLATION_STORAGE_KEY);
-    if (v2 && v2.trim()) {
-        _translationIdMem = normalizeTranslationId(v2);
-        return _translationIdMem;
-    }
-    const v1 = safeLocalStorageGet("bp_translation_id_v1");
-    if (v1 && v1.trim()) {
-        _translationIdMem = normalizeTranslationId(v1);
-        safeLocalStorageSet(TRANSLATION_STORAGE_KEY, _translationIdMem);
-        safeLocalStorageRemove("bp_translation_id_v1");
-        return _translationIdMem;
+    const current = safeLocalStorageGet(TRANSLATION_STORAGE_KEY);
+    if (current && current.trim()) {
+        translationIdMem = normalizeTranslationId(current);
+        return translationIdMem;
     }
 
-    _translationIdMem = null;
+    const legacy = safeLocalStorageGet(LEGACY_TRANSLATION_STORAGE_KEY);
+    if (legacy && legacy.trim()) {
+        translationIdMem = normalizeTranslationId(legacy);
+        safeLocalStorageSet(TRANSLATION_STORAGE_KEY, translationIdMem);
+        safeLocalStorageRemove(LEGACY_TRANSLATION_STORAGE_KEY);
+        return translationIdMem;
+    }
+
     return null;
 }
 
 export function setTranslationId(id: string | null): void {
-    const v = id && id.trim() ? normalizeTranslationId(id) : null;
-    _translationIdMem = v;
+    const next = id && id.trim() ? normalizeTranslationId(id) : null;
+    translationIdMem = next;
 
-    if (!v) safeLocalStorageRemove(TRANSLATION_STORAGE_KEY);
-    else safeLocalStorageSet(TRANSLATION_STORAGE_KEY, v);
+    if (next === null) {
+        safeLocalStorageRemove(TRANSLATION_STORAGE_KEY);
+        return;
+    }
+
+    safeLocalStorageSet(TRANSLATION_STORAGE_KEY, next);
 }
 
-export function reconcileTranslationId(translations: TranslationMeta[] | undefined | null): string | null {
+export function reconcileTranslationId(
+     translations: TranslationMeta[] | undefined | null,
+): string | null {
     const list = translations ?? [];
     if (list.length === 0) return getTranslationId();
 
     const current = getTranslationId();
-    if (current && list.some((t) => t.translationId === current)) return current;
+    if (current && list.some((t) => t.translationId === current)) {
+        return current;
+    }
 
-    const def = list.find((t) => !!t.isDefault)?.translationId ?? null;
-    const next = def ?? list[0]!.translationId ?? null;
-    setTranslationId(next);
-    return next;
+    const defaultId =
+         list.find((t) => t.isDefault)?.translationId ??
+         list[0]?.translationId ??
+         null;
+
+    setTranslationId(defaultId);
+    return defaultId;
 }
 
 function withTranslation(path: string, opts?: ApiRequestOptions): string {
-    const t = (opts?.translationId ?? getTranslationId())?.trim() || "";
-    if (!t) return path;
+    const translationId = (opts?.translationId ?? getTranslationId())?.trim() ?? "";
+    if (!translationId) return path;
 
     if (/[?&](t|translationId)=/i.test(path)) return path;
 
     const sep = path.includes("?") ? "&" : "?";
-    return `${path}${sep}t=${encodeURIComponent(t)}`;
+    return `${path}${sep}t=${encodeURIComponent(translationId)}`;
 }
 
-/* ------------------------------ Query helpers ------------------------------ */
+/* ------------------------------ Query helpers ---------------------------- */
 
 type QueryValue = string | number | boolean | null | undefined;
 
 function addQuery(path: string, params: Record<string, QueryValue>): string {
     const url = new URL(path, "http://local");
-    for (const [k, v] of Object.entries(params)) {
-        if (v == null) continue;
-        url.searchParams.set(k, String(v));
+    for (const [key, value] of Object.entries(params)) {
+        if (value == null) continue;
+        url.searchParams.set(key, String(value));
     }
-    const q = url.search.toString();
-    if (!q) return url.pathname;
-    return `${url.pathname}${q}`;
+    return `${url.pathname}${url.search}`;
 }
 
-/* ------------------------------ JSON / Errors ------------------------------ */
+/* --------------------------- JSON / envelope ----------------------------- */
 
-function isObj(v: unknown): v is Record<string, unknown> {
-    return typeof v === "object" && v !== null;
+function isObj(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
 }
 
-function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false } {
+function hasOwn<K extends string>(
+     value: Record<string, unknown>,
+     key: K,
+): value is Record<K, unknown> {
+    return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function tryParseJson(
+     text: string,
+): { ok: true; value: unknown } | { ok: false } {
     if (!text) return { ok: true, value: null };
     try {
         return { ok: true, value: JSON.parse(text) as unknown };
@@ -13756,47 +14215,125 @@ function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false 
     }
 }
 
-function mergeSignals(a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined {
-    if (!a) return b;
-    if (!b) return a;
-
-    if (a.aborted) return a;
-    if (b.aborted) return b;
-
-    const ctrl = new AbortController();
-    const onAbort = () => ctrl.abort();
-
-    a.addEventListener("abort", onAbort, { once: true });
-    b.addEventListener("abort", onAbort, { once: true });
-
-    return ctrl.signal;
+function isApiErrEnvelope(value: unknown): value is ApiErr {
+    if (!isObj(value)) return false;
+    if (!hasOwn(value, "ok") || value.ok !== false) return false;
+    if (!hasOwn(value, "error") || !isObj(value.error)) return false;
+    return typeof value.error.code === "string" && typeof value.error.message === "string";
 }
 
-function classifyFetchError(e: unknown): ApiError {
-    if (e && typeof e === "object" && (e as any).name === "AbortError") {
-        return new ApiError("ABORTED", "Request aborted.");
-    }
-    if (e instanceof ApiError) return e;
-    const msg = e instanceof Error ? e.message : String(e);
-    return new ApiError("NETWORK", msg || "Network error.");
+function isApiOkEnvelope<T>(value: unknown): value is ApiOk<T> {
+    if (!isObj(value)) return false;
+    if (!hasOwn(value, "ok") || value.ok !== true) return false;
+    return hasOwn(value, "data");
 }
 
 function isLikelyJson(res: Response): boolean {
-    const ct = (res.headers.get("content-type") ?? "").toLowerCase();
-    return ct.includes("application/json") || ct.includes("+json");
+    const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+    return contentType.includes("application/json") || contentType.includes("+json");
 }
 
 function formatHttpMessage(res: Response): string {
-    const s = res.statusText?.trim();
-    return s ? s : `HTTP ${res.status}`;
+    const statusText = res.statusText.trim();
+    return statusText ? statusText : `HTTP ${res.status}`;
 }
 
 function getRequestId(res: Response): string | undefined {
-    const v = res.headers.get("x-request-id") ?? res.headers.get("cf-ray") ?? undefined;
-    return v ? v : undefined;
+    const id = res.headers.get("x-request-id") ?? res.headers.get("cf-ray");
+    return id?.trim() || undefined;
 }
 
-/* ----------------------------- ETag 304 cache ------------------------------ */
+function bodySnippet(text: string | undefined): string | undefined {
+    if (!text) return undefined;
+    const normalized = text.trim();
+    if (!normalized) return undefined;
+    return normalized.length > 320 ? `${normalized.slice(0, 320)}…` : normalized;
+}
+
+/* ---------------------------- Abort / timeout ---------------------------- */
+
+type MergedSignal = {
+    signal?: AbortSignal;
+    cleanup: () => void;
+    didTimeout: () => boolean;
+};
+
+function mergeSignalsWithTimeout(
+     externalSignal: AbortSignal | undefined,
+     timeoutMs: number,
+): MergedSignal {
+    const timeoutCtrl = new AbortController();
+    const mergedCtrl = new AbortController();
+
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const abortMerged = () => {
+        if (!mergedCtrl.signal.aborted) mergedCtrl.abort();
+    };
+
+    const onExternalAbort = () => {
+        abortMerged();
+    };
+
+    const onTimeoutAbort = () => {
+        timedOut = true;
+        abortMerged();
+    };
+
+    if (externalSignal?.aborted) {
+        abortMerged();
+    } else if (externalSignal) {
+        externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        timer = setTimeout(() => {
+            timeoutCtrl.abort();
+        }, timeoutMs);
+
+        if (timeoutCtrl.signal.aborted) {
+            onTimeoutAbort();
+        } else {
+            timeoutCtrl.signal.addEventListener("abort", onTimeoutAbort, { once: true });
+        }
+    }
+
+    return {
+        signal: mergedCtrl.signal,
+        cleanup: () => {
+            if (timer) clearTimeout(timer);
+            if (externalSignal) {
+                externalSignal.removeEventListener("abort", onExternalAbort);
+            }
+            timeoutCtrl.signal.removeEventListener("abort", onTimeoutAbort);
+        },
+        didTimeout: () => timedOut,
+    };
+}
+
+function classifyFetchError(
+     error: unknown,
+     method: string,
+     url: string,
+     didTimeout: boolean,
+): ApiError {
+    if (error instanceof ApiError) return error;
+
+    if (error && typeof error === "object" && "name" in error) {
+        const name = String((error as { name?: unknown }).name ?? "");
+        if (name === "AbortError") {
+            return didTimeout
+                 ? new ApiError("TIMEOUT", "Request took too long.", { method, url })
+                 : new ApiError("ABORTED", "Request aborted.", { method, url });
+        }
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    return new ApiError("NETWORK", message || "Network error.", { method, url });
+}
+
+/* ------------------------------ ETag cache ------------------------------- */
 
 type CacheEntry = Readonly<{
     at: number;
@@ -13805,206 +14342,202 @@ type CacheEntry = Readonly<{
 }>;
 
 const DEFAULT_CACHE_TTL_MS = 30_000;
-const _cache = new Map<string, CacheEntry>();
+const responseCache = new Map<string, CacheEntry>();
 
 function cacheKey(method: string, url: string): string {
-    // method is part of key (POST responses should not be cached by default)
-    return `${method} ${url}`;
+    return `${method.toUpperCase()} ${url}`;
 }
 
 function cacheGet(key: string, ttlMs: number): CacheEntry | null {
-    const hit = _cache.get(key);
+    const hit = responseCache.get(key);
     if (!hit) return null;
-    if (ttlMs <= 0) return hit;
-    if (Date.now() - hit.at > ttlMs) {
-        _cache.delete(key);
+
+    if (ttlMs > 0 && Date.now() - hit.at > ttlMs) {
+        responseCache.delete(key);
         return null;
     }
+
     return hit;
 }
 
 function cachePut(key: string, etag: string, data: unknown): void {
-    if (!etag) return;
-    _cache.set(key, Object.freeze({ at: Date.now(), etag, data }));
+    const cleanEtag = etag.trim();
+    if (!cleanEtag) return;
+
+    responseCache.set(
+         key,
+         Object.freeze({
+             at: Date.now(),
+             etag: cleanEtag,
+             data,
+         }),
+    );
 }
 
 function shouldCacheResponse(method: string, res: Response): boolean {
     if (method !== "GET") return false;
     if (res.status !== 200) return false;
-    const etag = (res.headers.get("etag") ?? "").trim();
-    return !!etag;
+    return Boolean((res.headers.get("etag") ?? "").trim());
 }
 
-/* ------------------------------- Request core ------------------------------ */
+/* ----------------------------- Request core ------------------------------ */
 
 async function requestJson<T>(
-    method: "GET" | "POST",
-    path: string,
-    body: unknown | undefined,
-    opts: ApiRequestOptions,
+     method: "GET" | "POST",
+     path: string,
+     body: unknown | undefined,
+     opts: ApiRequestOptions = {},
 ): Promise<T> {
-    const pathWithT = withTranslation(path, opts);
-    const url = joinUrl(API_BASE, pathWithT);
+    const pathWithTranslation = withTranslation(path, opts);
+    const url = joinUrl(API_BASE, pathWithTranslation);
 
     const timeoutMs = opts.timeoutMs ?? 12_000;
-    const timeoutCtrl = new AbortController();
-    const timeoutOn = Number.isFinite(timeoutMs) && timeoutMs > 0;
-    const timer = timeoutOn ? setTimeout(() => timeoutCtrl.abort(), timeoutMs) : null;
-
-    const signal = mergeSignals(opts.signal, timeoutCtrl.signal);
-
-    const cacheMode: ApiCacheMode = opts.cacheMode ?? "default";
+    const cacheMode = opts.cacheMode ?? "default";
     const cacheTtlMs = opts.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+    const credentials = opts.credentials ?? "same-origin";
+
+    const merged = mergeSignalsWithTimeout(opts.signal, timeoutMs);
 
     const headers: Record<string, string> = {
         Accept: "application/json",
         ...(opts.headers ?? {}),
     };
 
-    // Client-side cache control preferences
-    if (cacheMode === "no-store") headers["Cache-Control"] = headers["Cache-Control"] ?? "no-store";
-    if (cacheMode === "reload") headers["Cache-Control"] = headers["Cache-Control"] ?? "no-cache";
+    if (cacheMode === "no-store" && headers["Cache-Control"] == null) {
+        headers["Cache-Control"] = "no-store";
+    } else if (cacheMode === "reload" && headers["Cache-Control"] == null) {
+        headers["Cache-Control"] = "no-cache";
+    }
 
     const key = cacheKey(method, url);
     const prior = cacheMode === "default" ? cacheGet(key, cacheTtlMs) : null;
 
-    // If we have an ETag, send conditional request (unless caller forced bypass)
-    if (prior?.etag && cacheMode === "default") {
+    if (method === "GET" && cacheMode === "default" && prior?.etag) {
         headers["If-None-Match"] = prior.etag;
     }
 
     try {
-        let payload: string | undefined;
-        if (method === "POST") {
-            headers["Content-Type"] = headers["Content-Type"] ?? "application/json";
-            payload = body === undefined ? undefined : JSON.stringify(body);
+        const payload =
+             method === "POST" && body !== undefined ? JSON.stringify(body) : undefined;
+
+        if (method === "POST" && headers["Content-Type"] == null) {
+            headers["Content-Type"] = "application/json";
         }
 
         const res = await fetch(url, {
             method,
             headers,
             body: payload,
-            signal,
-            credentials: opts.credentials ?? "same-origin",
+            signal: merged.signal,
+            credentials,
         });
 
         const requestId = getRequestId(res);
 
-        // 304 => return cached data (must exist)
         if (res.status === 304) {
             if (!prior) {
-                throw new ApiError("CACHE_MISS", "Server returned 304 but client has no cached body.", {
-                    status: 304,
-                    url,
-                    method,
-                    requestId,
-                });
+                throw new ApiError(
+                     "CACHE_MISS",
+                     "Server returned 304 but client has no cached response body.",
+                     {
+                         status: 304,
+                         method,
+                         url,
+                         requestId,
+                     },
+                );
             }
             return prior.data as T;
         }
 
-        // 204 => no content (treat as null)
         if (res.status === 204) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            return null as any as T;
+            return null as T;
         }
 
-        const bodyText = await res.text();
-        const parsed = tryParseJson(bodyText);
+        const text = await res.text();
+        const parsed = tryParseJson(text);
 
         if (!res.ok) {
-            if (parsed.ok && isObj(parsed.value) && (parsed.value as any).ok === false) {
-                const v = parsed.value as ApiErr;
-                throw new ApiError("API_ERROR", v.error?.message ?? formatHttpMessage(res), {
+            if (parsed.ok && isApiErrEnvelope(parsed.value)) {
+                throw new ApiError("API_ERROR", parsed.value.error.message, {
                     status: res.status,
-                    url,
                     method,
-                    bodyText,
+                    url,
                     requestId,
+                    bodyText: bodySnippet(text),
                 });
             }
+
             throw new ApiError("HTTP_ERROR", formatHttpMessage(res), {
                 status: res.status,
-                url,
                 method,
-                bodyText,
+                url,
                 requestId,
+                bodyText: bodySnippet(text),
             });
         }
 
-        // If server says JSON but parse failed: treat as NOT_JSON with diagnostics
         if (!parsed.ok) {
-            const code: ApiErrorCode = isLikelyJson(res) ? "NOT_JSON" : "BAD_RESPONSE";
-            throw new ApiError(code, "Expected JSON response but got non-JSON.", {
+            throw new ApiError(
+                 isLikelyJson(res) ? "NOT_JSON" : "BAD_RESPONSE",
+                 "Expected JSON response but received non-JSON content.",
+                 {
+                     status: res.status,
+                     method,
+                     url,
+                     requestId,
+                     bodyText: bodySnippet(text),
+                 },
+            );
+        }
+
+        if (!isApiOkEnvelope<T>(parsed.value)) {
+            if (isApiErrEnvelope(parsed.value)) {
+                throw new ApiError("API_ERROR", parsed.value.error.message, {
+                    status: res.status,
+                    method,
+                    url,
+                    requestId,
+                    bodyText: bodySnippet(text),
+                });
+            }
+
+            throw new ApiError("BAD_RESPONSE", "Missing ok:true response envelope.", {
                 status: res.status,
-                url,
                 method,
-                bodyText,
+                url,
                 requestId,
+                bodyText: bodySnippet(text),
             });
         }
 
-        if (!isObj(parsed.value)) {
-            throw new ApiError("BAD_RESPONSE", "Expected JSON object envelope.", {
-                status: res.status,
-                url,
-                method,
-                bodyText,
-                requestId,
-            });
-        }
+        const data = parsed.value.data;
 
-        const env = parsed.value as ApiRes<T>;
-        if ((env as any).ok === false) {
-            const e = env as ApiErr;
-            throw new ApiError("API_ERROR", e.error?.message ?? "API error.", {
-                status: res.status,
-                url,
-                method,
-                bodyText,
-                requestId,
-            });
-        }
-
-        if ((env as any).ok !== true) {
-            throw new ApiError("BAD_RESPONSE", "Missing ok:true in response envelope.", {
-                status: res.status,
-                url,
-                method,
-                bodyText,
-                requestId,
-            });
-        }
-
-        const data = (env as ApiOk<T>).data as unknown;
-
-        // Cache successful GET responses with ETag
         if (shouldCacheResponse(method, res)) {
-            const etag = (res.headers.get("etag") ?? "").trim();
-            cachePut(key, etag, data);
+            cachePut(key, res.headers.get("etag") ?? "", data);
         }
 
-        return data as T;
-    } catch (e) {
-        if (e && typeof e === "object" && (e as any).name === "AbortError") {
-            if (timeoutOn) throw new ApiError("TIMEOUT", "Request took too long.", { url, method });
-            throw new ApiError("ABORTED", "Request aborted.", { url, method });
-        }
-        throw classifyFetchError(e);
+        return data;
+    } catch (error: unknown) {
+        throw classifyFetchError(error, method, url, merged.didTimeout());
     } finally {
-        if (timer) clearTimeout(timer);
+        merged.cleanup();
     }
 }
 
 async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T> {
-    return requestJson("GET", path, undefined, opts);
+    return requestJson<T>("GET", path, undefined, opts);
 }
 
-async function postJson<T>(path: string, body?: unknown, opts: ApiRequestOptions = {}): Promise<T> {
-    return requestJson("POST", path, body, opts);
+async function postJson<T>(
+     path: string,
+     body?: unknown,
+     opts: ApiRequestOptions = {},
+): Promise<T> {
+    return requestJson<T>("POST", path, body, opts);
 }
 
-/* -------------------------------- API ------------------------------------- */
+/* --------------------------------- API ---------------------------------- */
 
 export function apiGetMeta(opts?: ApiRequestOptions): Promise<MetaPayload> {
     return getJson("/meta", opts);
@@ -14018,17 +14551,30 @@ export function apiGetBooks(opts?: ApiRequestOptions): Promise<{ books: BookRow[
     return getJson("/books", opts);
 }
 
-export function apiGetChapters(bookId: string, opts?: ApiRequestOptions): Promise<ChaptersPayload> {
+export function apiGetChapters(
+     bookId: string,
+     opts?: ApiRequestOptions,
+): Promise<ChaptersPayload> {
     return getJson(`/chapters/${encodeURIComponent(bookId)}`, opts);
 }
 
-export function apiGetChapter(bookId: string, chapter: number, opts?: ApiRequestOptions): Promise<ChapterPayload> {
-    return getJson(`/chapter/${encodeURIComponent(bookId)}/${encodeURIComponent(String(chapter))}`, opts);
+export function apiGetChapter(
+     bookId: string,
+     chapter: number,
+     opts?: ApiRequestOptions,
+): Promise<ChapterPayload> {
+    return getJson(
+         `/chapter/${encodeURIComponent(bookId)}/${encodeURIComponent(String(chapter))}`,
+         opts,
+    );
 }
 
-export function apiSearch(q: string, limit = 30, opts?: ApiRequestOptions): Promise<SearchPayload> {
-    const path = addQuery("/search", { q, limit });
-    return getJson(path, opts);
+export function apiSearch(
+     q: string,
+     limit = 30,
+     opts?: ApiRequestOptions,
+): Promise<SearchPayload> {
+    return getJson(addQuery("/search", { q, limit }), opts);
 }
 
 export function apiGetPerson(id: string, opts?: ApiRequestOptions): Promise<PersonPayload> {
@@ -14043,28 +14589,33 @@ export function apiGetEvent(id: string, opts?: ApiRequestOptions): Promise<Event
     return getJson(`/events/${encodeURIComponent(id)}`, opts);
 }
 
-/* --------------------- Infinite-scroll (global spine) ---------------------- */
-
 export function apiGetSpine(opts?: ApiRequestOptions): Promise<SpineStats> {
-    return getJson(`/spine`, opts);
+    return getJson("/spine", opts);
 }
 
-export function apiGetSlice(fromOrd: number, limit = 240, opts?: ApiRequestOptions): Promise<SlicePayload> {
-    const path = addQuery("/slice", { fromOrd, limit });
-    return getJson(path, opts);
+export function apiGetSlice(
+     fromOrd: number,
+     limit = 240,
+     opts?: ApiRequestOptions,
+): Promise<SlicePayload> {
+    return getJson(addQuery("/slice", { fromOrd, limit }), opts);
 }
 
 export function apiResolveLoc(
-    bookId: string,
-    chapter: number,
-    verse: number | null,
-    opts?: ApiRequestOptions,
+     bookId: string,
+     chapter: number,
+     verse: number | null,
+     opts?: ApiRequestOptions,
 ): Promise<LocPayload> {
-    const path = addQuery("/loc", { bookId, chapter, ...(verse != null ? { verse } : {}) });
-    return getJson(path, opts);
+    return getJson(
+         addQuery("/loc", {
+             bookId,
+             chapter,
+             ...(verse != null ? { verse } : {}),
+         }),
+         opts,
+    );
 }
-
-/* ------------------------------ Auth endpoints ----------------------------- */
 
 export function apiAuthMe(opts?: ApiRequestOptions): Promise<{ user: unknown | null }> {
     return getJson("/auth/me", opts);
@@ -14074,26 +14625,27 @@ export function apiAuthLogout(opts?: ApiRequestOptions): Promise<{ redirect: str
     return postJson("/auth/logout", undefined, opts);
 }
 
-/* -------------------------- Convenience / Debug ----------------------------- */
+/* -------------------------- Convenience / debug -------------------------- */
 
-export function formatApiError(e: unknown): string {
-    if (!(e instanceof ApiError)) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return msg || "Unknown error.";
+export function formatApiError(error: unknown): string {
+    if (!(error instanceof ApiError)) {
+        const message = error instanceof Error ? error.message : String(error);
+        return message || "Unknown error.";
     }
-    const parts: string[] = [];
-    parts.push(e.code);
-    if (typeof e.status === "number") parts.push(String(e.status));
-    if (e.method) parts.push(e.method);
-    if (e.url) parts.push(e.url);
-    if (e.requestId) parts.push(`req:${e.requestId}`);
 
-    if (e.bodyText) {
-        const t = e.bodyText.trim();
-        if (t) parts.push(t.length > 240 ? `${t.slice(0, 240)}…` : t);
-    }
+    const parts: string[] = [error.code];
+
+    if (typeof error.status === "number") parts.push(String(error.status));
+    if (error.method) parts.push(error.method);
+    if (error.url) parts.push(error.url);
+    if (error.requestId) parts.push(`req:${error.requestId}`);
+    if (error.bodyText) parts.push(error.bodyText);
 
     return parts.join(" · ");
+}
+
+export function clearApiResponseCache(): void {
+    responseCache.clear();
 }
 ```
 
@@ -14102,75 +14654,132 @@ export function formatApiError(e: unknown): string {
 ```tsx
 // apps/web/src/App.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AccountPage } from "./auth/AccountPage";
+import { AuthProvider, useAuth } from "./auth/useAuth";
 import { LearnMorePage } from "./LearnMorePage";
 import { Reader } from "./Reader";
+import { ReaderPrefsProvider } from "./reader/prefs/ReaderPrefsProvider";
 import { Search, type ReaderLocation } from "./Search";
 import { ThemeProvider, ThemeShell, ThemeTogglePill, useTheme } from "./theme";
 
-import { AuthProvider, useAuth } from "./auth/useAuth";
-import { ReaderPrefsProvider } from "./reader/prefs/ReaderPrefsProvider";
+type Page = "home" | "learn" | "reader" | "account";
 
-type Page = "home" | "learn" | "reader";
-
-/**
- * Rebrand: Biblia Populi -> Biblia.to
- * We migrate localStorage keys so existing users keep their last page / location.
- */
 const LS_LAST_PAGE = "bt_nav_last_page_v1";
 const LS_LAST_LOC = "bt_nav_last_loc_v1";
-
-// legacy keys (read-only migration)
 const LS_LAST_PAGE_LEGACY = "bp_nav_last_page_v1";
 const LS_LAST_LOC_LEGACY = "bp_nav_last_loc_v1";
 
-/* ---------------- Small helpers (safe localStorage) ---------------- */
+const HOME_HASH = "#/home";
+const LEARN_HASH = "#/learn";
+const READER_HASH = "#/reader";
+const ACCOUNT_HASH = "#/account";
+
+const DEFAULT_READER_LOCATION: ReaderLocation = {
+    bookId: "GEN",
+    chapter: 1,
+    verse: 1,
+};
+
+type AppStyles = Readonly<{
+    page: React.CSSProperties;
+    stage: React.CSSProperties;
+    centerStage: React.CSSProperties;
+    centerBlock: React.CSSProperties;
+    cornerControls: React.CSSProperties;
+    crossWrap: React.CSSProperties;
+    crossImg: React.CSSProperties;
+    h1: React.CSSProperties;
+    lede: React.CSSProperties;
+    searchContainer: React.CSSProperties;
+    ctaRow: React.CSSProperties;
+    primaryBtnButton: React.CSSProperties;
+    secondaryBtnButton: React.CSSProperties;
+    subtleBtnButton: React.CSSProperties;
+    signedInPill: React.CSSProperties;
+}>;
+
+type UrlIntent = Readonly<{
+    page?: Page;
+    loc?: ReaderLocation;
+}>;
+
+function isBrowser(): boolean {
+    return typeof window !== "undefined";
+}
+
 function safeGet(key: string): string | null {
+    if (!isBrowser()) return null;
+
     try {
-        return localStorage.getItem(key);
+        return window.localStorage.getItem(key);
     } catch {
         return null;
     }
 }
+
 function safeSet(key: string, val: string): void {
+    if (!isBrowser()) return;
+
     try {
-        localStorage.setItem(key, val);
-    } catch {}
+        window.localStorage.setItem(key, val);
+    } catch {
+        // ignore
+    }
 }
+
 function safeDel(key: string): void {
+    if (!isBrowser()) return;
+
     try {
-        localStorage.removeItem(key);
-    } catch {}
+        window.localStorage.removeItem(key);
+    } catch {
+        // ignore
+    }
 }
 
-function isPage(v: unknown): v is Page {
-    return v === "home" || v === "learn" || v === "reader";
+function isPage(value: unknown): value is Page {
+    return value === "home" || value === "learn" || value === "reader" || value === "account";
 }
 
-function toInt(v: unknown): number | null {
-    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+function toInt(value: unknown): number | null {
+    const n =
+         typeof value === "number"
+              ? value
+              : typeof value === "string" && value.trim() !== ""
+                   ? Number(value)
+                   : Number.NaN;
+
     return Number.isFinite(n) ? Math.trunc(n) : null;
 }
 
 function normalizeLoc(loc: Partial<ReaderLocation> | null | undefined): ReaderLocation | null {
-    if (!loc || typeof loc.bookId !== "string" || !loc.bookId.trim()) return null;
+    if (!loc || typeof loc.bookId !== "string" || loc.bookId.trim().length === 0) {
+        return null;
+    }
 
     const bookId = loc.bookId.trim().toUpperCase();
     const chapter = toInt((loc as { chapter?: unknown }).chapter);
     const verseRaw = (loc as { verse?: unknown }).verse;
 
-    if (chapter == null || chapter < 1) return null;
+    if (chapter == null || chapter < 1) {
+        return null;
+    }
 
     const verse = verseRaw == null ? undefined : toInt(verseRaw) ?? undefined;
-    if (verse != null && verse < 1) return { bookId, chapter };
+
+    if (verse != null && verse < 1) {
+        return { bookId, chapter };
+    }
 
     return { bookId, chapter, verse };
 }
 
 function parseLoc(raw: string | null): ReaderLocation | null {
     if (!raw) return null;
+
     try {
-        const j = JSON.parse(raw) as Partial<ReaderLocation>;
-        return normalizeLoc(j);
+        const parsed = JSON.parse(raw) as Partial<ReaderLocation>;
+        return normalizeLoc(parsed);
     } catch {
         return null;
     }
@@ -14178,6 +14787,7 @@ function parseLoc(raw: string | null): ReaderLocation | null {
 
 function encodeLoc(loc: ReaderLocation | null): string | null {
     if (!loc) return null;
+
     return JSON.stringify({
         bookId: loc.bookId,
         chapter: loc.chapter,
@@ -14185,519 +14795,494 @@ function encodeLoc(loc: ReaderLocation | null): string | null {
     });
 }
 
-/* ---------------- URL intent + syncing ---------------- */
-function readUrlIntent(): { page?: Page; loc?: ReaderLocation } {
+function readUrlIntent(): UrlIntent {
+    if (!isBrowser()) return {};
+
     try {
         const { hash, search, pathname } = window.location;
+        const trimmedHash = hash.trim();
 
-        /* ---------------- hash routes ---------------- */
-        const h = hash.trim();
-
-        // Explicit reader loc: #/read/GEN/1/1 or #/read/GEN/1
-        if (h.startsWith("#/read/")) {
-            const parts = h
-                .slice("#/read/".length)
-                .split("/")
-                .map((s) => s.trim())
-                .filter(Boolean);
+        if (trimmedHash.startsWith("#/read/")) {
+            const parts = trimmedHash
+                 .slice("#/read/".length)
+                 .split("/")
+                 .map((part) => part.trim())
+                 .filter(Boolean);
 
             const bookId = parts[0]?.toUpperCase();
             const chapter = toInt(parts[1]);
             const verse = parts[2] == null ? undefined : toInt(parts[2]) ?? undefined;
 
-            const loc = normalizeLoc({ bookId, chapter: chapter ?? undefined, verse });
-            if (loc) return { page: "reader", loc };
-        }
+            const loc = normalizeLoc({
+                bookId,
+                chapter: chapter ?? undefined,
+                verse,
+            });
 
-        // Reader without explicit loc (use saved loc / last-ord restore)
-        if (h === "#/reader") return { page: "reader" };
-        if (h === "#/learn") return { page: "learn" };
-        if (h === "#/home") return { page: "home" };
-
-        /* ---------------- query routes ---------------- */
-        const q = new URLSearchParams(search);
-
-        const read = q.get("read");
-        if (read) {
-            const m = read.trim().match(/^([A-Za-z0-9]{2,8})\.(\d+)(?:\.(\d+))?$/);
-            if (m) {
-                const loc = normalizeLoc({
-                    bookId: m[1],
-                    chapter: Number(m[2]),
-                    verse: m[3] ? Number(m[3]) : undefined,
-                });
-                if (loc) return { page: "reader", loc };
+            if (loc) {
+                return { page: "reader", loc };
             }
         }
 
-        const page = q.get("page");
-        if (page === "learn") return { page: "learn" };
-        if (page === "home") return { page: "home" };
-        if (page === "reader") return { page: "reader" };
+        if (trimmedHash === READER_HASH) return { page: "reader" };
+        if (trimmedHash === LEARN_HASH) return { page: "learn" };
+        if (trimmedHash === HOME_HASH) return { page: "home" };
+        if (trimmedHash === ACCOUNT_HASH) return { page: "account" };
 
-        /* ---------------- pathname routes ---------------- */
-        const p = (pathname ?? "").toLowerCase();
-        if (p.endsWith("/reader")) return { page: "reader" };
-        if (p.endsWith("/learn")) return { page: "learn" };
-        if (p.endsWith("/home")) return { page: "home" };
+        const query = new URLSearchParams(search);
+        const pageQuery = query.get("page")?.trim().toLowerCase();
 
-        return {};
+        if (pageQuery === "reader") return { page: "reader" };
+        if (pageQuery === "learn") return { page: "learn" };
+        if (pageQuery === "home") return { page: "home" };
+        if (pageQuery === "account") return { page: "account" };
+
+        if (pathname === "/account") return { page: "account" };
+        if (pathname === "/reader") return { page: "reader" };
+        if (pathname === "/learn") return { page: "learn" };
+        if (pathname === "/" || pathname === "") return { page: "home" };
     } catch {
-        return {};
+        // ignore
+    }
+
+    return {};
+}
+
+function hashForPage(page: Page, loc: ReaderLocation | null): string {
+    if (page === "reader" && loc) {
+        return loc.verse != null
+             ? `#/read/${loc.bookId}/${loc.chapter}/${loc.verse}`
+             : `#/read/${loc.bookId}/${loc.chapter}`;
+    }
+
+    switch (page) {
+        case "reader":
+            return READER_HASH;
+        case "learn":
+            return LEARN_HASH;
+        case "account":
+            return ACCOUNT_HASH;
+        case "home":
+        default:
+            return HOME_HASH;
     }
 }
 
-function formatHash(page: Page, loc: ReaderLocation | null): string {
-    if (page === "reader") {
-        if (loc) {
-            const base = `#/read/${loc.bookId}/${loc.chapter}`;
-            return loc.verse ? `${base}/${loc.verse}` : base;
-        }
-        return "#/reader";
-    }
-    if (page === "learn") return "#/learn";
-    return "#/home";
+function writeUrl(page: Page, loc: ReaderLocation | null): void {
+    if (!isBrowser()) return;
+
+    const nextHash = hashForPage(page, loc);
+    if (window.location.hash === nextHash) return;
+
+    window.history.replaceState(null, "", nextHash);
 }
 
-/* ---------------- App ---------------- */
+function getSavedPage(): Page | null {
+    const current = safeGet(LS_LAST_PAGE);
+    if (isPage(current)) return current;
 
-export default function App() {
-    return (
-        <ThemeProvider>
-            <AuthProvider>
-                <ReaderPrefsProvider>
-                    <AppInner />
-                </ReaderPrefsProvider>
-            </AuthProvider>
-        </ThemeProvider>
-    );
+    const legacy = safeGet(LS_LAST_PAGE_LEGACY);
+    if (isPage(legacy)) return legacy;
+
+    return null;
+}
+
+function getSavedLoc(): ReaderLocation | null {
+    return parseLoc(safeGet(LS_LAST_LOC)) ?? parseLoc(safeGet(LS_LAST_LOC_LEGACY));
+}
+
+function savePage(page: Page): void {
+    safeSet(LS_LAST_PAGE, page);
+}
+
+function saveLoc(loc: ReaderLocation | null): void {
+    const encoded = encodeLoc(loc);
+
+    if (encoded) {
+        safeSet(LS_LAST_LOC, encoded);
+        return;
+    }
+
+    safeDel(LS_LAST_LOC);
+}
+
+function createAppStyles(): AppStyles {
+    return {
+        page: {
+            minHeight: "100dvh",
+            background: "var(--bg)",
+            color: "var(--fg)",
+        },
+        stage: {
+            minHeight: "100dvh",
+        },
+        centerStage: {
+            minHeight: "100dvh",
+            display: "grid",
+            placeItems: "center",
+            padding: "28px 20px",
+        },
+        centerBlock: {
+            width: "100%",
+            maxWidth: 880,
+            display: "grid",
+            justifyItems: "center",
+            textAlign: "center",
+        },
+        cornerControls: {
+            position: "fixed",
+            top: 16,
+            right: 16,
+            zIndex: 20,
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+        },
+        crossWrap: {
+            width: 108,
+            height: 108,
+            marginBottom: 18,
+            display: "grid",
+            placeItems: "center",
+        },
+        crossImg: {
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            userSelect: "none",
+        },
+        h1: {
+            margin: 0,
+            fontSize: "clamp(42px, 7vw, 82px)",
+            lineHeight: 0.95,
+            letterSpacing: "-0.04em",
+            fontWeight: 820,
+        },
+        lede: {
+            margin: "16px 0 0",
+            maxWidth: 700,
+            fontSize: "clamp(16px, 2.1vw, 20px)",
+            lineHeight: 1.55,
+            opacity: 0.84,
+        },
+        searchContainer: {
+            width: "100%",
+            maxWidth: 760,
+            marginTop: 28,
+        },
+        ctaRow: {
+            marginTop: 18,
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 10,
+        },
+        primaryBtnButton: {
+            height: 44,
+            borderRadius: 999,
+            padding: "0 18px",
+            border: "1px solid transparent",
+            background: "var(--fg)",
+            color: "var(--bg)",
+            fontSize: 14,
+            fontWeight: 760,
+            cursor: "pointer",
+            boxShadow: "0 14px 32px color-mix(in srgb, black 14%, transparent)",
+        },
+        secondaryBtnButton: {
+            height: 44,
+            borderRadius: 999,
+            padding: "0 18px",
+            border: "1px solid color-mix(in srgb, var(--border) 76%, transparent)",
+            background: "transparent",
+            color: "var(--fg)",
+            fontSize: 14,
+            fontWeight: 760,
+            cursor: "pointer",
+        },
+        subtleBtnButton: {
+            height: 42,
+            borderRadius: 999,
+            padding: "0 16px",
+            border: "1px solid transparent",
+            background: "transparent",
+            color: "var(--fg)",
+            fontSize: 13,
+            fontWeight: 700,
+            cursor: "pointer",
+            opacity: 0.78,
+        },
+        signedInPill: {
+            marginTop: 12,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 8,
+            minHeight: 34,
+            borderRadius: 999,
+            padding: "0 12px",
+            border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
+            background: "color-mix(in srgb, var(--activeBg) 36%, transparent)",
+            fontSize: 13,
+            fontWeight: 650,
+            opacity: 0.9,
+        },
+    };
 }
 
 function AppInner() {
     const { mode, toggle } = useTheme();
+    const { openAccountPage } = useAuth();
 
-    const initialNav = useMemo(() => {
-        const url = typeof window === "undefined" ? {} : readUrlIntent();
+    const initialUrlIntentRef = useRef<UrlIntent>(readUrlIntent());
 
-        // Prefer new keys; fall back to legacy keys for migration.
-        const savedPageRaw = safeGet(LS_LAST_PAGE) ?? safeGet(LS_LAST_PAGE_LEGACY);
-        const savedPage: Page | null = isPage(savedPageRaw) ? savedPageRaw : null;
+    const [page, setPage] = useState<Page>(() => {
+        const initialPage = initialUrlIntentRef.current.page;
+        return initialPage ?? getSavedPage() ?? "home";
+    });
 
-        const savedLoc =
-            parseLoc(safeGet(LS_LAST_LOC)) ??
-            parseLoc(safeGet(LS_LAST_LOC_LEGACY));
+    const [readerLoc, setReaderLoc] = useState<ReaderLocation | null>(() => {
+        return initialUrlIntentRef.current.loc ?? getSavedLoc() ?? DEFAULT_READER_LOCATION;
+    });
 
-        // Default to HOME unless URL explicitly asked for reader.
-        const page: Page = (url.page as Page | undefined) ?? (savedPage && savedPage !== "reader" ? savedPage : "home");
-        const loc: ReaderLocation | null = url.loc ?? savedLoc;
+    const styles = useMemo<AppStyles>(() => createAppStyles(), []);
 
-        return { page, loc };
+    useEffect(() => {
+        if (!isBrowser()) return;
+
+        const onHashChange = () => {
+            const next = readUrlIntent();
+
+            if (next.page) {
+                setPage(next.page);
+            }
+
+            if (next.loc) {
+                setReaderLoc(next.loc);
+            }
+        };
+
+        window.addEventListener("hashchange", onHashChange);
+        return () => window.removeEventListener("hashchange", onHashChange);
     }, []);
 
-    const [page, setPage] = useState<Page>(initialNav.page);
-    const [readerLoc, setReaderLoc] = useState<ReaderLocation | null>(initialNav.loc);
-
-    // Whether *we* are currently writing to the URL (so popstate/hashchange doesn't bounce back)
-    const writingUrl = useRef(false);
-
-    // Keep last page + loc (new keys)
     useEffect(() => {
-        safeSet(LS_LAST_PAGE, page);
-    }, [page]);
-
-    useEffect(() => {
-        const enc = encodeLoc(readerLoc);
-        if (enc) safeSet(LS_LAST_LOC, enc);
-        else safeDel(LS_LAST_LOC);
-    }, [readerLoc]);
-
-    // One-time cleanup: once we've written new keys, legacy keys are no longer needed.
-    useEffect(() => {
-        // Only remove if new keys exist (avoid nuking in private mode edge cases).
-        const hasNew = safeGet(LS_LAST_PAGE) != null || safeGet(LS_LAST_LOC) != null;
-        if (!hasNew) return;
-        safeDel(LS_LAST_PAGE_LEGACY);
-        safeDel(LS_LAST_LOC_LEGACY);
-    }, []);
-
-    // Keep URL in sync
-    useEffect(() => {
-        if (typeof window === "undefined") return;
-
-        const effectiveLoc = page === "reader" ? readerLoc : null;
-        const nextHash = formatHash(page, effectiveLoc);
-
-        if (window.location.hash === nextHash) return;
-
-        writingUrl.current = true;
-        window.history.replaceState(null, "", nextHash);
-        window.setTimeout(() => {
-            writingUrl.current = false;
-        }, 0);
+        savePage(page);
+        writeUrl(page, page === "reader" ? readerLoc : null);
     }, [page, readerLoc]);
 
-    // URL -> state
     useEffect(() => {
-        if (typeof window === "undefined") return;
+        saveLoc(readerLoc);
+    }, [readerLoc]);
 
-        const onNav = () => {
-            if (writingUrl.current) return;
-
-            const intent = readUrlIntent();
-
-            if (intent.page) setPage(intent.page);
-            if (intent.loc) setReaderLoc(intent.loc);
-        };
-
-        window.addEventListener("hashchange", onNav);
-        window.addEventListener("popstate", onNav);
-        return () => {
-            window.removeEventListener("hashchange", onNav);
-            window.removeEventListener("popstate", onNav);
-        };
+    const goHome = useCallback(() => {
+        setPage("home");
     }, []);
 
-    const goHome = useCallback(() => setPage("home"), []);
-    const goLearn = useCallback(() => setPage("learn"), []);
+    const goLearn = useCallback(() => {
+        setPage("learn");
+    }, []);
+
+    const goAccount = useCallback(() => {
+        setPage("account");
+        openAccountPage();
+    }, [openAccountPage]);
 
     const beginReader = useCallback((loc: ReaderLocation) => {
-        const clean = normalizeLoc(loc) ?? { bookId: "GEN", chapter: 1, verse: 1 };
-        setReaderLoc(clean);
+        const normalized = normalizeLoc(loc);
+        if (!normalized) return;
+
+        setReaderLoc(normalized);
         setPage("reader");
     }, []);
 
     const startReading = useCallback(() => {
-        beginReader(readerLoc ?? { bookId: "GEN", chapter: 1, verse: 1 });
-    }, [readerLoc, beginReader]);
+        beginReader(readerLoc ?? DEFAULT_READER_LOCATION);
+    }, [beginReader, readerLoc]);
 
     const navigateTo = useCallback(
-        (loc: ReaderLocation) => {
-            const clean = normalizeLoc(loc);
-            if (!clean) return;
-            beginReader(clean);
-        },
-        [beginReader],
+         (loc: ReaderLocation) => {
+             const normalized = normalizeLoc(loc);
+             if (!normalized) return;
+
+             beginReader(normalized);
+         },
+         [beginReader],
     );
 
-    const renderPage = useCallback(
-        (p: Page, loc: ReaderLocation | null) => {
-            if (p === "home") {
-                return <Home onLearnMore={goLearn} onStartReading={startReading} onNavigate={navigateTo} />;
-            }
-            if (p === "learn") {
-                return <LearnMorePage mode={mode} onToggleTheme={toggle} onBack={goHome} styles={styles} />;
-            }
+    const renderPage = useCallback((): React.ReactNode => {
+        if (page === "home") {
             return (
-                <Reader
-                    styles={styles}
-                    initialLocation={loc ?? undefined}
-                    onBackHome={goHome}
-                    mode={mode}
-                    onToggleTheme={toggle}
-                />
+                 <Home
+                      styles={styles}
+                      onLearnMore={goLearn}
+                      onStartReading={startReading}
+                      onNavigate={navigateTo}
+                      onOpenAccount={goAccount}
+                 />
             );
-        },
-        [goHome, goLearn, mode, toggle, startReading, navigateTo],
-    );
+        }
 
-    // No more account pill in the corner; sign-in lives on Home and account menu lives in ReaderHeader.
-    const showCornerTheme = page !== "reader"; // reader already has a theme switch in the header
+        if (page === "learn") {
+            return (
+                 <LearnMorePage
+                      mode={mode}
+                      onToggleTheme={toggle}
+                      onBack={goHome}
+                      styles={styles}
+                 />
+            );
+        }
+
+        if (page === "account") {
+            return <AccountPage onBackHome={goHome} />;
+        }
+
+        return (
+             <Reader
+                  styles={styles}
+                  initialLocation={readerLoc ?? undefined}
+                  onBackHome={goHome}
+                  mode={mode}
+                  onToggleTheme={toggle}
+             />
+        );
+    }, [goAccount, goHome, goLearn, mode, navigateTo, page, readerLoc, startReading, styles, toggle]);
+
+    const showCornerTheme = page !== "reader";
 
     return (
-        <ThemeShell style={styles.page}>
-            {showCornerTheme ? (
-                <div style={styles.cornerControls} aria-label="Theme">
-                    <ThemeTogglePill mode={mode} onToggle={toggle} />
-                </div>
-            ) : null}
+         <ThemeShell style={styles.page}>
+             {showCornerTheme ? (
+                  <div style={styles.cornerControls} aria-label="Theme">
+                      <ThemeTogglePill mode={mode} onToggle={toggle} />
+                  </div>
+             ) : null}
 
-            <div style={styles.stage}>{renderPage(page, page === "reader" ? readerLoc : null)}</div>
-        </ThemeShell>
+             <div style={styles.stage}>{renderPage()}</div>
+         </ThemeShell>
     );
 }
 
-/* ---------------- Home ---------------- */
+type HomeProps = Readonly<{
+    styles: AppStyles;
+    onLearnMore: () => void;
+    onStartReading: () => void;
+    onNavigate: (loc: ReaderLocation) => void;
+    onOpenAccount: () => void;
+}>;
 
-function Home(props: { onLearnMore: () => void; onStartReading: () => void; onNavigate: (loc: ReaderLocation) => void }) {
-    const { onLearnMore, onStartReading, onNavigate } = props;
-    const { user, signInWithGoogle } = useAuth();
+function Home(props: HomeProps) {
+    const { styles, onLearnMore, onStartReading, onNavigate, onOpenAccount } = props;
+    const { user, signedIn, signInWithGoogle } = useAuth();
+
+    const onSignIn = useCallback(() => {
+        signInWithGoogle({
+            returnTo: isBrowser() ? window.location.href : undefined,
+        });
+    }, [signInWithGoogle]);
+
+    const signedInLabel = user?.displayName?.trim() || user?.email?.trim() || "User";
 
     return (
-        <main style={styles.centerStage} aria-label="Landing">
-            <div style={styles.centerBlock}>
-                <div style={styles.crossWrap} aria-hidden>
-                    <img src="/cross.png" alt="" style={styles.crossImg} draggable={false} decoding="async" loading="eager" />
-                </div>
+         <main style={styles.centerStage} aria-label="Landing">
+             <div style={styles.centerBlock}>
+                 <div style={styles.crossWrap} aria-hidden="true">
+                     <img
+                          src="/cross.png"
+                          alt=""
+                          style={styles.crossImg}
+                          draggable={false}
+                          decoding="async"
+                          loading="eager"
+                     />
+                 </div>
 
-                <h1 style={styles.h1}>Biblia.to</h1>
-                <p style={styles.lede}>
-                    A public, open-access KJV Scripture platform centered on <strong>Jesus Christ</strong>, crucified and risen.
-                </p>
+                 <h1 style={styles.h1}>Biblia.to</h1>
 
-                <div style={styles.searchContainer}>
-                    <Search
-                        styles={styles}
-                        onNavigate={onNavigate}
-                        onStartReading={onStartReading}
-                        hint="Type a word or a reference (John 3:16)"
-                    />
-                </div>
+                 <p style={styles.lede}>
+                     A public, open-access KJV Scripture platform centered on{" "}
+                     <strong>Jesus Christ</strong>, crucified and risen.
+                 </p>
 
-                <div style={styles.ctaRow}>
-                    <button type="button" onClick={onStartReading} style={styles.primaryBtnButton} aria-label="Start reading">
-                        Start reading
-                    </button>
-                </div>
+                 {signedIn ? (
+                      <div style={styles.signedInPill}>
+                          Signed in as {signedInLabel}
+                      </div>
+                 ) : null}
 
-                {/* Home is the only place we need a sign-in CTA. */}
-                <div style={styles.authRow} aria-label="Account">
-                    {!user ? (
-                        <>
-                            <button
-                                type="button"
-                                onClick={() => signInWithGoogle({ returnTo: window.location.href })}
-                                style={styles.authBtn}
-                            >
-                                Continue with Google
-                            </button>
-                            <div style={styles.authHint}>Optional. Use one account across devices.</div>
-                        </>
-                    ) : (
-                        <>
-                            <div style={styles.authHintStrong}>Signed in.</div>
-                            <div style={styles.authHint}>Open the Reader to manage account (sign out, refresh).</div>
-                        </>
-                    )}
-                </div>
+                 <div style={styles.searchContainer}>
+                     <Search
+                          styles={styles}
+                          onNavigate={onNavigate}
+                          onStartReading={onStartReading}
+                          hint="Type a word or a reference (John 3:16)"
+                     />
+                 </div>
 
-                <button type="button" onClick={onLearnMore} style={styles.learnMoreBtn}>
-                    Learn more
-                </button>
-            </div>
-        </main>
+                 <div style={styles.ctaRow}>
+                     <button
+                          type="button"
+                          onClick={onStartReading}
+                          style={styles.primaryBtnButton}
+                          aria-label="Start reading"
+                     >
+                         Start reading
+                     </button>
+
+                     {signedIn ? (
+                          <button
+                               type="button"
+                               onClick={onOpenAccount}
+                               style={styles.secondaryBtnButton}
+                               aria-label="Open account"
+                          >
+                              Account
+                          </button>
+                     ) : (
+                          <button
+                               type="button"
+                               onClick={onSignIn}
+                               style={styles.secondaryBtnButton}
+                               aria-label="Continue with Google"
+                          >
+                              Continue with Google
+                          </button>
+                     )}
+                 </div>
+
+                 <div style={{ marginTop: 10 }}>
+                     <button
+                          type="button"
+                          onClick={onLearnMore}
+                          style={styles.subtleBtnButton}
+                          aria-label="Learn more"
+                     >
+                         Learn more
+                     </button>
+                 </div>
+             </div>
+         </main>
     );
 }
 
-/* ---------------- Styles ---------------- */
-export const styles: Record<string, React.CSSProperties> = {
-    page: {
-        minHeight: "100vh",
-        background: "var(--bg)",
-        color: "var(--fg)",
-        WebkitFontSmoothing: "antialiased",
-        MozOsxFontSmoothing: "grayscale",
-    },
-
-    stage: {
-        position: "relative",
-        minHeight: "100vh",
-    },
-
-    cornerControls: {
-        position: "fixed",
-        top: 16,
-        right: 16,
-        zIndex: 50,
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-    },
-
-    centerStage: {
-        minHeight: "100vh",
-        display: "grid",
-        placeItems: "center",
-        padding: "64px 20px 48px",
-        position: "relative",
-    },
-
-    centerBlock: {
-        maxWidth: 860,
-        width: "100%",
-        textAlign: "center",
-        margin: "0 auto",
-    },
-
-    crossWrap: {
-        display: "grid",
-        placeItems: "center",
-        marginBottom: 10,
-        opacity: 0.97,
-    },
-
-    crossImg: {
-        width: 108,
-        height: 108,
-        objectFit: "contain",
-        userSelect: "none",
-        filter: "drop-shadow(0 14px 26px rgba(0,0,0,0.14))",
-    },
-
-    h1: {
-        marginTop: 2,
-        fontSize: 52,
-        lineHeight: 1.05,
-        letterSpacing: "-0.025em",
-        marginBottom: 6,
-    },
-
-    lede: {
-        marginTop: 6,
-        fontSize: 13,
-        lineHeight: 1.95,
-        color: "var(--muted)",
-        maxWidth: 620,
-        marginInline: "auto",
-    },
-
-    searchContainer: {
-        marginTop: 18,
-        marginBottom: 22,
-        display: "flex",
-        justifyContent: "center",
-    },
-
-    searchWrap: {
-        width: "100%",
-        maxWidth: 660,
-    },
-
-    searchRow: {
-        display: "grid",
-        gridTemplateColumns: "24px 1fr",
-        alignItems: "center",
-        gap: 8,
-        padding: "10px 18px",
-        borderRadius: 30,
-        border: "1px solid var(--hairline)",
-        background: "var(--panel)",
-        maxWidth: 660,
-        width: "100%",
-        boxShadow: "0 8px 24px rgba(0,0,0,0.07)",
-    },
-
-    searchRowFocused: {
-        borderColor: "var(--focus)",
-        boxShadow: "0 12px 36px rgba(0,0,0,0.12), 0 0 0 3px var(--focusRing)",
-    },
-
-    searchIcon: {
-        width: 24,
-        textAlign: "center",
-        color: "var(--muted)",
-        fontSize: 15,
-        opacity: 0.85,
-    },
-
-    searchInput: {
-        border: "none",
-        outline: "none",
-        background: "transparent",
-        color: "inherit",
-        fontSize: 13.5,
-        padding: "4px 0",
-        width: "100%",
-    },
-
-    searchPanel: {},
-
-    ctaRow: {
-        marginTop: 10,
-        display: "flex",
-        justifyContent: "center",
-    },
-
-    primaryBtnButton: {
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: "12px 20px",
-        borderRadius: 14,
-        background: "var(--fg)",
-        color: "var(--bg)",
-        fontSize: 13.5,
-        fontWeight: 760,
-        letterSpacing: "-0.01em",
-        boxShadow: "0 10px 28px rgba(0,0,0,0.09)",
-        border: "none",
-        cursor: "pointer",
-        WebkitTapHighlightColor: "transparent",
-    },
-
-    /* ---------- Auth CTA (home only) ---------- */
-    authRow: {
-        marginTop: 14,
-        display: "grid",
-        placeItems: "center",
-        gap: 8,
-    },
-
-    authBtn: {
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: "10px 14px",
-        borderRadius: 12,
-        border: "1px solid var(--hairline)",
-        background:
-            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 92%, white), color-mix(in oklab, var(--panel) 98%, transparent))",
-        color: "var(--fg)",
-        fontSize: 12.8,
-        fontWeight: 720,
-        letterSpacing: "-0.01em",
-        boxShadow: "0 10px 26px rgba(0,0,0,0.06)",
-        cursor: "pointer",
-        WebkitTapHighlightColor: "transparent",
-    },
-
-    authHint: {
-        fontSize: 12.2,
-        color: "var(--muted)",
-        lineHeight: 1.6,
-        maxWidth: 520,
-        marginInline: "auto",
-    },
-
-    authHintStrong: {
-        fontSize: 12.2,
-        color: "var(--fg)",
-        opacity: 0.92,
-        fontWeight: 760,
-        letterSpacing: "0.02em",
-        textTransform: "uppercase",
-    },
-
-    learnMoreBtn: {
-        marginTop: 18,
-        fontSize: 12.2,
-        color: "var(--muted)",
-        border: "none",
-        background: "transparent",
-        cursor: "pointer",
-        padding: "8px 12px",
-        borderRadius: 10,
-        letterSpacing: "0.08em",
-        textTransform: "uppercase",
-        WebkitTapHighlightColor: "transparent",
-    },
-
-    backBtn: {
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 8,
-        padding: "10px 12px",
-        borderRadius: 12,
-        border: "1px solid var(--hairline)",
-        background: "var(--panel)",
-        cursor: "pointer",
-    },
-};
+export default function App() {
+    return (
+         <ThemeProvider>
+             <AuthProvider>
+                 <ReaderPrefsProvider>
+                     <AppInner />
+                 </ReaderPrefsProvider>
+             </AuthProvider>
+         </ThemeProvider>
+    );
+}
 ```
 
 ### apps/web/src/auth/AccountMenu.tsx
 
 ```tsx
-// apps/web/src/auth/AccountMenu.tsx
+// cspell:words oklab
 import React, {
     useCallback,
     useEffect,
@@ -14708,7 +15293,14 @@ import React, {
     useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, LogIn, LogOut, RefreshCcw, UserRound } from "lucide-react";
+import {
+    ChevronDown,
+    LogIn,
+    LogOut,
+    RefreshCcw,
+    Settings2,
+    UserRound,
+} from "lucide-react";
 import { useAuth } from "./useAuth";
 
 type Size = "sm" | "md";
@@ -14728,14 +15320,24 @@ type PopPos = {
     transformOrigin: string;
 };
 
-type MenuActionState = "idle" | "refreshing" | "signing_out" | "signing_in";
+type MenuActionState =
+     | "idle"
+     | "refreshing"
+     | "signing_out"
+     | "signing_in"
+     | "opening_account";
 
-const MENU_WIDTH = 264;
+const MENU_WIDTH = 272;
+const MENU_GAP = 8;
+const VIEWPORT_MARGIN = 12;
+const MENU_Z_INDEX = 300;
+const POINTER_DOWN_FOCUS_RESTORE_DELAY_MS = 0;
 
 const useIsomorphicLayoutEffect =
      typeof window !== "undefined" ? useLayoutEffect : useEffect;
 
 function clamp(n: number, lo: number, hi: number): number {
+    if (!Number.isFinite(n)) return lo;
     return Math.max(lo, Math.min(hi, n));
 }
 
@@ -14748,13 +15350,26 @@ function safeFocus(el: HTMLElement | null | undefined): void {
     }
 }
 
-function prefersReducedMotion(): boolean {
-    if (typeof window === "undefined") return false;
-    try {
-        return window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false;
-    } catch {
-        return false;
-    }
+function usePrefersReducedMotion(): boolean {
+    const [reduced, setReduced] = useState(false);
+
+    useEffect(() => {
+        if (typeof window === "undefined" || !window.matchMedia) return;
+
+        const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+        const onChange = (event: MediaQueryListEvent) => {
+            setReduced(event.matches);
+        };
+
+        setReduced(mq.matches);
+        mq.addEventListener("change", onChange);
+
+        return () => {
+            mq.removeEventListener("change", onChange);
+        };
+    }, []);
+
+    return reduced;
 }
 
 function formatUserLabel(user: { displayName: string | null; email: string | null } | null): string {
@@ -14767,19 +15382,41 @@ function formatTriggerTitle(user: { displayName: string | null; email: string | 
 }
 
 function initialsFromUser(user: { displayName: string | null; email: string | null } | null): string {
-    const base = formatUserLabel(user);
-    const s = base.trim();
-    if (!s) return "U";
+    const base = formatUserLabel(user).trim();
+    if (!base) return "U";
 
-    const emailName = s.includes("@") ? s.split("@")[0] ?? s : s;
+    const emailName = base.includes("@") ? base.split("@")[0] ?? base : base;
     const normalized = emailName.replace(/[._-]+/g, " ").trim();
     const parts = normalized.split(/\s+/g).filter(Boolean);
 
     if (parts.length >= 2) {
-        return `${parts[0]![0] ?? ""}${parts[1]![0] ?? ""}`.toUpperCase();
+        return `${parts[0]?.[0] ?? ""}${parts[1]?.[0] ?? ""}`.toUpperCase();
     }
 
     return normalized.slice(0, 2).toUpperCase() || "U";
+}
+
+function eventComposedPath(e: Event): EventTarget[] | null {
+    const maybe = e as Event & { composedPath?: () => EventTarget[] };
+    return typeof maybe.composedPath === "function" ? maybe.composedPath() : null;
+}
+
+function pathIncludesNode(path: EventTarget[] | null, node: Node | null): boolean {
+    if (!path || !node) return false;
+    for (const entry of path) {
+        if (entry === node) return true;
+    }
+    return false;
+}
+
+function isWithin(
+     target: Node | null,
+     path: EventTarget[] | null,
+     container: HTMLElement | null | undefined,
+): boolean {
+    if (!container) return false;
+    if (target && container.contains(target)) return true;
+    return pathIncludesNode(path, container);
 }
 
 function usePopoverPosition(args: {
@@ -14790,6 +15427,7 @@ function usePopoverPosition(args: {
     menuRef: React.RefObject<HTMLElement | null>;
 }) {
     const { open, align, menuWidth, anchorRef, menuRef } = args;
+
     const [pos, setPos] = useState<PopPos | null>(null);
     const rafRef = useRef<number | null>(null);
 
@@ -14798,28 +15436,27 @@ function usePopoverPosition(args: {
         if (!anchor || typeof window === "undefined") return;
 
         const r = anchor.getBoundingClientRect();
-        const gap = 8;
-        const margin = 12;
-
         const mw = menuWidth;
         const mh = menuRef.current?.getBoundingClientRect().height ?? 0;
 
         const left =
              align === "right"
-                  ? clamp(r.right - mw, margin, window.innerWidth - mw - margin)
-                  : clamp(r.left, margin, window.innerWidth - mw - margin);
+                  ? clamp(r.right - mw, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN)
+                  : clamp(r.left, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN);
 
-        const belowTop = r.bottom + gap;
-        const aboveTop = r.top - gap - mh;
+        const belowTop = r.bottom + MENU_GAP;
+        const aboveTop = r.top - MENU_GAP - mh;
 
-        const canFitBelow = belowTop + mh <= window.innerHeight - margin;
-        const canFitAbove = aboveTop >= margin;
+        const canFitBelow = belowTop + mh <= window.innerHeight - VIEWPORT_MARGIN;
+        const canFitAbove = aboveTop >= VIEWPORT_MARGIN;
 
-        const placement: PopPos["placement"] =
-             !canFitBelow && canFitAbove ? "top" : "bottom";
-
+        const placement: PopPos["placement"] = !canFitBelow && canFitAbove ? "top" : "bottom";
         const unclampedTop = placement === "top" ? aboveTop : belowTop;
-        const top = clamp(unclampedTop, margin, Math.max(margin, window.innerHeight - mh - margin));
+        const top = clamp(
+             unclampedTop,
+             VIEWPORT_MARGIN,
+             Math.max(VIEWPORT_MARGIN, window.innerHeight - mh - VIEWPORT_MARGIN),
+        );
 
         const originX = align === "right" ? "right" : "left";
         const originY = placement === "top" ? "bottom" : "top";
@@ -14829,7 +15466,7 @@ function usePopoverPosition(args: {
             left,
             width: mw,
             placement,
-            transformOrigin: `${originY} ${originX}`,
+            transformOrigin: `${originX} ${originY}`,
         });
     }, [align, menuWidth, anchorRef, menuRef]);
 
@@ -14878,7 +15515,7 @@ function usePopoverPosition(args: {
                 rafRef.current = null;
             }
 
-            if (ro) ro.disconnect();
+            ro?.disconnect();
         };
     }, [open, compute, schedule, menuRef, anchorRef]);
 
@@ -15017,9 +15654,7 @@ function RowButton(props: {
 
              <div style={{ minWidth: 0, flex: 1 }}>
                  <div style={{ fontWeight: 780 }}>{label}</div>
-                 {hint ? (
-                      <div style={{ fontSize: 12, opacity: 0.78, marginTop: 2 }}>{hint}</div>
-                 ) : null}
+                 {hint ? <div style={{ fontSize: 12, opacity: 0.78, marginTop: 2 }}>{hint}</div> : null}
              </div>
          </button>
     );
@@ -15031,12 +15666,21 @@ export function AccountMenu({
                                 showLabelWhenSignedIn = false,
                                 style,
                             }: Props) {
-    const { loading, user, error, refresh, signInWithGoogle, signOut } = useAuth();
+    const {
+        loading,
+        user,
+        error,
+        signedIn,
+        refresh,
+        signInWithGoogle,
+        signOut,
+        openAccountPage,
+    } = useAuth();
 
     const btnRef = useRef<HTMLButtonElement | null>(null);
     const menuRef = useRef<HTMLDivElement | null>(null);
-    const wasOpenRef = useRef(false);
     const mountedRef = useRef(true);
+    const restoreFocusOnCloseRef = useRef(true);
 
     const [open, setOpen] = useState(false);
     const [pressed, setPressed] = useState(false);
@@ -15046,7 +15690,7 @@ export function AccountMenu({
     const triggerId = `acct-trigger-${reactId}`;
     const menuId = `acct-menu-${reactId}`;
 
-    const reducedMotion = useMemo(() => prefersReducedMotion(), []);
+    const reducedMotion = usePrefersReducedMotion();
 
     useEffect(() => {
         mountedRef.current = true;
@@ -15055,6 +15699,12 @@ export function AccountMenu({
         };
     }, []);
 
+    useEffect(() => {
+        if (!signedIn && open) {
+            setOpen(false);
+        }
+    }, [signedIn, open]);
+
     const dims = useMemo(() => {
         if (size === "md") {
             return { btn: 38, avatar: 28, labelMax: 220, chevron: 16 };
@@ -15062,14 +15712,22 @@ export function AccountMenu({
         return { btn: 32, avatar: 24, labelMax: 160, chevron: 14 };
     }, [size]);
 
-    const signedIn = !!user;
-    const userLabel = formatUserLabel(user);
     const triggerTitle = formatTriggerTitle(user);
     const showLabel = signedIn && showLabelWhenSignedIn;
 
-    const close = useCallback(() => setOpen(false), []);
-    const openMenu = useCallback(() => setOpen(true), []);
-    const toggle = useCallback(() => setOpen((v) => !v), []);
+    const close = useCallback((opts?: { restoreFocus?: boolean }) => {
+        restoreFocusOnCloseRef.current = opts?.restoreFocus ?? true;
+        setOpen(false);
+    }, []);
+
+    const openMenu = useCallback(() => {
+        setOpen(true);
+    }, []);
+
+    const toggle = useCallback(() => {
+        restoreFocusOnCloseRef.current = true;
+        setOpen((v) => !v);
+    }, []);
 
     const anchorStyle = useMemo<React.CSSProperties>(() => {
         const ringIdle = "0 0 0 1px color-mix(in srgb, var(--border) 62%, transparent)";
@@ -15141,20 +15799,26 @@ export function AccountMenu({
 
         const onPointerDownCapture = (e: PointerEvent) => {
             const target = e.target as Node | null;
-            if (!target) return;
+            const path = eventComposedPath(e);
 
-            const inBtn = btnRef.current?.contains(target) ?? false;
-            const inMenu = menuRef.current?.contains(target) ?? false;
-            if (!inBtn && !inMenu) close();
+            const inBtn = isWithin(target, path, btnRef.current);
+            const inMenu = isWithin(target, path, menuRef.current);
+
+            if (!inBtn && !inMenu) {
+                close({ restoreFocus: false });
+            }
         };
 
         const onFocusInCapture = (e: FocusEvent) => {
             const target = e.target as Node | null;
-            if (!target) return;
+            const path = eventComposedPath(e);
 
-            const inBtn = btnRef.current?.contains(target) ?? false;
-            const inMenu = menuRef.current?.contains(target) ?? false;
-            if (!inBtn && !inMenu) close();
+            const inBtn = isWithin(target, path, btnRef.current);
+            const inMenu = isWithin(target, path, menuRef.current);
+
+            if (!inBtn && !inMenu) {
+                close({ restoreFocus: false });
+            }
         };
 
         window.addEventListener("keydown", onKeyDown);
@@ -15169,17 +15833,22 @@ export function AccountMenu({
     }, [open, close]);
 
     useEffect(() => {
-        if (wasOpenRef.current && !open) {
-            safeFocus(btnRef.current);
-        }
-        wasOpenRef.current = open;
-    }, [open]);
-
-    useEffect(() => {
         if (!open || typeof window === "undefined") return;
-        const t = window.setTimeout(() => focusFirstItem(), 0);
+        const t = window.setTimeout(() => {
+            focusFirstItem();
+        }, 0);
         return () => window.clearTimeout(t);
     }, [open, focusFirstItem]);
+
+    useEffect(() => {
+        if (!open && restoreFocusOnCloseRef.current) {
+            const t = window.setTimeout(() => {
+                safeFocus(btnRef.current);
+            }, POINTER_DOWN_FOCUS_RESTORE_DELAY_MS);
+            return () => window.clearTimeout(t);
+        }
+        return;
+    }, [open]);
 
     const handleMenuKeyDown = useCallback(
          (e: React.KeyboardEvent) => {
@@ -15209,8 +15878,9 @@ export function AccountMenu({
                  if (!items.length) return;
 
                  const active = document.activeElement as HTMLElement | null;
-                 const index = items.indexOf(active ?? items[0]!);
-                 let nextIndex = e.key === "ArrowDown" ? index + 1 : index - 1;
+                 const currentIndex = active ? items.indexOf(active) : -1;
+                 const startIndex = currentIndex >= 0 ? currentIndex : 0;
+                 let nextIndex = e.key === "ArrowDown" ? startIndex + 1 : startIndex - 1;
 
                  if (nextIndex >= items.length) nextIndex = 0;
                  if (nextIndex < 0) nextIndex = items.length - 1;
@@ -15237,15 +15907,21 @@ export function AccountMenu({
          (e: React.KeyboardEvent) => {
              if (e.key === "ArrowDown") {
                  e.preventDefault();
-                 if (!open) openMenu();
-                 else focusFirstItem();
+                 if (!open) {
+                     openMenu();
+                 } else {
+                     focusFirstItem();
+                 }
                  return;
              }
 
              if (e.key === "ArrowUp") {
                  e.preventDefault();
-                 if (!open) openMenu();
-                 else focusLastItem();
+                 if (!open) {
+                     openMenu();
+                 } else {
+                     focusLastItem();
+                 }
                  return;
              }
 
@@ -15263,8 +15939,6 @@ export function AccountMenu({
          [open, openMenu, toggle, close, focusFirstItem, focusLastItem],
     );
 
-    const busy = loading || actionState !== "idle";
-
     const handleRefresh = useCallback(async () => {
         setActionState("refreshing");
         try {
@@ -15276,6 +15950,18 @@ export function AccountMenu({
             }
         }
     }, [refresh, close]);
+
+    const handleOpenAccount = useCallback(async () => {
+        setActionState("opening_account");
+        try {
+            openAccountPage();
+        } finally {
+            if (mountedRef.current) {
+                setActionState("idle");
+                close({ restoreFocus: false });
+            }
+        }
+    }, [openAccountPage, close]);
 
     const handleSignOut = useCallback(async () => {
         setActionState("signing_out");
@@ -15291,10 +15977,10 @@ export function AccountMenu({
 
     const handleSignIn = useCallback(() => {
         setActionState("signing_in");
-        close();
+        close({ restoreFocus: false });
+
         try {
-            const returnTo =
-                 typeof window !== "undefined" ? window.location.href : undefined;
+            const returnTo = typeof window !== "undefined" ? window.location.href : undefined;
             signInWithGoogle({ returnTo });
         } catch {
             if (mountedRef.current) {
@@ -15340,7 +16026,7 @@ export function AccountMenu({
                                 top: pos.top,
                                 left: pos.left,
                                 width: pos.width,
-                                zIndex: 100,
+                                zIndex: MENU_Z_INDEX,
                                 borderRadius: 14,
                                 border: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
                                 background:
@@ -15401,7 +16087,8 @@ export function AccountMenu({
                                          padding: "7px 9px",
                                          borderRadius: 12,
                                          border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
-                                         background: "color-mix(in srgb, var(--activeBg) 50%, transparent)",
+                                         background:
+                                              "color-mix(in srgb, var(--activeBg) 50%, transparent)",
                                          fontSize: 12,
                                          opacity: 0.9,
                                      }}
@@ -15432,6 +16119,15 @@ export function AccountMenu({
                                 <>
                                     <RowButton
                                          autoFocus
+                                         label="Account"
+                                         hint="Manage your session"
+                                         disabled={loading}
+                                         busy={actionState === "opening_account"}
+                                         icon={<Settings2 size={16} />}
+                                         onClick={handleOpenAccount}
+                                    />
+
+                                    <RowButton
                                          label="Refresh session"
                                          hint="Re-check login state"
                                          disabled={loading}
@@ -15502,6 +16198,8 @@ export function AccountMenu({
                                    opacity: 0.7,
                                    marginLeft: -2,
                                    flex: "0 0 auto",
+                                   transform: open ? "rotate(180deg)" : "rotate(0deg)",
+                                   transition: reducedMotion ? undefined : "transform 0.16s ease",
                                }}
                           >
                             <ChevronDown size={dims.chevron} />
@@ -15513,6 +16211,318 @@ export function AccountMenu({
              {menu}
          </>
     );
+}
+```
+
+### apps/web/src/auth/AccountPage.tsx
+
+```tsx
+import React, { useCallback, useMemo } from "react";
+import { LogIn, LogOut, RefreshCcw, ArrowLeft, ShieldCheck, UserRound } from "lucide-react";
+import { useAuth } from "./useAuth";
+
+export type AccountPageProps = {
+     onBackHome: () => void;
+};
+
+function initialsFrom(displayName: string | null | undefined, email: string | null | undefined): string {
+     const base = (displayName?.trim() || email?.trim() || "User").trim();
+     if (!base) return "U";
+
+     const emailName = base.includes("@") ? base.split("@")[0] ?? base : base;
+     const normalized = emailName.replace(/[._-]+/g, " ").trim();
+     const parts = normalized.split(/\s+/g).filter(Boolean);
+
+     if (parts.length >= 2) {
+          return `${parts[0]?.[0] ?? ""}${parts[1]?.[0] ?? ""}`.toUpperCase();
+     }
+     return normalized.slice(0, 2).toUpperCase() || "U";
+}
+
+function cardStyle(): React.CSSProperties {
+     return {
+          width: "100%",
+          maxWidth: 760,
+          borderRadius: 24,
+          border: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
+          background:
+               "linear-gradient(180deg, color-mix(in srgb, var(--card) 94%, white), color-mix(in srgb, var(--card) 98%, transparent))",
+          boxShadow: "0 22px 70px color-mix(in srgb, black 12%, transparent)",
+          padding: 24,
+          backdropFilter: "blur(10px)",
+          WebkitBackdropFilter: "blur(10px)",
+     };
+}
+
+function buttonStyle(kind: "primary" | "secondary" | "danger"): React.CSSProperties {
+     const common: React.CSSProperties = {
+          height: 42,
+          minWidth: 0,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 8,
+          borderRadius: 999,
+          padding: "0 16px",
+          border: "1px solid transparent",
+          cursor: "pointer",
+          fontSize: 14,
+          fontWeight: 760,
+          transition: "all 0.16s cubic-bezier(0.16, 1, 0.3, 1)",
+          textDecoration: "none",
+     };
+
+     if (kind === "primary") {
+          return {
+               ...common,
+               color: "white",
+               background: "var(--fg)",
+               boxShadow: "0 12px 28px color-mix(in srgb, black 18%, transparent)",
+          };
+     }
+
+     if (kind === "danger") {
+          return {
+               ...common,
+               color: "color-mix(in srgb, var(--fg) 78%, #b00020)",
+               background: "transparent",
+               border: "1px solid color-mix(in srgb, var(--border) 76%, transparent)",
+          };
+     }
+
+     return {
+          ...common,
+          color: "var(--fg)",
+          background: "transparent",
+          border: "1px solid color-mix(in srgb, var(--border) 76%, transparent)",
+     };
+}
+
+export function AccountPage({ onBackHome }: AccountPageProps) {
+     const {
+          loading,
+          signedIn,
+          user,
+          error,
+          refresh,
+          signInWithGoogle,
+          signOut,
+     } = useAuth();
+
+     const onSignIn = useCallback(() => {
+          const returnTo = typeof window !== "undefined" ? `${window.location.origin}${window.location.pathname}#/account` : undefined;
+          signInWithGoogle({ returnTo });
+     }, [signInWithGoogle]);
+
+     const onRefresh = useCallback(async () => {
+          await refresh();
+     }, [refresh]);
+
+     const displayName = user?.displayName?.trim() || "Signed in";
+     const email = user?.email?.trim() || "—";
+     const initials = useMemo(() => initialsFrom(user?.displayName, user?.email), [user?.displayName, user?.email]);
+
+     return (
+          <main
+               aria-label="Account"
+               style={{
+                    minHeight: "100%",
+                    display: "grid",
+                    placeItems: "center",
+                    padding: "40px 20px",
+               }}
+          >
+               <div style={cardStyle()}>
+                    <div
+                         style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: 16,
+                              marginBottom: 22,
+                         }}
+                    >
+                         <button
+                              type="button"
+                              onClick={onBackHome}
+                              style={buttonStyle("secondary")}
+                              aria-label="Back home"
+                         >
+                              <ArrowLeft size={16} />
+                              Home
+                         </button>
+
+                         <div
+                              style={{
+                                   display: "inline-flex",
+                                   alignItems: "center",
+                                   gap: 8,
+                                   fontSize: 13,
+                                   opacity: 0.8,
+                              }}
+                         >
+                              <ShieldCheck size={15} />
+                              Session
+                         </div>
+                    </div>
+
+                    <div
+                         style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 16,
+                              marginBottom: 22,
+                         }}
+                    >
+                         <div
+                              aria-hidden="true"
+                              style={{
+                                   width: 56,
+                                   height: 56,
+                                   borderRadius: 999,
+                                   display: "grid",
+                                   placeItems: "center",
+                                   fontSize: 19,
+                                   fontWeight: 820,
+                                   letterSpacing: "0.04em",
+                                   color: "var(--fg)",
+                                   background:
+                                        "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))",
+                                   boxShadow: "0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent)",
+                                   userSelect: "none",
+                                   flex: "0 0 auto",
+                              }}
+                         >
+                              {signedIn ? initials : <UserRound size={24} />}
+                         </div>
+
+                         <div style={{ minWidth: 0 }}>
+                              <h1
+                                   style={{
+                                        margin: 0,
+                                        fontSize: 28,
+                                        lineHeight: 1.05,
+                                        letterSpacing: "-0.02em",
+                                   }}
+                              >
+                                   {signedIn ? "Your account" : "Sign in"}
+                              </h1>
+
+                              <div
+                                   style={{
+                                        marginTop: 8,
+                                        fontSize: 14,
+                                        opacity: 0.78,
+                                   }}
+                              >
+                                   {loading
+                                        ? "Checking session…"
+                                        : signedIn
+                                             ? "Manage the current browser session."
+                                             : "Use Google sign-in to sync your account session."}
+                              </div>
+                         </div>
+                    </div>
+
+                    <div
+                         style={{
+                              borderRadius: 18,
+                              border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
+                              background: "color-mix(in srgb, var(--activeBg) 36%, transparent)",
+                              padding: 16,
+                         }}
+                    >
+                         <div
+                              style={{
+                                   fontSize: 12,
+                                   fontWeight: 760,
+                                   letterSpacing: "0.08em",
+                                   textTransform: "uppercase",
+                                   opacity: 0.64,
+                                   marginBottom: 10,
+                              }}
+                         >
+                              Identity
+                         </div>
+
+                         <div style={{ display: "grid", gap: 10 }}>
+                              <div>
+                                   <div style={{ fontSize: 12, opacity: 0.62, marginBottom: 4 }}>Name</div>
+                                   <div style={{ fontSize: 15, fontWeight: 720 }}>
+                                        {signedIn ? displayName : "Not signed in"}
+                                   </div>
+                              </div>
+
+                              <div>
+                                   <div style={{ fontSize: 12, opacity: 0.62, marginBottom: 4 }}>Email</div>
+                                   <div style={{ fontSize: 15, fontWeight: 640 }}>{signedIn ? email : "—"}</div>
+                              </div>
+                         </div>
+                    </div>
+
+                    {error ? (
+                         <div
+                              role="alert"
+                              style={{
+                                   marginTop: 14,
+                                   borderRadius: 16,
+                                   border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
+                                   background: "color-mix(in srgb, var(--activeBg) 42%, transparent)",
+                                   padding: 12,
+                                   fontSize: 13,
+                              }}
+                         >
+                              {error}
+                         </div>
+                    ) : null}
+
+                    <div
+                         style={{
+                              display: "flex",
+                              flexWrap: "wrap",
+                              gap: 10,
+                              marginTop: 18,
+                         }}
+                    >
+                         {!signedIn ? (
+                              <button
+                                   type="button"
+                                   onClick={onSignIn}
+                                   disabled={loading}
+                                   style={buttonStyle("primary")}
+                              >
+                                   <LogIn size={16} />
+                                   Continue with Google
+                              </button>
+                         ) : (
+                              <>
+                                   <button
+                                        type="button"
+                                        onClick={onRefresh}
+                                        disabled={loading}
+                                        style={buttonStyle("secondary")}
+                                   >
+                                        <RefreshCcw size={16} />
+                                        Refresh session
+                                   </button>
+
+                                   <button
+                                        type="button"
+                                        onClick={() => {
+                                             void signOut();
+                                        }}
+                                        disabled={loading}
+                                        style={buttonStyle("danger")}
+                                   >
+                                        <LogOut size={16} />
+                                        Sign out
+                                   </button>
+                              </>
+                         )}
+                    </div>
+               </div>
+          </main>
+     );
 }
 ```
 
@@ -15532,6 +16542,9 @@ export function AccountMenu({
 // - Normalize transport/server failures into a stable ApiError
 // - Keep UI-facing auth types stable even if API internals evolve
 // - Align with current server.ts auth payloads
+// - Same-origin by default; supports explicit VITE_API_BASE override
+// - Better abort / timeout / diagnostics behavior
+// - Preserve returnTo on OAuth start
 
 export type ApiError = Readonly<{
     code: string;
@@ -15558,18 +16571,32 @@ type ApiEnvelopeErr = Readonly<{ ok: false; error: ApiError }>;
 type ApiEnvelope<T> = ApiEnvelopeOk<T> | ApiEnvelopeErr;
 
 type AuthMeResponseData = Readonly<{
-    user: {
+    user:
+         | {
         id: string;
         email: string | null;
         displayName: string | null;
         emailVerifiedAt: string | Date | null;
         disabledAt?: string | Date | null;
-    } | null;
+    }
+         | null;
 }>;
 
 type AuthLogoutResponseData = Readonly<{
     redirect?: string | null;
 }>;
+
+type BrowserEnv = {
+    VITE_API_BASE?: string;
+};
+
+type ApiFetchEnvelopeOptions<T> = Readonly<{
+    emptyOkData: T;
+    timeoutMs?: number;
+}>;
+
+const DEFAULT_TIMEOUT_MS = 12_000;
+const MAX_ERROR_TEXT_LEN = 500;
 
 function trimSlash(s: string): string {
     return s.replace(/\/+$/, "");
@@ -15580,18 +16607,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function asStringOrNull(value: unknown): string | null {
-    return typeof value === "string" ? value : null;
+    if (typeof value !== "string") return null;
+    const t = value.trim();
+    return t.length > 0 ? t : null;
 }
 
 function toIsoOrNull(value: unknown): string | null {
     if (value == null) return null;
+
     if (typeof value === "string") {
         const t = value.trim();
         return t.length > 0 ? t : null;
     }
+
     if (value instanceof Date && Number.isFinite(value.getTime())) {
         return value.toISOString();
     }
+
     return null;
 }
 
@@ -15616,21 +16648,58 @@ function asApiError(code: string, message: string): ApiError {
     return { code: c, message: m };
 }
 
-function apiBase(): string {
-    const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
-    const explicit = env?.VITE_API_BASE;
-    if (typeof explicit === "string" && explicit.trim()) {
-        return trimSlash(explicit.trim());
+function envObject(): BrowserEnv {
+    const meta = import.meta as ImportMeta & { env?: BrowserEnv };
+    return meta.env ?? {};
+}
+
+function isAbsoluteHttpUrl(input: string): boolean {
+    try {
+        const u = new URL(input);
+        return u.protocol === "http:" || u.protocol === "https:";
+    } catch {
+        return false;
     }
-    return "http://localhost:3000";
+}
+
+function isPathLikeBase(input: string): boolean {
+    return input.startsWith("/");
+}
+
+function apiBase(): string {
+    const env = envObject();
+    const explicit = env.VITE_API_BASE;
+
+    if (typeof explicit === "string" && explicit.trim()) {
+        const normalized = explicit.trim();
+
+        if (isAbsoluteHttpUrl(normalized)) {
+            return trimSlash(normalized);
+        }
+
+        if (isPathLikeBase(normalized)) {
+            return trimSlash(normalized);
+        }
+    }
+
+    return "";
 }
 
 export { apiBase };
 
 function buildUrl(path: string): string {
-    const base = apiBase();
     const p = path.startsWith("/") ? path : `/${path}`;
-    return new URL(p, `${trimSlash(base)}/`).toString();
+    const base = apiBase();
+
+    if (!base) {
+        return p;
+    }
+
+    if (isAbsoluteHttpUrl(base)) {
+        return new URL(p, `${trimSlash(base)}/`).toString();
+    }
+
+    return `${trimSlash(base)}${p}`;
 }
 
 function isJsonContentType(ct: string | null): boolean {
@@ -15639,10 +16708,7 @@ function isJsonContentType(ct: string | null): boolean {
     return v.includes("application/json") || v.includes("+json");
 }
 
-function mergeHeaders(
-     base: Record<string, string>,
-     extra?: HeadersInit,
-): Headers {
+function mergeHeaders(base: Record<string, string>, extra?: HeadersInit): Headers {
     const out = new Headers(base);
     if (!extra) return out;
 
@@ -15659,17 +16725,98 @@ function mergeHeaders(
     for (const [key, value] of Object.entries(extra)) {
         if (typeof value !== "undefined") out.set(key, String(value));
     }
+
     return out;
 }
 
-type FetchEnvelopeOptions<T> = Readonly<{
-    emptyOkData: T;
-}>;
+function clipErrorText(text: string): string {
+    const trimmed = text.trim();
+    if (trimmed.length <= MAX_ERROR_TEXT_LEN) return trimmed;
+    return `${trimmed.slice(0, MAX_ERROR_TEXT_LEN)}…`;
+}
+
+function anySignalAborted(signal?: AbortSignal | null): boolean {
+    return !!signal?.aborted;
+}
+
+function mergeAbortSignals(
+     a?: AbortSignal,
+     b?: AbortSignal,
+): { signal?: AbortSignal; cleanup: () => void } {
+    if (!a && !b) {
+        return { signal: undefined, cleanup: () => void 0 };
+    }
+    if (a && !b) {
+        return { signal: a, cleanup: () => void 0 };
+    }
+    if (!a && b) {
+        return { signal: b, cleanup: () => void 0 };
+    }
+
+    const controller = new AbortController();
+
+    const abortFrom = (source: AbortSignal) => {
+        const reason = (source as AbortSignal & { reason?: unknown }).reason;
+        try {
+            controller.abort(reason);
+        } catch {
+            controller.abort();
+        }
+    };
+
+    if (a?.aborted) abortFrom(a);
+    if (b?.aborted) abortFrom(b);
+
+    const onAbortA = () => {
+        if (a) abortFrom(a);
+    };
+    const onAbortB = () => {
+        if (b) abortFrom(b);
+    };
+
+    a?.addEventListener("abort", onAbortA, { once: true });
+    b?.addEventListener("abort", onAbortB, { once: true });
+
+    return {
+        signal: controller.signal,
+        cleanup: () => {
+            a?.removeEventListener("abort", onAbortA);
+            b?.removeEventListener("abort", onAbortB);
+        },
+    };
+}
+
+function createTimeoutSignal(
+     timeoutMs: number | undefined,
+): { signal?: AbortSignal; cancel: () => void } {
+    if (typeof window === "undefined") {
+        return { signal: undefined, cancel: () => void 0 };
+    }
+
+    const ms =
+         typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+              ? Math.floor(timeoutMs)
+              : DEFAULT_TIMEOUT_MS;
+
+    const controller = new AbortController();
+    const id = window.setTimeout(() => {
+        try {
+            controller.abort(new DOMException("Request timed out", "TimeoutError"));
+        } catch {
+            controller.abort();
+        }
+    }, ms);
+
+    return {
+        signal: controller.signal,
+        cancel: () => window.clearTimeout(id),
+    };
+}
 
 async function apiFetchEnvelope<T>(
      path: string,
      init: RequestInit,
-     opts: FetchEnvelopeOptions<T>,
+     opts: ApiFetchEnvelopeOptions<T>,
 ): Promise<ApiEnvelope<T>> {
     const url = buildUrl(path);
     const hasBody = typeof init.body !== "undefined" && init.body !== null;
@@ -15682,15 +16829,39 @@ async function apiFetchEnvelope<T>(
          init.headers,
     );
 
+    const timeout = createTimeoutSignal(opts.timeoutMs);
+    const merged = mergeAbortSignals(init.signal ?? undefined, timeout.signal);
+
     let res: Response;
     try {
+        if (anySignalAborted(merged.signal)) {
+            return {
+                ok: false,
+                error: asApiError("aborted", "Request was aborted"),
+            };
+        }
+
         res = await fetch(url, {
             ...init,
+            signal: merged.signal,
             credentials: "include",
-            mode: "cors",
             headers,
         });
     } catch (error) {
+        timeout.cancel();
+        merged.cleanup();
+
+        if (error instanceof DOMException && error.name === "AbortError") {
+            const timedOut = timeout.signal?.aborted;
+            return {
+                ok: false,
+                error: asApiError(
+                     timedOut ? "timeout" : "aborted",
+                     timedOut ? "Request timed out" : "Request was aborted",
+                ),
+            };
+        }
+
         return {
             ok: false,
             error: asApiError(
@@ -15700,18 +16871,34 @@ async function apiFetchEnvelope<T>(
         };
     }
 
+    timeout.cancel();
+    merged.cleanup();
+
     if (res.status === 204) {
         return { ok: true, data: opts.emptyOkData };
     }
 
-    const ct = res.headers.get("content-type");
-    const text = await res.text();
+    let text = "";
+    try {
+        text = await res.text();
+    } catch {
+        if (res.ok) {
+            return { ok: true, data: opts.emptyOkData };
+        }
+        return {
+            ok: false,
+            error: asApiError("read_error", `Failed to read response body (HTTP ${res.status})`),
+        };
+    }
+
     const trimmed = text.trim();
+    const ct = res.headers.get("content-type");
 
     if (!trimmed) {
         if (res.ok) {
             return { ok: true, data: opts.emptyOkData };
         }
+
         return {
             ok: false,
             error: asApiError("empty_error_response", `HTTP ${res.status}`),
@@ -15719,10 +16906,19 @@ async function apiFetchEnvelope<T>(
     }
 
     if (!isJsonContentType(ct)) {
-        const msg = trimmed.length > 500 ? `${trimmed.slice(0, 500)}…` : trimmed;
+        if (res.ok) {
+            return {
+                ok: false,
+                error: asApiError(
+                     "non_json",
+                     `Expected JSON response but received ${ct || "unknown content type"}`,
+                ),
+            };
+        }
+
         return {
             ok: false,
-            error: asApiError("non_json", msg || `HTTP ${res.status}`),
+            error: asApiError("non_json", clipErrorText(trimmed) || `HTTP ${res.status}`),
         };
     }
 
@@ -15744,6 +16940,7 @@ async function apiFetchEnvelope<T>(
     }
 
     const ok = parsed.ok;
+
     if (ok === false) {
         const rawError = parsed.error;
         if (isRecord(rawError)) {
@@ -15755,6 +16952,7 @@ async function apiFetchEnvelope<T>(
                 ),
             };
         }
+
         return {
             ok: false,
             error: asApiError("api_error", `HTTP ${res.status}`),
@@ -15764,7 +16962,9 @@ async function apiFetchEnvelope<T>(
     if (ok === true) {
         return {
             ok: true,
-            data: ("data" in parsed ? (parsed.data as T) : opts.emptyOkData),
+            data: Object.prototype.hasOwnProperty.call(parsed, "data")
+                 ? (parsed.data as T)
+                 : opts.emptyOkData,
         };
     }
 
@@ -15792,8 +16992,10 @@ export async function apiAuthMe(signal?: AbortSignal): Promise<AuthMePayload> {
         return res;
     }
 
-    const user = normalizeAuthUser(res.data.user);
-    return { ok: true, user };
+    return {
+        ok: true,
+        user: normalizeAuthUser(res.data.user),
+    };
 }
 
 export async function apiAuthLogout(signal?: AbortSignal): Promise<AuthLogoutPayload> {
@@ -15809,15 +17011,32 @@ export async function apiAuthLogout(signal?: AbortSignal): Promise<AuthLogoutPay
 
     return {
         ok: true,
-        redirect: typeof res.data.redirect === "string" && res.data.redirect.trim()
-             ? res.data.redirect
-             : null,
+        redirect:
+             typeof res.data.redirect === "string" && res.data.redirect.trim()
+                  ? res.data.redirect.trim()
+                  : null,
     };
 }
 
-export function googleStartUrl(_returnTo?: string): string {
-    // Server currently owns redirect targets; ignore returnTo until explicitly supported server-side.
-    return buildUrl("/auth/google/start");
+function isSafeReturnTo(value: string): boolean {
+    try {
+        const url = new URL(value, window.location.origin);
+        return url.origin === window.location.origin;
+    } catch {
+        return false;
+    }
+}
+
+export function googleStartUrl(returnTo?: string): string {
+    const url = new URL(buildUrl("/auth/google/start"), window.location.origin);
+
+    const next =
+         typeof returnTo === "string" && returnTo.trim() && isSafeReturnTo(returnTo)
+              ? new URL(returnTo, window.location.origin).toString()
+              : window.location.href;
+
+    url.searchParams.set("returnTo", next);
+    return url.toString();
 }
 
 /**
@@ -15826,15 +17045,13 @@ export function googleStartUrl(_returnTo?: string): string {
  */
 export function navigateToGoogleStart(returnTo?: string): void {
     if (typeof window === "undefined") return;
-    const url = googleStartUrl(returnTo ?? window.location.href);
-    window.location.assign(url);
+    window.location.assign(googleStartUrl(returnTo ?? window.location.href));
 }
 ```
 
 ### apps/web/src/auth/useAuth.tsx
 
 ```tsx
-// apps/web/src/auth/useAuth.tsx
 import React, {
     createContext,
     useCallback,
@@ -15849,32 +17066,46 @@ import { apiAuthLogout, apiAuthMe, navigateToGoogleStart, type AuthUser } from "
 /**
  * Biblia.to — auth state provider
  *
- * Properties:
- * - coalesced /auth/me requests
- * - TTL caching to avoid pointless hammering
- * - StrictMode-safe initialization
- * - cross-tab sync via BroadcastChannel + storage fallback
- * - optimistic sign-out with server reconciliation
- * - no OAuth fetch misuse; login is top-level navigation only
- * - safe cleanup / abort / stale-request protection
+ * Responsibilities:
+ * - server-session hydration via /auth/me
+ * - coalesced refreshes with TTL
+ * - StrictMode-safe lifecycle
+ * - cross-tab sync (BroadcastChannel + storage fallback)
+ * - auth-aware navigation helpers for account surfaces
+ * - optimistic sign-out + server reconciliation
+ *
+ * Anti-loop rules:
+ * - exactly one BroadcastChannel instance per mounted provider
+ * - postBroadcast never creates channels
+ * - no signed_in broadcast
+ * - no hashchange-triggered auth refresh
+ * - OAuth-return detection uses query params only, never #/account
  */
 
 export type AuthState = Readonly<{
     loading: boolean;
     user: AuthUser | null;
     error: string | null;
+    signedIn: boolean;
 
     refresh: () => Promise<void>;
     refreshForce: () => Promise<void>;
+
     signInWithGoogle: (opts?: { returnTo?: string }) => void;
     signOut: () => Promise<void>;
+
+    accountHref: string;
+    openAccountPage: () => void;
 }>;
 
 const AuthContext = createContext<AuthState | null>(null);
 
 const AUTH_BC = "bp-auth";
 const AUTH_STORAGE_EVENT_KEY = "bp.auth.event.v1";
+
 const DEFAULT_ME_TTL_MS = 10_000;
+const FOCUS_REFRESH_COOLDOWN_MS = 4_000;
+const VISIBILITY_REFRESH_COOLDOWN_MS = 4_000;
 
 type Inflight = Readonly<{
     id: number;
@@ -15883,7 +17114,7 @@ type Inflight = Readonly<{
 }>;
 
 type BroadcastMsg = Readonly<{
-    type: "refresh" | "signed_out" | "signed_in";
+    type: "refresh" | "signed_out";
     at: number;
 }>;
 
@@ -15895,11 +17126,15 @@ function isBrowser(): boolean {
     return typeof window !== "undefined" && typeof document !== "undefined";
 }
 
+function getAccountHref(): string {
+    return "#/account";
+}
+
 function isBroadcastMsg(value: unknown): value is BroadcastMsg {
     if (!value || typeof value !== "object") return false;
     const v = value as Record<string, unknown>;
     return (
-         (v.type === "refresh" || v.type === "signed_out" || v.type === "signed_in") &&
+         (v.type === "refresh" || v.type === "signed_out") &&
          typeof v.at === "number" &&
          Number.isFinite(v.at)
     );
@@ -15916,6 +17151,7 @@ function safePostStorageEvent(msg: BroadcastMsg): void {
 
 function safeParseStorageEvent(raw: string | null): BroadcastMsg | null {
     if (!raw) return null;
+
     try {
         const parsed: unknown = JSON.parse(raw);
         return isBroadcastMsg(parsed) ? parsed : null;
@@ -15925,7 +17161,29 @@ function safeParseStorageEvent(raw: string | null): BroadcastMsg | null {
 }
 
 function shouldRefreshForMessage(msg: BroadcastMsg): boolean {
-    return msg.type === "refresh" || msg.type === "signed_out" || msg.type === "signed_in";
+    return msg.type === "refresh" || msg.type === "signed_out";
+}
+
+function safeErrorMessage(err: unknown, fallback: string): string {
+    if (err instanceof Error) {
+        const msg = err.message.trim();
+        return msg || fallback;
+    }
+    return fallback;
+}
+
+function looksLikeOAuthReturn(): boolean {
+    if (!isBrowser()) return false;
+
+    const q = new URLSearchParams(window.location.search);
+    return (
+         q.has("code") ||
+         q.has("state") ||
+         q.has("auth") ||
+         q.has("logged_in") ||
+         q.has("session") ||
+         q.has("oauth")
+    );
 }
 
 export function AuthProvider(props: { children: React.ReactNode }) {
@@ -15939,10 +17197,42 @@ export function AuthProvider(props: { children: React.ReactNode }) {
     const hydratedRef = useRef<boolean>(false);
     const lastMeAtRef = useRef<number>(0);
     const requestSeqRef = useRef<number>(0);
-    const initStartedRef = useRef<boolean>(false);
-    const unmountedRef = useRef<boolean>(false);
+    const mountSeqRef = useRef<number>(0);
+    const activeMountIdRef = useRef<number>(0);
+
     const bcRef = useRef<BroadcastChannel | null>(null);
     const lastSeenBroadcastAtRef = useRef<number>(0);
+    const lastFocusRefreshAtRef = useRef<number>(0);
+    const lastVisibilityRefreshAtRef = useRef<number>(0);
+    const signOutInFlightRef = useRef<Promise<void> | null>(null);
+
+    const isActiveMount = useCallback((mountId: number): boolean => {
+        return activeMountIdRef.current === mountId;
+    }, []);
+
+    const setLoadingIfActive = useCallback(
+         (mountId: number, next: boolean) => {
+             if (!isActiveMount(mountId)) return;
+             setLoading(next);
+         },
+         [isActiveMount],
+    );
+
+    const setUserIfActive = useCallback(
+         (mountId: number, next: AuthUser | null) => {
+             if (!isActiveMount(mountId)) return;
+             setUser(next);
+         },
+         [isActiveMount],
+    );
+
+    const setErrorIfActive = useCallback(
+         (mountId: number, next: string | null) => {
+             if (!isActiveMount(mountId)) return;
+             setError(next);
+         },
+         [isActiveMount],
+    );
 
     const postBroadcast = useCallback((msg: BroadcastMsg) => {
         if (!isBrowser()) return;
@@ -15950,12 +17240,7 @@ export function AuthProvider(props: { children: React.ReactNode }) {
         lastSeenBroadcastAtRef.current = Math.max(lastSeenBroadcastAtRef.current, msg.at);
 
         try {
-            if ("BroadcastChannel" in window) {
-                if (!bcRef.current) {
-                    bcRef.current = new BroadcastChannel(AUTH_BC);
-                }
-                bcRef.current.postMessage(msg);
-            }
+            bcRef.current?.postMessage(msg);
         } catch {
             // ignore
         }
@@ -15970,8 +17255,15 @@ export function AuthProvider(props: { children: React.ReactNode }) {
         }
     }, []);
 
+    const abortInflight = useCallback(() => {
+        const current = inflightRef.current;
+        if (!current) return;
+        current.ac.abort();
+        inflightRef.current = null;
+    }, []);
+
     const refreshImpl = useCallback(
-         async (force: boolean): Promise<void> => {
+         async (force: boolean, mountId?: number): Promise<void> => {
              const now = nowMs();
 
              if (!force && hydratedRef.current && now - lastMeAtRef.current < DEFAULT_ME_TTL_MS) {
@@ -15983,44 +17275,69 @@ export function AuthProvider(props: { children: React.ReactNode }) {
              }
 
              if (force && inflightRef.current) {
-                 inflightRef.current.ac.abort();
-                 inflightRef.current = null;
+                 abortInflight();
              }
 
              const id = ++requestSeqRef.current;
              const ac = new AbortController();
 
+             const setLoadingSafe = (next: boolean) => {
+                 if (mountId == null) {
+                     setLoading(next);
+                     return;
+                 }
+                 setLoadingIfActive(mountId, next);
+             };
+
+             const setUserSafe = (next: AuthUser | null) => {
+                 if (mountId == null) {
+                     setUser(next);
+                     return;
+                 }
+                 setUserIfActive(mountId, next);
+             };
+
+             const setErrorSafe = (next: string | null) => {
+                 if (mountId == null) {
+                     setError(next);
+                     return;
+                 }
+                 setErrorIfActive(mountId, next);
+             };
+
              if (!hydratedRef.current) {
-                 setLoading(true);
+                 setLoadingSafe(true);
              }
 
              const p: Promise<void> = (async () => {
                  try {
-                     setError(null);
+                     setErrorSafe(null);
 
                      const res = await apiAuthMe(ac.signal);
-                     if (ac.signal.aborted || unmountedRef.current) return;
+                     if (ac.signal.aborted) return;
+                     if (mountId != null && !isActiveMount(mountId)) return;
 
                      hydratedRef.current = true;
                      lastMeAtRef.current = nowMs();
 
                      if (res.ok) {
-                         setUser(res.user);
-                         setError(null);
+                         setUserSafe(res.user);
+                         setErrorSafe(null);
                      } else {
-                         setUser(null);
-                         setError(res.error.message || "Auth error");
+                         setUserSafe(null);
+                         setErrorSafe(res.error.message || "Auth error");
                      }
                  } catch (err) {
-                     if (ac.signal.aborted || unmountedRef.current) return;
+                     if (ac.signal.aborted) return;
+                     if (mountId != null && !isActiveMount(mountId)) return;
 
                      hydratedRef.current = true;
                      lastMeAtRef.current = nowMs();
-                     setUser(null);
-                     setError(err instanceof Error ? err.message : "Auth error");
+                     setUserSafe(null);
+                     setErrorSafe(safeErrorMessage(err, "Auth error"));
                  } finally {
-                     if (!ac.signal.aborted && !unmountedRef.current) {
-                         setLoading(false);
+                     if (!ac.signal.aborted && (mountId == null || isActiveMount(mountId))) {
+                         setLoadingSafe(false);
                      }
                      clearInflightIfSame(id);
                  }
@@ -16029,7 +17346,7 @@ export function AuthProvider(props: { children: React.ReactNode }) {
              inflightRef.current = { id, ac, p };
              return p;
          },
-         [clearInflightIfSame],
+         [abortInflight, clearInflightIfSame, isActiveMount, setErrorIfActive, setLoadingIfActive, setUserIfActive],
     );
 
     const refresh = useCallback(async (): Promise<void> => {
@@ -16040,34 +17357,107 @@ export function AuthProvider(props: { children: React.ReactNode }) {
         await refreshImpl(true);
     }, [refreshImpl]);
 
+    const openAccountPage = useCallback(() => {
+        if (!isBrowser()) return;
+        if (window.location.hash !== getAccountHref()) {
+            window.location.hash = getAccountHref();
+        }
+    }, []);
+
+    const signInWithGoogle = useCallback((opts?: { returnTo?: string }) => {
+        if (!isBrowser()) return;
+        const returnTo = opts?.returnTo ?? window.location.href;
+        navigateToGoogleStart(returnTo);
+    }, []);
+
+    const signOut = useCallback(async (): Promise<void> => {
+        if (signOutInFlightRef.current) {
+            return signOutInFlightRef.current;
+        }
+
+        const run = (async () => {
+            abortInflight();
+
+            setUser(null);
+            setError(null);
+            setLoading(false);
+            hydratedRef.current = true;
+            lastMeAtRef.current = nowMs();
+
+            let redirected = false;
+
+            try {
+                const ac = new AbortController();
+                const res = await apiAuthLogout(ac.signal);
+
+                if (!res.ok) {
+                    setError(res.error.message || "Sign out failed");
+                }
+
+                postBroadcast({ type: "signed_out", at: nowMs() });
+
+                if (res.ok && res.redirect && isBrowser()) {
+                    const redirect = res.redirect.trim();
+                    if (redirect) {
+                        redirected = true;
+                        window.location.assign(redirect);
+                        return;
+                    }
+                }
+            } catch (err) {
+                setError(safeErrorMessage(err, "Sign out failed"));
+                postBroadcast({ type: "signed_out", at: nowMs() });
+            } finally {
+                if (!redirected) {
+                    await refreshImpl(true);
+                }
+            }
+        })();
+
+        signOutInFlightRef.current = run;
+
+        try {
+            await run;
+        } finally {
+            signOutInFlightRef.current = null;
+        }
+    }, [abortInflight, postBroadcast, refreshImpl]);
+
     useEffect(() => {
         if (!isBrowser()) return;
-        if (initStartedRef.current) return;
 
-        initStartedRef.current = true;
-        unmountedRef.current = false;
+        const mountId = ++mountSeqRef.current;
+        activeMountIdRef.current = mountId;
 
-        void refreshForce();
+        void refreshImpl(true, mountId);
 
         const onFocus = () => {
-            void refreshForce();
+            const now = nowMs();
+            if (now - lastFocusRefreshAtRef.current < FOCUS_REFRESH_COOLDOWN_MS) return;
+            lastFocusRefreshAtRef.current = now;
+            void refreshImpl(true, mountId);
         };
 
         const onVisibilityChange = () => {
-            if (document.visibilityState === "visible") {
-                void refreshForce();
-            }
+            if (document.visibilityState !== "visible") return;
+
+            const now = nowMs();
+            if (now - lastVisibilityRefreshAtRef.current < VISIBILITY_REFRESH_COOLDOWN_MS) return;
+            lastVisibilityRefreshAtRef.current = now;
+            void refreshImpl(true, mountId);
         };
 
         const onStorage = (ev: StorageEvent) => {
             if (ev.key !== AUTH_STORAGE_EVENT_KEY) return;
+
             const msg = safeParseStorageEvent(ev.newValue);
             if (!msg) return;
             if (msg.at <= lastSeenBroadcastAtRef.current) return;
 
             lastSeenBroadcastAtRef.current = msg.at;
+
             if (shouldRefreshForMessage(msg)) {
-                void refreshForce();
+                void refreshImpl(true, mountId);
             }
         };
 
@@ -16077,34 +17467,38 @@ export function AuthProvider(props: { children: React.ReactNode }) {
 
         try {
             if ("BroadcastChannel" in window) {
-                bcRef.current = new BroadcastChannel(AUTH_BC);
-                bcRef.current.onmessage = (ev: MessageEvent<unknown>) => {
+                const bc = new BroadcastChannel(AUTH_BC);
+                bc.onmessage = (ev: MessageEvent<unknown>) => {
                     const msg = ev.data;
                     if (!isBroadcastMsg(msg)) return;
                     if (msg.at <= lastSeenBroadcastAtRef.current) return;
 
                     lastSeenBroadcastAtRef.current = msg.at;
+
                     if (shouldRefreshForMessage(msg)) {
-                        void refreshForce();
+                        void refreshImpl(true, mountId);
                     }
                 };
+                bcRef.current = bc;
             }
         } catch {
             bcRef.current = null;
         }
 
+        if (looksLikeOAuthReturn()) {
+            void refreshImpl(true, mountId);
+        }
+
         return () => {
-            unmountedRef.current = true;
+            if (activeMountIdRef.current === mountId) {
+                activeMountIdRef.current = 0;
+            }
 
             window.removeEventListener("focus", onFocus);
             document.removeEventListener("visibilitychange", onVisibilityChange);
             window.removeEventListener("storage", onStorage);
 
-            const current = inflightRef.current;
-            if (current) {
-                current.ac.abort();
-                inflightRef.current = null;
-            }
+            abortInflight();
 
             if (bcRef.current) {
                 try {
@@ -16115,59 +17509,22 @@ export function AuthProvider(props: { children: React.ReactNode }) {
                 bcRef.current = null;
             }
         };
-    }, [refreshForce]);
-
-    const signInWithGoogle = useCallback((opts?: { returnTo?: string }) => {
-        if (!isBrowser()) return;
-        const returnTo = opts?.returnTo ?? window.location.href;
-        navigateToGoogleStart(returnTo);
-    }, []);
-
-    const signOut = useCallback(async (): Promise<void> => {
-        const current = inflightRef.current;
-        if (current) {
-            current.ac.abort();
-            inflightRef.current = null;
-        }
-
-        setUser(null);
-        setError(null);
-        setLoading(false);
-
-        try {
-            const ac = new AbortController();
-            const res = await apiAuthLogout(ac.signal);
-
-            if (!res.ok) {
-                setError(res.error.message || "Sign out failed");
-            }
-
-            if (res.ok && res.redirect && isBrowser()) {
-                const redirect = res.redirect.trim();
-                if (redirect) {
-                    window.location.assign(redirect);
-                    return;
-                }
-            }
-        } catch (err) {
-            setError(err instanceof Error ? err.message : "Sign out failed");
-        } finally {
-            postBroadcast({ type: "signed_out", at: nowMs() });
-            await refreshForce();
-        }
-    }, [postBroadcast, refreshForce]);
+    }, [abortInflight, refreshImpl]);
 
     const value = useMemo<AuthState>(
          () => ({
              loading,
              user,
              error,
+             signedIn: !!user,
              refresh,
              refreshForce,
              signInWithGoogle,
              signOut,
+             accountHref: getAccountHref(),
+             openAccountPage,
          }),
-         [loading, user, error, refresh, refreshForce, signInWithGoogle, signOut],
+         [loading, user, error, refresh, refreshForce, signInWithGoogle, signOut, openAccountPage],
     );
 
     return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
@@ -16187,17 +17544,20 @@ export function useAuth(): AuthState {
 ```css
 /* apps/web/src/base.css — Biblia.to (minimal, reading-first, premium)
  *
- * Goals:
- * - Paper-soft light mode
- * - Ink-like dark mode
- * - Stable layout and scrollbars
- * - Controlled theme transitions
- * - Strong accessibility defaults
- * - Reader/annotation-ready primitives
+ * Hardened / improved:
+ * - stronger token system with explicit interactive + elevation primitives
+ * - safer viewport + safe-area handling
+ * - calmer theme swap rules without global jitter
+ * - better accessibility: forced-colors, contrast, disabled states, form controls
+ * - more robust overlay / backdrop fallback
+ * - improved typography defaults for scripture reading
+ * - annotation-ready color tokens + selection behavior
+ * - print-safe baseline
  *
  * Notes:
  * - Theme transitions are enabled only during explicit swaps via html.bp-theme-swap
  * - Layout tokens remain global primitives; component CSS should build on them
+ * - Keep this file global and boring: primitives only, no component-specific styling
  */
 
 /* =========================================================
@@ -16211,12 +17571,15 @@ export function useAuth(): AuthState {
             ui-sans-serif,
             system-ui,
             -apple-system,
+            BlinkMacSystemFont,
             "Segoe UI",
             Roboto,
             Arial,
             "Noto Sans",
             "Apple Color Emoji",
-            "Segoe UI Emoji";
+            "Segoe UI Emoji",
+            sans-serif;
+
     --font-serif:
             "Literata Variable",
             Literata,
@@ -16228,6 +17591,7 @@ export function useAuth(): AuthState {
             "Times New Roman",
             Times,
             serif;
+
     --font-rounded:
             "Quicksand Variable",
             Quicksand,
@@ -16236,32 +17600,64 @@ export function useAuth(): AuthState {
             -apple-system,
             "Segoe UI",
             Roboto,
-            Arial;
+            Arial,
+            sans-serif;
+
+    --font-mono:
+            ui-monospace,
+            SFMono-Regular,
+            Menlo,
+            Monaco,
+            Consolas,
+            "Liberation Mono",
+            "Courier New",
+            monospace;
 
     /* ---------------- Reader Typography ---------------- */
     --bpScriptureFont: var(--font-serif);
     --bpScriptureSize: 18px;
-    --bpScriptureLeading: 1.75;
+    --bpScriptureLeading: 1.78;
     --bpScriptureWeight: 400;
+    --bpScriptureTracking: 0;
     --bpReaderMeasure: 840px;
+    --bpReaderMeasureTight: 720px;
+
+    /* ---------------- App Typography ---------------- */
+    --text: 16px;
+    --leading: 1.6;
+    --tracking-tight: -0.02em;
+    --tracking-normal: 0.01em;
+    --tracking-wide: 0.02em;
 
     /* ---------------- Layout ---------------- */
     --container: 980px;
     --reading: 720px;
+    --pagePadX: 16px;
+    --pagePadY: 16px;
+    --safeTop: env(safe-area-inset-top, 0px);
+    --safeRight: env(safe-area-inset-right, 0px);
+    --safeBottom: env(safe-area-inset-bottom, 0px);
+    --safeLeft: env(safe-area-inset-left, 0px);
 
     /* ---------------- Radii ---------------- */
     --radius: 18px;
     --radius-sm: 13px;
     --radius-xs: 10px;
+    --radius-2xs: 8px;
+    --radius-pill: 999px;
 
     /* ---------------- Borders / Hairlines ---------------- */
     --hairlineW: 1px;
+    --hairlineW-strong: 1px;
 
-    /* ---------------- Text ---------------- */
-    --text: 16px;
-    --leading: 1.6;
-    --tracking-tight: -0.02em;
-    --tracking-normal: 0.01em;
+    /* ---------------- Spacing hints ---------------- */
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 20px;
+    --space-6: 24px;
+    --space-8: 32px;
 
     /* ---------------- Theme transition ---------------- */
     --themeDur: 320ms;
@@ -16271,46 +17667,65 @@ export function useAuth(): AuthState {
     --dur-1: 140ms;
     --dur-2: 220ms;
     --dur-3: 320ms;
+    --dur-4: 420ms;
     --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
     --ease-in: cubic-bezier(0.4, 0, 1, 1);
+    --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
 
     /* ---------------- Light Theme (Paper) ---------------- */
     --bg: #f6f4f0;
+    --bg-elevated: #faf8f5;
     --fg: #101012;
     --muted: rgba(16, 16, 18, 0.58);
     --muted2: rgba(16, 16, 18, 0.44);
+    --muted3: rgba(16, 16, 18, 0.3);
 
     --hairline: rgba(16, 16, 18, 0.11);
     --hairline2: rgba(16, 16, 18, 0.075);
+    --hairline3: rgba(16, 16, 18, 0.16);
 
     --panel: rgba(16, 16, 18, 0.025);
     --panel2: rgba(16, 16, 18, 0.04);
+    --panel3: rgba(16, 16, 18, 0.06);
 
     --overlay: rgba(246, 244, 240, 0.9);
     --overlay2: rgba(246, 244, 240, 0.96);
+    --scrim: rgba(16, 16, 18, 0.26);
     --activeBg: rgba(16, 16, 18, 0.045);
+    --hoverBg: rgba(16, 16, 18, 0.032);
+    --pressBg: rgba(16, 16, 18, 0.06);
 
     /* Brand / accents */
     --accent: rgba(170, 34, 34, 0.92);
     --accent2: rgba(170, 34, 34, 0.22);
+    --accent3: rgba(170, 34, 34, 0.1);
     --link: rgba(16, 16, 18, 0.86);
+    --visited: rgba(72, 46, 128, 0.82);
+
+    /* State */
+    --ok: rgba(19, 136, 94, 0.9);
+    --warn: rgba(180, 110, 12, 0.95);
+    --danger: rgba(186, 46, 46, 0.94);
 
     /* Selection */
     --selectionBg: rgba(16, 16, 18, 0.12);
 
     /* Focus */
-    --focusRing: rgba(16, 16, 18, 0.12);
+    --focusRing: rgba(16, 16, 18, 0.16);
     --focusShadow: 0 0 0 6px rgba(16, 16, 18, 0.08);
 
     /* Shadows */
     --shadowSoft: 0 10px 32px rgba(0, 0, 0, 0.1);
     --shadowPop: 0 24px 90px rgba(0, 0, 0, 0.18);
+    --shadowCard: 0 10px 28px rgba(0, 0, 0, 0.08);
     --shadowInset: inset 0 1px 0 rgba(255, 255, 255, 0.35);
 
     /* Scrollbars */
     --scrollTrack: rgba(16, 16, 18, 0.06);
     --scrollThumb: rgba(16, 16, 18, 0.18);
     --scrollThumbHover: rgba(16, 16, 18, 0.28);
+    --scrollSize: 10px;
+    --scrollRadius: 999px;
 
     /* Ambient */
     --ambientInk: rgba(16, 16, 18, 0.06);
@@ -16321,32 +17736,51 @@ export function useAuth(): AuthState {
     --hl-yellow: rgba(255, 213, 74, 0.45);
     --hl-green: rgba(72, 201, 176, 0.28);
     --hl-blue: rgba(120, 180, 255, 0.24);
+    --hl-rose: rgba(238, 118, 148, 0.24);
     --ink: rgba(16, 16, 18, 0.72);
     --ink-soft: rgba(16, 16, 18, 0.42);
 
-    /* Scrollbar geometry */
-    --scrollSize: 10px;
-    --scrollRadius: 999px;
+    /* Forms */
+    --controlH: 40px;
+    --controlPadX: 12px;
+    --controlBg: var(--panel);
+    --controlBorder: var(--hairline);
+    --controlBorderHover: var(--hairline3);
+
+    /* Layer hints */
+    --z-base: 0;
+    --z-sticky: 20;
+    --z-popover: 80;
+    --z-overlay: 90;
+    --z-modal: 100;
+    --z-toast: 110;
 }
 
 @supports (color: color-mix(in oklab, white, black)) {
     :root {
         --muted: color-mix(in oklab, var(--fg) 58%, transparent);
         --muted2: color-mix(in oklab, var(--fg) 44%, transparent);
+        --muted3: color-mix(in oklab, var(--fg) 30%, transparent);
 
         --hairline: color-mix(in oklab, var(--fg) 12%, transparent);
         --hairline2: color-mix(in oklab, var(--fg) 8%, transparent);
+        --hairline3: color-mix(in oklab, var(--fg) 17%, transparent);
 
         --panel: color-mix(in oklab, var(--fg) 3%, transparent);
         --panel2: color-mix(in oklab, var(--fg) 5%, transparent);
+        --panel3: color-mix(in oklab, var(--fg) 7%, transparent);
 
         --overlay: color-mix(in oklab, var(--bg) 90%, transparent);
         --overlay2: color-mix(in oklab, var(--bg) 96%, transparent);
+        --scrim: color-mix(in oklab, var(--fg) 26%, transparent);
+
         --activeBg: color-mix(in oklab, var(--fg) 5%, transparent);
+        --hoverBg: color-mix(in oklab, var(--fg) 3.5%, transparent);
+        --pressBg: color-mix(in oklab, var(--fg) 6.5%, transparent);
 
         --selectionBg: color-mix(in oklab, var(--fg) 14%, transparent);
 
-        --focusRing: color-mix(in oklab, var(--fg) 13%, transparent);
+        --focusRing: color-mix(in oklab, var(--fg) 16%, transparent);
         --focusShadow: 0 0 0 6px color-mix(in oklab, var(--fg) 10%, transparent);
 
         --scrollTrack: color-mix(in oklab, var(--fg) 6%, transparent);
@@ -16360,8 +17794,13 @@ export function useAuth(): AuthState {
         --hl-yellow: color-mix(in oklab, #ffd54a 52%, transparent);
         --hl-green: color-mix(in oklab, #48c9b0 34%, transparent);
         --hl-blue: color-mix(in oklab, #78b4ff 32%, transparent);
+        --hl-rose: color-mix(in oklab, #ee7694 28%, transparent);
+
         --ink: color-mix(in oklab, var(--fg) 78%, transparent);
         --ink-soft: color-mix(in oklab, var(--fg) 46%, transparent);
+
+        --accent2: color-mix(in oklab, var(--accent) 24%, transparent);
+        --accent3: color-mix(in oklab, var(--accent) 12%, transparent);
     }
 }
 
@@ -16370,31 +17809,41 @@ export function useAuth(): AuthState {
 ========================================================= */
 html[data-theme="dark"] {
     --bg: #0b0b0c;
+    --bg-elevated: #111113;
     --fg: #f4f3f1;
     --muted: rgba(244, 243, 241, 0.66);
     --muted2: rgba(244, 243, 241, 0.5);
+    --muted3: rgba(244, 243, 241, 0.34);
 
     --hairline: rgba(255, 255, 255, 0.1);
     --hairline2: rgba(255, 255, 255, 0.07);
+    --hairline3: rgba(255, 255, 255, 0.16);
 
     --panel: rgba(255, 255, 255, 0.045);
     --panel2: rgba(255, 255, 255, 0.065);
+    --panel3: rgba(255, 255, 255, 0.085);
 
     --overlay: rgba(11, 11, 12, 0.76);
     --overlay2: rgba(11, 11, 12, 0.88);
+    --scrim: rgba(0, 0, 0, 0.48);
     --activeBg: rgba(255, 255, 255, 0.065);
+    --hoverBg: rgba(255, 255, 255, 0.048);
+    --pressBg: rgba(255, 255, 255, 0.078);
 
     --accent: rgba(220, 70, 70, 0.92);
     --accent2: rgba(220, 70, 70, 0.26);
+    --accent3: rgba(220, 70, 70, 0.12);
     --link: rgba(244, 243, 241, 0.9);
+    --visited: rgba(191, 165, 255, 0.84);
 
     --selectionBg: rgba(244, 243, 241, 0.18);
 
-    --focusRing: rgba(255, 255, 255, 0.14);
+    --focusRing: rgba(255, 255, 255, 0.18);
     --focusShadow: 0 0 0 7px rgba(255, 255, 255, 0.08);
 
     --shadowSoft: 0 10px 36px rgba(0, 0, 0, 0.36);
     --shadowPop: 0 26px 110px rgba(0, 0, 0, 0.58);
+    --shadowCard: 0 12px 34px rgba(0, 0, 0, 0.34);
     --shadowInset: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 
     --scrollTrack: rgba(255, 255, 255, 0.08);
@@ -16408,6 +17857,7 @@ html[data-theme="dark"] {
     --hl-yellow: rgba(255, 213, 74, 0.26);
     --hl-green: rgba(72, 201, 176, 0.2);
     --hl-blue: rgba(120, 180, 255, 0.18);
+    --hl-rose: rgba(238, 118, 148, 0.18);
     --ink: rgba(244, 243, 241, 0.78);
     --ink-soft: rgba(244, 243, 241, 0.46);
 }
@@ -16416,12 +17866,15 @@ html[data-theme="dark"] {
     html[data-theme="dark"] {
         --muted: color-mix(in oklab, var(--fg) 66%, transparent);
         --muted2: color-mix(in oklab, var(--fg) 50%, transparent);
+        --muted3: color-mix(in oklab, var(--fg) 34%, transparent);
 
         --hairline: color-mix(in oklab, var(--fg) 11%, transparent);
         --hairline2: color-mix(in oklab, var(--fg) 8%, transparent);
+        --hairline3: color-mix(in oklab, var(--fg) 17%, transparent);
 
         --panel: color-mix(in oklab, var(--fg) 5%, transparent);
         --panel2: color-mix(in oklab, var(--fg) 7%, transparent);
+        --panel3: color-mix(in oklab, var(--fg) 9%, transparent);
 
         --scrollTrack: color-mix(in oklab, var(--fg) 10%, transparent);
         --scrollThumb: color-mix(in oklab, var(--fg) 20%, transparent);
@@ -16432,8 +17885,13 @@ html[data-theme="dark"] {
         --hl-yellow: color-mix(in oklab, #ffd54a 30%, transparent);
         --hl-green: color-mix(in oklab, #48c9b0 22%, transparent);
         --hl-blue: color-mix(in oklab, #78b4ff 20%, transparent);
+        --hl-rose: color-mix(in oklab, #ee7694 20%, transparent);
+
         --ink: color-mix(in oklab, var(--fg) 78%, transparent);
         --ink-soft: color-mix(in oklab, var(--fg) 46%, transparent);
+
+        --accent2: color-mix(in oklab, var(--accent) 28%, transparent);
+        --accent3: color-mix(in oklab, var(--accent) 14%, transparent);
     }
 }
 
@@ -16441,7 +17899,8 @@ html[data-theme="dark"] {
    Core HTML / Body
 ========================================================= */
 html {
-    scrollbar-gutter: stable;
+    min-height: 100%;
+    scrollbar-gutter: stable both-edges;
     font-family: var(--font-sans);
     font-size: var(--text);
     line-height: var(--leading);
@@ -16451,12 +17910,12 @@ html {
     -webkit-text-size-adjust: 100%;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-
-    /* Explicitly own form/control styling by theme */
+    text-rendering: optimizeLegibility;
     color-scheme: light;
-
     text-underline-offset: 3px;
     text-decoration-thickness: 1.25px;
+    accent-color: var(--accent);
+    hanging-punctuation: first last;
 }
 
 html[data-theme="dark"] {
@@ -16466,12 +17925,23 @@ html[data-theme="dark"] {
 body {
     margin: 0;
     min-height: 100%;
-    background: var(--bg);
+    background:
+            radial-gradient(circle at top, var(--ambientInk2), transparent 32%),
+            var(--bg);
     color: var(--fg);
+    overflow-wrap: break-word;
 }
 
 #root {
     min-height: 100dvh;
+    min-height: 100vh;
+    isolation: isolate;
+}
+
+@supports (min-height: 100svh) {
+    #root {
+        min-height: 100svh;
+    }
 }
 
 /* =========================================================
@@ -16484,29 +17954,51 @@ html.bp-theme-swap button,
 html.bp-theme-swap input,
 html.bp-theme-swap textarea,
 html.bp-theme-swap select,
+html.bp-theme-swap option,
 html.bp-theme-swap a,
+html.bp-theme-swap svg,
 html.bp-theme-swap [role="dialog"],
-html.bp-theme-swap [data-overlay] {
+html.bp-theme-swap [data-overlay],
+html.bp-theme-swap [data-surface] {
     transition:
             background-color var(--themeDur) var(--themeEase),
             color var(--themeDur) var(--themeEase),
             border-color var(--themeDur) var(--themeEase),
             outline-color var(--themeDur) var(--themeEase),
+            text-decoration-color var(--themeDur) var(--themeEase),
             box-shadow var(--themeDur) var(--themeEase),
-            fill var(--themeDur) var(--themeEase);
+            fill var(--themeDur) var(--themeEase),
+            stroke var(--themeDur) var(--themeEase),
+            opacity var(--themeDur) var(--themeEase);
 }
 
-/* Reduced motion */
+/* =========================================================
+   Reduced Motion
+========================================================= */
 @media (prefers-reduced-motion: reduce) {
     html {
         scroll-behavior: auto;
     }
 
-    *,
-    *::before,
-    *::after {
-        animation: none !important;
+    html.bp-theme-swap,
+    html.bp-theme-swap body,
+    html.bp-theme-swap #root,
+    html.bp-theme-swap button,
+    html.bp-theme-swap input,
+    html.bp-theme-swap textarea,
+    html.bp-theme-swap select,
+    html.bp-theme-swap option,
+    html.bp-theme-swap a,
+    html.bp-theme-swap svg,
+    html.bp-theme-swap [role="dialog"],
+    html.bp-theme-swap [data-overlay],
+    html.bp-theme-swap [data-surface] {
         transition: none !important;
+    }
+
+    .ambient__glow,
+    .ambient__p {
+        animation: none !important;
     }
 }
 
@@ -16517,38 +18009,102 @@ html.bp-theme-swap [data-overlay] {
 *::before,
 *::after {
     box-sizing: border-box;
+    min-width: 0;
+}
+
+* {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollThumb) var(--scrollTrack);
 }
 
 img,
 svg,
 video,
-canvas {
+canvas,
+picture {
     display: block;
     max-width: 100%;
+}
+
+iframe {
+    max-width: 100%;
+    border: 0;
+}
+
+hr {
+    height: 0;
+    margin: 0;
+    border: 0;
+    border-top: var(--hairlineW) solid var(--hairline);
 }
 
 h1,
 h2,
 h3,
-h4 {
+h4,
+h5,
+h6 {
     margin: 0;
     font-weight: 650;
+    line-height: 1.15;
     letter-spacing: var(--tracking-tight);
+    text-wrap: balance;
 }
 
-p {
+p,
+figure,
+blockquote,
+ul,
+ol,
+dl {
     margin: 0;
+}
+
+ul,
+ol {
+    padding-left: 1.25em;
+}
+
+small {
+    font-size: 0.875em;
+}
+
+code,
+kbd,
+samp,
+pre {
+    font-family: var(--font-mono);
+}
+
+pre,
+code {
+    font-size: 0.925em;
+}
+
+pre {
+    overflow: auto;
 }
 
 a {
     color: var(--link);
     text-decoration: none;
+    text-decoration-color: color-mix(in oklab, currentColor 40%, transparent);
+    transition:
+            color var(--dur-1) var(--ease-out),
+            text-decoration-color var(--dur-1) var(--ease-out),
+            opacity var(--dur-1) var(--ease-out);
 }
+
 a:hover {
     text-decoration: underline;
 }
+
 a:active {
     opacity: 0.92;
+}
+
+a:visited {
+    color: var(--visited);
 }
 
 ::selection {
@@ -16561,84 +18117,146 @@ input,
 textarea,
 select {
     font: inherit;
+    letter-spacing: inherit;
     color: inherit;
 }
 
+button,
+input,
+select,
+textarea {
+    -webkit-tap-highlight-color: transparent;
+}
+
 button {
+    appearance: none;
     border: 0;
     background: transparent;
     padding: 0;
     cursor: pointer;
 }
 
+button:disabled,
+input:disabled,
+textarea:disabled,
+select:disabled,
+[aria-disabled="true"] {
+    cursor: not-allowed;
+    opacity: 0.58;
+}
+
 input,
 textarea,
 select {
-    border: var(--hairlineW) solid var(--hairline);
-    background: var(--panel);
+    appearance: none;
+    width: 100%;
+    max-width: 100%;
+    min-height: var(--controlH);
+    padding: 9px var(--controlPadX);
+    border: var(--hairlineW) solid var(--controlBorder);
+    background: var(--controlBg);
     border-radius: 12px;
     outline: none;
     box-shadow: var(--shadowInset);
+    transition:
+            background-color var(--dur-1) var(--ease-out),
+            border-color var(--dur-1) var(--ease-out),
+            box-shadow var(--dur-1) var(--ease-out);
 }
 
-@supports (color: color-mix(in oklab, white, black)) {
-    input,
-    textarea,
-    select {
-        background: color-mix(in oklab, var(--panel) 70%, transparent);
-    }
+textarea {
+    resize: vertical;
+    min-height: 96px;
+}
+
+select {
+    padding-right: 36px;
+    background-image:
+            linear-gradient(45deg, transparent 50%, currentColor 50%),
+            linear-gradient(135deg, currentColor 50%, transparent 50%);
+    background-position:
+            calc(100% - 18px) calc(50% - 2px),
+            calc(100% - 12px) calc(50% - 2px);
+    background-size: 6px 6px, 6px 6px;
+    background-repeat: no-repeat;
+}
+
+input:hover,
+textarea:hover,
+select:hover {
+    border-color: var(--controlBorderHover);
 }
 
 input::placeholder,
 textarea::placeholder {
     color: var(--muted);
+    opacity: 1;
 }
 
-:focus-visible {
+input[type="search"]::-webkit-search-decoration,
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-results-button,
+input[type="search"]::-webkit-search-results-decoration {
+    appearance: none;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+    appearance: auto;
+    width: auto;
+    min-height: auto;
+    padding: 0;
+    border: 0;
+    background: none;
+    box-shadow: none;
+}
+
+:where(button, [role="button"], a, input, textarea, select, summary):focus-visible {
     outline: 2px solid var(--focusRing);
     outline-offset: 2px;
-    border-radius: 10px;
 }
 
 .focus-shadow:focus-visible {
     box-shadow: var(--focusShadow);
 }
 
-a,
-button {
-    -webkit-tap-highlight-color: transparent;
+[hidden] {
+    display: none !important;
 }
 
 /* =========================================================
    Scrollbars
 ========================================================= */
-* {
-    scrollbar-width: thin;
-    scrollbar-color: var(--scrollThumb) var(--scrollTrack);
-}
-
 *::-webkit-scrollbar {
     width: var(--scrollSize);
     height: var(--scrollSize);
 }
+
 *::-webkit-scrollbar-track {
     background: var(--scrollTrack);
 }
+
 *::-webkit-scrollbar-thumb {
     background: var(--scrollThumb);
     border-radius: var(--scrollRadius);
     border: 2px solid transparent;
     background-clip: padding-box;
 }
+
 *::-webkit-scrollbar-thumb:hover {
     background: var(--scrollThumbHover);
     border: 2px solid transparent;
     background-clip: padding-box;
 }
 
+*::-webkit-scrollbar-corner {
+    background: transparent;
+}
+
 .scrollbars-none {
     scrollbar-width: none;
 }
+
 .scrollbars-none::-webkit-scrollbar {
     display: none;
 }
@@ -16647,12 +18265,22 @@ button {
    Layout Utilities
 ========================================================= */
 .container {
-    width: min(var(--container), calc(100% - 32px));
+    width: min(var(--container), calc(100% - (var(--pagePadX) * 2)));
     margin-inline: auto;
 }
 
 .reading {
-    width: min(var(--reading), calc(100% - 32px));
+    width: min(var(--reading), calc(100% - (var(--pagePadX) * 2)));
+    margin-inline: auto;
+}
+
+.measure {
+    width: min(var(--bpReaderMeasure), calc(100% - (var(--pagePadX) * 2)));
+    margin-inline: auto;
+}
+
+.measure--tight {
+    width: min(var(--bpReaderMeasureTight), calc(100% - (var(--pagePadX) * 2)));
     margin-inline: auto;
 }
 
@@ -16663,8 +18291,23 @@ button {
     box-shadow: var(--shadowInset);
 }
 
+.surface-raised {
+    background: var(--panel2);
+    border: var(--hairlineW) solid var(--hairline);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadowCard), var(--shadowInset);
+}
+
 .hairline {
     border: var(--hairlineW) solid var(--hairline);
+}
+
+.hairline-top {
+    border-top: var(--hairlineW) solid var(--hairline);
+}
+
+.hairline-bottom {
+    border-bottom: var(--hairlineW) solid var(--hairline);
 }
 
 .muted {
@@ -16675,12 +18318,28 @@ button {
     color: var(--muted2);
 }
 
+.muted3 {
+    color: var(--muted3);
+}
+
 .shadow-soft {
     box-shadow: var(--shadowSoft);
 }
 
 .shadow-pop {
     box-shadow: var(--shadowPop);
+}
+
+.shadow-card {
+    box-shadow: var(--shadowCard);
+}
+
+.safe-pad {
+    padding:
+            calc(var(--pagePadY) + var(--safeTop))
+            calc(var(--pagePadX) + var(--safeRight))
+            calc(var(--pagePadY) + var(--safeBottom))
+            calc(var(--pagePadX) + var(--safeLeft));
 }
 
 /* =========================================================
@@ -16691,31 +18350,73 @@ button {
     align-items: center;
     justify-content: center;
     gap: 10px;
+    min-height: var(--controlH);
     padding: 10px 12px;
     border-radius: 12px;
     border: var(--hairlineW) solid var(--hairline);
     background: var(--panel);
     color: var(--fg);
     user-select: none;
+    white-space: nowrap;
     box-shadow: 0 8px 22px rgba(0, 0, 0, 0.06);
+    transition:
+            background-color var(--dur-1) var(--ease-out),
+            border-color var(--dur-1) var(--ease-out),
+            transform var(--dur-1) var(--ease-out),
+            box-shadow var(--dur-1) var(--ease-out),
+            opacity var(--dur-1) var(--ease-out);
 }
 
 .btn:hover {
-    border-color: var(--hairline2);
+    background: var(--hoverBg);
+    border-color: var(--hairline3);
 }
 
 .btn:active {
+    background: var(--pressBg);
     transform: translateY(0.5px);
+}
+
+.btn[aria-pressed="true"],
+.btn.is-active {
+    background: var(--activeBg);
+    border-color: var(--hairline3);
+}
+
+.btn--accent {
+    background: var(--accent3);
+    border-color: var(--accent2);
+    color: var(--fg);
+}
+
+.btn--accent:hover {
+    background: color-mix(in oklab, var(--accent3) 85%, var(--hoverBg));
+}
+
+.btn--ghost {
+    background: transparent;
+    box-shadow: none;
 }
 
 .pill {
     display: inline-flex;
     align-items: center;
     gap: 8px;
+    min-height: 34px;
     padding: 7px 10px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     border: var(--hairlineW) solid var(--hairline);
     background: var(--panel);
+    white-space: nowrap;
+    transition:
+            background-color var(--dur-1) var(--ease-out),
+            border-color var(--dur-1) var(--ease-out),
+            transform var(--dur-1) var(--ease-out);
+}
+
+.pill:hover {
+    background: var(--hoverBg);
+    border-color: var(--hairline3);
 }
 
 /* =========================================================
@@ -16726,6 +18427,11 @@ button {
     font-size: 18px;
     line-height: 1.75;
     color: var(--fg);
+    hanging-punctuation: first last;
+}
+
+.prose :where(p, li, blockquote) {
+    max-width: 70ch;
 }
 
 .scripture {
@@ -16733,38 +18439,58 @@ button {
     font-size: var(--bpScriptureSize);
     line-height: var(--bpScriptureLeading);
     font-weight: var(--bpScriptureWeight);
+    letter-spacing: var(--bpScriptureTracking);
     color: var(--fg);
-
+    text-wrap: pretty;
     text-rendering: optimizeLegibility;
     font-kerning: normal;
     font-variant-ligatures: common-ligatures contextual;
     font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
 }
 
-.measure {
-    width: min(var(--bpReaderMeasure), calc(100% - 32px));
-    margin-inline: auto;
+.scripture :where(p, div, section, article) {
+    hanging-punctuation: first last;
 }
 
 .scripture .vnum,
 .scripture .cnum {
     font-family: var(--font-sans);
     font-size: 12px;
+    line-height: 1;
     letter-spacing: 0.02em;
     color: var(--muted);
     user-select: none;
+    vertical-align: super;
+}
+
+.scripture .cnum {
+    font-weight: 650;
+}
+
+.reader-ui,
+.ui-sans {
+    font-family: var(--font-sans);
 }
 
 /* =========================================================
    Overlay primitives
 ========================================================= */
+.bp-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-overlay);
+    background: var(--scrim);
+}
+
 .bp-overlay {
     background: var(--overlay);
     border: var(--hairlineW) solid var(--hairline);
     box-shadow: var(--shadowPop);
     border-radius: var(--radius);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
+    position: relative;
+    z-index: var(--z-popover);
+    backdrop-filter: blur(10px) saturate(1.08);
+    -webkit-backdrop-filter: blur(10px) saturate(1.08);
 }
 
 .bp-overlay--solid {
@@ -16775,13 +18501,21 @@ button {
     background: var(--activeBg);
 }
 
+@supports not ((backdrop-filter: blur(10px)) or (-webkit-backdrop-filter: blur(10px))) {
+    .bp-overlay {
+        background: var(--overlay2);
+    }
+}
+
 /* =========================================================
    Annotation helpers
 ========================================================= */
 .bp-hl {
     background: var(--hl-yellow);
     border-radius: 6px;
-    padding: 0 2px;
+    padding-inline: 2px;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
 }
 
 .bp-hl--green {
@@ -16792,14 +18526,26 @@ button {
     background: var(--hl-blue);
 }
 
+.bp-hl--rose {
+    background: var(--hl-rose);
+}
+
 .bp-ink-layer {
     position: absolute;
     inset: 0;
     pointer-events: none;
+    touch-action: none;
+    user-select: none;
 }
 
 .bp-ink-layer.is-drawing {
     pointer-events: auto;
+}
+
+.bp-annotation-anchor {
+    position: absolute;
+    inset: 0 auto auto 0;
+    transform: translate(-50%, -50%);
 }
 
 /* =========================================================
@@ -16833,6 +18579,7 @@ button {
     pointer-events: none;
     overflow: hidden;
     border-radius: 26px;
+    z-index: -1;
 }
 
 .ambient__glow {
@@ -16842,6 +18589,7 @@ button {
     background: var(--ambientInk);
     opacity: 0.14;
     animation: bp-ambient-pulse 9000ms ease-in-out infinite;
+    will-change: transform, opacity;
 }
 
 .ambient__p {
@@ -16856,26 +18604,170 @@ button {
 }
 
 /* =========================================================
+   Utility states
+========================================================= */
+.is-hidden {
+    display: none !important;
+}
+
+.is-visually-hidden,
+.sr-only {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    overflow: hidden !important;
+    clip: rect(0 0 0 0) !important;
+    clip-path: inset(50%) !important;
+    white-space: nowrap !important;
+    border: 0 !important;
+}
+
+.is-inert {
+    pointer-events: none !important;
+    user-select: none !important;
+}
+
+/* =========================================================
    Mobile
 ========================================================= */
+@media (max-width: 720px) {
+    :root {
+        --pagePadX: 14px;
+        --pagePadY: 14px;
+        --container: 100%;
+        --reading: 100%;
+        --bpReaderMeasure: 100%;
+    }
+}
+
 @media (max-width: 480px) {
     :root {
         --bpScriptureSize: 17px;
+        --bpScriptureLeading: 1.76;
         --bpReaderMeasure: 100%;
         --text: 15.5px;
+        --pagePadX: 12px;
+        --pagePadY: 12px;
+        --radius: 16px;
+        --radius-sm: 12px;
+        --controlH: 38px;
     }
 
     .prose {
         font-size: 17px;
     }
 
-    .container {
-        width: calc(100% - 24px);
+    .container,
+    .reading,
+    .measure,
+    .measure--tight {
+        width: calc(100% - (var(--pagePadX) * 2));
+    }
+}
+
+/* =========================================================
+   Contrast / Forced Colors
+========================================================= */
+@media (prefers-contrast: more) {
+    :root {
+        --hairlineW: 1px;
+        --hairline: color-mix(in oklab, var(--fg) 24%, transparent);
+        --hairline3: color-mix(in oklab, var(--fg) 34%, transparent);
+        --selectionBg: color-mix(in oklab, var(--fg) 22%, transparent);
     }
 
-    .reading,
-    .measure {
-        width: calc(100% - 24px);
+    .surface,
+    .surface-raised,
+    .btn,
+    .pill,
+    input,
+    textarea,
+    select,
+    .bp-overlay {
+        border-color: var(--hairline3);
+    }
+}
+
+@media (forced-colors: active) {
+    :root {
+        --bg: Canvas;
+        --fg: CanvasText;
+        --link: LinkText;
+        --visited: VisitedText;
+        --hairline: GrayText;
+        --hairline2: GrayText;
+        --hairline3: GrayText;
+        --panel: Canvas;
+        --panel2: Canvas;
+        --panel3: Canvas;
+        --overlay: Canvas;
+        --overlay2: Canvas;
+        --selectionBg: Highlight;
+        --focusRing: Highlight;
+        --scrollTrack: Canvas;
+        --scrollThumb: GrayText;
+        --scrollThumbHover: GrayText;
+    }
+
+    * {
+        forced-color-adjust: auto;
+    }
+
+    .bp-overlay,
+    .surface,
+    .surface-raised,
+    .btn,
+    .pill,
+    input,
+    textarea,
+    select {
+        box-shadow: none !important;
+        backdrop-filter: none !important;
+        -webkit-backdrop-filter: none !important;
+    }
+}
+
+/* =========================================================
+   Print
+========================================================= */
+@media print {
+    :root {
+        --bg: #ffffff;
+        --fg: #000000;
+        --muted: rgba(0, 0, 0, 0.7);
+        --muted2: rgba(0, 0, 0, 0.55);
+        --hairline: rgba(0, 0, 0, 0.18);
+        --panel: transparent;
+        --panel2: transparent;
+        --panel3: transparent;
+        --overlay: transparent;
+        --overlay2: transparent;
+        --selectionBg: transparent;
+        --shadowSoft: none;
+        --shadowPop: none;
+        --shadowCard: none;
+        --shadowInset: none;
+    }
+
+    html,
+    body,
+    #root {
+        background: #fff !important;
+        color: #000 !important;
+    }
+
+    .bp-scrim,
+    .ambient,
+    .bp-ink-layer.is-drawing {
+        display: none !important;
+    }
+
+    a,
+    a:visited {
+        color: inherit;
+        text-decoration: none;
     }
 }
 ```
@@ -16893,7 +18785,7 @@ button {
 ### apps/web/src/LearnMorePage.tsx
 
 ```tsx
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
 type Mode = "light" | "dark";
 type Styles = Record<string, React.CSSProperties>;
@@ -16902,98 +18794,79 @@ type Props = {
     mode: Mode;
     onToggleTheme: () => void;
     onBack: () => void;
-    /** Pass the same styles object from App so this page matches exactly. */
     styles: Styles;
-
-    /**
-     * Optional: override product name shown in the page copy/footer.
-     * Default: "Biblia"
-     */
     brandName?: string;
-
-    /**
-     * Optional: show a theme toggle in the top bar.
-     * Default: false (since parent app likely already has it)
-     */
     showThemeToggle?: boolean;
 };
 
 const MQ_NARROW = "(max-width: 900px)";
+const MQ_REDUCED_MOTION = "(prefers-reduced-motion: reduce)";
 
-/** Safe media-query hook (supports older Safari). */
-function useMediaQuery(query: string, defaultValue = true): boolean {
-    const get = () => {
-        if (typeof window === "undefined") return defaultValue;
+function canUseDOM(): boolean {
+    return typeof window !== "undefined" && typeof window.matchMedia === "function";
+}
+
+function useMediaQuery(query: string, defaultValue = false): boolean {
+    const getSnapshot = (): boolean => {
+        if (!canUseDOM()) return defaultValue;
         return window.matchMedia(query).matches;
     };
 
-    const [matches, setMatches] = useState<boolean>(get);
+    const [matches, setMatches] = useState<boolean>(getSnapshot);
 
     useEffect(() => {
-        if (typeof window === "undefined") return;
-        const mq = window.matchMedia(query);
-        const onChange = () => setMatches(mq.matches);
+        if (!canUseDOM()) return;
 
-        onChange();
+        const media = window.matchMedia(query);
+        const update = () => setMatches(media.matches);
 
-        // Modern API
-        if (typeof mq.addEventListener === "function") {
-            mq.addEventListener("change", onChange);
-            return () => mq.removeEventListener("change", onChange);
+        update();
+
+        if (typeof media.addEventListener === "function") {
+            media.addEventListener("change", update);
+            return () => media.removeEventListener("change", update);
         }
 
-        // Legacy Safari
+        // Safari legacy
         // eslint-disable-next-line deprecation/deprecation
-        mq.addListener(onChange);
+        media.addListener(update);
         // eslint-disable-next-line deprecation/deprecation
-        return () => mq.removeListener(onChange);
+        return () => media.removeListener(update);
     }, [query]);
 
     return matches;
 }
 
 function usePrefersReducedMotion(): boolean {
-    return useMediaQuery("(prefers-reduced-motion: reduce)", false);
+    return useMediaQuery(MQ_REDUCED_MOTION, false);
 }
 
-/**
- * LearnMorePage — calm, reading-first note
- * Upgrades:
- * - better a11y (Skip link, focus-visible ring, keyboard shortcuts)
- * - optional theme toggle
- * - tiny motion only when allowed (respects prefers-reduced-motion)
- * - branding defaulted to "Biblia" (overrideable)
- */
-export function LearnMorePage(props: Props) {
-    const { onBack, styles, onToggleTheme, mode, brandName = "Biblia", showThemeToggle = false } = props;
+function isTypingTarget(target: EventTarget | null): boolean {
+    const el = target as HTMLElement | null;
+    if (!el) return false;
 
-    const isNarrow = useMediaQuery(MQ_NARROW, true);
-    const reduceMotion = usePrefersReducedMotion();
+    const tag = el.tagName.toLowerCase();
+    return tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable;
+}
 
-    // Button interaction states (subtle, no transforms)
-    const [hoverBack, setHoverBack] = useState(false);
-    const [hoverTheme, setHoverTheme] = useState(false);
-
-    const onBackEnter = useCallback(() => setHoverBack(true), []);
-    const onBackLeave = useCallback(() => setHoverBack(false), []);
-    const onThemeEnter = useCallback(() => setHoverTheme(true), []);
-    const onThemeLeave = useCallback(() => setHoverTheme(false), []);
-
-    // Keyboard shortcut: Escape / Backspace to go back (unless typing).
+function useBackShortcuts(onBack: () => void): void {
     useEffect(() => {
-        const isTypingTarget = (t: EventTarget | null) => {
-            const el = t as HTMLElement | null;
-            if (!el) return false;
-            const tag = (el.tagName || "").toLowerCase();
-            if (tag === "input" || tag === "textarea" || tag === "select") return true;
-            if (el.isContentEditable) return true;
-            return false;
-        };
+        if (!canUseDOM()) return;
 
-        const onKeyDown = (e: KeyboardEvent) => {
-            if (isTypingTarget(e.target)) return;
-            if (e.key === "Escape" || e.key === "Backspace") {
-                e.preventDefault();
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.defaultPrevented) return;
+            if (isTypingTarget(event.target)) return;
+
+            if (event.key === "Escape") {
+                event.preventDefault();
+                onBack();
+                return;
+            }
+
+            if (event.key === "Backspace") {
+                const active = document.activeElement as HTMLElement | null;
+                if (active && isTypingTarget(active)) return;
+                event.preventDefault();
                 onBack();
             }
         };
@@ -17001,129 +18874,168 @@ export function LearnMorePage(props: Props) {
         window.addEventListener("keydown", onKeyDown);
         return () => window.removeEventListener("keydown", onKeyDown);
     }, [onBack]);
+}
 
-    const maxContentWidth = isNarrow ? 680 : 760;
+function useCurrentYear(): number {
+    return useMemo(() => new Date().getFullYear(), []);
+}
 
-    const title = useMemo(() => `Welcome to ${brandName}`, [brandName]);
+function buttonStyle(base: React.CSSProperties, hover: boolean, active: boolean): React.CSSProperties {
+    return {
+        ...base,
+        ...(hover ? sx.buttonHover : null),
+        ...(active ? sx.buttonActive : null),
+    };
+}
+
+export function LearnMorePage({
+                                  mode,
+                                  onToggleTheme,
+                                  onBack,
+                                  styles,
+                                  brandName = "Biblia.to",
+                                  showThemeToggle = false,
+                              }: Props) {
+    const isNarrow = useMediaQuery(MQ_NARROW, true);
+    const reduceMotion = usePrefersReducedMotion();
+    const year = useCurrentYear();
+
+    const [backHovered, setBackHovered] = useState(false);
+    const [backPressed, setBackPressed] = useState(false);
+    const [themeHovered, setThemeHovered] = useState(false);
+    const [themePressed, setThemePressed] = useState(false);
+
+    useBackShortcuts(onBack);
 
     const themeLabel = mode === "dark" ? "Light mode" : "Dark mode";
+    const contentWidth = isNarrow ? 680 : 760;
+
+    const title = useMemo(() => {
+        return `About ${brandName}`;
+    }, [brandName]);
+
+    const paperStyle = useMemo<React.CSSProperties>(() => {
+        return {
+            ...sx.paper,
+            ...(reduceMotion ? null : sx.paperMotion),
+        };
+    }, [reduceMotion]);
 
     return (
-        <main aria-label="Learn more" style={{ ...styles.page, ...sx.page }}>
-            {/* Skip link for keyboard users */}
-            <a href="#learnmore-content" style={sx.skipLink}>
-                Skip to content
-            </a>
+         <main aria-label="About Biblia" style={{ ...styles.page, ...sx.page }}>
+             <a href="#learn-more-content" style={sx.skipLink}>
+                 Skip to content
+             </a>
 
-            <div style={sx.container}>
-                {/* Sticky top bar */}
-                <header style={sx.topBar} role="banner">
-                    <button
-                        type="button"
-                        onClick={onBack}
-                        style={{
-                            ...sx.backBtn,
-                            ...(hoverBack ? sx.backBtnHover : {}),
-                        }}
-                        aria-label="Back"
-                        onMouseEnter={onBackEnter}
-                        onMouseLeave={onBackLeave}
-                    >
+             <div style={sx.container}>
+                 <header style={sx.topBar} role="banner">
+                     <button
+                          type="button"
+                          onClick={onBack}
+                          aria-label="Back"
+                          style={buttonStyle(sx.backButton, backHovered, backPressed)}
+                          onMouseEnter={() => setBackHovered(true)}
+                          onMouseLeave={() => {
+                              setBackHovered(false);
+                              setBackPressed(false);
+                          }}
+                          onMouseDown={() => setBackPressed(true)}
+                          onMouseUp={() => setBackPressed(false)}
+                          onBlur={() => setBackPressed(false)}
+                     >
                         <span aria-hidden style={sx.backArrow}>
                             ←
                         </span>
-                        <span>Back</span>
-                    </button>
+                         <span>Back</span>
+                     </button>
 
-                    <div style={{ flex: 1 }} />
+                     <div style={sx.spacer} />
 
-                    {showThemeToggle ? (
-                        <button
-                            type="button"
-                            onClick={onToggleTheme}
-                            aria-label={`Toggle theme (${themeLabel})`}
-                            title={`Toggle theme (${themeLabel})`}
-                            style={{
-                                ...sx.iconBtn,
-                                ...(hoverTheme ? sx.iconBtnHover : {}),
-                            }}
-                            onMouseEnter={onThemeEnter}
-                            onMouseLeave={onThemeLeave}
-                        >
+                     {showThemeToggle ? (
+                          <button
+                               type="button"
+                               onClick={onToggleTheme}
+                               aria-label={`Toggle theme (${themeLabel})`}
+                               title={themeLabel}
+                               style={buttonStyle(sx.iconButton, themeHovered, themePressed)}
+                               onMouseEnter={() => setThemeHovered(true)}
+                               onMouseLeave={() => {
+                                   setThemeHovered(false);
+                                   setThemePressed(false);
+                               }}
+                               onMouseDown={() => setThemePressed(true)}
+                               onMouseUp={() => setThemePressed(false)}
+                               onBlur={() => setThemePressed(false)}
+                          >
                             <span aria-hidden style={sx.iconGlyph}>
                                 {mode === "dark" ? "☼" : "☾"}
                             </span>
-                        </button>
-                    ) : null}
-                </header>
+                          </button>
+                     ) : null}
+                 </header>
 
-                <section id="learnmore-content" style={{ ...sx.content, maxWidth: maxContentWidth }}>
-                    <div
-                        style={{
-                            ...sx.paper,
-                            ...(reduceMotion ? {} : sx.paperMotion),
-                        }}
-                    >
-                        <div style={sx.kicker}>a note from the dev</div>
-                        <h1 style={sx.h1}>{title}</h1>
-                        <div style={sx.hairline} />
+                 <section id="learn-more-content" style={{ ...sx.content, maxWidth: contentWidth }}>
+                     <article style={paperStyle}>
+                         <div style={sx.kicker}>kjv · truth · jesus christ</div>
+                         <h1 style={sx.h1}>{title}</h1>
+                         <div style={sx.hairline} />
 
-                        <div style={sx.prose}>
-                            <p style={sx.p}>
-                                {brandName} is built for reading: calm, beautiful, and fast — no clutter, no noise.
-                            </p>
+                         <div style={sx.prose}>
+                             <p style={sx.p}>
+                                 {brandName} exists to keep the Bible in front of you plainly and reverently.
+                             </p>
 
-                            <p style={sx.p}>
-                                I made this because I believe everyone should be able to open the Bible and read it in peace — no
-                                distractions, no paywalls, and no one trying to steer you.
-                            </p>
+                             <p style={sx.p}>
+                                 The aim is simple: open the Scriptures, read the text, and let the Word speak without clutter,
+                                 manipulation, or noise.
+                             </p>
 
-                            <p style={sx.p}>
-                                My hope is to give you a quiet space where the Word can speak for itself. Just you and the text.
-                            </p>
+                             <p style={sx.p}>
+                                 This project begins with the <strong>King James Version</strong>. Not because novelty is needed, but
+                                 because the text is weighty, familiar, and deeply rooted in the English-speaking church.
+                             </p>
 
-                            <div style={sx.quote} role="note" aria-label="Core statement">
-                                <div style={sx.quoteBar} aria-hidden />
-                                <div style={sx.quoteText}>
-                                    Centered on <strong>Jesus Christ</strong> — crucified and risen. That’s the heart of everything
-                                    here.
-                                </div>
-                            </div>
+                             <div style={sx.statement} role="note" aria-label="Foundation">
+                                 <div style={sx.statementBar} aria-hidden />
+                                 <div style={sx.statementText}>
+                                     Centered on <strong>Jesus Christ</strong> — the Son of God, crucified and risen, Lord and
+                                     Saviour.
+                                 </div>
+                             </div>
 
-                            <p style={sx.p}>
-                                I started with the KJV because it’s a steady, well-loved translation. Over time, more translations can
-                                be added — but the design stays the same: Scripture first.
-                            </p>
+                             <p style={sx.p}>
+                                 This is not built to entertain. It is built to serve truth, to honour Scripture, and to keep the
+                                 reading experience clean and serious.
+                             </p>
 
-                            <p style={sx.p}>
-                                You’ll find a clean reader, thoughtful search, and a few quiet tools to help you explore — all designed
-                                with care and simplicity.
-                            </p>
+                             <p style={sx.p}>
+                                 Search should be useful. Reading should be calm. Design should get out of the way. The point is not
+                                 the app. The point is the Bible.
+                             </p>
 
-                            <p style={{ ...sx.p, marginBottom: 0 }}>
-                                Whether you’re new to the Bible or have been reading it for years, I’m really glad you’re here.
-                            </p>
-                        </div>
+                             <p style={{ ...sx.p, marginBottom: 0 }}>
+                                 If this helps even one person spend more time with the Word of God and behold Christ more clearly, it
+                                 is worth building.
+                             </p>
+                         </div>
 
-                        <footer style={sx.footer}>
-                            <div style={sx.footerLine} />
-                            <div style={sx.footerMuted}>
-                                © {new Date().getFullYear()} {brandName}
-                            </div>
-                        </footer>
-                    </div>
-                </section>
-            </div>
-        </main>
+                         <footer style={sx.footer}>
+                             <div style={sx.footerLine} />
+                             <div style={sx.footerText}>© {year} {brandName}</div>
+                         </footer>
+                     </article>
+                 </section>
+             </div>
+         </main>
     );
 }
 
-// All styles are inline to keep the component self-contained.
-// CSS custom properties (--bg, --fg, --panel, --hairline, --muted) are set by the parent app.
 const sx: Record<string, React.CSSProperties> = {
     page: {
-        padding: "18px 0 96px",
+        minHeight: "100%",
+        padding: "18px 0 88px",
     },
+
     container: {
         paddingInline: 18,
     },
@@ -17131,38 +19043,43 @@ const sx: Record<string, React.CSSProperties> = {
     skipLink: {
         position: "absolute",
         left: 12,
-        top: 8,
+        top: 10,
+        zIndex: 100,
         padding: "10px 12px",
         borderRadius: 12,
+        border: "1px solid var(--hairline)",
         background: "var(--panel)",
         color: "var(--fg)",
-        border: "1px solid var(--hairline)",
-        boxShadow: "0 12px 26px rgba(0,0,0,0.10)",
         textDecoration: "none",
+        boxShadow: "0 10px 24px rgba(0,0,0,0.10)",
         transform: "translateY(-140%)",
         outline: "none",
-        zIndex: 100,
     },
 
     topBar: {
+        position: "sticky",
+        top: 0,
+        zIndex: 10,
         display: "flex",
         alignItems: "center",
         gap: 12,
         paddingTop: 12,
         paddingBottom: 12,
-        position: "sticky",
-        top: 0,
-        zIndex: 5,
         background:
-            "linear-gradient(to bottom, var(--bg) 0%, color-mix(in oklab, var(--bg) 70%, transparent) 70%, transparent 100%)",
+             "linear-gradient(to bottom, var(--bg) 0%, color-mix(in oklab, var(--bg) 76%, transparent) 72%, transparent 100%)",
         backdropFilter: "blur(10px)",
         WebkitBackdropFilter: "blur(10px)",
     },
 
-    backBtn: {
+    spacer: {
+        flex: 1,
+    },
+
+    backButton: {
         display: "inline-flex",
         alignItems: "center",
         gap: 10,
+        minHeight: 40,
         padding: "10px 12px",
         borderRadius: 12,
         border: "1px solid var(--hairline)",
@@ -17171,23 +19088,15 @@ const sx: Record<string, React.CSSProperties> = {
         cursor: "pointer",
         userSelect: "none",
         WebkitTapHighlightColor: "transparent",
-        boxShadow: "0 8px 22px rgba(0,0,0,0.06)",
-        fontSize: 12.8,
+        boxShadow: "0 8px 18px rgba(0,0,0,0.05)",
+        fontSize: 12.5,
+        fontWeight: 500,
         letterSpacing: "0.01em",
         outline: "none",
-    },
-    backBtnHover: {
-        borderColor: "color-mix(in oklab, var(--hairline) 55%, var(--fg))",
-        boxShadow: "0 10px 26px rgba(0,0,0,0.08)",
-        filter: "saturate(1.02)",
-    },
-    backArrow: {
-        display: "inline-block",
-        opacity: 0.78,
-        transform: "translateY(-0.5px)",
+        transition: "border-color 140ms ease, box-shadow 140ms ease, background 140ms ease, opacity 140ms ease",
     },
 
-    iconBtn: {
+    iconButton: {
         display: "inline-flex",
         alignItems: "center",
         justifyContent: "center",
@@ -17200,130 +19109,138 @@ const sx: Record<string, React.CSSProperties> = {
         cursor: "pointer",
         userSelect: "none",
         WebkitTapHighlightColor: "transparent",
-        boxShadow: "0 8px 22px rgba(0,0,0,0.06)",
+        boxShadow: "0 8px 18px rgba(0,0,0,0.05)",
         outline: "none",
+        transition: "border-color 140ms ease, box-shadow 140ms ease, background 140ms ease, opacity 140ms ease",
     },
-    iconBtnHover: {
-        borderColor: "color-mix(in oklab, var(--hairline) 55%, var(--fg))",
-        boxShadow: "0 10px 26px rgba(0,0,0,0.08)",
-        filter: "saturate(1.02)",
+
+    buttonHover: {
+        borderColor: "color-mix(in oklab, var(--hairline) 52%, var(--fg))",
+        boxShadow: "0 10px 24px rgba(0,0,0,0.07)",
     },
+
+    buttonActive: {
+        boxShadow: "0 6px 14px rgba(0,0,0,0.05)",
+        background: "color-mix(in oklab, var(--panel) 92%, var(--fg))",
+    },
+
+    backArrow: {
+        display: "inline-block",
+        opacity: 0.8,
+        transform: "translateY(-0.5px)",
+    },
+
     iconGlyph: {
         fontSize: 16,
         lineHeight: 1,
-        opacity: 0.82,
-        transform: "translateY(-0.5px)",
+        opacity: 0.84,
     },
 
     content: {
         width: "100%",
         marginInline: "auto",
         paddingTop: 18,
-        position: "relative",
     },
 
     paper: {
-        position: "relative",
-        zIndex: 1,
         borderRadius: 22,
         border: "1px solid var(--hairline)",
         background:
-            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 92%, transparent) 0%, var(--panel) 38%, var(--panel) 100%)",
-        boxShadow: "0 22px 60px rgba(0,0,0,0.06)",
-        padding: "26px 22px",
+             "linear-gradient(180deg, color-mix(in oklab, var(--panel) 94%, transparent) 0%, var(--panel) 36%, var(--panel) 100%)",
+        boxShadow: "0 22px 56px rgba(0,0,0,0.06)",
+        padding: "28px 22px",
     },
 
-    // Optional micro-motion only (never transforms layout)
     paperMotion: {
-        transition: "box-shadow 140ms ease, border-color 140ms ease, filter 140ms ease",
+        transition: "box-shadow 180ms ease, border-color 180ms ease, background 180ms ease",
     },
 
     kicker: {
         fontSize: 10,
-        letterSpacing: "0.28em",
+        lineHeight: 1.4,
+        letterSpacing: "0.24em",
         textTransform: "uppercase",
         color: "var(--muted)",
-        opacity: 0.86,
+        opacity: 0.88,
     },
 
     h1: {
         marginTop: 12,
         marginBottom: 0,
-        fontSize: 34,
-        lineHeight: 1.12,
-        letterSpacing: "-0.02em",
         color: "var(--fg)",
+        fontSize: 34,
+        lineHeight: 1.1,
+        letterSpacing: "-0.025em",
+        fontWeight: 600,
     },
 
     hairline: {
-        marginTop: 18,
         height: 1,
+        marginTop: 18,
         background: "var(--hairline)",
-        opacity: 0.85,
+        opacity: 0.9,
     },
 
     prose: {
         paddingTop: 18,
         color: "var(--muted)",
-        fontSize: 13.6,
-        letterSpacing: "0.015em",
-        lineHeight: 1.95,
+        fontSize: 14,
+        lineHeight: 1.9,
+        letterSpacing: "0.01em",
     },
+
     p: {
         marginTop: 0,
         marginBottom: 15,
     },
 
-    quote: {
+    statement: {
         display: "grid",
-        gridTemplateColumns: "10px 1fr",
+        gridTemplateColumns: "8px 1fr",
         gap: 12,
-        alignItems: "start",
-        margin: "20px 0 20px",
-        padding: "16px 16px",
+        alignItems: "stretch",
+        margin: "20px 0",
+        padding: "16px",
         borderRadius: 18,
         border: "1px solid var(--hairline)",
         background:
-            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 88%, transparent) 0%, var(--panel) 60%, var(--panel) 100%)",
-        boxShadow: "0 10px 26px rgba(0,0,0,0.06)",
+             "linear-gradient(180deg, color-mix(in oklab, var(--panel) 90%, transparent) 0%, var(--panel) 100%)",
+        boxShadow: "0 10px 24px rgba(0,0,0,0.05)",
     },
 
-    quoteBar: {
+    statementBar: {
         width: 3,
         height: "100%",
         borderRadius: 999,
         background: "var(--fg)",
-        opacity: 0.12,
-        marginTop: 2,
+        opacity: 0.16,
         marginLeft: 2,
     },
-    quoteText: {
-        fontSize: 13.6,
-        lineHeight: 1.85,
-        letterSpacing: "0.015em",
-        color: "var(--muted)",
+
+    statementText: {
+        color: "var(--fg)",
+        fontSize: 13.8,
+        lineHeight: 1.8,
+        letterSpacing: "0.01em",
     },
 
     footer: {
         paddingTop: 22,
     },
+
     footerLine: {
         height: 1,
         background: "var(--hairline)",
-        opacity: 0.8,
+        opacity: 0.82,
         marginBottom: 12,
     },
-    footerMuted: {
+
+    footerText: {
         color: "var(--muted)",
         fontSize: 12,
-        opacity: 0.85,
+        opacity: 0.86,
     },
 };
-
-// Focus styles (kept inline-friendly):
-// If your base.css already defines :focus-visible, you can remove these additions.
-// Otherwise, consider adding a global rule:
-// button:focus-visible, a:focus-visible { outline: 2px solid color-mix(in oklab, var(--fg) 35%, transparent); outline-offset: 2px; }
 ```
 
 ### apps/web/src/main.tsx
@@ -17342,36 +19259,141 @@ import "@fontsource-variable/literata";
 import "./index.css";
 import App from "./App";
 
-const el = document.getElementById("root");
-if (!el) {
-    throw new Error('Root element "#root" not found. Check apps/web/index.html');
+/**
+ * Biblia.to bootstrap
+ *
+ * Hardened / improved:
+ * - explicit root-element assertion
+ * - one root only (guards accidental double-mount in weird embeds / HMR edges)
+ * - early document markers for app-ready state
+ * - safe bootstrap error surfacing
+ * - preserves React StrictMode
+ */
+
+declare global {
+     interface Window {
+          __BIBLIA_WEB_ROOT__?: ReturnType<typeof createRoot>;
+     }
 }
 
-createRoot(el).render(
-    <StrictMode>
-        <App />
-    </StrictMode>,
-);
+function invariantRootElement(): HTMLElement {
+     const element = document.getElementById("root");
+     if (!element) {
+          throw new Error('Root element "#root" not found. Check apps/web/index.html');
+     }
+     return element;
+}
+
+function markDocumentBootState(state: "booting" | "ready" | "crashed"): void {
+     document.documentElement.setAttribute("data-app-state", state);
+}
+
+function renderBootstrapError(error: unknown): void {
+     const root = document.getElementById("root");
+     if (!root) return;
+
+     const message =
+          error instanceof Error
+               ? error.message
+               : typeof error === "string"
+                    ? error
+                    : "Unknown bootstrap error.";
+
+     root.innerHTML = `
+      <main
+        style="
+          min-height: 100dvh;
+          display: grid;
+          place-items: center;
+          padding: 24px;
+          background: var(--bg, #0b0b0c);
+          color: var(--fg, #f4f3f1);
+          font: 14px/1.6 Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        "
+      >
+        <div
+          style="
+            width: min(680px, 100%);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 16px;
+            padding: 18px 20px;
+            background: rgba(255,255,255,0.04);
+            box-shadow: 0 18px 50px rgba(0,0,0,0.28);
+          "
+        >
+          <div style="font-size:12px; letter-spacing:.08em; text-transform:uppercase; opacity:.72; margin-bottom:8px;">
+            Biblia.to
+          </div>
+          <h1 style="margin:0 0 8px; font-size:18px; line-height:1.2;">App failed to start</h1>
+          <p style="margin:0; opacity:.88; white-space:pre-wrap;">${escapeHtml(message)}</p>
+        </div>
+      </main>
+    `;
+}
+
+function escapeHtml(value: string): string {
+     return value
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+}
+
+function bootstrap(): void {
+     markDocumentBootState("booting");
+
+     const rootElement = invariantRootElement();
+     const root = window.__BIBLIA_WEB_ROOT__ ?? createRoot(rootElement);
+
+     window.__BIBLIA_WEB_ROOT__ = root;
+
+     root.render(
+          <StrictMode>
+               <App />
+          </StrictMode>,
+     );
+
+     markDocumentBootState("ready");
+}
+
+try {
+     bootstrap();
+} catch (error) {
+     markDocumentBootState("crashed");
+     renderBootstrapError(error);
+     throw error;
+}
 ```
 
 ### apps/web/src/PositionPill.tsx
 
 ```tsx
+// cspell:words oklab
 // apps/web/src/PositionPill.tsx
 // Biblia.to — Position Pill (Book / Chapter / Verse picker)
 //
-// Deep upgrades in this pass:
-// - Zero "any" casts in event unsubs; no deprecated mq signatures.
-// - Bulletproof outside-click handling (no scrollbar mis-close; supports touch/pen).
-// - Keyboard UX: arrows to move between columns; Enter commits; Esc closes; Home/End jump.
-// - Accessibility: proper listbox/option semantics + roving tabindex + aria-activedescendant.
-// - Focus restore to pill on close; remembers last focused column.
-// - Robust async chapters loading with AbortController + per-book cache + stale guard.
-// - Safer positioning: auto reflow on resize/scroll/visualViewport; clamps within viewport.
-// - Fixes tiny bugs: removed stray imports; removed unused pending flags; consistent phases.
-// - Keeps monochrome-only visuals (no hue). Popover CSS injection uses only theme vars.
+// Hardened / micropolished:
+// - no deprecated MediaQueryList listener APIs
+// - no unsafe event-unsubscribe casts
+// - robust outside-click handling via composedPath()
+// - focus restore to pill on close
+// - roving focus + listbox semantics
+// - async chapter loading with per-book cache + AbortController + stale guard
+// - viewport-clamped popover with resize / scroll / visualViewport reflow
+// - monochrome-only visuals
+// - calmer open/close animation + button press states
+// - fixed custom CSS var typing on inline styles
+// - deduplicated focus/scroll movement logic
 
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { apiGetChapters, type BookRow, type ChaptersPayload } from "./api";
 
@@ -17388,47 +19410,64 @@ type Props = {
   onJump: (bookId: string, chapter: number, verse: number | null) => void;
 };
 
+type WheelOption = Readonly<{
+  key: string;
+  label: string;
+  value: number;
+}>;
+
+type PopPos = Readonly<{
+  left: number;
+  top: number;
+  height: number;
+  width: number;
+}>;
+
+type Col = "book" | "chapter" | "verse";
+type Phase = "opening" | "open" | "closing";
+type CssVarStyle = React.CSSProperties & Record<`--${string}`, string | number>;
+
 /* ---------------- Compact + paper-like ---------------- */
+
 const SCALE = 0.84;
 const S = (n: number) => Math.round(n * SCALE);
 
 const POPOVER_W = S(440);
 const COL_NARROW_W = S(92);
 const POPOVER_MAX_H = S(330);
+const POPOVER_MIN_H = S(200);
 const POPOVER_MARGIN = 14;
 const LIST_PAD = S(10);
 
-// Pill stability: fixed width (no jitter)
 const PILL_W_CLOSED = S(216);
 const PILL_W_OPEN = S(226);
 const NUM_COL_W = S(62);
 const PILL_PAD_X = S(9);
 const PILL_GAP = S(6);
 
-// Micro delay to prevent accidental close on scrollbars/drags outside
 const CLOSE_DELAY_MS = 110;
-
-// phase timings
 const OPEN_MS = 150;
 const CLOSE_MS = 145;
 
-type WheelOption = { key: string; label: string; value: number };
-type PopPos = Readonly<{ left: number; top: number; height: number; width: number }>;
-
-type Col = "book" | "chapter" | "verse";
-
-function pressedStyle(styles: Record<string, React.CSSProperties>): React.CSSProperties | null {
-  return (styles as any).btnPressed ?? (styles as any).buttonPressed ?? null;
-}
+const POP_ID = "bp-pos-popover";
+const CSS_SENTINEL_ATTR = "data-bp-pos-popover-css";
 
 function clampInt(n: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, n));
+  if (!Number.isFinite(n)) return lo;
+  return Math.max(lo, Math.min(hi, Math.trunc(n)));
 }
 
 function buildNumberOptions(min: number, max: number): WheelOption[] {
   const out: WheelOption[] = [];
-  for (let i = min; i <= max; i++) out.push({ key: String(i), label: String(i), value: i });
+  for (let i = min; i <= max; i += 1) {
+    out.push({ key: String(i), label: String(i), value: i });
+  }
   return out;
+}
+
+function pressedStyle(styles: Record<string, React.CSSProperties>): React.CSSProperties | null {
+  const record = styles as Record<string, React.CSSProperties | undefined>;
+  return record.btnPressed ?? record.buttonPressed ?? null;
 }
 
 function computePopoverPos(anchor: DOMRect, desiredWidth: number): PopPos {
@@ -17444,85 +19483,105 @@ function computePopoverPos(anchor: DOMRect, desiredWidth: number): PopPos {
   const belowAvail = vh - belowTop - margin;
   const cap = Math.min(POPOVER_MAX_H, vh - margin * 2);
 
-  if (belowAvail >= S(200)) {
-    return { left, top: belowTop, height: Math.min(cap, belowAvail), width };
+  if (belowAvail >= POPOVER_MIN_H) {
+    return {
+      left,
+      top: belowTop,
+      height: Math.min(cap, belowAvail),
+      width,
+    };
   }
 
-  const top = clampInt(Math.round(anchor.top - 12 - cap), margin, Math.max(margin, vh - cap - margin));
+  const top = clampInt(
+       Math.round(anchor.top - 12 - cap),
+       margin,
+       Math.max(margin, vh - cap - margin),
+  );
   const aboveAvail = Math.round(anchor.top - top - 12);
-  return { left, top, height: Math.min(cap, Math.max(S(200), aboveAvail)), width };
+
+  return {
+    left,
+    top,
+    height: Math.min(cap, Math.max(POPOVER_MIN_H, aboveAvail)),
+    width,
+  };
 }
 
 function subscribeMediaQuery(query: string, onChange: (matches: boolean) => void): () => void {
   if (typeof window === "undefined" || !window.matchMedia) return () => {};
+
   const mq = window.matchMedia(query);
+  const handler = (event: MediaQueryListEvent) => onChange(event.matches);
 
-  const handler = () => onChange(!!mq.matches);
-  handler();
+  onChange(mq.matches);
+  mq.addEventListener("change", handler);
 
-  if (mq.addEventListener) {
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }
-
-  // legacy fallback without TS deprecated signatures
-  const anyMq = mq as any;
-  if (typeof anyMq.addListener === "function") {
-    anyMq.addListener(handler);
-    return () => {
-      if (typeof anyMq.removeListener === "function") anyMq.removeListener(handler);
-    };
-  }
-
-  return () => {};
+  return () => {
+    mq.removeEventListener("change", handler);
+  };
 }
 
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(false);
-  useEffect(() => subscribeMediaQuery("(prefers-reduced-motion: reduce)", (m) => setReduced(!!m)), []);
+
+  useEffect(() => {
+    return subscribeMediaQuery("(prefers-reduced-motion: reduce)", setReduced);
+  }, []);
+
   return reduced;
 }
 
 function useLatestRef<T>(value: T) {
   const r = useRef(value);
+
   useEffect(() => {
     r.current = value;
   }, [value]);
+
   return r;
 }
 
 function injectPopoverCssOnce(): void {
-  const k = "data-bp-pos-popover-css";
-  if (typeof document === "undefined" || document.querySelector(`style[${k}="1"]`)) return;
+  if (typeof document === "undefined") return;
+  if (document.querySelector(`style[${CSS_SENTINEL_ATTR}="1"]`)) return;
 
   const el = document.createElement("style");
-  el.setAttribute(k, "1");
-
-  // ZERO hue: only neutral vars / grayscale mixes
+  el.setAttribute(CSS_SENTINEL_ATTR, "1");
   el.textContent = `
-#bp-pos-popover .bp-scroll { scrollbar-width: thin; scrollbar-color: var(--hairline) transparent; }
-#bp-pos-popover .bp-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
-#bp-pos-popover .bp-scroll::-webkit-scrollbar-track { background: transparent !important; }
-#bp-pos-popover .bp-scroll::-webkit-scrollbar-thumb {
+#${POP_ID} .bp-scroll { scrollbar-width: thin; scrollbar-color: var(--hairline) transparent; }
+#${POP_ID} .bp-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+#${POP_ID} .bp-scroll::-webkit-scrollbar-track { background: transparent !important; }
+#${POP_ID} .bp-scroll::-webkit-scrollbar-thumb {
   background: var(--hairline);
   border-radius: 999px;
   border: 2px solid transparent;
   background-clip: padding-box;
 }
-#bp-pos-popover .bp-scroll::-webkit-scrollbar-thumb:hover { background: var(--focusRing); }
+#${POP_ID} .bp-scroll::-webkit-scrollbar-thumb:hover { background: var(--focusRing); }
 
-#bp-pos-popover button.bp-row { transition: background 150ms ease, box-shadow 150ms ease, transform 110ms ease; }
-#bp-pos-popover button.bp-row:active { transform: scale(0.982); }
-#bp-pos-popover button.bp-row:hover { background: color-mix(in oklab, var(--panel) 22%, transparent); }
-#bp-pos-popover button.bp-row:focus-visible { outline: none; box-shadow: inset 0 0 0 1px var(--bpAccentRing), 0 0 0 3px color-mix(in oklab, var(--bpAccentRing) 55%, transparent); }
+#${POP_ID} button.bp-row {
+  transition: background 150ms ease, box-shadow 150ms ease, transform 110ms ease;
+}
+#${POP_ID} button.bp-row:active { transform: scale(0.982); }
+#${POP_ID} button.bp-row:hover { background: color-mix(in oklab, var(--panel) 22%, transparent); }
+#${POP_ID} button.bp-row:focus-visible {
+  outline: none;
+  box-shadow:
+    inset 0 0 0 1px var(--bpAccentRing),
+    0 0 0 3px color-mix(in oklab, var(--bpAccentRing) 55%, transparent);
+}
 
-#bp-pos-popover button.bp-go { transition: transform 160ms cubic-bezier(0.23, 1.0, 0.32, 1.0), box-shadow 160ms ease, opacity 160ms ease; }
-#bp-pos-popover button.bp-go:active { transform: scale(0.955) translateY(1px); }
+#${POP_ID} button.bp-go {
+  transition:
+    transform 160ms cubic-bezier(0.23, 1.0, 0.32, 1.0),
+    box-shadow 160ms ease,
+    opacity 160ms ease;
+}
+#${POP_ID} button.bp-go:active { transform: scale(0.955) translateY(1px); }
 `;
   document.head.appendChild(el);
 }
 
-/* --------------------------- Roving focus helpers --------------------------- */
 function nextIndex(cur: number, delta: number, len: number): number {
   if (len <= 0) return 0;
   const n = cur + delta;
@@ -17531,7 +19590,6 @@ function nextIndex(cur: number, delta: number, len: number): number {
   return n;
 }
 
-/** Accepts undefined because Map.get() returns T | undefined */
 function scrollIntoViewCentered(el: HTMLElement | null | undefined): void {
   if (!el) return;
   try {
@@ -17541,19 +19599,25 @@ function scrollIntoViewCentered(el: HTMLElement | null | undefined): void {
   }
 }
 
+function eventComposedPath(e: Event): EventTarget[] | null {
+  const maybe = e as Event & { composedPath?: () => EventTarget[] };
+  return typeof maybe.composedPath === "function" ? maybe.composedPath() : null;
+}
+
+function targetWithinNode(target: Node | null, path: EventTarget[] | null, node: Node | null): boolean {
+  if (!node) return false;
+  if (target && node.contains(target)) return true;
+  if (!path) return false;
+
+  for (const entry of path) {
+    if (entry === node) return true;
+  }
+  return false;
+}
+
 /* --------------------------- List Item --------------------------- */
-const ListItem = React.memo(function ListItem({
-                                                active,
-                                                onClick,
-                                                children,
-                                                tight = false,
-                                                mapRef,
-                                                itemKey,
-                                                ariaLabel,
-                                                tabIndex,
-                                                id,
-                                                onFocus,
-                                              }: {
+
+const ListItem = React.memo(function ListItem(props: {
   active: boolean;
   onClick: () => void;
   children: React.ReactNode;
@@ -17565,41 +19629,59 @@ const ListItem = React.memo(function ListItem({
   id?: string;
   onFocus?: () => void;
 }) {
+  const {
+    active,
+    onClick,
+    children,
+    tight = false,
+    mapRef,
+    itemKey,
+    ariaLabel,
+    tabIndex,
+    id,
+    onFocus,
+  } = props;
+
   const ref = useRef<HTMLButtonElement>(null);
   const baseStyle = tight ? sx.itemTight : sx.item;
 
   useEffect(() => {
     if (!mapRef || !itemKey) return;
+
     mapRef.current?.set(itemKey, ref.current);
     return () => {
-      if (mapRef.current?.get(itemKey) === ref.current) mapRef.current?.set(itemKey, null);
+      if (mapRef.current?.get(itemKey) === ref.current) {
+        mapRef.current?.set(itemKey, null);
+      }
     };
   }, [mapRef, itemKey]);
 
   return (
-      <button
-          id={id}
-          type="button"
-          className="bp-row"
-          ref={ref}
-          style={{ ...baseStyle, ...(active ? sx.itemActive : null) }}
-          onPointerDown={(e) => {
-            if (e.pointerType !== "mouse") e.preventDefault();
-          }}
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={onClick}
-          onFocus={onFocus}
-          aria-label={ariaLabel}
-          role="option"
-          aria-selected={active}
-          tabIndex={tabIndex}
-      >
-        {active && <span style={sx.activeBar} aria-hidden />}
-        {children}
-        <span style={{ ...sx.selDot, ...(active ? sx.selDotOn : null) }} aria-hidden />
-      </button>
+       <button
+            id={id}
+            type="button"
+            className="bp-row"
+            ref={ref}
+            style={{ ...baseStyle, ...(active ? sx.itemActive : null) }}
+            onPointerDown={(e) => {
+              if (e.pointerType !== "mouse") e.preventDefault();
+            }}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={onClick}
+            onFocus={onFocus}
+            aria-label={ariaLabel}
+            role="option"
+            aria-selected={active}
+            tabIndex={tabIndex}
+       >
+         {active ? <span style={sx.activeBar} aria-hidden /> : null}
+         {children}
+         <span style={{ ...sx.selDot, ...(active ? sx.selDotOn : null) }} aria-hidden />
+       </button>
   );
 });
+
+/* --------------------------- Component --------------------------- */
 
 export function PositionPill({ styles, books, current, onJump }: Props) {
   const reducedMotion = usePrefersReducedMotion();
@@ -17608,40 +19690,46 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   const anchorRef = useRef<HTMLButtonElement | null>(null);
   const popoverElRef = useRef<HTMLDivElement | null>(null);
 
+  const bookBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+  const chapBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+  const verseBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+
+  const chaptersCacheRef = useRef<Map<string, ChaptersPayload>>(new Map());
+  const abortRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef(0);
+  const closeTimerRef = useRef<number | null>(null);
+
   const [open, setOpen] = useState(false);
-  const [phase, setPhase] = useState<"opening" | "open" | "closing">("opening");
+  const [phase, setPhase] = useState<Phase>("opening");
   const [popPos, setPopPos] = useState<PopPos | null>(null);
 
   const [pressPill, setPressPill] = useState(false);
   const [pressGo, setPressGo] = useState(false);
 
-  const closeTimerRef = useRef<number | null>(null);
-  const clearCloseTimer = useCallback(() => {
-    if (closeTimerRef.current != null) {
-      window.clearTimeout(closeTimerRef.current);
-      closeTimerRef.current = null;
-    }
-  }, []);
-
-  const bookBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-  const chapBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-  const verseBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-
-  const openRef = useLatestRef(open);
-  const phaseRef = useLatestRef(phase);
-
-  // last active column for keyboard UX
   const [activeCol, setActiveCol] = useState<Col>("book");
-  const activeColRef = useLatestRef(activeCol);
-
-  // For roving focus indices
   const [activeBookIdx, setActiveBookIdx] = useState(0);
   const [activeChapIdx, setActiveChapIdx] = useState(0);
   const [activeVerseIdx, setActiveVerseIdx] = useState(0);
 
+  const [bookId, setBookId] = useState<string>(current.bookId ?? list[0]?.bookId ?? "GEN");
+  const [chapter, setChapter] = useState<number>(current.chapter ?? 1);
+  const [verse, setVerse] = useState<number | null>(current.verse ?? null);
+
+  const [pendingChapter, setPendingChapter] = useState(false);
+  const [pendingVerse, setPendingVerse] = useState(false);
+  const [chaptersMeta, setChaptersMeta] = useState<ChaptersPayload | null>(null);
+
+  const openRef = useLatestRef(open);
+  const phaseRef = useLatestRef(phase);
+  const activeColRef = useLatestRef(activeCol);
+
   useEffect(() => {
     injectPopoverCssOnce();
   }, []);
+
+  const currentBookId = current.bookId ?? list[0]?.bookId ?? "GEN";
+  const currentChap = current.chapter ?? 1;
+  const currentVerse = current.verse ?? null;
 
   const bookNameById = useMemo(() => {
     const m = new Map<string, string>();
@@ -17649,39 +19737,29 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     return m;
   }, [list]);
 
-  const currentBookId = current.bookId ?? list[0]?.bookId ?? "GEN";
-  const currentBookName = (current.bookId ? bookNameById.get(current.bookId) : null) ?? currentBookId ?? "…";
-  const currentChap = current.chapter ?? 1;
-  const currentVerse = current.verse ?? null;
+  const currentBookName =
+       (current.bookId ? bookNameById.get(current.bookId) : null) ??
+       currentBookId ??
+       "…";
 
-  const pillLabel = useMemo(() => {
-    return currentVerse == null ? `${currentBookName} ${currentChap}` : `${currentBookName} ${currentChap}:${currentVerse}`;
-  }, [currentBookName, currentChap, currentVerse]);
+  const selectedBook = useMemo(
+       () => list.find((b) => b.bookId === bookId) ?? null,
+       [list, bookId],
+  );
 
-  const [bookId, setBookId] = useState<string>(currentBookId);
-  const [chapter, setChapter] = useState<number>(currentChap);
-  const [verse, setVerse] = useState<number | null>(currentVerse);
-
-  const [pendingChapter, setPendingChapter] = useState<boolean>(false);
-  const [pendingVerse, setPendingVerse] = useState<boolean>(false);
-
-  // Chapters: cache + abortable fetch
-  const chaptersCacheRef = useRef<Map<string, ChaptersPayload>>(new Map());
-  const abortRef = useRef<AbortController | null>(null);
-  const [chaptersMeta, setChaptersMeta] = useState<ChaptersPayload | null>(null);
-
-  const selectedBook = useMemo(() => list.find((b) => b.bookId === bookId) ?? null, [list, bookId]);
   const bookName = selectedBook?.name ?? bookId;
   const testamentTag = (selectedBook?.testament ?? "").toUpperCase();
   const chapterMax = selectedBook?.chapters ?? 999;
 
-  // ensure active book index stays valid
   useEffect(() => {
     const idx = Math.max(0, list.findIndex((b) => b.bookId === bookId));
     setActiveBookIdx(idx >= 0 ? idx : 0);
   }, [list, bookId]);
 
-  // Load chapters when open+book changes
+  useEffect(() => {
+    setChapter((c) => clampInt(c || 1, 1, chapterMax));
+  }, [chapterMax]);
+
   useEffect(() => {
     if (!open) return;
 
@@ -17694,36 +19772,31 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       return;
     }
 
+    const id = ++requestIdRef.current;
     const ac = new AbortController();
     abortRef.current = ac;
 
-    let alive = true;
-    apiGetChapters(bookId, { signal: ac.signal } as any)
-        .then((p) => {
-          if (!alive || ac.signal.aborted) return;
-          chaptersCacheRef.current.set(bookId, p);
-          setChaptersMeta(p);
-        })
-        .catch(() => {
-          if (!alive || ac.signal.aborted) return;
-          setChaptersMeta(null);
-        });
+    apiGetChapters(bookId, { signal: ac.signal })
+         .then((payload) => {
+           if (ac.signal.aborted) return;
+           if (id !== requestIdRef.current) return;
+           chaptersCacheRef.current.set(bookId, payload);
+           setChaptersMeta(payload);
+         })
+         .catch(() => {
+           if (ac.signal.aborted) return;
+           if (id !== requestIdRef.current) return;
+           setChaptersMeta(null);
+         });
 
     return () => {
-      alive = false;
       ac.abort();
     };
   }, [open, bookId]);
 
-  // Clamp chapter when book changes
-  useEffect(() => {
-    setChapter((c) => clampInt(c || 1, 1, chapterMax));
-  }, [chapterMax]);
-
   const verseMax = useMemo(() => {
-    const meta = chaptersMeta;
-    if (!meta) return 999;
-    const row = meta.chapters.find((c) => c.chapter === chapter);
+    if (!chaptersMeta) return 999;
+    const row = chaptersMeta.chapters.find((c) => c.chapter === chapter);
     return row?.verseCount ?? 999;
   }, [chaptersMeta, chapter]);
 
@@ -17734,16 +19807,23 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   const chapterOptions = useMemo(() => buildNumberOptions(1, chapterMax), [chapterMax]);
   const verseOptions = useMemo(() => buildNumberOptions(1, verseMax), [verseMax]);
 
-  // sync active indices for roving focus
   useEffect(() => {
     setActiveChapIdx(Math.max(0, Math.min(chapterOptions.length - 1, chapter - 1)));
   }, [chapterOptions.length, chapter]);
 
   useEffect(() => {
-    setActiveVerseIdx(verse == null ? 0 : Math.max(0, Math.min(verseOptions.length - 1, verse - 1)));
+    setActiveVerseIdx(
+         verse == null ? 0 : Math.max(0, Math.min(verseOptions.length - 1, verse - 1)),
+    );
   }, [verseOptions.length, verse]);
 
-  // Reset local state when closed (and restore focus to pill)
+  const clearCloseTimer = useCallback(() => {
+    if (closeTimerRef.current != null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     if (open) return;
 
@@ -17753,36 +19833,51 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setBookId(currentBookId);
     setChapter(currentChap);
     setVerse(currentVerse);
-
     setPendingChapter(false);
     setPendingVerse(false);
     setChaptersMeta(null);
-
     setActiveCol("book");
+
     clearCloseTimer();
 
-    // restore focus
-    const id = requestAnimationFrame(() => anchorRef.current?.focus());
+    const id = requestAnimationFrame(() => {
+      anchorRef.current?.focus();
+    });
     return () => cancelAnimationFrame(id);
   }, [open, currentBookId, currentChap, currentVerse, clearCloseTimer]);
 
-  const titleBookPart = bookName;
   const titleNumPart = useMemo(() => {
     if (pendingChapter) return "";
-    let s = ` ${chapter}`;
-    if (!pendingVerse && verse != null) s += `:${verse}`;
-    return s;
+    let out = ` ${chapter}`;
+    if (!pendingVerse && verse != null) out += `:${verse}`;
+    return out;
   }, [pendingChapter, pendingVerse, chapter, verse]);
-  const titleTagPart = testamentTag;
+
+  const pillLabel = useMemo(() => {
+    return currentVerse == null
+         ? `${currentBookName} ${currentChap}`
+         : `${currentBookName} ${currentChap}:${currentVerse}`;
+  }, [currentBookName, currentChap, currentVerse]);
 
   const closePopover = useCallback(() => {
     if (!openRef.current || phaseRef.current === "closing") return;
     setPhase("closing");
   }, [openRef, phaseRef]);
 
+  const openPopover = useCallback(() => {
+    clearCloseTimer();
+    setOpen(true);
+    setPhase("opening");
+  }, [clearCloseTimer]);
+
+  const toggleOpen = useCallback(() => {
+    if (openRef.current) closePopover();
+    else openPopover();
+  }, [openRef, closePopover, openPopover]);
+
   const commit = useCallback(() => {
     const ch = pendingChapter ? 1 : chapter;
-    const v: number | null = pendingVerse || verse == null ? null : verse;
+    const v = pendingVerse || verse == null ? null : verse;
     onJump(bookId, ch, v);
     closePopover();
   }, [bookId, chapter, verse, pendingChapter, pendingVerse, onJump, closePopover]);
@@ -17809,31 +19904,89 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setVerse(nextVerse);
   }, []);
 
-  const openPopover = useCallback(() => {
-    clearCloseTimer();
-    setOpen(true);
-    setPhase("opening");
-  }, [clearCloseTimer]);
+  const focusBookByIndex = useCallback(
+       (idx: number) => {
+         const id = list[idx]?.bookId;
+         const el = id ? bookBtnMapRef.current.get(id) : null;
+         el?.focus();
+         scrollIntoViewCentered(el);
+       },
+       [list],
+  );
 
-  const toggleOpen = useCallback(() => {
-    if (openRef.current) closePopover();
-    else openPopover();
-  }, [openRef, openPopover, closePopover]);
+  const focusChapterByIndex = useCallback(
+       (idx: number) => {
+         const n = chapterOptions[idx]?.value;
+         const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
+         el?.focus();
+         scrollIntoViewCentered(el);
+       },
+       [chapterOptions],
+  );
 
-  // Positioning (resize/scroll/vv)
+  const focusVerseByIndex = useCallback(
+       (idx: number) => {
+         const n = verseOptions[idx]?.value;
+         const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
+         el?.focus();
+         scrollIntoViewCentered(el);
+       },
+       [verseOptions],
+  );
+
+  const focusCurrentColumnSelection = useCallback(
+       (col: Col) => {
+         if (col === "book") {
+           focusBookByIndex(activeBookIdx);
+           return;
+         }
+         if (col === "chapter") {
+           focusChapterByIndex(activeChapIdx);
+           return;
+         }
+         focusVerseByIndex(activeVerseIdx);
+       },
+       [activeBookIdx, activeChapIdx, activeVerseIdx, focusBookByIndex, focusChapterByIndex, focusVerseByIndex],
+  );
+
+  const focusColumnBoundary = useCallback(
+       (col: Col, atEnd: boolean) => {
+         if (col === "book") {
+           const idx = atEnd ? Math.max(0, list.length - 1) : 0;
+           setActiveBookIdx(idx);
+           focusBookByIndex(idx);
+           return;
+         }
+
+         if (col === "chapter") {
+           const idx = atEnd ? Math.max(0, chapterOptions.length - 1) : 0;
+           setActiveChapIdx(idx);
+           focusChapterByIndex(idx);
+           return;
+         }
+
+         const idx = atEnd ? Math.max(0, verseOptions.length - 1) : 0;
+         setActiveVerseIdx(idx);
+         focusVerseByIndex(idx);
+       },
+       [list.length, chapterOptions.length, verseOptions.length, focusBookByIndex, focusChapterByIndex, focusVerseByIndex],
+  );
+
   useLayoutEffect(() => {
     if (!open) return;
     const a = anchorRef.current;
     if (!a) return;
 
     let raf = 0;
+
     const update = () => {
       cancelAnimationFrame(raf);
       raf = requestAnimationFrame(() => {
-        const r = a.getBoundingClientRect();
-        setPopPos(computePopoverPos(r, POPOVER_W));
+        const rect = a.getBoundingClientRect();
+        setPopPos(computePopoverPos(rect, POPOVER_W));
       });
     };
+
     update();
 
     window.addEventListener("resize", update, { passive: true });
@@ -17852,7 +20005,6 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     };
   }, [open]);
 
-  // Phase timing
   useEffect(() => {
     if (!open) return;
     if (reducedMotion) {
@@ -17860,6 +20012,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       return;
     }
     if (phase !== "opening") return;
+
     const id = window.setTimeout(() => setPhase("open"), OPEN_MS);
     return () => window.clearTimeout(id);
   }, [open, phase, reducedMotion]);
@@ -17870,36 +20023,34 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       setOpen(false);
       return;
     }
+
     const id = window.setTimeout(() => setOpen(false), CLOSE_MS);
     return () => window.clearTimeout(id);
   }, [open, phase, reducedMotion]);
 
-  // Outside click + keyboard (capture)
   useEffect(() => {
     if (!open) return;
 
     const onPointerDownCapture = (e: PointerEvent) => {
-      const t = e.target as Node | null;
-      if (!t) return;
+      const target = e.target as Node | null;
+      const path = eventComposedPath(e);
 
-      const a = anchorRef.current;
-      const pop = popoverElRef.current;
+      const inAnchor = targetWithinNode(target, path, anchorRef.current);
+      const inPop = targetWithinNode(target, path, popoverElRef.current);
 
-      if (a && a.contains(t)) return;
-      if (pop && pop.contains(t)) return;
+      if (inAnchor || inPop) return;
 
       clearCloseTimer();
       closeTimerRef.current = window.setTimeout(() => closePopover(), CLOSE_DELAY_MS);
     };
 
-    const onKey = (e: KeyboardEvent) => {
+    const onKeyCapture = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
         closePopover();
         return;
       }
 
-      // If focus is inside the popover, support Enter to commit
       if (e.key === "Enter") {
         const pop = popoverElRef.current;
         const activeEl = document.activeElement;
@@ -17911,20 +20062,18 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     };
 
     document.addEventListener("pointerdown", onPointerDownCapture, { capture: true });
-    document.addEventListener("keydown", onKey, { capture: true });
+    document.addEventListener("keydown", onKeyCapture, { capture: true });
 
     return () => {
       document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
-      document.removeEventListener("keydown", onKey, { capture: true });
+      document.removeEventListener("keydown", onKeyCapture, { capture: true });
     };
   }, [open, commit, closePopover, clearCloseTimer, pendingChapter]);
 
-  // Focus management (after open)
   useEffect(() => {
     if (!open) return;
 
     const id = requestAnimationFrame(() => {
-      // Focus the currently selected book, and try to align the other columns too
       const bookEl = bookBtnMapRef.current.get(bookId) ?? null;
       bookEl?.focus();
       scrollIntoViewCentered(bookEl);
@@ -17933,6 +20082,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
         const chapEl = chapBtnMapRef.current.get(`c:${chapter}`) ?? null;
         scrollIntoViewCentered(chapEl);
       }
+
       if (!pendingVerse && verse != null) {
         const verseEl = verseBtnMapRef.current.get(`v:${verse}`) ?? null;
         scrollIntoViewCentered(verseEl);
@@ -17958,338 +20108,313 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   };
 
   const popAnim: React.CSSProperties = reducedMotion
-      ? { opacity: 1, transform: "none" }
-      : phase === "opening"
-          ? { opacity: 0, transform: "scale(0.975) translateY(6px)" }
-          : phase === "closing"
-              ? { opacity: 0, transform: "scale(0.988) translateY(4px)" }
-              : { opacity: 1, transform: "scale(1) translateY(0)" };
+       ? { opacity: 1, transform: "none" }
+       : phase === "opening"
+            ? { opacity: 0, transform: "scale(0.975) translateY(6px)" }
+            : phase === "closing"
+                 ? { opacity: 0, transform: "scale(0.988) translateY(4px)" }
+                 : { opacity: 1, transform: "scale(1) translateY(0)" };
 
   const popTransition = reducedMotion
-      ? undefined
-      : "opacity 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0)";
+       ? undefined
+       : "opacity 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0)";
 
-  // Monochrome accent derived from theme tokens (no hue)
-  const bpAccent = "var(--fg)";
-  const bpAccentSoft = "color-mix(in oklab, var(--panel) 26%, transparent)";
-  const bpAccentRing = "color-mix(in oklab, var(--focusRing) 72%, transparent)";
-
-  // Keyboard navigation inside popover (roving focus)
-  const onPopoverKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    const key = e.key;
-
-    const col: Col = activeColRef.current;
-    const isBooks = col === "book";
-    const isCh = col === "chapter";
-    const isV = col === "verse";
-
-    const moveCol = (next: Col) => {
-      setActiveCol(next);
-      requestAnimationFrame(() => {
-        if (next === "book") {
-          const b = list[activeBookIdx]?.bookId;
-          const el = b ? bookBtnMapRef.current.get(b) : null;
-          el?.focus();
-          scrollIntoViewCentered(el);
-        } else if (next === "chapter") {
-          const n = chapterOptions[activeChapIdx]?.value;
-          const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
-          el?.focus();
-          scrollIntoViewCentered(el);
-        } else {
-          const n = verseOptions[activeVerseIdx]?.value;
-          const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
-          el?.focus();
-          scrollIntoViewCentered(el);
-        }
-      });
-    };
-
-    const handleUpDown = (delta: number) => {
-      if (isBooks) {
-        const idx = nextIndex(activeBookIdx, delta, list.length);
-        setActiveBookIdx(idx);
-        const id = list[idx]?.bookId;
-        if (id) {
-          const el = bookBtnMapRef.current.get(id) ?? null;
-          el?.focus();
-          scrollIntoViewCentered(el);
-        }
-        e.preventDefault();
-        return;
-      }
-
-      if (isCh) {
-        const idx = nextIndex(activeChapIdx, delta, chapterOptions.length);
-        setActiveChapIdx(idx);
-        const n = chapterOptions[idx]?.value;
-        if (n != null) {
-          const el = chapBtnMapRef.current.get(`c:${n}`) ?? null;
-          el?.focus();
-          scrollIntoViewCentered(el);
-        }
-        e.preventDefault();
-        return;
-      }
-
-      // verse
-      const idx = nextIndex(activeVerseIdx, delta, verseOptions.length);
-      setActiveVerseIdx(idx);
-      const n = verseOptions[idx]?.value;
-      if (n != null) {
-        const el = verseBtnMapRef.current.get(`v:${n}`) ?? null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      }
-      e.preventDefault();
-    };
-
-    if (key === "ArrowLeft") {
-      if (isV) moveCol("chapter");
-      else if (isCh) moveCol("book");
-      e.preventDefault();
-      return;
-    }
-    if (key === "ArrowRight") {
-      if (isBooks) moveCol("chapter");
-      else if (isCh) moveCol("verse");
-      e.preventDefault();
-      return;
-    }
-    if (key === "ArrowUp") return handleUpDown(-1);
-    if (key === "ArrowDown") return handleUpDown(1);
-
-    if (key === "Home") {
-      if (isBooks) {
-        setActiveBookIdx(0);
-        const id = list[0]?.bookId;
-        const el = id ? bookBtnMapRef.current.get(id) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      } else if (isCh) {
-        setActiveChapIdx(0);
-        const n = chapterOptions[0]?.value;
-        const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      } else {
-        setActiveVerseIdx(0);
-        const n = verseOptions[0]?.value;
-        const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      }
-      e.preventDefault();
-      return;
-    }
-
-    if (key === "End") {
-      if (isBooks) {
-        const idx = Math.max(0, list.length - 1);
-        setActiveBookIdx(idx);
-        const id = list[idx]?.bookId;
-        const el = id ? bookBtnMapRef.current.get(id) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      } else if (isCh) {
-        const idx = Math.max(0, chapterOptions.length - 1);
-        setActiveChapIdx(idx);
-        const n = chapterOptions[idx]?.value;
-        const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      } else {
-        const idx = Math.max(0, verseOptions.length - 1);
-        setActiveVerseIdx(idx);
-        const n = verseOptions[idx]?.value;
-        const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      }
-      e.preventDefault();
-      return;
-    }
+  const popoverStyle: CssVarStyle = {
+    ...sx.popover,
+    left: popPos?.left ?? 0,
+    top: popPos?.top ?? 0,
+    width: popPos?.width ?? POPOVER_W,
+    height: popPos?.height ?? POPOVER_MIN_H,
+    ...popAnim,
+    transition: popTransition,
+    "--bpAccent": "var(--fg)",
+    "--bpAccentSoft": "color-mix(in oklab, var(--panel) 26%, transparent)",
+    "--bpAccentRing": "color-mix(in oklab, var(--focusRing) 72%, transparent)",
   };
 
+  const onPopoverKeyDown = useCallback(
+       (e: React.KeyboardEvent<HTMLDivElement>) => {
+         const key = e.key;
+         const col = activeColRef.current;
+         const isBooks = col === "book";
+         const isCh = col === "chapter";
+         const isV = col === "verse";
+
+         const moveCol = (next: Col) => {
+           setActiveCol(next);
+           requestAnimationFrame(() => {
+             focusCurrentColumnSelection(next);
+           });
+         };
+
+         const handleUpDown = (delta: number) => {
+           if (isBooks) {
+             const idx = nextIndex(activeBookIdx, delta, list.length);
+             setActiveBookIdx(idx);
+             focusBookByIndex(idx);
+             e.preventDefault();
+             return;
+           }
+
+           if (isCh) {
+             const idx = nextIndex(activeChapIdx, delta, chapterOptions.length);
+             setActiveChapIdx(idx);
+             focusChapterByIndex(idx);
+             e.preventDefault();
+             return;
+           }
+
+           const idx = nextIndex(activeVerseIdx, delta, verseOptions.length);
+           setActiveVerseIdx(idx);
+           focusVerseByIndex(idx);
+           e.preventDefault();
+         };
+
+         if (key === "ArrowLeft") {
+           if (isV) moveCol("chapter");
+           else if (isCh) moveCol("book");
+           e.preventDefault();
+           return;
+         }
+
+         if (key === "ArrowRight") {
+           if (isBooks) moveCol("chapter");
+           else if (isCh) moveCol("verse");
+           e.preventDefault();
+           return;
+         }
+
+         if (key === "ArrowUp") {
+           handleUpDown(-1);
+           return;
+         }
+
+         if (key === "ArrowDown") {
+           handleUpDown(1);
+           return;
+         }
+
+         if (key === "Home") {
+           focusColumnBoundary(col, false);
+           e.preventDefault();
+           return;
+         }
+
+         if (key === "End") {
+           focusColumnBoundary(col, true);
+           e.preventDefault();
+         }
+       },
+       [
+         activeBookIdx,
+         activeChapIdx,
+         activeVerseIdx,
+         activeColRef,
+         chapterOptions.length,
+         verseOptions.length,
+         list.length,
+         focusBookByIndex,
+         focusChapterByIndex,
+         focusVerseByIndex,
+         focusCurrentColumnSelection,
+         focusColumnBoundary,
+       ],
+  );
+
   const popover =
-      open && popPos
-          ? createPortal(
-              <div
-                  id="bp-pos-popover"
-                  ref={popoverElRef}
-                  style={{
-                    ...sx.popover,
-                    left: popPos.left,
-                    top: popPos.top,
-                    width: popPos.width,
-                    height: popPos.height,
-                    ...popAnim,
-                    transition: popTransition,
-                    ["--bpAccent" as any]: bpAccent,
-                    ["--bpAccentSoft" as any]: bpAccentSoft,
-                    ["--bpAccentRing" as any]: bpAccentRing,
-                  }}
-                  role="dialog"
-                  aria-label="Jump"
-                  aria-modal="false"
-                  onKeyDown={onPopoverKeyDown}
-              >
-                <div style={sx.topRow}>
-                  <div
-                      style={sx.titleWrap}
-                      aria-label="Selection summary"
-                      title={`${titleBookPart}${titleNumPart}${titleTagPart}`}
-                  >
-                    <span style={sx.titleBook}>{titleBookPart}</span>
-                    {titleNumPart && <span style={sx.titleNum}>{titleNumPart}</span>}
-                    {titleTagPart && <span style={sx.titleTag}>{titleTagPart}</span>}
-                  </div>
+       open && popPos
+            ? createPortal(
+                 <div
+                      id={POP_ID}
+                      ref={popoverElRef}
+                      style={popoverStyle}
+                      role="dialog"
+                      aria-label="Jump"
+                      aria-modal="false"
+                      onKeyDown={onPopoverKeyDown}
+                 >
+                   <div style={sx.topRow}>
+                     <div
+                          style={sx.titleWrap}
+                          aria-label="Selection summary"
+                          title={`${bookName}${titleNumPart}${testamentTag}`}
+                     >
+                       <span style={sx.titleBook}>{bookName}</span>
+                       {titleNumPart ? <span style={sx.titleNum}>{titleNumPart}</span> : null}
+                       {testamentTag ? <span style={sx.titleTag}>{testamentTag}</span> : null}
+                     </div>
 
-                  <button
-                      type="button"
-                      className="bp-go"
-                      style={goStyle}
-                      onClick={() => {
-                        if (canCommit) commit();
-                      }}
-                      disabled={!canCommit}
-                      onPointerDown={() => setPressGo(true)}
-                      onPointerUp={() => setPressGo(false)}
-                      onPointerCancel={() => setPressGo(false)}
-                      onPointerLeave={() => setPressGo(false)}
-                      aria-label="Confirm jump"
-                      title={canCommit ? "Confirm" : "Pick a chapter first"}
-                  >
-                    →
-                  </button>
-                </div>
+                     <button
+                          type="button"
+                          className="bp-go"
+                          style={goStyle}
+                          onClick={() => {
+                            if (canCommit) commit();
+                          }}
+                          disabled={!canCommit}
+                          onPointerDown={() => setPressGo(true)}
+                          onPointerUp={() => setPressGo(false)}
+                          onPointerCancel={() => setPressGo(false)}
+                          onPointerLeave={() => setPressGo(false)}
+                          aria-label="Confirm jump"
+                          title={canCommit ? "Confirm" : "Pick a chapter first"}
+                     >
+                       →
+                     </button>
+                   </div>
 
-                <div style={sx.bodyRow}>
-                  {/* Books */}
-                  <div style={sx.col}>
-                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
-                      {list.map((b, idx) => {
-                        const active = b.bookId === bookId;
-                        const tabIndex = activeCol === "book" && idx === activeBookIdx ? 0 : -1;
-                        return (
-                            <ListItem
-                                key={b.bookId}
-                                active={active}
-                                onClick={() => onPickBook(b.bookId)}
-                                mapRef={bookBtnMapRef}
-                                itemKey={b.bookId}
-                                ariaLabel={`Select ${b.name}`}
-                                tabIndex={tabIndex}
-                                onFocus={() => setActiveCol("book")}
-                            >
-                        <span style={sx.itemLine}>
-                          <span style={{ ...sx.itemTextBook, ...(active ? sx.itemTextActive : null) }}>{b.name}</span>
-                        </span>
-                            </ListItem>
-                        );
-                      })}
-                    </div>
-                  </div>
+                   <div style={sx.bodyRow}>
+                     <div style={sx.col}>
+                       <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
+                         {list.map((b, idx) => {
+                           const active = b.bookId === bookId;
+                           const tabIndex =
+                                activeCol === "book" && idx === activeBookIdx ? 0 : -1;
 
-                  {/* Chapters */}
-                  <div style={sx.colNarrow}>
-                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
-                      {chapterOptions.map((o, idx) => {
-                        const n = o.value;
-                        const active = !pendingChapter && n === chapter;
-                        const tabIndex = activeCol === "chapter" && idx === activeChapIdx ? 0 : -1;
-                        return (
-                            <ListItem
-                                key={o.key}
-                                active={active}
-                                onClick={() => onPickChapter(n)}
-                                tight
-                                mapRef={chapBtnMapRef}
-                                itemKey={`c:${n}`}
-                                ariaLabel={`Chapter ${n}`}
-                                tabIndex={tabIndex}
-                                onFocus={() => setActiveCol("chapter")}
-                            >
-                        <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
-                          <span style={sx.prefixLabel}>CH</span> {n}
-                        </span>
-                            </ListItem>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  {/* Verses */}
-                  <div style={sx.colNarrow}>
-                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Verses">
-                      {!chaptersMeta ? (
-                          <div style={sx.loadingBox}>Loading…</div>
-                      ) : (
-                          verseOptions.map((o, idx) => {
-                            const n = o.value;
-                            const active = !pendingVerse && verse === n;
-                            const tabIndex = activeCol === "verse" && idx === activeVerseIdx ? 0 : -1;
-                            return (
+                           return (
                                 <ListItem
-                                    key={o.key}
-                                    active={active}
-                                    onClick={() => onPickVerse(n)}
-                                    tight
-                                    mapRef={verseBtnMapRef}
-                                    itemKey={`v:${n}`}
-                                    ariaLabel={`Verse ${n}`}
-                                    tabIndex={tabIndex}
-                                    onFocus={() => setActiveCol("verse")}
+                                     key={b.bookId}
+                                     active={active}
+                                     onClick={() => onPickBook(b.bookId)}
+                                     mapRef={bookBtnMapRef}
+                                     itemKey={b.bookId}
+                                     ariaLabel={`Select ${b.name}`}
+                                     tabIndex={tabIndex}
+                                     onFocus={() => setActiveCol("book")}
                                 >
-                          <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
-                            <span style={sx.prefixLabel}>V</span> {n}
-                          </span>
+                                              <span style={sx.itemLine}>
+                                                  <span
+                                                       style={{
+                                                         ...sx.itemTextBook,
+                                                         ...(active ? sx.itemTextActive : null),
+                                                       }}
+                                                  >
+                                                      {b.name}
+                                                  </span>
+                                              </span>
                                 </ListItem>
-                            );
-                          })
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </div>,
-              document.body,
-          )
-          : null;
+                           );
+                         })}
+                       </div>
+                     </div>
+
+                     <div style={sx.colNarrow}>
+                       <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
+                         {chapterOptions.map((o, idx) => {
+                           const n = o.value;
+                           const active = !pendingChapter && n === chapter;
+                           const tabIndex =
+                                activeCol === "chapter" && idx === activeChapIdx ? 0 : -1;
+
+                           return (
+                                <ListItem
+                                     key={o.key}
+                                     active={active}
+                                     onClick={() => onPickChapter(n)}
+                                     tight
+                                     mapRef={chapBtnMapRef}
+                                     itemKey={`c:${n}`}
+                                     ariaLabel={`Chapter ${n}`}
+                                     tabIndex={tabIndex}
+                                     onFocus={() => setActiveCol("chapter")}
+                                >
+                                              <span
+                                                   style={{
+                                                     ...sx.numText,
+                                                     ...(active ? sx.numTextActive : null),
+                                                   }}
+                                              >
+                                                  <span style={sx.prefixLabel}>CH</span> {n}
+                                              </span>
+                                </ListItem>
+                           );
+                         })}
+                       </div>
+                     </div>
+
+                     <div style={sx.colNarrow}>
+                       <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Verses">
+                         {!chaptersMeta ? (
+                              <div style={sx.loadingBox}>Loading…</div>
+                         ) : (
+                              verseOptions.map((o, idx) => {
+                                const n = o.value;
+                                const active = !pendingVerse && verse === n;
+                                const tabIndex =
+                                     activeCol === "verse" && idx === activeVerseIdx ? 0 : -1;
+
+                                return (
+                                     <ListItem
+                                          key={o.key}
+                                          active={active}
+                                          onClick={() => onPickVerse(n)}
+                                          tight
+                                          mapRef={verseBtnMapRef}
+                                          itemKey={`v:${n}`}
+                                          ariaLabel={`Verse ${n}`}
+                                          tabIndex={tabIndex}
+                                          onFocus={() => setActiveCol("verse")}
+                                     >
+                                                  <span
+                                                       style={{
+                                                         ...sx.numText,
+                                                         ...(active ? sx.numTextActive : null),
+                                                       }}
+                                                  >
+                                                      <span style={sx.prefixLabel}>V</span> {n}
+                                                  </span>
+                                     </ListItem>
+                                );
+                              })
+                         )}
+                       </div>
+                     </div>
+                   </div>
+                 </div>,
+                 document.body,
+            )
+            : null;
 
   return (
-      <div style={sx.root}>
-        <button
-            ref={anchorRef}
-            type="button"
-            className="bp-pill"
-            style={pillStyle}
-            aria-label="Current position"
-            aria-haspopup="dialog"
-            aria-expanded={open}
-            onClick={toggleOpen}
-            onPointerDown={() => {
-              clearCloseTimer();
-              setPressPill(true);
-            }}
-            onPointerUp={() => setPressPill(false)}
-            onPointerCancel={() => setPressPill(false)}
-            onPointerLeave={() => setPressPill(false)}
-            title={pillLabel}
-        >
-          <span style={sx.pillTextStrong}>{currentBookName}</span>
-          <span style={sx.pillTextMuted}>{currentVerse == null ? `${currentChap}` : `${currentChap}:${currentVerse}`}</span>
-          <span style={sx.caret} aria-hidden>
-          ▾
-        </span>
-        </button>
+       <div style={sx.root}>
+         <button
+              ref={anchorRef}
+              type="button"
+              className="bp-pill"
+              style={pillStyle}
+              aria-label="Current position"
+              aria-haspopup="dialog"
+              aria-expanded={open}
+              onClick={toggleOpen}
+              onPointerDown={() => {
+                clearCloseTimer();
+                setPressPill(true);
+              }}
+              onPointerUp={() => setPressPill(false)}
+              onPointerCancel={() => setPressPill(false)}
+              onPointerLeave={() => setPressPill(false)}
+              title={pillLabel}
+         >
+           <span style={sx.pillTextStrong}>{currentBookName}</span>
+           <span style={sx.pillTextMuted}>
+                    {currentVerse == null ? `${currentChap}` : `${currentChap}:${currentVerse}`}
+                </span>
+           <span style={sx.caret} aria-hidden>
+                    ▾
+                </span>
+         </button>
 
-        {popover}
-      </div>
+         {popover}
+       </div>
   );
 }
 
 const sx: Record<string, React.CSSProperties> = {
-  root: { position: "relative", display: "flex", alignItems: "center" },
+  root: {
+    position: "relative",
+    display: "flex",
+    alignItems: "center",
+  },
 
   pill: {
     display: "inline-grid",
@@ -18307,14 +20432,16 @@ const sx: Record<string, React.CSSProperties> = {
     lineHeight: 1,
     boxShadow: "0 6px 18px rgba(0,0,0,0.06)",
     transition:
-        "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
+         "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
     whiteSpace: "nowrap",
     textAlign: "left",
     WebkitTapHighlightColor: "transparent",
     outline: "none",
     willChange: "transform",
   },
-  pillPressedFallback: { transform: "scale(0.97)" },
+  pillPressedFallback: {
+    transform: "scale(0.97)",
+  },
   pillOpen: {
     boxShadow: "0 14px 42px rgba(0,0,0,0.12)",
     transform: "translateY(-1px)",
@@ -18435,8 +20562,13 @@ const sx: Record<string, React.CSSProperties> = {
     WebkitTapHighlightColor: "transparent",
     outline: "none",
   },
-  goBtnDisabled: { opacity: 0.52, cursor: "not-allowed" },
-  goPressedFallback: { transform: "scale(0.945)" },
+  goBtnDisabled: {
+    opacity: 0.52,
+    cursor: "not-allowed",
+  },
+  goPressedFallback: {
+    transform: "scale(0.945)",
+  },
 
   bodyRow: {
     display: "grid",
@@ -18446,8 +20578,18 @@ const sx: Record<string, React.CSSProperties> = {
     minHeight: 0,
     flex: "1 1 auto",
   },
-  col: { minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" },
-  colNarrow: { minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" },
+  col: {
+    minWidth: 0,
+    minHeight: 0,
+    display: "flex",
+    flexDirection: "column",
+  },
+  colNarrow: {
+    minWidth: 0,
+    minHeight: 0,
+    display: "flex",
+    flexDirection: "column",
+  },
 
   list: {
     borderRadius: S(12),
@@ -18512,7 +20654,12 @@ const sx: Record<string, React.CSSProperties> = {
     borderBottomLeftRadius: S(12),
   },
 
-  itemLine: { display: "inline-flex", alignItems: "baseline", gap: S(7), minWidth: 0 },
+  itemLine: {
+    display: "inline-flex",
+    alignItems: "baseline",
+    gap: S(7),
+    minWidth: 0,
+  },
   itemTextBook: {
     fontSize: 13.9 * SCALE,
     fontWeight: 600,
@@ -18524,7 +20671,10 @@ const sx: Record<string, React.CSSProperties> = {
     whiteSpace: "nowrap",
     minWidth: 0,
   },
-  itemTextActive: { opacity: 1, fontWeight: 670 },
+  itemTextActive: {
+    opacity: 1,
+    fontWeight: 670,
+  },
 
   numText: {
     fontSize: 13.7 * SCALE,
@@ -18534,7 +20684,10 @@ const sx: Record<string, React.CSSProperties> = {
     fontWeight: 560,
     fontVariantNumeric: "tabular-nums",
   },
-  numTextActive: { opacity: 1, fontWeight: 670 },
+  numTextActive: {
+    opacity: 1,
+    fontWeight: 670,
+  },
 
   prefixLabel: {
     fontSize: 10.8 * SCALE,
@@ -18577,6 +20730,7 @@ const sx: Record<string, React.CSSProperties> = {
 ### apps/web/src/Reader.tsx
 
 ```tsx
+// apps/web/src/Reader.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiGetBooks, apiGetSpine, apiResolveLoc, type BookRow } from "./api";
 import type { ReaderLocation } from "./Search";
@@ -18588,19 +20742,39 @@ import type { ReaderViewportHandle } from "./reader/ReaderViewport";
 import { applyReaderTypographyFromStorage } from "./reader/typography";
 import { useReaderAnnotations } from "./reader/useReaderAnnotations";
 
-type Props = {
+type Props = Readonly<{
     styles: Record<string, React.CSSProperties>;
     onBackHome: () => void;
     initialLocation?: ReaderLocation;
     mode?: Mode;
     onToggleTheme?: () => void;
-};
+}>;
+
+type ScrollMode = "auto" | "smooth";
 
 const LS_LAST_ORD = "bp_last_pos_ord_v1";
 const LS_LAST_LOC = "bp_last_pos_loc_v1";
 
+type PendingJump = Readonly<{
+    ord: number;
+    behavior: ScrollMode;
+}>;
+
+type StoredLocation = Readonly<{
+    bookId: string;
+    chapter: number;
+    verse: number | null;
+}>;
+
+const INITIAL_POSITION: ReaderPosition = {
+    ord: 1,
+    verse: null,
+    book: null,
+};
+
 function safeGetLS(key: string): string | null {
     try {
+        if (typeof localStorage === "undefined") return null;
         return localStorage.getItem(key);
     } catch {
         return null;
@@ -18609,6 +20783,7 @@ function safeGetLS(key: string): string | null {
 
 function safeSetLS(key: string, value: string): void {
     try {
+        if (typeof localStorage === "undefined") return;
         localStorage.setItem(key, value);
     } catch {
         // ignore
@@ -18616,22 +20791,66 @@ function safeSetLS(key: string, value: string): void {
 }
 
 function clampOrd(ord: number, spine: SpineStats): number {
-    const n = Math.floor(ord);
+    const n = Math.trunc(ord);
     return Math.max(spine.verseOrdMin, Math.min(spine.verseOrdMax, n));
 }
 
-function parseFiniteInt(s: string | null): number | null {
-    if (!s) return null;
-    const n = Number(s);
+function parseFiniteInt(value: string | null): number | null {
+    if (!value) return null;
+    const n = Number(value);
     if (!Number.isFinite(n)) return null;
-    return Math.floor(n);
+    return Math.trunc(n);
 }
-
-type PendingJump = { ord: number; behavior: "auto" | "smooth" };
 
 function makeLocKey(loc?: ReaderLocation): string {
     if (!loc) return "";
     return `${loc.bookId}:${loc.chapter}:${loc.verse ?? ""}`;
+}
+
+function isStoredLocation(value: unknown): value is StoredLocation {
+    if (!value || typeof value !== "object") return false;
+    const v = value as Record<string, unknown>;
+
+    if (typeof v.bookId !== "string" || v.bookId.trim() === "") return false;
+    if (typeof v.chapter !== "number" || !Number.isFinite(v.chapter) || v.chapter < 1) return false;
+    if (v.verse !== null && (typeof v.verse !== "number" || !Number.isFinite(v.verse) || v.verse < 1)) return false;
+
+    return true;
+}
+
+function parseStoredLocation(raw: string | null): StoredLocation | null {
+    if (!raw) return null;
+
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        return isStoredLocation(parsed)
+             ? {
+                 bookId: parsed.bookId.trim().toUpperCase(),
+                 chapter: Math.trunc(parsed.chapter),
+                 verse: parsed.verse == null ? null : Math.trunc(parsed.verse),
+             }
+             : null;
+    } catch {
+        return null;
+    }
+}
+
+function sameVerse(
+     a: ReaderPosition["verse"] | null | undefined,
+     b: ReaderPosition["verse"] | null | undefined,
+): boolean {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    return a.bookId === b.bookId && a.chapter === b.chapter && a.verse === b.verse;
+}
+
+function sameBook(
+     a: ReaderPosition["book"] | null | undefined,
+     b: ReaderPosition["book"] | null | undefined,
+): boolean {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    return a.bookId === b.bookId;
 }
 
 export function Reader(props: Props) {
@@ -18640,7 +20859,7 @@ export function Reader(props: Props) {
     const [books, setBooks] = useState<BookRow[] | null>(null);
     const [spine, setSpine] = useState<SpineStats | null>(null);
     const [err, setErr] = useState<string | null>(null);
-    const [pos, setPos] = useState<ReaderPosition>(() => ({ ord: 1, verse: null, book: null }));
+    const [pos, setPos] = useState<ReaderPosition>(INITIAL_POSITION);
 
     const viewportHandleRef = useRef<ReaderViewportHandle | null>(null);
     const [viewportHandle, setViewportHandle] = useState<ReaderViewportHandle | null>(null);
@@ -18648,11 +20867,11 @@ export function Reader(props: Props) {
 
     const pendingJumpRef = useRef<PendingJump | null>(null);
     const didRestoreRef = useRef(false);
-    const appliedInitialKeyRef = useRef<string>("");
+    const appliedInitialKeyRef = useRef("");
+    const loadSeqRef = useRef(0);
     const resolveSeqRef = useRef(0);
 
     const selectionRootRef = useRef<HTMLDivElement | null>(null);
-
     const annotations = useReaderAnnotations(selectionRootRef);
 
     useEffect(() => {
@@ -18664,97 +20883,105 @@ export function Reader(props: Props) {
     }, [spine?.verseOrdMin, spine?.verseOrdMax, spine?.verseCount]);
 
     useEffect(() => {
-        const ac = new AbortController();
+        const seq = ++loadSeqRef.current;
         let alive = true;
 
         (async () => {
             try {
-                const [b, s] = await Promise.all([apiGetBooks(), apiGetSpine()]);
-                if (!alive || ac.signal.aborted) return;
-                setBooks(b.books);
-                setSpine(s);
+                setErr(null);
+                const [bookRes, spineRes] = await Promise.all([apiGetBooks(), apiGetSpine()]);
+                if (!alive || seq !== loadSeqRef.current) return;
+
+                setBooks(bookRes.books);
+                setSpine(spineRes);
             } catch (e: unknown) {
+                if (!alive || seq !== loadSeqRef.current) return;
                 const msg = e instanceof Error ? e.message : String(e);
-                if (!alive || ac.signal.aborted) return;
                 setErr(msg);
             }
         })();
 
         return () => {
             alive = false;
-            ac.abort();
         };
     }, []);
 
     const bookById = useMemo(() => {
-        const m = new Map<string, BookRow>();
-        for (const b of books ?? []) m.set(b.bookId, b);
-        return m;
+        const map = new Map<string, BookRow>();
+        for (const book of books ?? []) {
+            map.set(book.bookId, book);
+        }
+        return map;
     }, [books]);
 
     const posLabel = useMemo(() => {
         if (!spine) return "…";
         if (!pos.verse) return `#${pos.ord}`;
+
         const bookName = pos.book?.name ?? pos.verse.bookId;
         return `${bookName} ${pos.verse.chapter}:${pos.verse.verse}`;
-    }, [spine, pos.ord, pos.verse, pos.book]);
+    }, [spine, pos]);
 
     const canJumpNow = !!(spine && viewportReady && viewportHandle);
 
-    const setViewportRef = useCallback((h: ReaderViewportHandle | null) => {
-        viewportHandleRef.current = h;
-        setViewportHandle(h);
+    const setViewportRef = useCallback((handle: ReaderViewportHandle | null) => {
+        viewportHandleRef.current = handle;
+        setViewportHandle(handle);
     }, []);
 
     const jumpToOrd = useCallback(
-        (ord: number, behavior: "auto" | "smooth") => {
-            if (!spine) return;
-            const clamped = clampOrd(ord, spine);
+         (ord: number, behavior: ScrollMode) => {
+             if (!spine) return;
 
-            if (viewportHandle && viewportReady) {
-                viewportHandle.jumpToOrd(clamped, behavior);
-            } else {
-                pendingJumpRef.current = { ord: clamped, behavior };
-            }
-        },
-        [spine, viewportHandle, viewportReady],
+             const clamped = clampOrd(ord, spine);
+             const handle = viewportHandleRef.current;
+
+             if (handle && viewportReady) {
+                 handle.jumpToOrd(clamped, behavior);
+                 return;
+             }
+
+             pendingJumpRef.current = { ord: clamped, behavior };
+         },
+         [spine, viewportReady],
     );
 
     const resolveAndJump = useCallback(
-        async (bookId: string, chapter: number, verse: number | null, behavior: "auto" | "smooth") => {
-            if (!bookId) return;
+         async (bookId: string, chapter: number, verse: number | null, behavior: ScrollMode) => {
+             const cleanBookId = bookId.trim().toUpperCase();
+             if (!cleanBookId || chapter < 1) return;
 
-            annotations.clearSelection();
-            setErr(null);
+             annotations.clearSelection();
+             setErr(null);
 
-            const seq = ++resolveSeqRef.current;
+             const seq = ++resolveSeqRef.current;
 
-            try {
-                const loc = await apiResolveLoc(bookId, chapter, verse);
-                if (seq !== resolveSeqRef.current) return;
-                if (!loc?.verseOrd) return;
+             try {
+                 const loc = await apiResolveLoc(cleanBookId, chapter, verse);
+                 if (seq !== resolveSeqRef.current) return;
+                 if (!loc?.verseOrd || !Number.isFinite(loc.verseOrd)) return;
 
-                jumpToOrd(loc.verseOrd, behavior);
+                 jumpToOrd(loc.verseOrd, behavior);
 
-                safeSetLS(
-                    LS_LAST_LOC,
-                    JSON.stringify({
-                        bookId,
-                        chapter,
-                        verse: verse ?? null,
-                    }),
-                );
-            } catch (e: unknown) {
-                if (seq !== resolveSeqRef.current) return;
-                const msg = e instanceof Error ? e.message : String(e);
-                setErr(msg);
-            }
-        },
-        [annotations, jumpToOrd],
+                 safeSetLS(
+                      LS_LAST_LOC,
+                      JSON.stringify({
+                          bookId: cleanBookId,
+                          chapter,
+                          verse: verse ?? null,
+                      } satisfies StoredLocation),
+                 );
+             } catch (e: unknown) {
+                 if (seq !== resolveSeqRef.current) return;
+                 const msg = e instanceof Error ? e.message : String(e);
+                 setErr(msg);
+             }
+         },
+         [annotations, jumpToOrd],
     );
 
     useEffect(() => {
-        if (!spine) return;
+        if (!spine || !initialLocation) return;
 
         const key = makeLocKey(initialLocation);
         if (!key) return;
@@ -18762,10 +20989,12 @@ export function Reader(props: Props) {
 
         appliedInitialKeyRef.current = key;
 
-        const loc = initialLocation;
-        if (!loc) return;
-
-        void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "auto");
+        void resolveAndJump(
+             initialLocation.bookId,
+             initialLocation.chapter,
+             initialLocation.verse ?? null,
+             "auto",
+        );
     }, [spine, initialLocation, resolveAndJump]);
 
     useEffect(() => {
@@ -18775,11 +21004,17 @@ export function Reader(props: Props) {
 
         didRestoreRef.current = true;
 
+        const storedLoc = parseStoredLocation(safeGetLS(LS_LAST_LOC));
+        if (storedLoc) {
+            void resolveAndJump(storedLoc.bookId, storedLoc.chapter, storedLoc.verse, "auto");
+            return;
+        }
+
         const ordRaw = parseFiniteInt(safeGetLS(LS_LAST_ORD));
         if (ordRaw == null) return;
 
         jumpToOrd(ordRaw, "auto");
-    }, [spine, initialLocation, jumpToOrd]);
+    }, [spine, initialLocation, jumpToOrd, resolveAndJump]);
 
     useEffect(() => {
         if (!canJumpNow) return;
@@ -18807,46 +21042,31 @@ export function Reader(props: Props) {
         setViewportReady(true);
     }, []);
 
-    const handleError = useCallback((m: string) => {
-        setErr(m);
+    const handleError = useCallback((message: string) => {
+        setErr(message);
     }, []);
 
-    const handlePosition = useCallback((p: ReaderPosition) => {
+    const handlePosition = useCallback((next: ReaderPosition) => {
         setPos((prev) => {
-            const prevV = prev.verse;
-            const nextV = p.verse;
-
-            const sameOrd = prev.ord === p.ord;
-
-            const sameVerse =
-                prevV === nextV ||
-                (!!prevV &&
-                    !!nextV &&
-                    prevV.bookId === nextV.bookId &&
-                    prevV.chapter === nextV.chapter &&
-                    prevV.verse === nextV.verse);
-
-            const sameBook =
-                prev.book === p.book ||
-                (!!prev.book && !!p.book && prev.book.bookId === p.book.bookId);
-
-            if (sameOrd && sameVerse && sameBook) return prev;
-            return p;
+            if (prev.ord === next.ord && sameVerse(prev.verse, next.verse) && sameBook(prev.book, next.book)) {
+                return prev;
+            }
+            return next;
         });
     }, []);
 
     const handleJumpRef = useCallback(
-        (bookId: string, chapter: number, verse: number | null) => {
-            void resolveAndJump(bookId, chapter, verse, "smooth");
-        },
-        [resolveAndJump],
+         (bookId: string, chapter: number, verse: number | null) => {
+             void resolveAndJump(bookId, chapter, verse, "smooth");
+         },
+         [resolveAndJump],
     );
 
     const handleNavigate = useCallback(
-        (loc: ReaderLocation) => {
-            void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "smooth");
-        },
-        [resolveAndJump],
+         (loc: ReaderLocation) => {
+             void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "smooth");
+         },
+         [resolveAndJump],
     );
 
     const handleBackHome = useCallback(() => {
@@ -18855,51 +21075,47 @@ export function Reader(props: Props) {
     }, [annotations, onBackHome]);
 
     const topContent = useMemo(
-        () => (
-            <ReaderSelectionToolbar
-                selection={annotations.selection}
-                onHighlight={() => {
-                    annotations.createHighlight();
-                }}
-                onBookmark={() => {
-                    annotations.createBookmark();
-                }}
-                onNote={() => {
-                    annotations.createNote(null, "New note");
-                }}
-                onClear={annotations.clearSelection}
-            />
-        ),
-        [annotations],
+         () => (
+              <ReaderSelectionToolbar
+                   selection={annotations.selection}
+                   onHighlight={annotations.createHighlight}
+                   onBookmark={annotations.createBookmark}
+                   onNote={() => {
+                       annotations.createNote(null, "New note");
+                   }}
+                   onClear={annotations.clearSelection}
+              />
+         ),
+         [annotations],
     );
 
     return (
-        <ReaderShell
-            styles={styles}
-            books={books}
-            onBackHome={handleBackHome}
-            current={{
-                label: posLabel,
-                ord: pos.ord,
-                bookId: pos.verse?.bookId ?? null,
-                chapter: pos.verse?.chapter ?? null,
-                verse: pos.verse?.verse ?? null,
-            }}
-            onJumpRef={handleJumpRef}
-            onNavigate={handleNavigate}
-            mode={mode}
-            onToggleTheme={onToggleTheme}
-            spine={spine}
-            bookById={bookById}
-            viewportRef={setViewportRef}
-            selectionRootRef={selectionRootRef}
-            annotationSnapshot={annotations.snapshot}
-            topContent={topContent}
-            onPosition={handlePosition}
-            onError={handleError}
-            onReady={handleReady}
-            err={err}
-        />
+         <ReaderShell
+              styles={styles}
+              books={books}
+              onBackHome={handleBackHome}
+              current={{
+                  label: posLabel,
+                  ord: pos.ord,
+                  bookId: pos.verse?.bookId ?? null,
+                  chapter: pos.verse?.chapter ?? null,
+                  verse: pos.verse?.verse ?? null,
+              }}
+              onJumpRef={handleJumpRef}
+              onNavigate={handleNavigate}
+              mode={mode}
+              onToggleTheme={onToggleTheme}
+              spine={spine}
+              bookById={bookById}
+              viewportRef={setViewportRef}
+              selectionRootRef={selectionRootRef}
+              annotationSnapshot={annotations.snapshot}
+              topContent={topContent}
+              onPosition={handlePosition}
+              onError={handleError}
+              onReady={handleReady}
+              err={err}
+         />
     );
 }
 ```
@@ -18907,6 +21123,7 @@ export function Reader(props: Props) {
 ### apps/web/src/reader/annotationStore.ts
 
 ```ts
+// apps/web/src/reader/annotationStore.ts
 import {
     ANNOTATION_KIND,
     createAnnotation,
@@ -18962,16 +21179,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null;
 }
 
-function hasNonEmptyStringProp(
-    value: Record<string, unknown>,
-    key: string,
-): boolean {
-    const v = value[key];
-    return typeof v === "string" && v.trim().length > 0;
+function hasNonEmptyStringProp(value: Record<string, unknown>, key: string): boolean {
+    const candidate = value[key];
+    return typeof candidate === "string" && candidate.trim().length > 0;
 }
 
 function isPersistedAnnotationEventEnvelope(
-    value: unknown,
+     value: unknown,
 ): value is PersistedAnnotationEventEnvelope {
     if (!isRecord(value)) return false;
     return hasNonEmptyStringProp(value, "type") && hasNonEmptyStringProp(value, "eventId");
@@ -18986,8 +21200,12 @@ function safeJsonParse<T>(raw: string | null): T | null {
     }
 }
 
-function safeJsonStringify(value: unknown): string {
-    return JSON.stringify(value);
+function safeJsonStringify(value: unknown): string | null {
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return null;
+    }
 }
 
 function canUseWindowStorage(): boolean {
@@ -19008,7 +21226,7 @@ function safeStorageSet(key: string, value: string): void {
     try {
         window.localStorage.setItem(key, value);
     } catch {
-        // ignore
+        // ignore storage quota / privacy mode failures
     }
 }
 
@@ -19024,7 +21242,10 @@ function safeStorageRemove(key: string): void {
 function randomHex(bytes = 10): string {
     const out = new Uint8Array(bytes);
 
-    if (typeof globalThis.crypto !== "undefined" && typeof globalThis.crypto.getRandomValues === "function") {
+    if (
+         typeof globalThis.crypto !== "undefined" &&
+         typeof globalThis.crypto.getRandomValues === "function"
+    ) {
         globalThis.crypto.getRandomValues(out);
     } else {
         for (let i = 0; i < out.length; i += 1) {
@@ -19036,15 +21257,19 @@ function randomHex(bytes = 10): string {
 }
 
 function loadOrCreateBrandedId<T extends string>(
-    key: string,
-    create: (seed?: string) => T,
+     key: string,
+     create: (seed?: string) => T,
 ): T {
     const raw = safeStorageGet(key);
     if (typeof raw === "string" && raw.trim().length > 0) {
-        return raw as T;
+        try {
+            return create(raw.trim());
+        } catch {
+            // fall through and reissue
+        }
     }
 
-    const next = create(randomHex(6));
+    const next = create(randomHex(8));
     safeStorageSet(key, next);
     return next;
 }
@@ -19057,13 +21282,65 @@ function materializeEvents(input: unknown): AnnotationEvent[] {
         if (!isPersistedAnnotationEventEnvelope(item)) continue;
         out.push(item as unknown as AnnotationEvent);
     }
-
     return out;
 }
 
 function sortAnnotationsNewestFirst(a: Annotation, b: Annotation): number {
     if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
+    if (a.createdAt !== b.createdAt) return b.createdAt - a.createdAt;
     return a.annotationId.localeCompare(b.annotationId);
+}
+
+function normalizeStringList(input: readonly string[] | undefined): string[] {
+    if (!input || input.length === 0) return [];
+
+    const seen = new Set<string>();
+    const out: string[] = [];
+
+    for (const item of input) {
+        if (typeof item !== "string") continue;
+        const value = item.trim();
+        if (!value) continue;
+        if (seen.has(value)) continue;
+        seen.add(value);
+        out.push(value);
+    }
+
+    return out;
+}
+
+function normalizeNullableText(value: string | null | undefined): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeSelectionText(value: string | null | undefined): string | null {
+    if (typeof value !== "string") return null;
+    const collapsed = value.replace(/\s+/g, " ").trim();
+    return collapsed.length > 0 ? collapsed : null;
+}
+
+function getKind(
+     value: CreateTextAnnotationInput["kind"] | undefined,
+): Annotation["kind"] {
+    switch (value) {
+        case "NOTE":
+            return ANNOTATION_KIND.NOTE;
+        case "BOOKMARK":
+            return ANNOTATION_KIND.BOOKMARK;
+        case "HIGHLIGHT":
+        default:
+            return ANNOTATION_KIND.HIGHLIGHT;
+    }
+}
+
+function normalizeVerseOrdRange(startOrd: number, endOrd: number): {
+    startOrd: number;
+    endOrd: number;
+} {
+    if (startOrd <= endOrd) return { startOrd, endOrd };
+    return { startOrd: endOrd, endOrd: startOrd };
 }
 
 export class ReaderAnnotationStore {
@@ -19089,7 +21366,7 @@ export class ReaderAnnotationStore {
         this.deviceId = loadOrCreateBrandedId(this.deviceStorageKey, createDeviceId);
         this.userId = loadOrCreateBrandedId(this.userStorageKey, createUserId);
 
-        const raw = safeStorageGet(this.storageKey);
+        const raw = this.persist ? safeStorageGet(this.storageKey) : null;
         this.events = materializeEvents(safeJsonParse<unknown>(raw));
 
         try {
@@ -19129,8 +21406,8 @@ export class ReaderAnnotationStore {
 
     listAnnotations(): readonly Annotation[] {
         return [...this.snapshot.annotations.values()]
-            .filter((annotation) => annotation.deletedAt === null)
-            .sort(sortAnnotationsNewestFirst);
+             .filter((annotation) => annotation.deletedAt === null)
+             .sort(sortAnnotationsNewestFirst);
     }
 
     listAnnotationsForVerseOrd(verseOrd: number): readonly Annotation[] {
@@ -19139,12 +21416,13 @@ export class ReaderAnnotationStore {
         for (const annotation of this.snapshot.annotations.values()) {
             if (annotation.deletedAt !== null) continue;
 
-            const hit = annotation.spans.some((span: Annotation["spans"][number]) => {
-                return (
-                    span.deletedAt === null &&
-                    span.start.verseOrd <= verseOrd &&
-                    span.end.verseOrd >= verseOrd
+            const hit = annotation.spans.some((span) => {
+                if (span.deletedAt !== null) return false;
+                const range = normalizeVerseOrdRange(
+                     span.start.verseOrd,
+                     span.end.verseOrd,
                 );
+                return verseOrd >= range.startOrd && verseOrd <= range.endOrd;
             });
 
             if (hit) out.push(annotation);
@@ -19178,17 +21456,18 @@ export class ReaderAnnotationStore {
     }
 
     createTextAnnotation(input: CreateTextAnnotationInput): AnnotationId {
-        const now = this.now();
-        const annotationId = createAnnotationId(input.selection.start.verseKey);
+        const createdAt = this.now();
+        const selection = input.selection;
+        const annotationId = createAnnotationId(selection.start.verseKey);
 
         const span = createAnnotationSpan({
-            start: input.selection.start,
-            end: input.selection.end,
-            text: input.selection.text,
-            translationId: input.selection.translationId,
+            start: selection.start,
+            end: selection.end,
+            text: normalizeSelectionText(selection.text),
+            translationId: normalizeNullableText(selection.translationId),
             ordinal: 1,
-            createdAt: now,
-            updatedAt: now,
+            createdAt,
+            updatedAt: createdAt,
             deletedAt: null,
         });
 
@@ -19198,28 +21477,23 @@ export class ReaderAnnotationStore {
             createdByUserId: this.userId,
             updatedByUserId: this.userId,
             deviceId: this.deviceId,
-            kind:
-                input.kind === "NOTE"
-                    ? ANNOTATION_KIND.NOTE
-                    : input.kind === "BOOKMARK"
-                        ? ANNOTATION_KIND.BOOKMARK
-                        : ANNOTATION_KIND.HIGHLIGHT,
-            title: input.title ?? null,
-            body: input.body ?? null,
-            color: input.color ?? null,
-            labels: input.labels ?? [],
-            collectionIds: input.collectionIds ?? [],
+            kind: getKind(input.kind),
+            title: normalizeNullableText(input.title),
+            body: normalizeNullableText(input.body),
+            color: normalizeNullableText(input.color),
+            labels: normalizeStringList(input.labels),
+            collectionIds: normalizeStringList(input.collectionIds),
             spans: [span],
             strokes: [],
             pinned: input.pinned ?? false,
             archived: input.archived ?? false,
-            createdAt: now,
-            updatedAt: now,
+            createdAt,
+            updatedAt: createdAt,
             deletedAt: null,
             revision: 1,
         });
 
-        const meta = this.makeEventMeta(now);
+        const meta = this.makeEventMeta(createdAt);
         const event = createAnnotationCreatedEvent(annotation, meta);
 
         this.append(event);
@@ -19255,7 +21529,9 @@ export class ReaderAnnotationStore {
 
     private persistNow(): void {
         if (!this.persist) return;
-        safeStorageSet(this.storageKey, safeJsonStringify(this.events));
+        const raw = safeJsonStringify(this.events);
+        if (raw === null) return;
+        safeStorageSet(this.storageKey, raw);
     }
 
     private emit(): void {
@@ -19282,50 +21558,193 @@ export function resetReaderAnnotationStoreSingleton(): void {
 
 ```tsx
 // apps/web/src/reader/BookTitlePage.tsx
-import React, { useMemo } from "react";
+import React, { memo, useMemo } from "react";
+import type { CSSProperties } from "react";
 import type { BookRow } from "../api";
 
 /**
- * Biblia.to — Book Title Page (premium + virtualizer-safe)
+ * Biblia.to — Book Title Page
  *
- * Design goals:
- * - Predictable height + wrapping (TanStack Virtual friendly)
- * - No huge shadows/filters that explode paint cost
- * - Uses your actual font tokens (base.css): --font-serif / --font-sans
- * - Clean, “luxury card” with subtle ink + hairlines
- *
- * Notes:
- * - All text is short and wraps; no long unbroken runs.
- * - Uses color-mix tokens already present elsewhere in your app.
+ * Hardened goals:
+ * - smaller / calmer surface
+ * - deterministic sizing for virtualization
+ * - no expensive paint effects
+ * - no `any`
+ * - resilient against odd book/testament values
  */
 
-function formatTestament(t: unknown): string {
-    const v = String(t ?? "").trim().toUpperCase();
-    if (v === "NT" || v === "NEW" || v.includes("NEW")) return "THE NEW TESTAMENT";
-    if (v === "OT" || v === "OLD" || v.includes("OLD")) return "THE OLD TESTAMENT";
+type TitleParts = {
+    prefix: string;
+    main: string;
+    subtitle?: string;
+};
+
+const WRAP_STYLE: CSSProperties = {
+    padding: "16px 8px 12px",
+    display: "flex",
+    justifyContent: "center",
+    background: "transparent",
+};
+
+const CARD_STYLE: CSSProperties = {
+    width: "100%",
+    maxWidth: 680,
+    borderRadius: 16,
+    padding: "14px 14px 12px",
+    background: "color-mix(in oklab, var(--panel) 94%, var(--bg))",
+    border: "1px solid color-mix(in oklab, var(--hairline) 90%, transparent)",
+    boxShadow: "0 8px 24px rgba(0,0,0,0.06)",
+    overflow: "hidden",
+    boxSizing: "border-box",
+};
+
+const HAIRLINE_TOP_STYLE: CSSProperties = {
+    height: 1,
+    marginBottom: 10,
+    background:
+         "linear-gradient(to right, transparent, color-mix(in oklab, var(--hairline) 94%, transparent), transparent)",
+    opacity: 0.9,
+};
+
+const HAIRLINE_BOTTOM_STYLE: CSSProperties = {
+    height: 1,
+    marginTop: 12,
+    background:
+         "linear-gradient(to right, transparent, color-mix(in oklab, var(--hairline) 88%, transparent), transparent)",
+    opacity: 0.7,
+};
+
+const KICKER_STYLE: CSSProperties = {
+    marginBottom: 10,
+    fontFamily: "var(--font-sans)",
+    fontSize: 10,
+    letterSpacing: "0.24em",
+    textTransform: "uppercase",
+    color: "var(--muted)",
+    textAlign: "center",
+    userSelect: "none",
+};
+
+const TITLE_BLOCK_STYLE: CSSProperties = {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 6,
+    padding: "2px 0",
+};
+
+const PREFIX_STYLE: CSSProperties = {
+    maxWidth: 520,
+    padding: "0 6px",
+    fontFamily: "var(--font-sans)",
+    fontSize: 11,
+    letterSpacing: "0.16em",
+    textTransform: "uppercase",
+    color: "color-mix(in oklab, var(--fg) 74%, var(--muted))",
+    textAlign: "center",
+    lineHeight: 1.25,
+    userSelect: "none",
+    textWrap: "balance",
+};
+
+const MAIN_STYLE: CSSProperties = {
+    margin: 0,
+    maxWidth: 600,
+    padding: "0 6px",
+    fontFamily: "var(--font-serif)",
+    fontWeight: 720,
+    fontSize: 28,
+    letterSpacing: "0.03em",
+    textTransform: "uppercase",
+    textAlign: "center",
+    color: "var(--fg)",
+    lineHeight: 1.05,
+    userSelect: "none",
+    overflowWrap: "anywhere",
+    textWrap: "balance",
+};
+
+const SUBTITLE_STYLE: CSSProperties = {
+    maxWidth: 600,
+    padding: "0 8px",
+    fontFamily: "var(--font-serif)",
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: "0.12em",
+    textTransform: "uppercase",
+    color: "color-mix(in oklab, var(--fg) 78%, var(--muted))",
+    textAlign: "center",
+    lineHeight: 1.15,
+    userSelect: "none",
+    overflowWrap: "anywhere",
+    textWrap: "balance",
+};
+
+const RULE_STYLE: CSSProperties = {
+    width: "min(320px, 70%)",
+    height: 1,
+    marginTop: 2,
+    background: "color-mix(in oklab, var(--hairline) 92%, transparent)",
+    opacity: 0.9,
+};
+
+const MOTTO_STYLE: CSSProperties = {
+    marginTop: 6,
+    maxWidth: 520,
+    padding: "0 8px",
+    fontFamily: "var(--font-sans)",
+    fontSize: 10,
+    letterSpacing: "0.14em",
+    textTransform: "uppercase",
+    color: "color-mix(in oklab, var(--fg) 60%, var(--muted))",
+    textAlign: "center",
+    lineHeight: 1.25,
+    userSelect: "none",
+};
+
+function readTestament(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const v = value.trim().toUpperCase();
+    if (!v) return null;
+    return v;
+}
+
+function formatTestament(testament: unknown): string {
+    const value = readTestament(testament);
+    if (!value) return "HOLY SCRIPTURE";
+    if (value === "NT" || value === "NEW" || value.includes("NEW")) {
+        return "THE NEW TESTAMENT";
+    }
+    if (value === "OT" || value === "OLD" || value.includes("OLD")) {
+        return "THE OLD TESTAMENT";
+    }
     return "HOLY SCRIPTURE";
 }
 
+function normalizeWhitespace(value: string): string {
+    return value.trim().replace(/\s+/g, " ");
+}
+
 function normalizeBookName(book: BookRow | null, bookId: string): string {
-    const raw = (book?.name ?? bookId).toString().trim();
-    return raw || bookId;
+    const fromBook =
+         book && typeof book.name === "string" ? normalizeWhitespace(book.name) : "";
+    const fromId = normalizeWhitespace(bookId);
+    return fromBook || fromId || "UNKNOWN";
 }
 
-function upperWords(s: string): string {
-    return s
-        .trim()
-        .replace(/\s+/g, " ")
-        .toUpperCase();
+function upperWords(value: string): string {
+    return normalizeWhitespace(value).toUpperCase();
 }
 
-function getBookTitleParts(book: BookRow | null, bookId: string): { prefix: string; main: string; subtitle?: string } {
+function getBookTitleParts(book: BookRow | null, bookId: string): TitleParts {
     const raw = upperWords(normalizeBookName(book, bookId));
 
-    if (raw === "PSALMS") return { prefix: "", main: "PSALMS" };
-    if (raw === "PROVERBS") return { prefix: "THE BOOK OF", main: "PROVERBS" };
+    if (raw === "PSALMS") {
+        return { prefix: "", main: "PSALMS" };
+    }
 
-    if (["MATTHEW", "MARK", "LUKE", "JOHN"].includes(raw)) {
-        return { prefix: "THE GOSPEL ACCORDING TO", main: raw };
+    if (raw === "PROVERBS") {
+        return { prefix: "THE BOOK OF", main: "PROVERBS" };
     }
 
     if (raw === "ACTS" || raw === "ACTS OF THE APOSTLES") {
@@ -19336,7 +21755,14 @@ function getBookTitleParts(book: BookRow | null, bookId: string): { prefix: stri
         return { prefix: "THE REVELATION OF", main: "JOHN" };
     }
 
-    // Epistles styling (optional flourish)
+    if (raw === "SONG OF SOLOMON" || raw === "SONG OF SONGS") {
+        return { prefix: "THE SONG OF", main: "SOLOMON" };
+    }
+
+    if (raw === "MATTHEW" || raw === "MARK" || raw === "LUKE" || raw === "JOHN") {
+        return { prefix: "THE GOSPEL ACCORDING TO", main: raw };
+    }
+
     if (raw.startsWith("1 ") || raw.startsWith("2 ") || raw.startsWith("3 ")) {
         return { prefix: "THE EPISTLE OF", main: raw };
     }
@@ -19344,163 +21770,50 @@ function getBookTitleParts(book: BookRow | null, bookId: string): { prefix: stri
     return { prefix: "THE BOOK OF", main: raw };
 }
 
-export const BookTitlePage = React.memo(function BookTitlePage(props: { book: BookRow | null; bookId: string }) {
+function getBookTestament(book: BookRow | null): unknown {
+    if (!book) return null;
+    const record = book as unknown as Record<string, unknown>;
+    return record.testament ?? null;
+}
+
+export const BookTitlePage = memo(function BookTitlePage(props: {
+    book: BookRow | null;
+    bookId: string;
+}) {
     const { book, bookId } = props;
 
     const displayName = useMemo(() => normalizeBookName(book, bookId), [book, bookId]);
-    const testament = useMemo(() => formatTestament((book as any)?.testament), [book]);
-    const { prefix, main, subtitle } = useMemo(() => getBookTitleParts(book, bookId), [book, bookId]);
+    const testament = useMemo(
+         () => formatTestament(getBookTestament(book)),
+         [book],
+    );
+    const parts = useMemo(() => getBookTitleParts(book, bookId), [book, bookId]);
 
     return (
-        <section style={s.wrap} aria-label={`Book: ${displayName}`}>
-            <div style={s.card}>
-                {/* Top hairline */}
-                <div style={s.hairlineTop} aria-hidden="true" />
+         <section style={WRAP_STYLE} aria-label={`Book: ${displayName}`}>
+             <div style={CARD_STYLE}>
+                 <div style={HAIRLINE_TOP_STYLE} aria-hidden="true" />
 
-                {/* Kicker */}
-                <div style={s.kicker}>{testament}</div>
+                 <div style={KICKER_STYLE}>{testament}</div>
 
-                {/* Title */}
-                <div style={s.titleBlock}>
-                    {prefix ? <div style={s.prefix}>{prefix}</div> : null}
+                 <div style={TITLE_BLOCK_STYLE}>
+                     {parts.prefix ? <div style={PREFIX_STYLE}>{parts.prefix}</div> : null}
 
-                    <h1 style={s.main}>{main}</h1>
+                     <h1 style={MAIN_STYLE}>{parts.main}</h1>
 
-                    {subtitle ? <div style={s.subtitle}>{subtitle}</div> : null}
+                     {parts.subtitle ? (
+                          <div style={SUBTITLE_STYLE}>{parts.subtitle}</div>
+                     ) : null}
 
-                    <div style={s.rule} aria-hidden="true" />
+                     <div style={RULE_STYLE} aria-hidden="true" />
+                     <div style={MOTTO_STYLE}>VERBUM DOMINI MANET IN AETERNUM</div>
+                 </div>
 
-                    <div style={s.motto}>VERBUM DOMINI MANET IN AETERNUM</div>
-                </div>
-
-                {/* Bottom hairline */}
-                <div style={s.hairlineBot} aria-hidden="true" />
-            </div>
-        </section>
+                 <div style={HAIRLINE_BOTTOM_STYLE} aria-hidden="true" />
+             </div>
+         </section>
     );
 });
-
-const s: Record<string, React.CSSProperties> = {
-    wrap: {
-        padding: "24px 12px 18px",
-        display: "flex",
-        justifyContent: "center",
-        background: "transparent",
-    },
-
-    card: {
-        width: "100%",
-        maxWidth: 760,
-        borderRadius: 20,
-        padding: "18px 16px",
-        background: "color-mix(in oklab, var(--card) 92%, var(--bg) 8%)",
-        border: "1px solid color-mix(in oklab, var(--border) 78%, transparent)",
-        boxShadow: "0 16px 44px color-mix(in oklab, black 14%, transparent), inset 0 1px 0 rgba(255,255,255,0.16)",
-        overflow: "hidden",
-        contain: "paint",
-    },
-
-    hairlineTop: {
-        height: 1,
-        background:
-            "linear-gradient(to right, transparent, color-mix(in oklab, var(--border) 78%, transparent), transparent)",
-        opacity: 0.95,
-        marginBottom: 12,
-    },
-    hairlineBot: {
-        height: 1,
-        background:
-            "linear-gradient(to right, transparent, color-mix(in oklab, var(--border) 72%, transparent), transparent)",
-        opacity: 0.75,
-        marginTop: 14,
-    },
-
-    kicker: {
-        fontFamily: "var(--font-sans)",
-        fontSize: 12,
-        letterSpacing: "0.22em",
-        textTransform: "uppercase",
-        color: "color-mix(in oklab, var(--fg) 70%, var(--muted) 30%)",
-        textAlign: "center",
-        marginBottom: 12,
-        userSelect: "none",
-    },
-
-    titleBlock: {
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        gap: 8,
-        padding: "4px 0 2px",
-    },
-
-    prefix: {
-        fontFamily: "var(--font-sans)",
-        fontSize: 12.5,
-        letterSpacing: "0.18em",
-        textTransform: "uppercase",
-        color: "color-mix(in oklab, var(--fg) 72%, var(--muted) 28%)",
-        textAlign: "center",
-        userSelect: "none",
-        maxWidth: 560,
-        lineHeight: 1.25,
-        padding: "0 6px",
-    },
-
-    main: {
-        margin: 0,
-        fontFamily: "var(--font-serif)",
-        fontWeight: 760,
-        fontSize: 34,
-        letterSpacing: "0.05em",
-        textTransform: "uppercase",
-        textAlign: "center",
-        color: "color-mix(in oklab, var(--fg) 92%, var(--muted) 8%)",
-        lineHeight: 1.06,
-        userSelect: "none",
-        maxWidth: 660,
-        padding: "0 6px",
-        overflowWrap: "anywhere",
-        textWrap: "balance",
-    },
-
-    subtitle: {
-        fontFamily: "var(--font-serif)",
-        fontSize: 16,
-        fontWeight: 620,
-        letterSpacing: "0.14em",
-        textTransform: "uppercase",
-        color: "color-mix(in oklab, var(--fg) 78%, var(--muted) 22%)",
-        textAlign: "center",
-        userSelect: "none",
-        maxWidth: 660,
-        lineHeight: 1.12,
-        padding: "0 8px",
-        overflowWrap: "anywhere",
-    },
-
-    rule: {
-        width: "min(520px, 86%)",
-        height: 1,
-        background: "color-mix(in oklab, var(--border) 75%, transparent)",
-        opacity: 0.9,
-        marginTop: 2,
-    },
-
-    motto: {
-        marginTop: 8,
-        fontFamily: "var(--font-sans)",
-        fontSize: 11.5,
-        letterSpacing: "0.16em",
-        textTransform: "uppercase",
-        color: "color-mix(in oklab, var(--fg) 62%, var(--muted) 38%)",
-        textAlign: "center",
-        userSelect: "none",
-        maxWidth: 620,
-        lineHeight: 1.25,
-        padding: "0 8px",
-    },
-};
 ```
 
 ### apps/web/src/reader/prefs/ReaderPrefsProvider.tsx
@@ -19772,161 +22085,471 @@ export function useReaderPrefs(): ReaderPrefsState {
 ### apps/web/src/reader/ReaderAnnotationOverlay.tsx
 
 ```tsx
+// cspell:words oklab
 import React, { memo, useMemo } from "react";
+import type { CSSProperties } from "react";
 import type { Annotation } from "@biblia/annotation";
 
 type Props = {
-    annotations: readonly Annotation[];
+     annotations: readonly Annotation[];
 };
 
-function toneForKind(kind: Annotation["kind"]): {
-    tint: string;
-    rail: string;
-    dot: string;
-} {
-    switch (kind) {
-        case "BOOKMARK":
-            return {
-                tint: "color-mix(in oklab, #7ba9ff 10%, transparent)",
-                rail: "color-mix(in oklab, #5f92ff 70%, transparent)",
-                dot: "color-mix(in oklab, #5f92ff 82%, transparent)",
-            };
-        case "NOTE":
-            return {
-                tint: "color-mix(in oklab, #b191ff 10%, transparent)",
-                rail: "color-mix(in oklab, #9c75ff 70%, transparent)",
-                dot: "color-mix(in oklab, #9c75ff 82%, transparent)",
-            };
-        case "DRAWING":
-            return {
-                tint: "color-mix(in oklab, #7de0d0 10%, transparent)",
-                rail: "color-mix(in oklab, #42cdb7 70%, transparent)",
-                dot: "color-mix(in oklab, #42cdb7 82%, transparent)",
-            };
-        default:
-            return {
-                tint: "color-mix(in oklab, #efcf73 12%, transparent)",
-                rail: "color-mix(in oklab, #ddb54c 68%, transparent)",
-                dot: "color-mix(in oklab, #ddb54c 82%, transparent)",
-            };
-    }
+type Tone = Readonly<{
+     wash: string;
+     rail: string;
+     dot: string;
+     ring: string;
+}>;
+
+const MAX_MARKERS = 3;
+const CORNER_TOP = 8;
+const CORNER_RIGHT = 10;
+const RAIL_INSET_Y = 8;
+const RAIL_WIDTH = 2;
+const DOT_SIZE = 6;
+const STACK_BADGE_H = 18;
+
+function toneForKind(kind: Annotation["kind"]): Tone {
+     switch (kind) {
+          case "BOOKMARK":
+               return {
+                    wash: "color-mix(in oklab, #7ba9ff 8%, transparent)",
+                    rail: "color-mix(in oklab, #5f92ff 58%, transparent)",
+                    dot: "color-mix(in oklab, #5f92ff 74%, transparent)",
+                    ring: "color-mix(in oklab, white 60%, transparent)",
+               };
+          case "NOTE":
+               return {
+                    wash: "color-mix(in oklab, #b191ff 8%, transparent)",
+                    rail: "color-mix(in oklab, #9c75ff 58%, transparent)",
+                    dot: "color-mix(in oklab, #9c75ff 74%, transparent)",
+                    ring: "color-mix(in oklab, white 60%, transparent)",
+               };
+          case "DRAWING":
+               return {
+                    wash: "color-mix(in oklab, #7de0d0 8%, transparent)",
+                    rail: "color-mix(in oklab, #42cdb7 58%, transparent)",
+                    dot: "color-mix(in oklab, #42cdb7 74%, transparent)",
+                    ring: "color-mix(in oklab, white 60%, transparent)",
+               };
+          case "HIGHLIGHT":
+          default:
+               return {
+                    wash: "color-mix(in oklab, #efcf73 10%, transparent)",
+                    rail: "color-mix(in oklab, #ddb54c 56%, transparent)",
+                    dot: "color-mix(in oklab, #ddb54c 74%, transparent)",
+                    ring: "color-mix(in oklab, white 60%, transparent)",
+               };
+     }
 }
 
+function isLiveAnnotation(annotation: Annotation): boolean {
+     return annotation.deletedAt === null;
+}
+
+function hasKind(list: readonly Annotation[], kind: Annotation["kind"]): boolean {
+     return list.some((annotation) => annotation.kind === kind);
+}
+
+const sx: Record<string, CSSProperties> = {
+     root: {
+          position: "absolute",
+          inset: 0,
+          pointerEvents: "none",
+          borderRadius: 16,
+          overflow: "hidden",
+          zIndex: 0,
+     },
+
+     wash: {
+          position: "absolute",
+          inset: 0,
+          borderRadius: 16,
+     },
+
+     rail: {
+          position: "absolute",
+          left: 0,
+          top: RAIL_INSET_Y,
+          bottom: RAIL_INSET_Y,
+          width: RAIL_WIDTH,
+          borderRadius: 999,
+     },
+
+     markerRow: {
+          position: "absolute",
+          top: CORNER_TOP,
+          right: CORNER_RIGHT,
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 4,
+     },
+
+     dot: {
+          width: DOT_SIZE,
+          height: DOT_SIZE,
+          borderRadius: 999,
+          flex: "0 0 auto",
+     },
+
+     countBadge: {
+          minWidth: 18,
+          height: STACK_BADGE_H,
+          paddingInline: 5,
+          borderRadius: 999,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontSize: 10,
+          fontWeight: 700,
+          lineHeight: 1,
+          letterSpacing: "-0.01em",
+          userSelect: "none",
+     },
+};
+
 export const ReaderAnnotationOverlay = memo(function ReaderAnnotationOverlay(props: Props) {
-    const { annotations } = props;
+     const { annotations } = props;
 
-    const live = useMemo(
-        () => annotations.filter((annotation) => annotation.deletedAt === null),
-        [annotations],
-    );
+     const live = useMemo(
+          () => annotations.filter(isLiveAnnotation),
+          [annotations],
+     );
 
-    const primary = live[0] ?? null;
-    const hasHighlight = live.some((annotation) => annotation.kind === "HIGHLIGHT");
-    const hasBookmark = live.some((annotation) => annotation.kind === "BOOKMARK");
-    const hasNote = live.some((annotation) => annotation.kind === "NOTE");
-    const markerKinds = live.slice(0, 3).map((annotation) => annotation.kind);
+     const primary = live[0] ?? null;
 
-    if (!primary) return null;
+     const markerKinds = useMemo(
+          () => live.slice(0, MAX_MARKERS).map((annotation) => annotation.kind),
+          [live],
+     );
 
-    const tone = toneForKind(primary.kind);
+     const meta = useMemo(() => {
+          if (!primary) {
+               return {
+                    tone: null as Tone | null,
+                    hasHighlight: false,
+                    showRail: false,
+                    extraCount: 0,
+               };
+          }
 
-    return (
-        <div
-            aria-hidden="true"
-            style={{
-                position: "absolute",
-                inset: 0,
-                pointerEvents: "none",
-                borderRadius: 16,
-                overflow: "hidden",
-                zIndex: 0,
-            }}
-        >
-            {hasHighlight ? (
-                <div
-                    style={{
-                        position: "absolute",
-                        inset: 0,
-                        background: tone.tint,
-                        borderRadius: 16,
-                    }}
-                />
-            ) : null}
+          const tone = toneForKind(primary.kind);
+          const hasHighlight = hasKind(live, "HIGHLIGHT");
+          const showRail =
+               hasKind(live, "BOOKMARK") ||
+               hasKind(live, "NOTE") ||
+               hasKind(live, "DRAWING");
 
-            {(hasBookmark || hasNote || primary.kind === "DRAWING") ? (
-                <div
-                    style={{
-                        position: "absolute",
-                        left: 0,
-                        top: 8,
-                        bottom: 8,
-                        width: 3,
-                        borderRadius: 999,
-                        background: tone.rail,
-                    }}
-                />
-            ) : null}
+          return {
+               tone,
+               hasHighlight,
+               showRail,
+               extraCount: Math.max(0, live.length - MAX_MARKERS),
+          };
+     }, [live, primary]);
 
-            <div
-                style={{
-                    position: "absolute",
-                    top: 8,
-                    right: 10,
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: 5,
-                }}
-            >
-                {markerKinds.map((kind, index) => {
-                    const markerTone = toneForKind(kind);
-                    return (
-                        <span
-                            key={`${kind}-${index}`}
-                            style={{
-                                width: 7,
-                                height: 7,
-                                borderRadius: 999,
-                                background: markerTone.dot,
-                                boxShadow: "0 0 0 1px color-mix(in oklab, white 58%, transparent)",
-                            }}
-                        />
-                    );
-                })}
+     if (!primary || !meta.tone) return null;
 
-                {live.length > 3 ? (
-                    <span
-                        style={{
-                            minWidth: 18,
-                            height: 18,
-                            paddingInline: 5,
-                            borderRadius: 999,
-                            display: "inline-flex",
-                            alignItems: "center",
-                            justifyContent: "center",
-                            background: "color-mix(in oklab, var(--card, white) 92%, transparent)",
-                            color: "color-mix(in oklab, var(--text, #111) 70%, transparent)",
-                            fontSize: 10,
-                            fontWeight: 700,
-                            lineHeight: 1,
-                            border: "1px solid color-mix(in oklab, var(--border, rgba(127,127,127,0.2)) 84%, transparent)",
-                        }}
-                    >
-                        +{live.length - 3}
+     return (
+          <div aria-hidden="true" style={sx.root}>
+               {meta.hasHighlight ? (
+                    <div
+                         style={{
+                              ...sx.wash,
+                              background: meta.tone.wash,
+                         }}
+                    />
+               ) : null}
+
+               {meta.showRail ? (
+                    <div
+                         style={{
+                              ...sx.rail,
+                              background: meta.tone.rail,
+                         }}
+                    />
+               ) : null}
+
+               <div style={sx.markerRow}>
+                    {markerKinds.map((kind, index) => {
+                         const markerTone = toneForKind(kind);
+
+                         return (
+                              <span
+                                   key={`${kind}-${index}`}
+                                   style={{
+                                        ...sx.dot,
+                                        background: markerTone.dot,
+                                        boxShadow: `0 0 0 1px ${markerTone.ring}`,
+                                   }}
+                              />
+                         );
+                    })}
+
+                    {meta.extraCount > 0 ? (
+                         <span
+                              style={{
+                                   ...sx.countBadge,
+                                   background: "color-mix(in oklab, var(--card, white) 94%, transparent)",
+                                   color: "color-mix(in oklab, var(--text, #111) 62%, transparent)",
+                                   border: "1px solid color-mix(in oklab, var(--border, rgba(127,127,127,0.2)) 78%, transparent)",
+                              }}
+                         >
+                        +{meta.extraCount}
                     </span>
-                ) : null}
-            </div>
-        </div>
-    );
+                    ) : null}
+               </div>
+          </div>
+     );
 });
+```
+
+### apps/web/src/reader/ReaderDomSelectionResolver.ts
+
+```ts
+// apps/web/src/reader/ReaderDomSelectionResolver.ts
+import type {
+    DomSelectionResolver,
+    DomSelectionTokenLocator,
+} from "@biblia/annotation";
+
+const ATTR_VERSE_KEY = "data-verse-key";
+const ATTR_VERSE_ORD = "data-verse-ord";
+const ATTR_TOKEN_INDEX = "data-token-index";
+const ATTR_TOKEN_CHAR_START = "data-token-char-start";
+const ATTR_TOKEN_CHAR_END = "data-token-char-end";
+const ATTR_TRANSLATION_ID = "data-translation-id";
+
+type HTMLElementWithParent = HTMLElement & { parentElement: HTMLElement | null };
+
+function isElement(value: unknown): value is Element {
+    return typeof Element !== "undefined" && value instanceof Element;
+}
+
+function isHTMLElement(value: unknown): value is HTMLElement {
+    return typeof HTMLElement !== "undefined" && value instanceof HTMLElement;
+}
+
+function isTextNode(value: unknown): value is Text {
+    return typeof Text !== "undefined" && value instanceof Text;
+}
+
+function normalizeString(value: string | null | undefined): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function parseIntStrict(value: string | null | undefined): number | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return null;
+    if (!/^-?\d+$/.test(trimmed)) return null;
+
+    const parsed = Number(trimmed);
+    if (!Number.isSafeInteger(parsed)) return null;
+    return parsed;
+}
+
+function clampInt(value: number, min: number, max: number): number {
+    if (!Number.isFinite(value)) return min;
+    const asInt = Math.trunc(value);
+    if (asInt < min) return min;
+    if (asInt > max) return max;
+    return asInt;
+}
+
+function getNodeTextLength(node: Node | null): number {
+    if (!node) return 0;
+    const text = node.textContent;
+    return typeof text === "string" ? text.length : 0;
+}
+
+function getClosestElement(node: Node | null): Element | null {
+    if (!node) return null;
+    if (isElement(node)) return node;
+    return node.parentElement;
+}
+
+function getClosestHTMLElement(node: Node | null): HTMLElement | null {
+    const el = getClosestElement(node);
+    return isHTMLElement(el) ? el : null;
+}
+
+function getParentHTMLElement(el: HTMLElement | null): HTMLElement | null {
+    if (!el) return null;
+    return (el as HTMLElementWithParent).parentElement;
+}
+
+function findClosestAttrElement(node: Node | null, attr: string): HTMLElement | null {
+    let current = getClosestHTMLElement(node);
+
+    while (current) {
+        if (current.hasAttribute(attr)) {
+            return current;
+        }
+        current = getParentHTMLElement(current);
+    }
+
+    return null;
+}
+
+function findVerseElement(node: Node | null): HTMLElement | null {
+    let current = getClosestHTMLElement(node);
+
+    while (current) {
+        if (current.hasAttribute(ATTR_VERSE_KEY) && current.hasAttribute(ATTR_VERSE_ORD)) {
+            return current;
+        }
+        current = getParentHTMLElement(current);
+    }
+
+    return null;
+}
+
+function getVerseKey(verseEl: HTMLElement): string | null {
+    return normalizeString(verseEl.getAttribute(ATTR_VERSE_KEY));
+}
+
+function getVerseOrd(verseEl: HTMLElement): number | null {
+    const ord = parseIntStrict(verseEl.getAttribute(ATTR_VERSE_ORD));
+    if (ord == null || ord < 1) return null;
+    return ord;
+}
+
+function getTokenIndex(tokenEl: HTMLElement | null): number | null {
+    if (!tokenEl) return null;
+    const index = parseIntStrict(tokenEl.getAttribute(ATTR_TOKEN_INDEX));
+    if (index == null || index < 0) return null;
+    return index;
+}
+
+function getTokenCharStart(tokenEl: HTMLElement | null): number | null {
+    if (!tokenEl) return null;
+    const start = parseIntStrict(tokenEl.getAttribute(ATTR_TOKEN_CHAR_START));
+    if (start == null || start < 0) return null;
+    return start;
+}
+
+function getTokenCharEnd(tokenEl: HTMLElement | null): number | null {
+    if (!tokenEl) return null;
+    const end = parseIntStrict(tokenEl.getAttribute(ATTR_TOKEN_CHAR_END));
+    if (end == null || end < 0) return null;
+    return end;
+}
+
+function resolveOffsetWithinNode(node: Node, offset: number): number {
+    if (isTextNode(node)) {
+        return clampInt(offset, 0, getNodeTextLength(node));
+    }
+
+    return clampInt(offset, 0, node.childNodes.length);
+}
+
+/**
+ * Best-effort local offset inside a token.
+ *
+ * Important:
+ * - We keep this conservative and deterministic.
+ * - We do NOT try to fully reconstruct nested DOM text layout here.
+ * - For text nodes inside token elements, raw text offset is already the calmest signal.
+ */
+function resolveTokenRelativeOffset(node: Node, offset: number, tokenEl: HTMLElement): number {
+    const tokenTextLen = getNodeTextLength(tokenEl);
+
+    if (isTextNode(node)) {
+        return clampInt(offset, 0, getNodeTextLength(node));
+    }
+
+    if (node === tokenEl) {
+        return clampInt(resolveOffsetWithinNode(node, offset), 0, tokenTextLen);
+    }
+
+    return clampInt(offset, 0, tokenTextLen);
+}
+
+function resolveCharOffset(node: Node, offset: number, tokenEl: HTMLElement | null): number | null {
+    if (!tokenEl) {
+        if (isTextNode(node)) {
+            return clampInt(offset, 0, getNodeTextLength(node));
+        }
+        return null;
+    }
+
+    const tokenStart = getTokenCharStart(tokenEl);
+    const tokenEnd = getTokenCharEnd(tokenEl);
+
+    if (tokenStart == null && tokenEnd == null) {
+        if (isTextNode(node)) {
+            return clampInt(offset, 0, getNodeTextLength(node));
+        }
+        return null;
+    }
+
+    if (tokenStart != null && tokenEnd != null) {
+        const lo = Math.min(tokenStart, tokenEnd);
+        const hi = Math.max(tokenStart, tokenEnd);
+        const width = Math.max(0, hi - lo);
+        const local = resolveTokenRelativeOffset(node, offset, tokenEl);
+        return lo + clampInt(local, 0, width);
+    }
+
+    if (tokenStart != null) {
+        const local = resolveTokenRelativeOffset(node, offset, tokenEl);
+        return tokenStart + Math.max(0, local);
+    }
+
+    return tokenEnd;
+}
+
+function buildLocator(
+     verseEl: HTMLElement,
+     tokenEl: HTMLElement | null,
+     node: Node,
+     offset: number,
+): DomSelectionTokenLocator | null {
+    const verseKey = getVerseKey(verseEl);
+    const verseOrd = getVerseOrd(verseEl);
+
+    if (!verseKey || verseOrd == null) {
+        return null;
+    }
+
+    const tokenIndex = getTokenIndex(tokenEl);
+    const charOffset = resolveCharOffset(node, offset, tokenEl);
+
+    return {
+        verseOrd,
+        verseKey,
+        tokenIndex,
+        charOffset,
+    };
+}
+
+export class ReaderDomSelectionResolver implements DomSelectionResolver {
+    resolveBoundary(node: Node, offset: number): DomSelectionTokenLocator | null {
+        const verseEl = findVerseElement(node);
+        if (!verseEl) return null;
+
+        const tokenEl = findClosestAttrElement(node, ATTR_TOKEN_INDEX);
+        return buildLocator(verseEl, tokenEl, node, offset);
+    }
+
+    resolveTranslationId(root: Node): string | null {
+        const el = findClosestAttrElement(root, ATTR_TRANSLATION_ID);
+        if (!el) return null;
+        return normalizeString(el.getAttribute(ATTR_TRANSLATION_ID));
+    }
+}
 ```
 
 ### apps/web/src/reader/ReaderHeader.tsx
 
 ```tsx
 // apps/web/src/reader/ReaderHeader.tsx
-import React, { memo, useMemo, useState, useCallback } from "react";
+import React, { memo, useCallback, useMemo, useState } from "react";
+import type { CSSProperties, PointerEventHandler, ReactNode } from "react";
 import type { BookRow } from "../api";
-import type { ReaderLocation } from "../Search";
 import { PositionPill } from "../PositionPill";
 import { ThemeToggleSwitch } from "../theme";
 import { AccountMenu } from "../auth/AccountMenu";
@@ -19935,1141 +22558,758 @@ import { ReaderTypographyControl } from "./ReaderTypographyControl";
 import { Home } from "lucide-react";
 
 type CurrentPos = {
-    label: string;
-    ord: number;
-    bookId: string | null;
-    chapter: number | null;
-    verse: number | null;
+     label: string;
+     ord: number;
+     bookId: string | null;
+     chapter: number | null;
+     verse: number | null;
 };
 
 type Props = {
-    styles: Record<string, React.CSSProperties>;
-    books: BookRow[] | null;
+     styles: Record<string, React.CSSProperties>;
+     books: BookRow[] | null;
 
-    onBackHome: () => void;
+     onBackHome: () => void;
 
-    current: CurrentPos;
-    onJumpRef: (bookId: string, chapter: number, verse: number | null) => void;
+     current: CurrentPos;
+     onJumpRef: (bookId: string, chapter: number, verse: number | null) => void;
 
-    onNavigate: (loc: ReaderLocation) => void;
+     // retained for API compatibility, not used by header anymore
+     onNavigate: (loc: { bookId: string; chapter: number; verse?: number }) => void;
 
-    // legacy: keep props but header uses global theme now
-    mode?: "light" | "dark";
-    onToggleTheme?: () => void;
+     // legacy: keep props but header uses global theme now
+     mode?: "light" | "dark";
+     onToggleTheme?: () => void;
 };
 
-type DockProps = { children: React.ReactNode; title?: string; ariaLabel?: string };
+type DockProps = {
+     children: ReactNode;
+     title?: string;
+     ariaLabel?: string;
+     pad?: number;
+};
 
 const Dock = memo(function Dock(props: DockProps) {
-    const dock = useMemo<React.CSSProperties>(
-        () => ({
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 3,
-            borderRadius: 999,
-            background: "color-mix(in srgb, var(--bg) 86%, var(--panel))",
-            border: "1px solid color-mix(in srgb, var(--border) 65%, transparent)",
-            boxShadow: "0 8px 18px rgba(0,0,0,0.05)",
-        }),
-        [],
-    );
+     const { children, title, ariaLabel, pad = 3 } = props;
 
-    return (
-        <div style={dock} title={props.title} aria-label={props.ariaLabel}>
-            {props.children}
-        </div>
-    );
+     const dock = useMemo<CSSProperties>(
+          () => ({
+               display: "inline-flex",
+               alignItems: "center",
+               justifyContent: "center",
+               padding: pad,
+               minHeight: 38,
+               borderRadius: 999,
+               background: "color-mix(in srgb, var(--bg) 86%, var(--panel))",
+               border: "1px solid color-mix(in srgb, var(--border) 62%, transparent)",
+               boxShadow: "0 8px 18px rgba(0,0,0,0.045)",
+               backdropFilter: "blur(10px)",
+               WebkitBackdropFilter: "blur(10px)",
+          }),
+          [pad],
+     );
+
+     return (
+          <div style={dock} title={title} aria-label={ariaLabel}>
+               {children}
+          </div>
+     );
+});
+
+const HeaderGroup = memo(function HeaderGroup(props: {
+     children: ReactNode;
+     ariaLabel?: string;
+     gap?: number;
+}) {
+     const style = useMemo<CSSProperties>(
+          () => ({
+               display: "flex",
+               alignItems: "center",
+               gap: props.gap ?? 8,
+               minWidth: 0,
+          }),
+          [props.gap],
+     );
+
+     return (
+          <div style={style} aria-label={props.ariaLabel}>
+               {props.children}
+          </div>
+     );
+});
+
+const Divider = memo(function Divider() {
+     return (
+          <div
+               aria-hidden
+               style={{
+                    width: 1,
+                    height: 20,
+                    background: "color-mix(in srgb, var(--border) 68%, transparent)",
+                    opacity: 0.78,
+                    marginInline: 1,
+                    flex: "0 0 auto",
+               }}
+          />
+     );
+});
+
+type IconDockButtonProps = {
+     ariaLabel: string;
+     title: string;
+     onClick: () => void;
+     icon: ReactNode;
+     pressed?: boolean;
+};
+
+const IconDockButton = memo(function IconDockButton(props: IconDockButtonProps) {
+     const { ariaLabel, title, onClick, icon, pressed = false } = props;
+     const [hover, setHover] = useState(false);
+     const [down, setDown] = useState(false);
+
+     const style = useMemo<CSSProperties>(
+          () => ({
+               appearance: "none",
+               WebkitAppearance: "none",
+               width: 32,
+               height: 32,
+               border: "1px solid transparent",
+               borderRadius: 999,
+               background:
+                    down || pressed
+                         ? "color-mix(in srgb, var(--activeBg) 76%, transparent)"
+                         : hover
+                              ? "color-mix(in srgb, var(--activeBg) 58%, transparent)"
+                              : "transparent",
+               color: "var(--fg)",
+               display: "inline-flex",
+               alignItems: "center",
+               justifyContent: "center",
+               cursor: "pointer",
+               transform: down ? "scale(0.97)" : "scale(1)",
+               transition:
+                    "transform 120ms ease, background 140ms ease, border-color 140ms ease, opacity 140ms ease",
+               WebkitTapHighlightColor: "transparent",
+               outline: "none",
+               boxShadow:
+                    hover || down || pressed
+                         ? "inset 0 0 0 1px color-mix(in srgb, var(--border) 58%, transparent)"
+                         : "none",
+          }),
+          [down, hover, pressed],
+     );
+
+     const onPointerEnter = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+          if (e.pointerType === "touch") return;
+          setHover(true);
+     }, []);
+
+     const onPointerLeave = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+          if (e.pointerType === "touch") return;
+          setHover(false);
+          setDown(false);
+     }, []);
+
+     const onPointerDown = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+          try {
+               e.currentTarget.setPointerCapture(e.pointerId);
+          } catch {
+               // ignore
+          }
+          setDown(true);
+     }, []);
+
+     const onPointerClear = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+          try {
+               e.currentTarget.releasePointerCapture(e.pointerId);
+          } catch {
+               // ignore
+          }
+          setDown(false);
+     }, []);
+
+     return (
+          <button
+               type="button"
+               aria-label={ariaLabel}
+               title={title}
+               onClick={onClick}
+               onPointerEnter={onPointerEnter}
+               onPointerLeave={onPointerLeave}
+               onPointerDown={onPointerDown}
+               onPointerUp={onPointerClear}
+               onPointerCancel={onPointerClear}
+               onPointerOutCapture={onPointerClear}
+               style={style}
+          >
+               {icon}
+          </button>
+     );
 });
 
 export const ReaderHeader = memo(function ReaderHeader(props: Props) {
-    const { styles, books, onBackHome, current, onJumpRef } = props;
+     const { styles, books, onBackHome, current, onJumpRef } = props;
 
-    const [pressBack, setPressBack] = useState(false);
-    const [hoverBack, setHoverBack] = useState(false);
+     const topLeftStyle = sx.topLeft;
+     const topCenterStyle = sx.topCenter;
+     const topRightStyle = sx.topRight;
+     const topBarStyle = sx.topBar;
 
-    // Some style packs use different names — support both.
-    const pressed =
-        ((styles as any).btnPressed as React.CSSProperties | undefined) ??
-        ((styles as any).buttonPressed as React.CSSProperties | undefined);
+     const shellStyle = useMemo<CSSProperties>(
+          () => ({
+               display: "flex",
+               alignItems: "center",
+               gap: 8,
+               minWidth: 0,
+          }),
+          [],
+     );
 
-    const sxAny = sx as any;
+     const centerWrapStyle = useMemo<CSSProperties>(
+          () => ({
+               display: "flex",
+               alignItems: "center",
+               justifyContent: "center",
+               minWidth: 0,
+               width: "100%",
+          }),
+          [],
+     );
 
-    const backStyle = useMemo<React.CSSProperties>(() => {
-        return {
-            ...sx.backBtn,
-            ...(hoverBack ? (sxAny.backBtnHover as React.CSSProperties) : null),
-            ...(pressBack ? (sxAny.backBtnActive as React.CSSProperties) : null),
-            ...(pressBack && pressed ? pressed : null),
-            // tighten for icon-only home button
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: 8,
-            paddingInline: 10,
-            minWidth: 38,
-        };
-    }, [hoverBack, pressBack, pressed, sxAny]);
+     const rightClusterStyle = useMemo<CSSProperties>(
+          () => ({
+               display: "flex",
+               alignItems: "center",
+               justifyContent: "flex-end",
+               gap: 8,
+               minWidth: 0,
+          }),
+          [],
+     );
 
-    const onBackPointerEnter = useCallback<React.PointerEventHandler<HTMLButtonElement>>((e) => {
-        if (e.pointerType === "touch") return;
-        setHoverBack(true);
-    }, []);
+     const onJump = useCallback(
+          (bookId: string, chapter: number, verse: number | null) => {
+               onJumpRef(bookId, chapter, verse);
+          },
+          [onJumpRef],
+     );
 
-    const onBackPointerLeave = useCallback<React.PointerEventHandler<HTMLButtonElement>>((e) => {
-        if (e.pointerType === "touch") return;
-        setHoverBack(false);
-        setPressBack(false);
-    }, []);
+     const homeDock = useMemo(
+          () => (
+               <Dock title="Home" ariaLabel="Home">
+                    <IconDockButton
+                         ariaLabel="Home"
+                         title="Home"
+                         onClick={onBackHome}
+                         icon={<Home size={17} aria-hidden />}
+                    />
+               </Dock>
+          ),
+          [onBackHome],
+     );
 
-    const onBackPointerDown = useCallback<React.PointerEventHandler<HTMLButtonElement>>((e) => {
-        try {
-            e.currentTarget.setPointerCapture(e.pointerId);
-        } catch {
-            // ignore
-        }
-        setPressBack(true);
-    }, []);
+     const accountDock = useMemo(
+          () => (
+               <Dock title="Account" ariaLabel="Account">
+                    <AccountMenu size="sm" />
+               </Dock>
+          ),
+          [],
+     );
 
-    const onBackPointerClear = useCallback<React.PointerEventHandler<HTMLButtonElement>>((e) => {
-        try {
-            e.currentTarget.releasePointerCapture(e.pointerId);
-        } catch {
-            // ignore
-        }
-        setPressBack(false);
-    }, []);
-
-    const rightStack = useMemo<React.CSSProperties>(
-        () => ({
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-            minWidth: 0,
-        }),
-        [],
-    );
-
-    const leftStack = useMemo<React.CSSProperties>(
-        () => ({
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-            minWidth: 0,
-        }),
-        [],
-    );
-
-    const split = useMemo<React.CSSProperties>(
-        () => ({
-            width: 1,
-            height: 22,
-            background: "color-mix(in srgb, var(--border) 70%, transparent)",
-            marginInline: 2,
-            opacity: 0.9,
-        }),
-        [],
-    );
-
-    const onJump = useCallback(
-        (bookId: string, chapter: number, verse: number | null) => onJumpRef(bookId, chapter, verse),
-        [onJumpRef],
-    );
-
-    return (
-        <div style={sx.topBar}>
-            <div style={sx.topLeft}>
-                <div style={leftStack} aria-label="Home and account">
-                    <button
-                        type="button"
-                        style={backStyle}
-                        onClick={onBackHome}
-                        aria-label="Home"
-                        title="Home"
-                        onPointerEnter={onBackPointerEnter}
-                        onPointerLeave={onBackPointerLeave}
-                        onPointerDown={onBackPointerDown}
-                        onPointerUp={onBackPointerClear}
-                        onPointerCancel={onBackPointerClear}
-                        onPointerOutCapture={onBackPointerClear}
-                    >
-                        <Home size={18} aria-hidden />
-                    </button>
-
-                    <Dock title="Account" ariaLabel="Account">
-                        <AccountMenu size="sm" />
-                    </Dock>
-                </div>
-            </div>
-
-            <div style={sx.topCenter}>
-                <PositionPill styles={styles} books={books} current={current} onJump={onJump} />
-            </div>
-
-            <div style={sx.topRight}>
-                <div style={sx.rightCluster}>
-                    {/* Search removed for now */}
-
+     const typeDock = useMemo(
+          () => (
+               <Dock title="Typography" ariaLabel="Typography">
                     <ReaderTypographyControl />
+               </Dock>
+          ),
+          [],
+     );
 
-                    <div style={rightStack} aria-label="Theme">
-                        <div style={split} aria-hidden />
+     const themeDock = useMemo(
+          () => (
+               <Dock title="Theme" ariaLabel="Theme">
+                    <ThemeToggleSwitch size="sm" />
+               </Dock>
+          ),
+          [],
+     );
 
-                        <div style={sx.themeWrap}>
-                            <Dock title="Theme" ariaLabel="Theme">
-                                <ThemeToggleSwitch size="sm" />
-                            </Dock>
-                        </div>
+     return (
+          <div style={topBarStyle}>
+               <div style={topLeftStyle}>
+                    <HeaderGroup ariaLabel="Navigation and account">
+                         {homeDock}
+                         {accountDock}
+                    </HeaderGroup>
+               </div>
+
+               <div style={topCenterStyle}>
+                    <div style={centerWrapStyle}>
+                         <PositionPill
+                              styles={styles}
+                              books={books}
+                              current={current}
+                              onJump={onJump}
+                         />
                     </div>
-                </div>
-            </div>
-        </div>
-    );
+               </div>
+
+               <div style={topRightStyle}>
+                    <div style={rightClusterStyle}>
+                         <HeaderGroup ariaLabel="Reader controls">
+                              {typeDock}
+                         </HeaderGroup>
+
+                         <HeaderGroup ariaLabel="Appearance" gap={6}>
+                              <Divider />
+                              {themeDock}
+                         </HeaderGroup>
+                    </div>
+               </div>
+          </div>
+     );
 });
-```
-
-### apps/web/src/reader/ReaderHeaderSearch.tsx
-
-```tsx
-// apps/web/src/reader/ReaderHeaderSearch.tsx
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { apiGetBooks, apiSearch, type BookRow, type SearchPayload, type SearchResult } from "../api";
-import type { ReaderLocation } from "../Search";
-
-/**
- * ReaderHeaderSearch — compact, header-only search
- * - Smaller height + tighter padding (fixes “too tall” in header)
- * - Uses same reference parsing + results panel logic
- * - Accepts `books` from parent to avoid redundant API call
- */
-
-type Props = {
-    onNavigate: (loc: ReaderLocation) => void;
-
-    /** Optional: pass already-loaded books (recommended for Reader header) */
-    books?: BookRow[] | null;
-
-    /** Enable Ctrl/Cmd+K focus */
-    enableHotkey?: boolean;
-
-    /** Placeholder override */
-    placeholder?: string;
-
-    /** Max results */
-    limit?: number;
-};
-
-type RefParse = { ok: true; loc: ReaderLocation; label: string } | { ok: false };
-
-function normalizeSpaces(s: string): string {
-    return s.replace(/\s+/g, " ").trim();
-}
-
-function toKey(s: string): string {
-    return normalizeSpaces(s.toLowerCase().replace(/[.,]/g, " "));
-}
-
-function insertSpaceBeforeDigits(s: string): string {
-    // "john3:16" -> "john 3:16"
-    // "1cor13:4" -> "1cor 13:4"
-    return s.replace(/([a-zA-Z])(\d)/g, "$1 $2");
-}
-
-function buildBookLookup(books: BookRow[]): Map<string, string> {
-    const m = new Map<string, string>();
-
-    for (const b of books) {
-        const id = b.bookId;
-
-        const add = (k: string | null | undefined) => {
-            if (!k) return;
-            const kk = toKey(k);
-            if (!kk) return;
-            if (!m.has(kk)) m.set(kk, id);
-        };
-
-        add(id);
-        add(b.name);
-        add(b.nameShort);
-        add(b.osised ?? null);
-
-        // extra friendly keys
-        add((b.nameShort ?? "").replace(/\./g, "")); // "Jn."
-        add(b.name.replace(/\./g, ""));
-    }
-
-    // hand-friendly aliases (minimal)
-    const addAlias = (alias: string, bookId: string) => {
-        const k = toKey(alias);
-        if (!m.has(k)) m.set(k, bookId);
-    };
-
-    addAlias("psalm", "PSA");
-    addAlias("psalms", "PSA");
-    addAlias("song of songs", "SNG");
-    addAlias("song", "SNG");
-    addAlias("canticles", "SNG");
-
-    addAlias("jn", "JHN");
-    addAlias("joh", "JHN");
-    addAlias("mt", "MAT");
-    addAlias("mk", "MRK");
-    addAlias("lk", "LUK");
-    addAlias("rom", "ROM");
-    addAlias("rev", "REV");
-
-    return m;
-}
-
-function parseReference(raw: string, lookup: Map<string, string> | null, bookNameById: Map<string, string> | null): RefParse {
-    if (!lookup) return { ok: false };
-
-    let q = normalizeSpaces(raw);
-    if (!q) return { ok: false };
-
-    q = insertSpaceBeforeDigits(q);
-    q = normalizeSpaces(q);
-
-    // Split last token as chap[:verse]
-    const parts = q.split(" ");
-    if (parts.length < 2) return { ok: false };
-
-    const last = parts[parts.length - 1] ?? "";
-    const m = last.match(/^(\d{1,3})(?::(\d{1,3}))?$/);
-    if (!m) return { ok: false };
-
-    const chap = Number(m[1]);
-    const verse = m[2] ? Number(m[2]) : undefined;
-    if (!Number.isFinite(chap) || chap < 1) return { ok: false };
-    if (verse != null && (!Number.isFinite(verse) || verse < 1)) return { ok: false };
-
-    const bookPart = normalizeSpaces(parts.slice(0, -1).join(" "));
-    if (!bookPart) return { ok: false };
-
-    const tryKey = (k: string): string | null => lookup.get(toKey(k)) ?? null;
-
-    // Try exact
-    let bookId = tryKey(bookPart);
-
-    // Try without spaces: "1 cor" -> "1cor"
-    if (!bookId) bookId = tryKey(bookPart.replace(/\s+/g, ""));
-
-    // Try removing punctuation
-    if (!bookId) bookId = tryKey(bookPart.replace(/[^a-zA-Z0-9\s]/g, ""));
-
-    if (!bookId) return { ok: false };
-
-    const fullName = bookNameById?.get(bookId) ?? bookId;
-    const label = verse ? `${fullName} ${chap}:${verse}` : `${fullName} ${chap}`;
-    return { ok: true, loc: { bookId, chapter: chap, verse }, label };
-}
-
-function splitSnippet(snippet: string): Array<{ text: string; hi: boolean }> {
-    // Server uses ‹ and › for FTS snippet markers.
-    if (!snippet.includes("‹")) return [{ text: snippet, hi: false }];
-
-    const out: Array<{ text: string; hi: boolean }> = [];
-    let hi = false;
-    let buf = "";
-
-    for (let i = 0; i < snippet.length; i++) {
-        const ch = snippet[i]!;
-        if (ch === "‹") {
-            if (buf) out.push({ text: buf, hi });
-            buf = "";
-            hi = true;
-            continue;
-        }
-        if (ch === "›") {
-            if (buf) out.push({ text: buf, hi });
-            buf = "";
-            hi = false;
-            continue;
-        }
-        buf += ch;
-    }
-    if (buf) out.push({ text: buf, hi });
-    return out;
-}
-
-function isMacPlatform(): boolean {
-    if (typeof navigator === "undefined") return false;
-    const p = (navigator.platform || navigator.userAgent || "").toLowerCase();
-    return p.includes("mac");
-}
-
-export function ReaderHeaderSearch(props: Props) {
-    const { onNavigate, enableHotkey = true, placeholder, limit = 20 } = props;
-
-    const inputRef = useRef<HTMLInputElement | null>(null);
-
-    const [books, setBooks] = useState<BookRow[] | null>(props.books ?? null);
-
-    const [q, setQ] = useState("");
-    const [focused, setFocused] = useState(false);
-
-    const [loading, setLoading] = useState(false);
-    const [payload, setPayload] = useState<SearchPayload | null>(null);
-    const [err, setErr] = useState<string | null>(null);
-
-    const [activeIdx, setActiveIdx] = useState(0);
-    const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
-
-    // Prefer parent-provided books; else load.
-    useEffect(() => {
-        if (props.books) {
-            setBooks(props.books);
-            return;
-        }
-
-        let alive = true;
-        apiGetBooks()
-            .then((r) => alive && setBooks(r.books))
-            .catch(() => alive && setBooks(null));
-
-        return () => {
-            alive = false;
-        };
-    }, [props.books]);
-
-    const bookLookup = useMemo(() => (books && books.length ? buildBookLookup(books) : null), [books]);
-
-    const bookNameById = useMemo(() => {
-        const m = new Map<string, string>();
-        for (const b of books ?? []) m.set(b.bookId, b.name);
-        return m;
-    }, [books]);
-
-    // Hotkey: Ctrl/Cmd+K
-    useEffect(() => {
-        if (!enableHotkey) return;
-
-        function onKeyDown(e: KeyboardEvent) {
-            const meta = e.metaKey || e.ctrlKey;
-            if (meta && e.key.toLowerCase() === "k") {
-                e.preventDefault();
-                inputRef.current?.focus();
-            }
-            if (e.key === "Escape" && document.activeElement === inputRef.current) {
-                e.preventDefault();
-                if (q.trim()) setQ("");
-                else inputRef.current?.blur();
-            }
-        }
-
-        window.addEventListener("keydown", onKeyDown);
-        return () => window.removeEventListener("keydown", onKeyDown);
-    }, [enableHotkey, q]);
-
-    const ref = useMemo(() => parseReference(q, bookLookup, bookNameById), [q, bookLookup, bookNameById]);
-
-    // Debounced search
-    useEffect(() => {
-        let alive = true;
-        const qq = q.trim();
-
-        setErr(null);
-        setPayload(null);
-        setActiveIdx(0);
-
-        if (!qq) {
-            setLoading(false);
-            return () => {
-                alive = false;
-            };
-        }
-
-        setLoading(true);
-        const t = setTimeout(() => {
-            apiSearch(qq, limit)
-                .then((p) => {
-                    if (!alive) return;
-                    setPayload(p);
-                    setLoading(false);
-                })
-                .catch((e) => {
-                    if (!alive) return;
-                    setErr(String(e?.message ?? e));
-                    setLoading(false);
-                });
-        }, 160);
-
-        return () => {
-            alive = false;
-            clearTimeout(t);
-        };
-    }, [q, limit]);
-
-    const results = payload?.results ?? [];
-    const showPanel = focused && (q.trim().length > 0 || loading || err != null);
-
-    const items = useMemo(() => {
-        const list: Array<
-            | { kind: "ref"; label: string; loc: ReaderLocation }
-            | { kind: "result"; label: string; result: SearchResult }
-        > = [];
-
-        if (ref.ok) list.push({ kind: "ref", label: `Go to ${ref.label}`, loc: ref.loc });
-
-        for (const r of results) {
-            const fullBook = bookNameById.get(r.bookId) ?? r.bookId;
-            list.push({
-                kind: "result",
-                label: `${fullBook} ${r.chapter}:${r.verse}`,
-                result: r,
-            });
-        }
-
-        return list;
-    }, [ref, results, bookNameById]);
-
-    // keep active item visible
-    useEffect(() => {
-        const el = itemRefs.current[activeIdx];
-        if (!el) return;
-        el.scrollIntoView({ block: "nearest" });
-    }, [activeIdx]);
-
-    function commitSelection(idx: number): void {
-        const item = items[idx];
-        if (!item) return;
-
-        if (item.kind === "ref") {
-            onNavigate(item.loc);
-            setFocused(false);
-            inputRef.current?.blur();
-            return;
-        }
-
-        const r = item.result;
-        onNavigate({ bookId: r.bookId, chapter: r.chapter, verse: r.verse });
-        setFocused(false);
-        inputRef.current?.blur();
-    }
-
-    function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>): void {
-        if (e.key === "Enter") {
-            e.preventDefault();
-            if (!q.trim()) return;
-            if (items.length > 0) commitSelection(activeIdx);
-            else if (ref.ok) onNavigate(ref.loc);
-            return;
-        }
-
-        if (e.key === "ArrowDown") {
-            e.preventDefault();
-            setActiveIdx((i) => Math.min(items.length - 1, i + 1));
-            return;
-        }
-        if (e.key === "ArrowUp") {
-            e.preventDefault();
-            setActiveIdx((i) => Math.max(0, i - 1));
-            return;
-        }
-    }
-
-    const hotkeyLabel = isMacPlatform() ? "⌘K" : "Ctrl+K";
-
-    return (
-        <div style={{ position: "relative" }}>
-            <div
-                style={{ ...hxs.row, ...(focused ? hxs.rowFocused : null) }}
-                aria-label="Search"
-                onMouseDown={() => inputRef.current?.focus()}
-            >
-        <span style={hxs.icon} aria-hidden>
-          ⌕
-        </span>
-
-                <input
-                    ref={inputRef}
-                    value={q}
-                    onChange={(e) => setQ(e.target.value)}
-                    placeholder={placeholder ?? "Search… (John 3:16)"}
-                    style={hxs.input}
-                    aria-label="Search scripture"
-                    spellCheck={false}
-                    inputMode="search"
-                    onFocus={() => setFocused(true)}
-                    onBlur={() => {
-                        // delay so click selection works
-                        setTimeout(() => setFocused(false), 120);
-                    }}
-                    onKeyDown={onKeyDown}
-                />
-
-                <span style={hxs.hotkey} aria-hidden>
-          {hotkeyLabel}
-        </span>
-            </div>
-
-            {!showPanel ? null : (
-                <div style={hxs.panel} role="listbox" aria-label="Search results">
-                    {err ? <div style={hxs.panelMsg}>{err}</div> : null}
-                    {!err && loading ? <div style={hxs.panelMsg}>Searching…</div> : null}
-                    {!err && !loading && items.length === 0 ? <div style={hxs.panelMsg}>No results.</div> : null}
-
-                    {!err && !loading && items.length > 0 ? (
-                        <div style={hxs.list}>
-                            {items.map((it, idx) => {
-                                const active = idx === activeIdx;
-                                return (
-                                    <button
-                                        key={`${it.kind}:${it.label}:${idx}`}
-                                        ref={(el) => {
-                                            itemRefs.current[idx] = el;
-                                        }}
-                                        type="button"
-                                        style={{ ...hxs.item, ...(active ? hxs.itemActive : null) }}
-                                        onMouseEnter={() => setActiveIdx(idx)}
-                                        onMouseDown={(e) => {
-                                            // prevent input blur before click
-                                            e.preventDefault();
-                                            commitSelection(idx);
-                                        }}
-                                    >
-                                        <div style={hxs.itemTop}>
-                                            <span style={hxs.itemLabel}>{it.label}</span>
-                                            <span style={hxs.itemMeta}>{it.kind === "ref" ? "ref" : payload?.mode ?? "search"}</span>
-                                        </div>
-
-                                        {it.kind === "result" && it.result?.snippet ? (
-                                            <div style={hxs.snippet}>
-                                                {splitSnippet(it.result.snippet).map((seg, i) => (
-                                                    <span key={i} style={seg.hi ? hxs.hi : undefined}>
-                            {seg.text}
-                          </span>
-                                                ))}
-                                            </div>
-                                        ) : null}
-                                    </button>
-                                );
-                            })}
-                        </div>
-                    ) : null}
-                </div>
-            )}
-        </div>
-    );
-}
-
-const hxs: Record<string, React.CSSProperties> = {
-    row: {
-        height: 30,
-        display: "grid",
-        gridTemplateColumns: "18px 1fr auto",
-        alignItems: "center",
-        gap: 6,
-        padding: "0 10px",
-        borderRadius: 999,
-        border: "1px solid var(--hairline)",
-        background: "var(--panel)",
-        boxShadow: "none",
-        cursor: "text",
-        userSelect: "none",
-    },
-    rowFocused: {
-        borderColor: "var(--focus)",
-        outline: "1px solid var(--focusRing)",
-        boxShadow: "0 10px 30px rgba(0,0,0,0.08)",
-    },
-    icon: {
-        width: 18,
-        textAlign: "center",
-        color: "var(--muted)",
-        fontSize: 12,
-        transform: "translateY(-0.5px)",
-    },
-    input: {
-        width: "100%",
-        height: 30,
-        border: "none",
-        outline: "none",
-        background: "transparent",
-        color: "inherit",
-        fontSize: 12,
-        padding: 0,
-        lineHeight: "30px",
-    },
-    hotkey: {
-        fontSize: 10,
-        letterSpacing: "0.14em",
-        textTransform: "uppercase",
-        color: "var(--muted)",
-        opacity: 0.75,
-        userSelect: "none",
-        paddingLeft: 6,
-    },
-
-    panel: {
-        position: "absolute",
-        left: 0,
-        right: 0,
-        marginTop: 8,
-        borderRadius: 14,
-        border: "1px solid var(--hairline)",
-        background: "var(--bg)",
-        boxShadow: "0 24px 90px rgba(0,0,0,0.20)",
-        overflow: "hidden",
-        zIndex: 20,
-    },
-    panelMsg: {
-        padding: "10px 10px",
-        fontSize: 12,
-        color: "var(--muted)",
-        whiteSpace: "pre-wrap",
-    },
-    list: {
-        display: "flex",
-        flexDirection: "column",
-        maxHeight: 280,
-        overflowY: "auto",
-    },
-    item: {
-        textAlign: "left",
-        border: "none",
-        background: "transparent",
-        color: "inherit",
-        cursor: "pointer",
-        padding: "9px 10px",
-        borderTop: "1px solid var(--hairline)",
-    },
-    itemActive: {
-        background: "var(--panel)",
-    },
-    itemTop: {
-        display: "flex",
-        alignItems: "baseline",
-        justifyContent: "space-between",
-        gap: 10,
-    },
-    itemLabel: {
-        fontSize: 12,
-        letterSpacing: "0.02em",
-    },
-    itemMeta: {
-        fontSize: 10,
-        color: "var(--muted)",
-        letterSpacing: "0.14em",
-        textTransform: "uppercase",
-        userSelect: "none",
-    },
-    snippet: {
-        marginTop: 5,
-        fontSize: 11.5,
-        color: "var(--muted)",
-        lineHeight: 1.55,
-    },
-    hi: {
-        color: "var(--fg)",
-    },
-};
 ```
 
 ### apps/web/src/reader/ReaderSelectionToolbar.tsx
 
 ```tsx
+// cspell:words oklab
+// apps/web/src/reader/ReaderSelectionToolbar.tsx
 import React, { memo, useMemo, useState } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { SelectionAnchorInput } from "@biblia/annotation";
-import {
-    Bookmark,
-    Highlighter,
-    NotebookPen,
-    Sparkles,
-    X,
-} from "lucide-react";
+import { Bookmark, Highlighter, NotebookPen, X } from "lucide-react";
 
 type Props = {
-    selection: SelectionAnchorInput | null;
-    onHighlight: () => void;
-    onBookmark: () => void;
-    onNote: () => void;
-    onClear?: () => void;
-    className?: string;
+     selection: SelectionAnchorInput | null;
+     onHighlight: () => void;
+     onBookmark: () => void;
+     onNote: () => void;
+     onClear?: () => void;
+     className?: string;
 };
 
 type ActionTone = "gold" | "blue" | "violet";
 
+type ActionSpec = {
+     key: "highlight" | "bookmark" | "note";
+     label: string;
+     title: string;
+     onClick: () => void;
+     icon: ReactNode;
+     tone: ActionTone;
+};
+
 type ActionButtonProps = {
-    label: string;
-    title: string;
-    onClick: () => void;
-    icon: React.ReactNode;
-    tone: ActionTone;
+     label: string;
+     title: string;
+     onClick: () => void;
+     icon: ReactNode;
+     tone: ActionTone;
+};
+
+type ToneStyles = {
+     color: string;
+     background: string;
+     backgroundHover: string;
+     borderColor: string;
+};
+
+const STICKY_TOP = 10;
+const PANEL_MAX_WIDTH = 660;
+
+const TOOLBAR_WRAP_STYLE: CSSProperties = {
+     position: "sticky",
+     top: STICKY_TOP,
+     zIndex: 60,
+     width: "100%",
+     display: "flex",
+     justifyContent: "center",
+     padding: "8px 12px 10px",
+     pointerEvents: "none",
+};
+
+const PANEL_STYLE: CSSProperties = {
+     pointerEvents: "auto",
+     width: "min(100%, 660px)",
+     maxWidth: PANEL_MAX_WIDTH,
+     borderRadius: 16,
+     border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+     background:
+          "color-mix(in oklab, var(--panel) 92%, var(--bg))",
+     boxShadow:
+          "0 10px 24px rgba(0,0,0,0.08), 0 1px 3px rgba(0,0,0,0.04)",
+     overflow: "hidden",
+     backdropFilter: "blur(12px)",
+     WebkitBackdropFilter: "blur(12px)",
+};
+
+const PANEL_INNER_STYLE: CSSProperties = {
+     display: "grid",
+     gridTemplateColumns: "minmax(0, 1fr) auto",
+     alignItems: "center",
+     gap: 10,
+     padding: "8px 10px",
+};
+
+const META_STYLE: CSSProperties = {
+     minWidth: 0,
+     display: "flex",
+     alignItems: "center",
+     gap: 10,
+};
+
+const BADGE_STYLE: CSSProperties = {
+     width: 18,
+     height: 18,
+     borderRadius: 999,
+     display: "inline-flex",
+     alignItems: "center",
+     justifyContent: "center",
+     flex: "0 0 auto",
+     background: "color-mix(in oklab, var(--fg) 5%, transparent)",
+     color: "color-mix(in oklab, var(--fg) 50%, transparent)",
+};
+
+const TEXT_WRAP_STYLE: CSSProperties = {
+     minWidth: 0,
+     display: "flex",
+     flexDirection: "column",
+     gap: 1,
+};
+
+const LABEL_STYLE: CSSProperties = {
+     minWidth: 0,
+     fontSize: 12.5,
+     fontWeight: 700,
+     letterSpacing: "-0.015em",
+     lineHeight: 1.15,
+     color: "var(--fg)",
+     overflow: "hidden",
+     textOverflow: "ellipsis",
+     whiteSpace: "nowrap",
+};
+
+const DETAIL_STYLE: CSSProperties = {
+     minWidth: 0,
+     fontSize: 11.5,
+     lineHeight: 1.25,
+     color: "color-mix(in oklab, var(--fg) 56%, transparent)",
+     overflow: "hidden",
+     textOverflow: "ellipsis",
+     whiteSpace: "nowrap",
+};
+
+const ACTIONS_STYLE: CSSProperties = {
+     display: "flex",
+     alignItems: "center",
+     justifyContent: "flex-end",
+     gap: 6,
+     flexWrap: "nowrap",
+     minWidth: 0,
 };
 
 function cleanText(value: string): string {
-    return value.replace(/\s+/g, " ").trim();
+     return value.replace(/\s+/g, " ").trim();
 }
 
-function clampText(value: string, max = 132): string {
-    const text = cleanText(value);
-    if (text.length <= max) return text;
-    return `${text.slice(0, max - 1).trimEnd()}…`;
+function clampText(value: string, max = 96): string {
+     const text = cleanText(value);
+     if (text.length <= max) return text;
+     return `${text.slice(0, max - 1).trimEnd()}…`;
 }
 
 function getSelectionLabel(selection: SelectionAnchorInput | null): string | null {
-    if (!selection) return null;
+     if (!selection) return null;
 
-    const start = cleanText(selection.start.verseKey);
-    const end = cleanText(selection.end.verseKey);
+     const start = cleanText(selection.start.verseKey);
+     const end = cleanText(selection.end.verseKey);
 
-    if (!start) return null;
-    if (start === end) return start;
-    return `${start} — ${end}`;
+     if (!start) return null;
+     if (!end || start === end) return start;
+     return `${start} — ${end}`;
 }
 
 function getSelectionDetail(selection: SelectionAnchorInput | null): string | null {
-    if (!selection) return null;
+     if (!selection) return null;
 
-    const text = selection.text ? cleanText(selection.text) : "";
-    if (text.length > 0) return clampText(text);
+     const text = selection.text ? clampText(selection.text, 96) : "";
+     if (text) return text;
 
-    const translationId = selection.translationId ? cleanText(selection.translationId) : "";
-    if (translationId.length > 0) return `Selection in ${translationId}`;
+     const translationId = selection.translationId ? cleanText(selection.translationId) : "";
+     if (translationId) return translationId;
 
-    return "Text selection";
+     return "Text selection";
 }
 
-function getPanelBorder(): string {
-    return "1px solid color-mix(in oklab, var(--reader-border, var(--border, rgba(127,127,127,0.24))) 86%, transparent)";
-}
-
-function getPanelBackground(): string {
-    return `
-        linear-gradient(
-            180deg,
-            color-mix(in oklab, var(--reader-card, var(--card, rgba(255,255,255,0.96))) 96%, white) 0%,
-            color-mix(in oklab, var(--reader-card, var(--card, rgba(255,255,255,0.96))) 100%, transparent) 100%
-        )
-    `;
-}
-
-function getPanelShadow(): string {
-    return "0 14px 34px rgba(0,0,0,0.10), 0 2px 10px rgba(0,0,0,0.05)";
-}
-
-function getToneStyles(tone: ActionTone): {
-    color: string;
-    background: string;
-    border: string;
-    shadow: string;
-    hoverBackground: string;
-} {
-    switch (tone) {
-        case "gold":
-            return {
-                color: "color-mix(in oklab, var(--text, #111) 76%, #8a6400)",
-                background: "color-mix(in oklab, #efcf73 16%, var(--card, white))",
-                border: "1px solid color-mix(in oklab, #ddb54c 40%, transparent)",
-                shadow: "0 6px 16px color-mix(in oklab, #ddb54c 12%, transparent)",
-                hoverBackground: "color-mix(in oklab, #efcf73 22%, var(--card, white))",
-            };
-        case "blue":
-            return {
-                color: "color-mix(in oklab, var(--text, #111) 76%, #295ed8)",
-                background: "color-mix(in oklab, #7ba9ff 14%, var(--card, white))",
-                border: "1px solid color-mix(in oklab, #6d9fff 38%, transparent)",
-                shadow: "0 6px 16px color-mix(in oklab, #6d9fff 11%, transparent)",
-                hoverBackground: "color-mix(in oklab, #7ba9ff 20%, var(--card, white))",
-            };
-        case "violet":
-            return {
-                color: "color-mix(in oklab, var(--text, #111) 76%, #6b47d8)",
-                background: "color-mix(in oklab, #b191ff 14%, var(--card, white))",
-                border: "1px solid color-mix(in oklab, #a884ff 38%, transparent)",
-                shadow: "0 6px 16px color-mix(in oklab, #a884ff 11%, transparent)",
-                hoverBackground: "color-mix(in oklab, #b191ff 20%, var(--card, white))",
-            };
-    }
+function getToneStyles(tone: ActionTone): ToneStyles {
+     switch (tone) {
+          case "gold":
+               return {
+                    color: "color-mix(in oklab, var(--fg) 84%, #8d6800)",
+                    background: "color-mix(in oklab, #efcf73 10%, var(--panel))",
+                    backgroundHover: "color-mix(in oklab, #efcf73 14%, var(--panel))",
+                    borderColor: "color-mix(in oklab, #ddb54c 22%, transparent)",
+               };
+          case "blue":
+               return {
+                    color: "color-mix(in oklab, var(--fg) 84%, #295ed8)",
+                    background: "color-mix(in oklab, #7ba9ff 10%, var(--panel))",
+                    backgroundHover: "color-mix(in oklab, #7ba9ff 14%, var(--panel))",
+                    borderColor: "color-mix(in oklab, #6d9fff 22%, transparent)",
+               };
+          case "violet":
+               return {
+                    color: "color-mix(in oklab, var(--fg) 84%, #6b47d8)",
+                    background: "color-mix(in oklab, #b191ff 10%, var(--panel))",
+                    backgroundHover: "color-mix(in oklab, #b191ff 14%, var(--panel))",
+                    borderColor: "color-mix(in oklab, #a884ff 22%, transparent)",
+               };
+     }
 }
 
 const ActionButton = memo(function ActionButton(props: ActionButtonProps) {
-    const { label, title, onClick, icon, tone } = props;
-    const toneStyles = getToneStyles(tone);
-    const [hovered, setHovered] = useState(false);
+     const { label, title, onClick, icon, tone } = props;
+     const toneStyles = getToneStyles(tone);
+     const [hover, setHover] = useState(false);
+     const [pressing, setPressing] = useState(false);
 
-    return (
-        <button
-            type="button"
-            title={title}
-            aria-label={title}
-            onClick={onClick}
-            onMouseDown={(event) => {
-                event.preventDefault();
-            }}
-            onMouseEnter={() => {
-                setHovered(true);
-            }}
-            onMouseLeave={() => {
-                setHovered(false);
-            }}
-            style={{
-                appearance: "none",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 8,
-                height: 38,
-                padding: "0 14px",
-                borderRadius: 999,
-                border: toneStyles.border,
-                background: hovered ? toneStyles.hoverBackground : toneStyles.background,
-                color: toneStyles.color,
-                boxShadow: toneStyles.shadow,
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-                fontSize: 13,
-                fontWeight: 700,
-                lineHeight: 1,
-                letterSpacing: "-0.01em",
-                transform: hovered ? "translateY(-1px)" : "translateY(0)",
-                transition:
-                    "transform 120ms ease, background 120ms ease, border-color 120ms ease, box-shadow 120ms ease, color 120ms ease",
-                WebkitTapHighlightColor: "transparent",
-            }}
-        >
-            <span
-                aria-hidden="true"
-                style={{
-                    width: 16,
-                    height: 16,
+     return (
+          <button
+               type="button"
+               title={title}
+               aria-label={title}
+               onClick={onClick}
+               onMouseDown={(event) => {
+                    event.preventDefault();
+                    setPressing(true);
+               }}
+               onMouseUp={() => setPressing(false)}
+               onMouseLeave={() => {
+                    setHover(false);
+                    setPressing(false);
+               }}
+               onMouseEnter={() => setHover(true)}
+               onFocus={() => setHover(true)}
+               onBlur={() => {
+                    setHover(false);
+                    setPressing(false);
+               }}
+               style={{
+                    appearance: "none",
+                    WebkitAppearance: "none",
                     display: "inline-flex",
                     alignItems: "center",
                     justifyContent: "center",
-                    flex: "0 0 auto",
-                }}
+                    gap: 6,
+                    height: 30,
+                    padding: "0 10px",
+                    borderRadius: 999,
+                    border: `1px solid ${toneStyles.borderColor}`,
+                    background: hover ? toneStyles.backgroundHover : toneStyles.background,
+                    color: toneStyles.color,
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                    fontSize: 11.5,
+                    fontWeight: 690,
+                    lineHeight: 1,
+                    letterSpacing: "-0.01em",
+                    transform: pressing ? "scale(0.985)" : "translateY(0)",
+                    transition:
+                         "transform 120ms ease, background 120ms ease, border-color 120ms ease, opacity 120ms ease",
+                    WebkitTapHighlightColor: "transparent",
+               }}
+          >
+            <span
+                 aria-hidden="true"
+                 style={{
+                      width: 14,
+                      height: 14,
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      flex: "0 0 auto",
+                      opacity: 0.9,
+                 }}
             >
                 {icon}
             </span>
-            <span>{label}</span>
-        </button>
-    );
+               <span>{label}</span>
+          </button>
+     );
 });
 
 const ClearButton = memo(function ClearButton(props: { onClick: () => void }) {
-    const [hovered, setHovered] = useState(false);
+     const [hover, setHover] = useState(false);
+     const [pressing, setPressing] = useState(false);
 
-    return (
-        <button
-            type="button"
-            title="Clear selection"
-            aria-label="Clear selection"
-            onClick={props.onClick}
-            onMouseDown={(event) => {
-                event.preventDefault();
-            }}
-            onMouseEnter={() => {
-                setHovered(true);
-            }}
-            onMouseLeave={() => {
-                setHovered(false);
-            }}
-            style={{
-                appearance: "none",
-                width: 38,
-                height: 38,
-                borderRadius: 999,
-                border: "1px solid color-mix(in oklab, var(--border, rgba(127,127,127,0.24)) 86%, transparent)",
-                background: hovered
-                    ? "color-mix(in oklab, var(--text, #111) 5%, transparent)"
-                    : "transparent",
-                color: "color-mix(in oklab, var(--text, #111) 70%, transparent)",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                cursor: "pointer",
-                flex: "0 0 auto",
-                transform: hovered ? "translateY(-1px)" : "translateY(0)",
-                transition: "background 120ms ease, transform 120ms ease, border-color 120ms ease",
-                WebkitTapHighlightColor: "transparent",
-            }}
-        >
-            <X size={17} strokeWidth={2.1} />
-        </button>
-    );
+     return (
+          <button
+               type="button"
+               title="Clear selection"
+               aria-label="Clear selection"
+               onClick={props.onClick}
+               onMouseDown={(event) => {
+                    event.preventDefault();
+                    setPressing(true);
+               }}
+               onMouseUp={() => setPressing(false)}
+               onMouseEnter={() => setHover(true)}
+               onMouseLeave={() => {
+                    setHover(false);
+                    setPressing(false);
+               }}
+               onFocus={() => setHover(true)}
+               onBlur={() => {
+                    setHover(false);
+                    setPressing(false);
+               }}
+               style={{
+                    appearance: "none",
+                    WebkitAppearance: "none",
+                    width: 30,
+                    height: 30,
+                    borderRadius: 999,
+                    border: "1px solid color-mix(in oklab, var(--hairline) 90%, transparent)",
+                    background: hover
+                         ? "color-mix(in oklab, var(--fg) 5%, transparent)"
+                         : "transparent",
+                    color: "color-mix(in oklab, var(--fg) 62%, transparent)",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    cursor: "pointer",
+                    flex: "0 0 auto",
+                    transform: pressing ? "scale(0.985)" : "translateY(0)",
+                    transition:
+                         "background 120ms ease, transform 120ms ease, border-color 120ms ease, opacity 120ms ease",
+                    WebkitTapHighlightColor: "transparent",
+               }}
+          >
+               <X size={14} strokeWidth={2.1} />
+          </button>
+     );
 });
 
 export const ReaderSelectionToolbar = memo(function ReaderSelectionToolbar(props: Props) {
-    const { selection, onHighlight, onBookmark, onNote, onClear, className } = props;
+     const { selection, onHighlight, onBookmark, onNote, onClear, className } = props;
 
-    const label = useMemo(() => getSelectionLabel(selection), [selection]);
-    const detail = useMemo(() => getSelectionDetail(selection), [selection]);
+     const label = useMemo(() => getSelectionLabel(selection), [selection]);
+     const detail = useMemo(() => getSelectionDetail(selection), [selection]);
 
-    if (!selection) return null;
+     const actions = useMemo<ActionSpec[]>(
+          () => [
+               {
+                    key: "highlight",
+                    label: "Highlight",
+                    title: "Create highlight",
+                    onClick: onHighlight,
+                    icon: <Highlighter size={14} strokeWidth={2.1} />,
+                    tone: "gold",
+               },
+               {
+                    key: "bookmark",
+                    label: "Bookmark",
+                    title: "Create bookmark",
+                    onClick: onBookmark,
+                    icon: <Bookmark size={14} strokeWidth={2.1} />,
+                    tone: "blue",
+               },
+               {
+                    key: "note",
+                    label: "Note",
+                    title: "Create note",
+                    onClick: onNote,
+                    icon: <NotebookPen size={14} strokeWidth={2.1} />,
+                    tone: "violet",
+               },
+          ],
+          [onBookmark, onHighlight, onNote],
+     );
 
-    return (
-        <div
-            className={className}
-            role="toolbar"
-            aria-label="Selection actions"
-            style={{
-                position: "sticky",
-                top: 8,
-                zIndex: 60,
-                width: "100%",
-                display: "flex",
-                justifyContent: "center",
-                padding: "8px 12px 14px",
-                pointerEvents: "none",
-            }}
-        >
-            <div
-                style={{
-                    pointerEvents: "auto",
-                    width: "min(940px, 100%)",
-                    borderRadius: 22,
-                    border: getPanelBorder(),
-                    background: getPanelBackground(),
-                    boxShadow: getPanelShadow(),
-                    overflow: "hidden",
-                }}
-            >
-                <div
-                    style={{
-                        display: "grid",
-                        gridTemplateColumns: "minmax(0, 1fr) auto",
-                        gap: 12,
-                        alignItems: "center",
-                        padding: "12px 14px",
-                    }}
-                >
-                    <div
-                        style={{
-                            minWidth: 0,
-                            display: "flex",
-                            flexDirection: "column",
-                            gap: 4,
-                        }}
-                    >
-                        <div
-                            style={{
-                                display: "flex",
-                                alignItems: "center",
-                                gap: 8,
-                                minWidth: 0,
-                                flexWrap: "wrap",
-                            }}
-                        >
-                            <div
-                                aria-hidden="true"
-                                style={{
-                                    width: 24,
-                                    height: 24,
-                                    borderRadius: 999,
-                                    display: "inline-flex",
-                                    alignItems: "center",
-                                    justifyContent: "center",
-                                    background: "color-mix(in oklab, var(--text, #111) 6%, transparent)",
-                                    color: "color-mix(in oklab, var(--text, #111) 76%, transparent)",
-                                    flex: "0 0 auto",
-                                }}
-                            >
-                                <Sparkles size={13} strokeWidth={2.2} />
-                            </div>
+     if (!selection) return null;
 
-                            {label ? (
-                                <div
-                                    style={{
-                                        minWidth: 0,
-                                        fontSize: 14,
-                                        fontWeight: 800,
-                                        letterSpacing: "-0.02em",
-                                        color: "var(--text, inherit)",
-                                        overflow: "hidden",
-                                        textOverflow: "ellipsis",
-                                        whiteSpace: "nowrap",
-                                    }}
-                                    title={label}
-                                >
-                                    {label}
-                                </div>
-                            ) : null}
-                        </div>
+     return (
+          <div
+               className={className}
+               role="toolbar"
+               aria-label="Selection actions"
+               style={TOOLBAR_WRAP_STYLE}
+          >
+               <div style={PANEL_STYLE}>
+                    <div style={PANEL_INNER_STYLE}>
+                         <div style={META_STYLE}>
+                              <div aria-hidden="true" style={BADGE_STYLE}>
+                                   <Highlighter size={11} strokeWidth={2.1} />
+                              </div>
 
-                        {detail ? (
-                            <div
-                                style={{
-                                    minWidth: 0,
-                                    fontSize: 13,
-                                    lineHeight: 1.35,
-                                    color: "color-mix(in oklab, var(--text, #111) 66%, transparent)",
-                                    overflow: "hidden",
-                                    textOverflow: "ellipsis",
-                                    whiteSpace: "nowrap",
-                                }}
-                                title={detail}
-                            >
-                                {detail}
-                            </div>
-                        ) : null}
+                              <div style={TEXT_WRAP_STYLE}>
+                                   {label ? (
+                                        <div style={LABEL_STYLE} title={label}>
+                                             {label}
+                                        </div>
+                                   ) : null}
+
+                                   {detail ? (
+                                        <div style={DETAIL_STYLE} title={detail}>
+                                             {detail}
+                                        </div>
+                                   ) : null}
+                              </div>
+                         </div>
+
+                         <div style={ACTIONS_STYLE}>
+                              {actions.map((action) => (
+                                   <ActionButton
+                                        key={action.key}
+                                        label={action.label}
+                                        title={action.title}
+                                        onClick={action.onClick}
+                                        icon={action.icon}
+                                        tone={action.tone}
+                                   />
+                              ))}
+
+                              {onClear ? <ClearButton onClick={onClear} /> : null}
+                         </div>
                     </div>
-
-                    <div
-                        style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "flex-end",
-                            gap: 8,
-                            flexWrap: "wrap",
-                        }}
-                    >
-                        <ActionButton
-                            label="Highlight"
-                            title="Create highlight"
-                            onClick={onHighlight}
-                            icon={<Highlighter size={16} strokeWidth={2.1} />}
-                            tone="gold"
-                        />
-
-                        <ActionButton
-                            label="Bookmark"
-                            title="Create bookmark"
-                            onClick={onBookmark}
-                            icon={<Bookmark size={16} strokeWidth={2.1} />}
-                            tone="blue"
-                        />
-
-                        <ActionButton
-                            label="Note"
-                            title="Create note"
-                            onClick={onNote}
-                            icon={<NotebookPen size={16} strokeWidth={2.1} />}
-                            tone="violet"
-                        />
-
-                        {onClear ? <ClearButton onClick={onClear} /> : null}
-                    </div>
-                </div>
-            </div>
-        </div>
-    );
+               </div>
+          </div>
+     );
 });
 ```
 
 ### apps/web/src/reader/ReaderShell.tsx
 
 ```tsx
-import React, { memo, useMemo } from "react";
+// apps/web/src/reader/ReaderShell.tsx
+import React, { memo, useEffect, useMemo, useRef } from "react";
+import type { CSSProperties, MutableRefObject, ReactNode, Ref } from "react";
 import type { AnnotationSnapshot } from "@biblia/annotation";
 import type { BookRow } from "../api";
 import type { ReaderLocation } from "../Search";
 import type { Mode } from "../theme";
-import type { ReaderPosition, SpineStats } from "./types";
 import { ReaderHeader } from "./ReaderHeader";
-import { ReaderViewport, type ReaderViewportHandle } from "./ReaderViewport";
 import { sx } from "./sx";
+import type { ReaderPosition, SpineStats } from "./types";
+import { ReaderViewport, type ReaderViewportHandle } from "./ReaderViewport";
 
-type CurrentPos = {
+type CurrentPos = Readonly<{
     label: string;
     ord: number;
     bookId: string | null;
     chapter: number | null;
     verse: number | null;
-};
+}>;
 
-type Props = {
-    styles: Record<string, React.CSSProperties>;
+type SpineValidation =
+     | { ok: true }
+     | { ok: false; msg: string };
+
+type Props = Readonly<{
+    styles: Record<string, CSSProperties>;
     books: BookRow[] | null;
 
     onBackHome: () => void;
@@ -21084,89 +23324,123 @@ type Props = {
     spine: SpineStats | null;
     bookById: Map<string, BookRow>;
 
-    viewportRef?: React.Ref<ReaderViewportHandle> | null;
-    selectionRootRef?: React.MutableRefObject<HTMLDivElement | null> | null;
+    viewportRef?: Ref<ReaderViewportHandle> | null;
+    selectionRootRef?: MutableRefObject<HTMLDivElement | null> | null;
     annotationSnapshot?: AnnotationSnapshot | null;
-    topContent?: React.ReactNode;
+    topContent?: ReactNode;
 
     onPosition: (pos: ReaderPosition) => void;
     onError?: (msg: string) => void;
     onReady?: () => void;
 
     err?: string | null;
+}>;
+
+const MEASURE_WRAP_STYLE: CSSProperties = {
+    maxWidth: "var(--bpReaderMeasure, 840px)",
+    marginInline: "auto",
+    paddingInline: 18,
+    boxSizing: "border-box",
+    width: "100%",
+    minWidth: 0,
 };
 
-function validateSpine(spine: SpineStats | null): { ok: true } | { ok: false; msg: string } {
-    if (!spine) return { ok: false, msg: "Missing spine." };
+const ERR_BANNER_OUTER_STYLE: CSSProperties = {
+    borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+    background: "color-mix(in oklab, var(--bg) 94%, var(--panel))",
+};
+
+const ERR_BANNER_INNER_STYLE: CSSProperties = {
+    paddingBlock: 9,
+};
+
+const ERR_TEXT_STYLE: CSSProperties = {
+    fontSize: 12,
+    color: "var(--muted)",
+    whiteSpace: "pre-wrap",
+};
+
+const LOADING_TEXT_STYLE: CSSProperties = {
+    ...sx.msg,
+    paddingTop: 22,
+};
+
+function isFiniteIntegerLike(value: unknown): value is number {
+    return typeof value === "number" && Number.isFinite(value);
+}
+
+function validateSpine(spine: SpineStats | null): SpineValidation {
+    if (!spine) {
+        return { ok: false, msg: "Missing spine." };
+    }
 
     const { verseOrdMin, verseOrdMax, verseCount } = spine;
 
-    if (!Number.isFinite(verseOrdMin) || !Number.isFinite(verseOrdMax) || !Number.isFinite(verseCount)) {
+    if (
+         !isFiniteIntegerLike(verseOrdMin) ||
+         !isFiniteIntegerLike(verseOrdMax) ||
+         !isFiniteIntegerLike(verseCount)
+    ) {
         return { ok: false, msg: "Spine has non-numeric fields." };
     }
+
+    if (!Number.isInteger(verseOrdMin) || !Number.isInteger(verseOrdMax) || !Number.isInteger(verseCount)) {
+        return { ok: false, msg: "Spine fields must be integers." };
+    }
+
     if (verseOrdMin <= 0 || verseOrdMax <= 0) {
         return { ok: false, msg: "Spine ord bounds must be > 0." };
     }
+
     if (verseOrdMax < verseOrdMin) {
         return { ok: false, msg: "Spine ord bounds invalid (max < min)." };
     }
 
-    const derived = verseOrdMax - verseOrdMin + 1;
     if (verseCount <= 0) {
         return { ok: false, msg: "Spine verseCount must be > 0." };
     }
-    if (Math.abs(verseCount - derived) > 10_000) {
+
+    const derivedCount = verseOrdMax - verseOrdMin + 1;
+    if (verseCount !== derivedCount) {
         return {
             ok: false,
-            msg: `Spine mismatch: verseCount=${verseCount} but bounds imply ${derived}. Refusing to mount reader.`,
+            msg: `Spine mismatch: verseCount=${verseCount} but bounds imply ${derivedCount}. Refusing to mount reader.`,
         };
     }
 
     return { ok: true };
 }
 
-const MeasureWrap = memo(function MeasureWrap(props: { children: React.ReactNode }) {
-    const style = useMemo<React.CSSProperties>(
-        () => ({
-            maxWidth: "var(--bpReaderMeasure, 840px)",
-            marginInline: "auto",
-            paddingInline: 18,
-        }),
-        [],
-    );
+function buildViewportKey(spine: SpineStats | null): string {
+    if (!spine) return "no-spine";
+    return `${spine.verseOrdMin}:${spine.verseOrdMax}:${spine.verseCount}`;
+}
 
-    return <div style={style}>{props.children}</div>;
+const MeasureWrap = memo(function MeasureWrap(props: Readonly<{ children: ReactNode }>) {
+    return <div style={MEASURE_WRAP_STYLE}>{props.children}</div>;
 });
 
-const ErrBanner = memo(function ErrBanner(props: { msg: string }) {
-    const outer = useMemo<React.CSSProperties>(
-        () => ({
-            borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-            background: "color-mix(in oklab, var(--bg) 94%, var(--panel))",
-        }),
-        [],
-    );
-
+const ErrBanner = memo(function ErrBanner(props: Readonly<{ msg: string }>) {
     return (
-        <div role="status" aria-live="polite" style={outer}>
-            <MeasureWrap>
-                <div style={{ paddingBlock: 9 }}>
-                    <div style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "pre-wrap" }}>{props.msg}</div>
-                </div>
-            </MeasureWrap>
-        </div>
+         <div role="status" aria-live="polite" style={ERR_BANNER_OUTER_STYLE}>
+             <MeasureWrap>
+                 <div style={ERR_BANNER_INNER_STYLE}>
+                     <div style={ERR_TEXT_STYLE}>{props.msg}</div>
+                 </div>
+             </MeasureWrap>
+         </div>
     );
 });
 
-const LoadingBody = memo(function LoadingBody() {
+const LoadingBody = memo(function LoadingBody(props: Readonly<{ msg?: string | null }>) {
     return (
-        <div style={sx.body}>
-            <MeasureWrap>
-                <div style={sx.msg} role="status" aria-live="polite">
-                    Loading…
-                </div>
-            </MeasureWrap>
-        </div>
+         <div style={sx.body}>
+             <MeasureWrap>
+                 <div style={LOADING_TEXT_STYLE} role="status" aria-live="polite">
+                     {props.msg ?? "Loading…"}
+                 </div>
+             </MeasureWrap>
+         </div>
     );
 });
 
@@ -21193,52 +23467,75 @@ export function ReaderShell(props: Props) {
     } = props;
 
     const spineCheck = useMemo(() => validateSpine(spine), [spine]);
-    const hasData = spineCheck.ok;
-
-    const viewportKey = useMemo(() => {
-        if (!spine) return "no-spine";
-        return `${spine.verseOrdMin}:${spine.verseOrdMax}:${spine.verseCount}`;
-    }, [spine]);
+    const hasValidSpine = spineCheck.ok;
+    const viewportKey = useMemo(() => buildViewportKey(spine), [spine]);
 
     const bannerMsg = useMemo(() => {
         if (err) return err;
-        if (!spine && !err) return null;
+        if (!spine) return null;
         if (!spineCheck.ok) return spineCheck.msg;
         return null;
     }, [err, spine, spineCheck]);
 
+    const reportedErrorRef = useRef<string | null>(null);
+    const readyCalledRef = useRef(false);
+
+    useEffect(() => {
+        if (!bannerMsg || !onError) return;
+        if (reportedErrorRef.current === bannerMsg) return;
+
+        reportedErrorRef.current = bannerMsg;
+        onError(bannerMsg);
+    }, [bannerMsg, onError]);
+
+    useEffect(() => {
+        if (!hasValidSpine) {
+            readyCalledRef.current = false;
+            return;
+        }
+        if (!spine) {
+            readyCalledRef.current = false;
+            return;
+        }
+        if (!onReady) return;
+        if (readyCalledRef.current) return;
+
+        readyCalledRef.current = true;
+        onReady();
+    }, [hasValidSpine, onReady, spine]);
+
     return (
-        <main style={sx.page} aria-busy={!hasData}>
-            <ReaderHeader
-                styles={styles}
-                books={books}
-                onBackHome={onBackHome}
-                current={current}
-                onJumpRef={onJumpRef}
-                onNavigate={onNavigate}
-                mode={mode}
-                onToggleTheme={onToggleTheme}
-            />
+         <main style={sx.page} aria-busy={!hasValidSpine} aria-live="polite">
+             <ReaderHeader
+                  styles={styles}
+                  books={books}
+                  onBackHome={onBackHome}
+                  current={current}
+                  onJumpRef={onJumpRef}
+                  onNavigate={onNavigate}
+                  mode={mode}
+                  onToggleTheme={onToggleTheme}
+             />
 
-            {bannerMsg ? <ErrBanner msg={bannerMsg} /> : null}
+             {bannerMsg ? <ErrBanner msg={bannerMsg} /> : null}
 
-            {hasData && spine ? (
-                <ReaderViewport
-                    key={viewportKey}
-                    ref={viewportRef ?? null}
-                    spine={spine}
-                    bookById={bookById}
-                    selectionRootRef={selectionRootRef ?? null}
-                    annotationSnapshot={annotationSnapshot ?? null}
-                    onPosition={onPosition}
-                    onError={onError}
-                    onReady={onReady}
-                    topContent={topContent ?? null}
-                />
-            ) : (
-                <LoadingBody />
-            )}
-        </main>
+             {hasValidSpine && spine ? (
+                  <ReaderViewport
+                       key={viewportKey}
+                       ref={viewportRef ?? null}
+                       spine={spine}
+                       bookById={bookById}
+                       selectionRootRef={selectionRootRef ?? null}
+                       annotationSnapshot={annotationSnapshot ?? null}
+                       topContent={topContent ?? null}
+                       onPosition={onPosition}
+                       onError={onError}
+                       onReady={onReady}
+                  />
+             ) : (
+                  <LoadingBody msg={!spine && !err ? "Loading…" : undefined} />
+             )}
+         </main>
     );
 }
 ```
@@ -21246,8 +23543,17 @@ export function ReaderShell(props: Props) {
 ### apps/web/src/reader/ReaderTypographyControl.tsx
 
 ```tsx
+// cspell:words oklab
 // apps/web/src/reader/ReaderTypographyControl.tsx
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, {
+    useCallback,
+    useEffect,
+    useId,
+    useLayoutEffect,
+    useMemo,
+    useRef,
+    useState,
+} from "react";
 import {
     applyReaderTypography,
     clearReaderTypography,
@@ -21262,70 +23568,114 @@ import {
 } from "./typography";
 
 /**
- * Biblia.to — Reader Typography Control (elite + bulletproof)
+ * Biblia.to — Reader Typography Control
  *
- * Contract (your request):
- * - Width locked (measurePx fixed to DEFAULT)
- * - Leading locked (leading fixed to DEFAULT)
- * - User controls: Enable + Font + Size + Weight
+ * Locked contract:
+ * - measurePx always fixed to DEFAULT_TYPOGRAPHY.measurePx
+ * - leading always fixed to DEFAULT_TYPOGRAPHY.leading
+ * - user controls: enabled + font + size + weight
  *
- * Upgrades:
- * - No click-outside "as any" hacks. Uses a clean capture listener + composedPath() when available.
- * - Focus correctness: open -> focus panel; close -> restore focus to trigger.
- * - Keyboard: Escape closes; Left/Right cycles fonts when panel open and no range focused; Home/End snaps range.
- * - A11y: aria-controls, aria-expanded, role="dialog", label wiring.
- * - Reduced motion respected; animation injected once per app (and not removed).
- * - Prevents legacy stored values from reintroducing measure/leading drift.
+ * Notes:
+ * - stable storage/apply contract
+ * - viewport-aware panel positioning
+ * - touch + mouse friendly controls
+ * - hard guard against stale/legacy measure/leading drift
+ * - no deprecated MediaQueryList listener APIs
  */
 
 type FontOpt = ReturnType<typeof fontOptions>[number] & {
     cssFamily?: string;
     family?: string;
+    previewFamily?: string;
+    previewText?: string;
 };
 
-type RangeId = "sizePx" | "weight";
+type PanelSide = "bottom-right" | "bottom-left";
+
+const PANEL_W = 332;
+const PANEL_GAP = 10;
+const SAMPLE_TEXT = "In the beginning God created the heaven and the earth.";
 
 function clampNum(n: number, lo: number, hi: number): number {
     if (!Number.isFinite(n)) return lo;
     return Math.max(lo, Math.min(hi, n));
 }
 
-function usePrefersReducedMotion(): boolean {
-    const [reduced, setReduced] = useState(false);
-    useEffect(() => {
-        if (typeof window === "undefined" || !window.matchMedia) return;
-        const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-        const onChange = () => setReduced(mq.matches);
-        onChange();
-        // Safari legacy
-        if (mq.addEventListener) mq.addEventListener("change", onChange);
-        else mq.addListener(onChange);
-        return () => {
-            if (mq.removeEventListener) mq.removeEventListener("change", onChange);
-            else mq.removeListener(onChange);
-        };
-    }, []);
-    return reduced;
+function roundToStep(n: number, step: number): number {
+    if (!Number.isFinite(n) || !Number.isFinite(step) || step <= 0) return n;
+    return Math.round(n / step) * step;
+}
+
+function normalizeLockedTypography(input: ReaderTypography): ReaderTypography {
+    return updateTypography(input, {
+        measurePx: DEFAULT_TYPOGRAPHY.measurePx,
+        leading: DEFAULT_TYPOGRAPHY.leading,
+    });
 }
 
 function nextOf<T>(arr: readonly T[], current: T, dir: 1 | -1): T {
+    if (arr.length === 0) return current;
     const i = Math.max(0, arr.indexOf(current));
     const n = (i + dir + arr.length) % arr.length;
     return arr[n]!;
 }
 
-function fontFamilyForOpt(f: FontOpt): string {
-    const fam = (f.cssFamily ?? f.family ?? String(f.id)).trim();
+function fontFamilyForOpt(f: FontOpt | null): string {
+    if (!f) return "var(--font-serif)";
+    const fam = (f.previewFamily ?? f.cssFamily ?? f.family ?? String(f.id)).trim();
     if (!fam) return "var(--font-serif)";
-    if (fam.includes(",") || fam.startsWith("var(") || fam.startsWith("ui-") || fam.includes("system-ui")) return fam;
-    return `"${fam}", ui-serif, Georgia, Cambria, "Times New Roman", serif`;
+    if (
+         fam.startsWith("var(") ||
+         fam.includes(",") ||
+         fam.startsWith("ui-") ||
+         fam.includes("system-ui")
+    ) {
+        return fam;
+    }
+    return `"${fam}", var(--font-serif), Georgia, Cambria, "Times New Roman", serif`;
+}
+
+function isRangeInput(el: Element | null): el is HTMLInputElement {
+    return !!el && el.tagName === "INPUT" && (el as HTMLInputElement).type === "range";
+}
+
+function eventComposedPath(e: Event): EventTarget[] | null {
+    const maybe = e as Event & { composedPath?: () => EventTarget[] };
+    return typeof maybe.composedPath === "function" ? maybe.composedPath() : null;
+}
+
+function pathContainsNode(path: EventTarget[] | null, node: Node | null): boolean {
+    if (!path || !node) return false;
+    for (const entry of path) {
+        if (entry === node) return true;
+    }
+    return false;
+}
+
+function usePrefersReducedMotion(): boolean {
+    const [reduced, setReduced] = useState(false);
+
+    useEffect(() => {
+        if (typeof window === "undefined" || !window.matchMedia) return;
+
+        const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+        const onChange = (event: MediaQueryListEvent) => setReduced(event.matches);
+
+        setReduced(mq.matches);
+        mq.addEventListener("change", onChange);
+
+        return () => {
+            mq.removeEventListener("change", onChange);
+        };
+    }, []);
+
+    return reduced;
 }
 
 function useInjectOnceStyle(cssText: string, attr: string): void {
     useEffect(() => {
         if (typeof document === "undefined") return;
-        const sel = `style[${attr}="1"]`;
-        if (document.querySelector(sel)) return;
+        if (document.querySelector(`style[${attr}="1"]`)) return;
 
         const el = document.createElement("style");
         el.setAttribute(attr, "1");
@@ -21334,118 +23684,197 @@ function useInjectOnceStyle(cssText: string, attr: string): void {
     }, [cssText, attr]);
 }
 
+function useViewportPanelSide(
+     open: boolean,
+     triggerRef: React.RefObject<HTMLButtonElement | null>,
+): PanelSide {
+    const [side, setSide] = useState<PanelSide>("bottom-right");
+
+    useLayoutEffect(() => {
+        if (!open || typeof window === "undefined") return;
+
+        const compute = () => {
+            const trigger = triggerRef.current;
+            if (!trigger) return;
+
+            const rect = trigger.getBoundingClientRect();
+            const roomRight = window.innerWidth - rect.right;
+            const roomLeft = rect.left;
+
+            if (roomRight >= PANEL_W || roomRight >= roomLeft) {
+                setSide("bottom-right");
+            } else {
+                setSide("bottom-left");
+            }
+        };
+
+        compute();
+        window.addEventListener("resize", compute);
+
+        return () => window.removeEventListener("resize", compute);
+    }, [open, triggerRef]);
+
+    return side;
+}
+
 function IconAa() {
     return <span style={{ fontWeight: 860, letterSpacing: "-0.06em" }}>Aa</span>;
 }
+
 function IconX() {
     return <span style={{ fontSize: 14, lineHeight: 1 }}>✕</span>;
 }
 
-function isRangeInput(el: Element | null): el is HTMLInputElement {
-    return !!el && el.tagName === "INPUT" && (el as HTMLInputElement).type === "range";
+function IconCheck(props: { on: boolean }) {
+    return (
+         <span
+              aria-hidden
+              style={{
+                  width: 14,
+                  height: 14,
+                  borderRadius: 999,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: 10,
+                  lineHeight: 1,
+                  border: "1px solid color-mix(in oklab, var(--hairline) 88%, transparent)",
+                  background: props.on
+                       ? "color-mix(in oklab, var(--focus) 92%, transparent)"
+                       : "transparent",
+                  color: props.on ? "#fff" : "transparent",
+                  flexShrink: 0,
+              }}
+         >
+            ✓
+        </span>
+    );
 }
 
-function eventComposedPath(e: Event): EventTarget[] | null {
-    const anyE = e as unknown as { composedPath?: () => EventTarget[] };
-    return typeof anyE.composedPath === "function" ? anyE.composedPath() : null;
-}
-
-function pathContainsNode(path: EventTarget[] | null, node: Node | null): boolean {
-    if (!path || !node) return false;
-    for (const t of path) if (t === node) return true;
-    return false;
-}
-
-const PANEL_ID = "bp-typo-panel";
+const FONT_PREVIEW_TEXTS = [
+    "Blessed are the pure in heart.",
+    "The earth was without form, and void.",
+    "The Lord is my shepherd; I shall not want.",
+] as const;
 
 export function ReaderTypographyControl() {
-    const stored = useMemo(() => loadReaderTypography(), []);
-    const [enabled, setEnabled] = useState<boolean>(!!stored);
-    const [t, setT] = useState<ReaderTypography>(stored ?? DEFAULT_TYPOGRAPHY);
-    const [open, setOpen] = useState(false);
+    const storageLoadedRef = useRef<ReaderTypography | null>(null);
+    if (storageLoadedRef.current === null) {
+        storageLoadedRef.current = loadReaderTypography();
+    }
 
-    const reducedMotion = usePrefersReducedMotion();
+    const stored = storageLoadedRef.current;
+    const [enabled, setEnabled] = useState<boolean>(!!stored);
+    const [t, setT] = useState<ReaderTypography>(
+         normalizeLockedTypography(stored ?? DEFAULT_TYPOGRAPHY),
+    );
+    const [open, setOpen] = useState(false);
 
     const rootRef = useRef<HTMLDivElement | null>(null);
     const triggerRef = useRef<HTMLButtonElement | null>(null);
     const panelRef = useRef<HTMLDivElement | null>(null);
+    const firstFontButtonRef = useRef<HTMLButtonElement | null>(null);
 
-    // Track whether a slider currently has focus (so Left/Right doesn't steal arrows)
-    const [activeRange, setActiveRange] = useState<RangeId | null>(null);
-
+    const reducedMotion = usePrefersReducedMotion();
     const limits = useMemo(() => typographyLimits(), []);
     const fonts = useMemo(() => fontOptions() as FontOpt[], []);
+    const ids = useMemo(() => fonts.map((f) => f.id) as TypographyFont[], [fonts]);
+
+    const panelSide = useViewportPanelSide(open, triggerRef);
+
+    const panelId = useId();
+    const labelId = `${panelId}-label`;
+    const descId = `${panelId}-desc`;
 
     useInjectOnceStyle(
-        `
+         `
 @keyframes bpTypoPop {
   from { opacity: 0; transform: translateY(6px) scale(0.985); }
   to   { opacity: 1; transform: translateY(0px) scale(1); }
 }
 `,
-        "data-bp-typo-pop",
+         "data-bp-typo-pop",
     );
 
-    const ids = useMemo(() => (fonts.map((f) => f.id) as TypographyFont[]), [fonts]);
+    const current = useMemo(() => normalizeLockedTypography(t), [t]);
 
-    const fontIndex = useMemo(() => {
+    const currentFontIndex = useMemo(() => {
         if (!fonts.length) return 0;
-        const idx = fonts.findIndex((f) => f.id === t.font);
+        const idx = fonts.findIndex((f) => f.id === current.font);
         return idx >= 0 ? idx : 0;
-    }, [fonts, t.font]);
+    }, [fonts, current.font]);
 
-    const curFont = useMemo(() => (fonts.length ? fonts[fontIndex]! : null), [fonts, fontIndex]);
+    const currentFont = useMemo(() => {
+        if (!fonts.length) return null;
+        return fonts[currentFontIndex] ?? null;
+    }, [fonts, currentFontIndex]);
+
+    const currentFontCss = useMemo(() => fontFamilyForOpt(currentFont), [currentFont]);
 
     const summary = useMemo(() => {
-        const size = `${Math.round(t.sizePx)}px`;
-        const weight = `${Math.round(t.weight)}`;
-        const font = curFont?.label ?? String(t.font);
+        const font = currentFont?.label ?? String(current.font);
+        const size = `${Math.round(current.sizePx)}px`;
+        const weight = `${Math.round(current.weight)}`;
         return `${font} · ${size} · ${weight}`;
-    }, [t.sizePx, t.weight, t.font, curFont]);
+    }, [current, currentFont]);
+
+    const setPatch = useCallback((patch: Partial<ReaderTypography>) => {
+        setEnabled(true);
+        setT((prev) => normalizeLockedTypography(updateTypography(prev, patch)));
+    }, []);
 
     const closePanel = useCallback(() => {
         setOpen(false);
-        setActiveRange(null);
-        queueMicrotask(() => triggerRef.current?.focus());
+        queueMicrotask(() => {
+            triggerRef.current?.focus();
+        });
     }, []);
-
-    const ensureEnabled = useCallback(() => {
-        setEnabled((prev) => (prev ? prev : true));
-    }, []);
-
-    const setPatch = useCallback(
-        (patch: Partial<ReaderTypography>) => {
-            ensureEnabled();
-            setT((prev) => updateTypography(prev, patch));
-        },
-        [ensureEnabled],
-    );
 
     const resetToDefaults = useCallback(() => {
         setEnabled(false);
-        setT(DEFAULT_TYPOGRAPHY);
+        setT(normalizeLockedTypography(DEFAULT_TYPOGRAPHY));
         setOpen(false);
-        setActiveRange(null);
-        queueMicrotask(() => triggerRef.current?.focus());
-    }, []);
-
-    // Lock contract fields always (measurePx + leading)
-    useEffect(() => {
-        setT((prev) =>
-            updateTypography(prev, {
-                measurePx: DEFAULT_TYPOGRAPHY.measurePx,
-                leading: DEFAULT_TYPOGRAPHY.leading,
-            }),
-        );
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
-
-    // Live apply + save (and enforce locked fields even if storage is dirty)
-    useEffect(() => {
-        const locked = updateTypography(t, {
-            measurePx: DEFAULT_TYPOGRAPHY.measurePx,
-            leading: DEFAULT_TYPOGRAPHY.leading,
+        queueMicrotask(() => {
+            triggerRef.current?.focus();
         });
+    }, []);
+
+    const cycleFont = useCallback(
+         (dir: -1 | 1) => {
+             if (!ids.length) return;
+             setPatch({ font: nextOf(ids, current.font, dir) });
+         },
+         [ids, current.font, setPatch],
+    );
+
+    const applySizeDelta = useCallback(
+         (delta: number) => {
+             const step = limits.sizePx.step;
+             const next = clampNum(
+                  roundToStep(current.sizePx + delta * step, step),
+                  limits.sizePx.lo,
+                  limits.sizePx.hi,
+             );
+             setPatch({ sizePx: Math.round(next) });
+         },
+         [current.sizePx, limits.sizePx.hi, limits.sizePx.lo, limits.sizePx.step, setPatch],
+    );
+
+    const applyWeightDelta = useCallback(
+         (delta: number) => {
+             const step = limits.weight.step;
+             const next = clampNum(
+                  roundToStep(current.weight + delta * step, step),
+                  limits.weight.lo,
+                  limits.weight.hi,
+             );
+             setPatch({ weight: Math.round(next) });
+         },
+         [current.weight, limits.weight.hi, limits.weight.lo, limits.weight.step, setPatch],
+    );
+
+    useEffect(() => {
+        const locked = normalizeLockedTypography(current);
 
         if (!enabled) {
             applyReaderTypography(null);
@@ -21453,22 +23882,31 @@ export function ReaderTypographyControl() {
             return;
         }
 
-        // Apply locked snapshot (prevents drift if someone patched t elsewhere)
         applyReaderTypography(locked);
         saveReaderTypography(locked);
 
-        // Keep state coherent if we had to clamp/lock
-        if (locked !== t) setT(locked);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [enabled, t]);
+        if (
+             locked.measurePx !== current.measurePx ||
+             locked.leading !== current.leading ||
+             locked.sizePx !== current.sizePx ||
+             locked.weight !== current.weight ||
+             locked.font !== current.font
+        ) {
+            setT(locked);
+        }
+    }, [enabled, current]);
 
-    // Open -> focus panel (so Escape works immediately)
     useEffect(() => {
         if (!open) return;
-        queueMicrotask(() => panelRef.current?.focus());
+        queueMicrotask(() => {
+            if (firstFontButtonRef.current) {
+                firstFontButtonRef.current.focus();
+                return;
+            }
+            panelRef.current?.focus();
+        });
     }, [open]);
 
-    // Click-outside (capture) — portals/shadow safe via composedPath when available.
     useEffect(() => {
         if (!open) return;
 
@@ -21478,16 +23916,20 @@ export function ReaderTypographyControl() {
 
             const target = e.target as Node | null;
             const path = eventComposedPath(e);
+            const inside =
+                 !!(target && root.contains(target)) || pathContainsNode(path, root);
 
-            const inside = (target && root.contains(target)) || pathContainsNode(path, root);
             if (!inside) closePanel();
         };
 
         document.addEventListener("pointerdown", onPointerDownCapture, { capture: true });
-        return () => document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
+        return () => {
+            document.removeEventListener("pointerdown", onPointerDownCapture, {
+                capture: true,
+            });
+        };
     }, [open, closePanel]);
 
-    // Keyboard
     useEffect(() => {
         if (!open) return;
 
@@ -21500,253 +23942,428 @@ export function ReaderTypographyControl() {
 
             if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-            // If a slider is focused, allow arrows to adjust it; add Home/End for snap.
-            const ae = document.activeElement as Element | null;
-            if (isRangeInput(ae)) {
+            const activeEl = document.activeElement as Element | null;
+
+            if (isRangeInput(activeEl)) {
                 if (e.key === "Home" || e.key === "End") {
-                    const input = ae as HTMLInputElement;
-                    const min = Number(input.min);
-                    const max = Number(input.max);
-                    input.value = String(e.key === "Home" ? min : max);
-                    input.dispatchEvent(new Event("input", { bubbles: true }));
-                    input.dispatchEvent(new Event("change", { bubbles: true }));
+                    const min = Number(activeEl.min);
+                    const max = Number(activeEl.max);
+                    activeEl.value = String(e.key === "Home" ? min : max);
+                    activeEl.dispatchEvent(new Event("input", { bubbles: true }));
+                    activeEl.dispatchEvent(new Event("change", { bubbles: true }));
                     e.preventDefault();
                 }
                 return;
             }
 
-            // Font cycling (only when enabled, panel open, and no range focused)
-            if (!enabled) return;
-            if (!ids.length) return;
-
-            if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
-                const dir: 1 | -1 = e.key === "ArrowRight" ? 1 : -1;
-                setPatch({ font: nextOf(ids, t.font, dir) });
-                e.preventDefault();
+            switch (e.key) {
+                case "ArrowLeft":
+                    cycleFont(-1);
+                    e.preventDefault();
+                    return;
+                case "ArrowRight":
+                    cycleFont(1);
+                    e.preventDefault();
+                    return;
+                case "[":
+                    applySizeDelta(-1);
+                    e.preventDefault();
+                    return;
+                case "]":
+                    applySizeDelta(1);
+                    e.preventDefault();
+                    return;
+                case "-":
+                    applyWeightDelta(-1);
+                    e.preventDefault();
+                    return;
+                case "=":
+                case "+":
+                    applyWeightDelta(1);
+                    e.preventDefault();
+                    return;
+                default:
+                    return;
             }
         };
 
         window.addEventListener("keydown", onKeyCapture, { capture: true });
         return () => window.removeEventListener("keydown", onKeyCapture, { capture: true });
-    }, [open, closePanel, enabled, ids, setPatch, t.font]);
+    }, [open, closePanel, cycleFont, applySizeDelta, applyWeightDelta]);
 
-    const onToggleOpen = useCallback(() => setOpen((v) => !v), []);
+    const panelStyle = useMemo<React.CSSProperties>(() => {
+        const base: React.CSSProperties = {
+            ...sx.panel,
+            ...(reducedMotion ? sx.panelNoMotion : null),
+        };
 
-    const hopFont = useCallback(
-        (dir: -1 | 1) => {
-            if (!enabled || !ids.length) return;
-            setPatch({ font: nextOf(ids, t.font, dir) });
-        },
-        [enabled, ids, setPatch, t.font],
-    );
+        if (panelSide === "bottom-left") {
+            return {
+                ...base,
+                left: 0,
+                right: "auto",
+                transformOrigin: "top left",
+            };
+        }
+
+        return {
+            ...base,
+            right: 0,
+            left: "auto",
+            transformOrigin: "top right",
+        };
+    }, [panelSide, reducedMotion]);
 
     const sliderStyle = enabled ? sx.range : { ...sx.range, ...sx.rangeDisabled };
 
     return (
-        <div ref={rootRef} style={sx.root}>
-            <button
-                ref={triggerRef}
-                type="button"
-                style={{
-                    ...sx.trigger,
-                    ...(open ? sx.triggerOpen : {}),
-                    ...(enabled ? null : sx.triggerDisabled),
-                }}
-                onClick={onToggleOpen}
-                aria-haspopup="dialog"
-                aria-expanded={open}
-                aria-controls={PANEL_ID}
-                aria-label="Typography settings"
-                title={`Typography (${summary})`}
-            >
+         <div ref={rootRef} style={sx.root}>
+             <button
+                  ref={triggerRef}
+                  type="button"
+                  style={{
+                      ...sx.trigger,
+                      ...(open ? sx.triggerOpen : null),
+                      ...(enabled ? null : sx.triggerDisabled),
+                  }}
+                  onClick={() => setOpen((v) => !v)}
+                  aria-haspopup="dialog"
+                  aria-expanded={open}
+                  aria-controls={panelId}
+                  aria-label="Typography settings"
+                  title={`Typography (${summary})`}
+             >
                 <span style={sx.triggerGlyph}>
                     <IconAa />
                 </span>
-                <span style={{ ...sx.dot, ...(enabled ? sx.dotOn : sx.dotOff) }} aria-hidden />
-            </button>
+                 <span style={{ ...sx.dot, ...(enabled ? sx.dotOn : sx.dotOff) }} aria-hidden />
+             </button>
 
-            {open && (
-                <div
-                    id={PANEL_ID}
-                    ref={panelRef}
-                    style={{
-                        ...sx.panel,
-                        ...(reducedMotion ? sx.panelNoMotion : {}),
-                    }}
-                    role="dialog"
-                    aria-label="Typography settings"
-                    tabIndex={-1}
-                >
-                    {/* Header */}
-                    <div style={sx.header}>
-                        <div style={sx.hTitle}>Typography</div>
+             {open ? (
+                  <div
+                       id={panelId}
+                       ref={panelRef}
+                       role="dialog"
+                       aria-modal="false"
+                       aria-labelledby={labelId}
+                       aria-describedby={descId}
+                       tabIndex={-1}
+                       style={panelStyle}
+                  >
+                      <div style={sx.header}>
+                          <div style={sx.hTitleWrap}>
+                              <div id={labelId} style={sx.hTitle}>
+                                  Typography
+                              </div>
+                              <div id={descId} style={sx.hSub}>
+                                  Reader overrides for font, size, and weight.
+                              </div>
+                          </div>
 
-                        <div style={sx.hRight}>
-                            <label style={sx.switchLabel} title={enabled ? "Overrides on" : "Overrides off"}>
-                                <input
-                                    type="checkbox"
-                                    checked={enabled}
-                                    onChange={() => setEnabled((v) => !v)}
-                                    style={sx.switchInput}
-                                    aria-label={enabled ? "Turn typography overrides off" : "Turn typography overrides on"}
-                                />
-                                <span
-                                    style={{
-                                        ...sx.switchTrack,
-                                        background: enabled
-                                            ? "color-mix(in oklab, var(--focus) 86%, transparent)"
-                                            : "color-mix(in oklab, var(--panel) 92%, transparent)",
-                                    }}
-                                    aria-hidden
-                                />
-                                <span
-                                    style={{
-                                        ...sx.switchThumb,
-                                        transform: enabled ? "translateX(12px)" : "translateX(0px)",
-                                    }}
-                                    aria-hidden
-                                />
-                            </label>
+                          <div style={sx.hRight}>
+                              <label style={sx.switchLabel} title={enabled ? "Overrides on" : "Overrides off"}>
+                                  <input
+                                       type="checkbox"
+                                       checked={enabled}
+                                       onChange={() => setEnabled((v) => !v)}
+                                       style={sx.switchInput}
+                                       aria-label={
+                                           enabled
+                                                ? "Turn typography overrides off"
+                                                : "Turn typography overrides on"
+                                       }
+                                  />
+                                  <span
+                                       style={{
+                                           ...sx.switchTrack,
+                                           background: enabled
+                                                ? "color-mix(in oklab, var(--focus) 86%, transparent)"
+                                                : "color-mix(in oklab, var(--panel) 92%, transparent)",
+                                       }}
+                                       aria-hidden
+                                  />
+                                  <span
+                                       style={{
+                                           ...sx.switchThumb,
+                                           transform: enabled ? "translateX(12px)" : "translateX(0px)",
+                                       }}
+                                       aria-hidden
+                                  />
+                              </label>
 
-                            <button type="button" onClick={closePanel} style={sx.iconBtn} aria-label="Close">
-                                <IconX />
-                            </button>
-                        </div>
-                    </div>
+                              <button
+                                   type="button"
+                                   onClick={closePanel}
+                                   style={sx.iconBtn}
+                                   aria-label="Close"
+                              >
+                                  <IconX />
+                              </button>
+                          </div>
+                      </div>
 
-                    {/* Summary */}
-                    <div style={sx.sub} title={summary}>
-                        {summary}
-                    </div>
+                      <div style={sx.summaryRow}>
+                          <div style={sx.summaryText} title={summary}>
+                              {summary}
+                          </div>
+                          <div style={sx.lockPill} title="Width and leading are locked">
+                              Locked layout
+                          </div>
+                      </div>
 
-                    {/* Body */}
-                    <div style={sx.body}>
-                        {!enabled && (
-                            <div style={sx.offRow}>
-                                <span style={sx.offPill}>Off</span>
-                                <span style={sx.offText}>Enable to apply changes.</span>
-                            </div>
-                        )}
+                      <div
+                           style={{
+                               ...sx.sampleCard,
+                               ...(enabled ? null : sx.sampleCardDisabled),
+                           }}
+                           aria-hidden={!enabled}
+                      >
+                          <div style={sx.sampleMetaRow}>
+                              <span style={sx.sampleMetaLabel}>Live preview</span>
+                              <span style={sx.sampleMetaValue}>
+                                {Math.round(current.sizePx)}px · {Math.round(current.weight)}
+                            </span>
+                          </div>
 
-                        {/* Font row */}
-                        <div style={sx.row}>
-                            <div style={sx.rowLabel}>Font</div>
-                            <div style={sx.rowRight}>
-                                <button
-                                    type="button"
-                                    style={{ ...sx.chevBtn, ...(enabled ? null : sx.chevBtnDisabled) }}
-                                    onClick={() => hopFont(-1)}
-                                    disabled={!enabled || fonts.length === 0}
-                                    aria-label="Previous font"
-                                    title="Previous font"
-                                >
-                                    ‹
-                                </button>
+                          <div
+                               style={{
+                                   ...sx.sampleVerse,
+                                   fontFamily: currentFontCss,
+                                   fontSize: current.sizePx,
+                                   fontWeight: current.weight,
+                                   lineHeight: DEFAULT_TYPOGRAPHY.leading,
+                                   maxWidth: DEFAULT_TYPOGRAPHY.measurePx,
+                               }}
+                          >
+                              {SAMPLE_TEXT}
+                          </div>
+                      </div>
 
-                                <button
-                                    type="button"
-                                    style={{
-                                        ...sx.fontPill,
-                                        ...(enabled ? null : sx.fontPillDisabled),
-                                        ...(curFont ? { fontFamily: fontFamilyForOpt(curFont) } : null),
-                                    }}
-                                    onClick={() => hopFont(1)}
-                                    disabled={!enabled || fonts.length === 0}
-                                    aria-label={curFont ? `Font: ${curFont.label}` : "Font"}
-                                    title={curFont ? `${curFont.label} (${fontIndex + 1}/${fonts.length})` : "Font"}
-                                >
-                                    <span style={sx.fontName}>{curFont?.label ?? "—"}</span>
-                                    <span style={sx.fontCount}>{fonts.length ? `${fontIndex + 1}/${fonts.length}` : ""}</span>
-                                </button>
+                      {!enabled ? (
+                           <div style={sx.offRow}>
+                               <span style={sx.offPill}>Off</span>
+                               <span style={sx.offText}>Enable to apply reader typography overrides.</span>
+                           </div>
+                      ) : null}
 
-                                <button
-                                    type="button"
-                                    style={{ ...sx.chevBtn, ...(enabled ? null : sx.chevBtnDisabled) }}
-                                    onClick={() => hopFont(1)}
-                                    disabled={!enabled || fonts.length === 0}
-                                    aria-label="Next font"
-                                    title="Next font"
-                                >
-                                    ›
-                                </button>
-                            </div>
-                        </div>
+                      <div style={sx.body}>
+                          <div style={sx.sectionHead}>
+                              <div style={sx.sectionTitle}>Fonts</div>
+                              <div style={sx.sectionHint}>← → to cycle</div>
+                          </div>
 
-                        {/* Size */}
-                        <div style={sx.block}>
-                            <div style={sx.blockTop}>
-                                <span style={sx.blockLabel}>Size</span>
-                                <span style={sx.blockValue}>{Math.round(t.sizePx)}px</span>
-                            </div>
-                            <input
-                                type="range"
-                                min={12}
-                                max={limits.sizePx.hi}
-                                step={limits.sizePx.step}
-                                value={t.sizePx}
-                                onChange={(e) =>
-                                    setPatch({
-                                        sizePx: Math.round(clampNum(Number(e.target.value), 12, limits.sizePx.hi)),
-                                    })
-                                }
-                                onFocus={() => setActiveRange("sizePx")}
-                                onBlur={() => setActiveRange((v) => (v === "sizePx" ? null : v))}
-                                style={sliderStyle}
-                                disabled={!enabled}
-                                aria-label="Scripture font size"
-                            />
-                        </div>
+                          <div style={sx.fontNavRow}>
+                              <button
+                                   type="button"
+                                   style={{ ...sx.chevBtn, ...(enabled ? null : sx.chevBtnDisabled) }}
+                                   onClick={() => cycleFont(-1)}
+                                   disabled={!enabled || fonts.length === 0}
+                                   aria-label="Previous font"
+                                   title="Previous font"
+                              >
+                                  ‹
+                              </button>
 
-                        {/* Weight */}
-                        <div style={sx.block}>
-                            <div style={sx.blockTop}>
-                                <span style={sx.blockLabel}>Weight</span>
-                                <span style={sx.blockValue}>{Math.round(t.weight)}</span>
-                            </div>
-                            <input
-                                type="range"
-                                min={200}
-                                max={limits.weight.hi}
-                                step={limits.weight.step}
-                                value={t.weight}
-                                onChange={(e) =>
-                                    setPatch({
-                                        weight: Math.round(clampNum(Number(e.target.value), 200, limits.weight.hi)),
-                                    })
-                                }
-                                onFocus={() => setActiveRange("weight")}
-                                onBlur={() => setActiveRange((v) => (v === "weight" ? null : v))}
-                                style={sliderStyle}
-                                disabled={!enabled}
-                                aria-label="Scripture font weight"
-                            />
-                        </div>
-                    </div>
+                              <div style={sx.fontIndexPill}>
+                                  {fonts.length ? `${currentFontIndex + 1}/${fonts.length}` : "0/0"}
+                              </div>
 
-                    {/* Footer */}
-                    <div style={sx.footer}>
-                        <button type="button" style={sx.doneBtn} onClick={closePanel}>
-                            Done
-                        </button>
-                        <button
-                            type="button"
-                            style={sx.resetBtn}
-                            onClick={resetToDefaults}
-                            title="Reset and turn off overrides"
-                        >
-                            Reset
-                        </button>
-                    </div>
-                </div>
-            )}
-        </div>
+                              <button
+                                   type="button"
+                                   style={{ ...sx.chevBtn, ...(enabled ? null : sx.chevBtnDisabled) }}
+                                   onClick={() => cycleFont(1)}
+                                   disabled={!enabled || fonts.length === 0}
+                                   aria-label="Next font"
+                                   title="Next font"
+                              >
+                                  ›
+                              </button>
+                          </div>
+
+                          <div style={sx.fontGrid} role="list" aria-label="Font choices">
+                              {fonts.map((font, index) => {
+                                  const selected = font.id === current.font;
+                                  const previewFamily = fontFamilyForOpt(font);
+                                  const previewText =
+                                       font.previewText?.trim() ||
+                                       FONT_PREVIEW_TEXTS[index % FONT_PREVIEW_TEXTS.length];
+
+                                  return (
+                                       <button
+                                            key={font.id}
+                                            ref={index === 0 ? firstFontButtonRef : undefined}
+                                            type="button"
+                                            role="listitem"
+                                            disabled={!enabled}
+                                            aria-pressed={selected}
+                                            onClick={() => setPatch({ font: font.id })}
+                                            title={font.label}
+                                            style={{
+                                                ...sx.fontCard,
+                                                ...(selected ? sx.fontCardSelected : null),
+                                                ...(enabled ? null : sx.fontCardDisabled),
+                                            }}
+                                       >
+                                           <div style={sx.fontCardTop}>
+                                               <IconCheck on={selected} />
+                                               <span style={sx.fontCardName}>{font.label}</span>
+                                           </div>
+
+                                           <div
+                                                style={{
+                                                    ...sx.fontCardSample,
+                                                    fontFamily: previewFamily,
+                                                    fontWeight: current.weight,
+                                                }}
+                                           >
+                                               {previewText}
+                                           </div>
+                                       </button>
+                                  );
+                              })}
+                          </div>
+
+                          <div style={sx.block}>
+                              <div style={sx.blockTop}>
+                                  <span style={sx.blockLabel}>Size</span>
+                                  <div style={sx.blockTopRight}>
+                                      <button
+                                           type="button"
+                                           style={{
+                                               ...sx.miniStepBtn,
+                                               ...(enabled ? null : sx.miniStepBtnDisabled),
+                                           }}
+                                           onClick={() => applySizeDelta(-1)}
+                                           disabled={!enabled}
+                                           aria-label="Decrease size"
+                                      >
+                                          −
+                                      </button>
+                                      <span style={sx.blockValue}>{Math.round(current.sizePx)}px</span>
+                                      <button
+                                           type="button"
+                                           style={{
+                                               ...sx.miniStepBtn,
+                                               ...(enabled ? null : sx.miniStepBtnDisabled),
+                                           }}
+                                           onClick={() => applySizeDelta(1)}
+                                           disabled={!enabled}
+                                           aria-label="Increase size"
+                                      >
+                                          +
+                                      </button>
+                                  </div>
+                              </div>
+
+                              <input
+                                   type="range"
+                                   min={limits.sizePx.lo}
+                                   max={limits.sizePx.hi}
+                                   step={limits.sizePx.step}
+                                   value={current.sizePx}
+                                   onChange={(e) =>
+                                        setPatch({
+                                            sizePx: Math.round(
+                                                 clampNum(
+                                                      Number(e.target.value),
+                                                      limits.sizePx.lo,
+                                                      limits.sizePx.hi,
+                                                 ),
+                                            ),
+                                        })
+                                   }
+                                   style={sliderStyle}
+                                   disabled={!enabled}
+                                   aria-label="Scripture font size"
+                              />
+
+                              <div style={sx.keyHint}>Keys: [ and ]</div>
+                          </div>
+
+                          <div style={sx.block}>
+                              <div style={sx.blockTop}>
+                                  <span style={sx.blockLabel}>Weight</span>
+                                  <div style={sx.blockTopRight}>
+                                      <button
+                                           type="button"
+                                           style={{
+                                               ...sx.miniStepBtn,
+                                               ...(enabled ? null : sx.miniStepBtnDisabled),
+                                           }}
+                                           onClick={() => applyWeightDelta(-1)}
+                                           disabled={!enabled}
+                                           aria-label="Decrease weight"
+                                      >
+                                          −
+                                      </button>
+                                      <span style={sx.blockValue}>{Math.round(current.weight)}</span>
+                                      <button
+                                           type="button"
+                                           style={{
+                                               ...sx.miniStepBtn,
+                                               ...(enabled ? null : sx.miniStepBtnDisabled),
+                                           }}
+                                           onClick={() => applyWeightDelta(1)}
+                                           disabled={!enabled}
+                                           aria-label="Increase weight"
+                                      >
+                                          +
+                                      </button>
+                                  </div>
+                              </div>
+
+                              <input
+                                   type="range"
+                                   min={limits.weight.lo}
+                                   max={limits.weight.hi}
+                                   step={limits.weight.step}
+                                   value={current.weight}
+                                   onChange={(e) =>
+                                        setPatch({
+                                            weight: Math.round(
+                                                 clampNum(
+                                                      Number(e.target.value),
+                                                      limits.weight.lo,
+                                                      limits.weight.hi,
+                                                 ),
+                                            ),
+                                        })
+                                   }
+                                   style={sliderStyle}
+                                   disabled={!enabled}
+                                   aria-label="Scripture font weight"
+                              />
+
+                              <div style={sx.keyHint}>Keys: - and +</div>
+                          </div>
+                      </div>
+
+                      <div style={sx.footer}>
+                          <button type="button" style={sx.doneBtn} onClick={closePanel}>
+                              Done
+                          </button>
+
+                          <button
+                               type="button"
+                               style={sx.resetBtn}
+                               onClick={resetToDefaults}
+                               title="Reset and turn off overrides"
+                          >
+                              Reset
+                          </button>
+                      </div>
+                  </div>
+             ) : null}
+         </div>
     );
 }
 
-const PANEL_W = 286;
-
 const sx: Record<string, React.CSSProperties> = {
-    root: { position: "relative", display: "inline-flex", alignItems: "center" },
+    root: {
+        position: "relative",
+        display: "inline-flex",
+        alignItems: "center",
+    },
 
     trigger: {
         width: 32,
@@ -21761,7 +24378,7 @@ const sx: Record<string, React.CSSProperties> = {
         userSelect: "none",
         boxShadow: "0 10px 26px rgba(0,0,0,0.075)",
         transition:
-            "transform 200ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 200ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
+             "transform 200ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 200ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
         position: "relative",
         outline: "none",
         WebkitTapHighlightColor: "transparent",
@@ -21772,8 +24389,14 @@ const sx: Record<string, React.CSSProperties> = {
         boxShadow: "0 22px 62px rgba(0,0,0,0.18)",
         background: "color-mix(in oklab, var(--panel) 86%, transparent)",
     },
-    triggerDisabled: { opacity: 0.92 },
-    triggerGlyph: { fontSize: 13.5, fontWeight: 860, letterSpacing: "-0.05em" },
+    triggerDisabled: {
+        opacity: 0.92,
+    },
+    triggerGlyph: {
+        fontSize: 13.5,
+        fontWeight: 860,
+        letterSpacing: "-0.05em",
+    },
 
     dot: {
         position: "absolute",
@@ -21788,47 +24411,88 @@ const sx: Record<string, React.CSSProperties> = {
         background: "var(--focus)",
         boxShadow: "0 0 0 4px color-mix(in oklab, var(--focus) 14%, transparent)",
     },
-    dotOff: { background: "color-mix(in oklab, var(--muted) 40%, transparent)" },
+    dotOff: {
+        background: "color-mix(in oklab, var(--muted) 40%, transparent)",
+    },
 
     panel: {
         position: "absolute",
-        right: 0,
-        top: 42,
+        top: 32 + PANEL_GAP,
         width: PANEL_W,
-        maxWidth: "min(340px, calc(100vw - 18px))",
-        borderRadius: 16,
+        maxWidth: "min(360px, calc(100vw - 18px))",
+        borderRadius: 18,
         border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-        background: "var(--bg)",
-        boxShadow: "0 26px 78px rgba(0,0,0,0.20)",
+        background: "color-mix(in oklab, var(--bg) 96%, var(--panel))",
+        boxShadow: "0 28px 80px rgba(0,0,0,0.22)",
         overflow: "hidden",
         zIndex: 9999,
-        padding: 8,
+        padding: 10,
         display: "flex",
         flexDirection: "column",
-        gap: 7,
-        transformOrigin: "top right",
+        gap: 8,
         animation: "bpTypoPop 170ms cubic-bezier(0.23, 1, 0.32, 1) both",
+        backdropFilter: "blur(18px)",
+        WebkitBackdropFilter: "blur(18px)",
     },
-    panelNoMotion: { animation: "none" },
+    panelNoMotion: {
+        animation: "none",
+    },
 
     header: {
         display: "flex",
-        alignItems: "center",
+        alignItems: "flex-start",
         justifyContent: "space-between",
-        gap: 8,
+        gap: 10,
         padding: "1px 1px 0",
     },
-    hTitle: { fontSize: 12.6, fontWeight: 860, letterSpacing: "-0.02em" },
-    hRight: { display: "flex", alignItems: "center", gap: 6, flexShrink: 0 },
+    hTitleWrap: {
+        display: "flex",
+        flexDirection: "column",
+        gap: 2,
+        minWidth: 0,
+    },
+    hTitle: {
+        fontSize: 13,
+        fontWeight: 860,
+        letterSpacing: "-0.02em",
+    },
+    hSub: {
+        fontSize: 10.8,
+        color: "var(--muted)",
+        lineHeight: 1.3,
+    },
+    hRight: {
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        flexShrink: 0,
+    },
 
-    sub: {
-        fontSize: 10.7,
+    summaryRow: {
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        justifyContent: "space-between",
+        minWidth: 0,
+    },
+    summaryText: {
+        minWidth: 0,
+        fontSize: 10.8,
         color: "var(--muted)",
         letterSpacing: "-0.01em",
         overflow: "hidden",
         textOverflow: "ellipsis",
         whiteSpace: "nowrap",
-        padding: "0 1px",
+    },
+    lockPill: {
+        flexShrink: 0,
+        fontSize: 10.1,
+        fontWeight: 780,
+        color: "var(--muted)",
+        padding: "4px 8px",
+        borderRadius: 999,
+        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
     },
 
     iconBtn: {
@@ -21842,7 +24506,8 @@ const sx: Record<string, React.CSSProperties> = {
         alignItems: "center",
         justifyContent: "center",
         cursor: "pointer",
-        transition: "transform 140ms cubic-bezier(0.23, 1, 0.32, 1), background 140ms ease, border-color 140ms ease",
+        transition:
+             "transform 140ms cubic-bezier(0.23, 1, 0.32, 1), background 140ms ease, border-color 140ms ease",
         WebkitTapHighlightColor: "transparent",
         userSelect: "none",
     },
@@ -21863,8 +24528,18 @@ const sx: Record<string, React.CSSProperties> = {
         userSelect: "none",
         WebkitTapHighlightColor: "transparent",
     },
-    switchInput: { position: "absolute", inset: 0, opacity: 0, cursor: "pointer" },
-    switchTrack: { position: "absolute", inset: 0, borderRadius: 999, transition: "background 180ms ease" },
+    switchInput: {
+        position: "absolute",
+        inset: 0,
+        opacity: 0,
+        cursor: "pointer",
+    },
+    switchTrack: {
+        position: "absolute",
+        inset: 0,
+        borderRadius: 999,
+        transition: "background 180ms ease",
+    },
     switchThumb: {
         position: "absolute",
         top: 3,
@@ -21878,22 +24553,48 @@ const sx: Record<string, React.CSSProperties> = {
         transition: "transform 180ms cubic-bezier(0.23, 1, 0.32, 1)",
     },
 
-    body: {
-        background: "color-mix(in oklab, var(--bg) 86%, var(--panel))",
-        borderRadius: 12,
-        border: "1px solid var(--hairline)",
-        padding: 8,
+    sampleCard: {
+        borderRadius: 14,
+        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        background:
+             "linear-gradient(180deg, color-mix(in oklab, var(--panel) 96%, transparent), color-mix(in oklab, var(--bg) 94%, var(--panel)))",
+        padding: 10,
         display: "flex",
         flexDirection: "column",
         gap: 8,
+    },
+    sampleCardDisabled: {
+        opacity: 0.66,
+    },
+    sampleMetaRow: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 8,
+    },
+    sampleMetaLabel: {
+        fontSize: 10.8,
+        color: "var(--muted)",
+        fontWeight: 740,
+    },
+    sampleMetaValue: {
+        fontSize: 10.8,
+        color: "var(--muted)",
+        fontVariantNumeric: "tabular-nums",
+    },
+    sampleVerse: {
+        color: "var(--fg)",
+        letterSpacing: "-0.01em",
+        wordBreak: "break-word",
+        textWrap: "pretty",
     },
 
     offRow: {
         display: "flex",
         alignItems: "center",
         gap: 8,
-        padding: "6px 8px",
-        borderRadius: 10,
+        padding: "7px 9px",
+        borderRadius: 11,
         border: "1px dashed color-mix(in oklab, var(--hairline) 92%, transparent)",
         background: "color-mix(in oklab, var(--bg) 65%, transparent)",
     },
@@ -21908,14 +24609,59 @@ const sx: Record<string, React.CSSProperties> = {
         border: "1px solid var(--hairline)",
         background: "color-mix(in oklab, var(--panel) 90%, transparent)",
     },
-    offText: { fontSize: 11.2, color: "var(--muted)" },
+    offText: {
+        fontSize: 11.2,
+        color: "var(--muted)",
+    },
 
-    row: { display: "grid", gridTemplateColumns: "56px 1fr", alignItems: "center", gap: 8 },
-    rowLabel: { fontSize: 11.6, fontWeight: 820, color: "var(--muted)", letterSpacing: "-0.01em" },
-    rowRight: { display: "flex", alignItems: "center", gap: 6 },
+    body: {
+        background: "color-mix(in oklab, var(--bg) 86%, var(--panel))",
+        borderRadius: 14,
+        border: "1px solid var(--hairline)",
+        padding: 9,
+        display: "flex",
+        flexDirection: "column",
+        gap: 10,
+    },
+
+    sectionHead: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 8,
+    },
+    sectionTitle: {
+        fontSize: 11.7,
+        fontWeight: 840,
+        letterSpacing: "-0.01em",
+    },
+    sectionHint: {
+        fontSize: 10.5,
+        color: "var(--muted)",
+    },
+
+    fontNavRow: {
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+    },
+    fontIndexPill: {
+        flex: 1,
+        height: 30,
+        borderRadius: 10,
+        border: "1px solid var(--hairline)",
+        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontSize: 11,
+        fontWeight: 760,
+        color: "var(--muted)",
+        fontVariantNumeric: "tabular-nums",
+    },
 
     chevBtn: {
-        width: 28,
+        width: 30,
         height: 30,
         borderRadius: 10,
         border: "1px solid var(--hairline)",
@@ -21929,40 +24675,115 @@ const sx: Record<string, React.CSSProperties> = {
         color: "var(--muted)",
         fontSize: 18,
         fontWeight: 760,
+        flexShrink: 0,
     },
-    chevBtnDisabled: { cursor: "not-allowed", opacity: 0.55 },
+    chevBtnDisabled: {
+        cursor: "not-allowed",
+        opacity: 0.55,
+    },
 
-    fontPill: {
-        flex: 1,
-        height: 30,
-        borderRadius: 10,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
-        cursor: "pointer",
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: 10,
-        padding: "0 10px",
-        minWidth: 0,
+    fontGrid: {
+        display: "grid",
+        gridTemplateColumns: "1fr",
+        gap: 7,
+        maxHeight: 204,
+        overflowY: "auto",
+        paddingRight: 2,
+    },
+    fontCard: {
+        width: "100%",
+        borderRadius: 12,
+        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        background: "color-mix(in oklab, var(--panel) 90%, transparent)",
+        padding: "9px 10px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 7,
         textAlign: "left",
+        cursor: "pointer",
         WebkitTapHighlightColor: "transparent",
     },
-    fontPillDisabled: { cursor: "not-allowed", opacity: 0.65 },
-    fontName: {
-        fontSize: 11.4,
+    fontCardSelected: {
+        borderColor: "color-mix(in oklab, var(--focus) 68%, var(--hairline))",
+        boxShadow: "0 0 0 1px color-mix(in oklab, var(--focus) 18%, transparent) inset",
+        background: "color-mix(in oklab, var(--focus) 9%, var(--panel))",
+    },
+    fontCardDisabled: {
+        cursor: "not-allowed",
+        opacity: 0.62,
+    },
+    fontCardTop: {
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+    },
+    fontCardName: {
+        minWidth: 0,
+        fontSize: 11.5,
         fontWeight: 820,
         letterSpacing: "-0.01em",
         overflow: "hidden",
         textOverflow: "ellipsis",
         whiteSpace: "nowrap",
     },
-    fontCount: { fontSize: 10.6, color: "var(--muted)", fontVariantNumeric: "tabular-nums", flexShrink: 0 },
+    fontCardSample: {
+        fontSize: 14.2,
+        lineHeight: 1.25,
+        color: "color-mix(in oklab, var(--fg) 94%, var(--muted) 6%)",
+        letterSpacing: "-0.01em",
+        textWrap: "pretty",
+        overflowWrap: "anywhere",
+    },
 
-    block: { display: "flex", flexDirection: "column", gap: 6 },
-    blockTop: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 },
-    blockLabel: { fontSize: 11.6, fontWeight: 820, letterSpacing: "-0.01em" },
-    blockValue: { fontSize: 11.6, color: "var(--focus)", fontVariantNumeric: "tabular-nums", fontWeight: 860 },
+    block: {
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+    },
+    blockTop: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 10,
+    },
+    blockTopRight: {
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+    },
+    blockLabel: {
+        fontSize: 11.6,
+        fontWeight: 820,
+        letterSpacing: "-0.01em",
+    },
+    blockValue: {
+        minWidth: 52,
+        textAlign: "center",
+        fontSize: 11.6,
+        color: "var(--focus)",
+        fontVariantNumeric: "tabular-nums",
+        fontWeight: 860,
+    },
+    miniStepBtn: {
+        width: 24,
+        height: 24,
+        borderRadius: 8,
+        border: "1px solid var(--hairline)",
+        background: "color-mix(in oklab, var(--panel) 90%, transparent)",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        cursor: "pointer",
+        color: "var(--muted)",
+        fontSize: 15,
+        fontWeight: 860,
+        padding: 0,
+        flexShrink: 0,
+    },
+    miniStepBtnDisabled: {
+        cursor: "not-allowed",
+        opacity: 0.55,
+    },
 
     range: {
         width: "100%",
@@ -21972,12 +24793,26 @@ const sx: Record<string, React.CSSProperties> = {
         borderRadius: 999,
         background: "color-mix(in oklab, var(--hairline) 44%, transparent)",
     },
-    rangeDisabled: { cursor: "not-allowed", opacity: 0.55 },
+    rangeDisabled: {
+        cursor: "not-allowed",
+        opacity: 0.55,
+    },
 
-    footer: { display: "flex", alignItems: "center", gap: 6, paddingTop: 1 },
+    keyHint: {
+        fontSize: 10.5,
+        color: "var(--muted)",
+        fontVariantNumeric: "tabular-nums",
+    },
+
+    footer: {
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        paddingTop: 1,
+    },
     doneBtn: {
         flex: 1,
-        height: 34,
+        height: 35,
         borderRadius: 11,
         border: "1px solid color-mix(in oklab, var(--focus) 70%, var(--hairline))",
         background: "var(--focus)",
@@ -21990,12 +24825,12 @@ const sx: Record<string, React.CSSProperties> = {
         WebkitTapHighlightColor: "transparent",
     },
     resetBtn: {
-        height: 34,
+        height: 35,
         borderRadius: 11,
         border: "1px solid var(--hairline)",
         background: "transparent",
         color: "var(--muted)",
-        fontSize: 12.0,
+        fontSize: 12,
         fontWeight: 740,
         padding: "0 12px",
         cursor: "pointer",
@@ -22008,860 +24843,810 @@ const sx: Record<string, React.CSSProperties> = {
 
 ```tsx
 import React, {
-    forwardRef,
-    useCallback,
-    useEffect,
-    useImperativeHandle,
-    useLayoutEffect,
-    useMemo,
-    useRef,
-    useState,
+     forwardRef,
+     useCallback,
+     useEffect,
+     useImperativeHandle,
+     useLayoutEffect,
+     useMemo,
+     useRef,
+     useState,
 } from "react";
 import type { Annotation, AnnotationSnapshot } from "@biblia/annotation";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { apiGetSlice, type BookRow } from "../api";
+import { BookTitlePage } from "./BookTitlePage";
+import { sx } from "./sx";
 import type { ReaderPosition, SliceVerse, SpineStats } from "./types";
 import { VerseRow } from "./VerseRow";
-import { sx } from "./sx";
-import { BookTitlePage } from "./BookTitlePage";
 
 const CHUNK = 240;
 const PREFETCH_CHUNKS_AHEAD = 2;
 const PREFETCH_CHUNKS_BEHIND = 1;
 const MAX_CHUNKS_IN_MEMORY = 10;
 const EST_ROW_PX = 56;
+const GATE_COOLDOWN_TICKS = 8;
+
 const EMPTY_ANNOTATIONS: readonly Annotation[] = [];
+const GATE_BLOCK_KEYS = new Set([
+     " ",
+     "PageDown",
+     "PageUp",
+     "ArrowDown",
+     "ArrowUp",
+     "Home",
+     "End",
+]);
 
 type ScrollMode = "auto" | "smooth";
 
-function chunkStart(ord: number): number {
-    return Math.floor((ord - 1) / CHUNK) * CHUNK + 1;
+function clamp(n: number, lo: number, hi: number): number {
+     return Math.max(lo, Math.min(hi, n));
 }
 
-function clamp(n: number, lo: number, hi: number): number {
-    return Math.max(lo, Math.min(hi, n));
+function chunkStart(ord: number): number {
+     return Math.floor((ord - 1) / CHUNK) * CHUNK + 1;
 }
 
 function readMaybeString(value: unknown): string | null {
-    if (typeof value !== "string") return null;
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : null;
+     if (typeof value !== "string") return null;
+     const trimmed = value.trim();
+     return trimmed.length > 0 ? trimmed : null;
 }
 
 function getRowTranslationId(row: SliceVerse): string | null {
-    const record = row as unknown as Record<string, unknown>;
-    return (
-        readMaybeString(record.translationId) ??
-        readMaybeString(record.translation_id) ??
-        null
-    );
+     const record = row as unknown as Record<string, unknown>;
+     return readMaybeString(record.translationId) ?? readMaybeString(record.translation_id) ?? null;
+}
+
+function normalizeSpanBounds(
+     startOrd: number,
+     endOrd: number,
+     minOrd: number,
+     maxOrd: number,
+): { startOrd: number; endOrd: number } | null {
+     const a = clamp(startOrd, minOrd, maxOrd);
+     const b = clamp(endOrd, minOrd, maxOrd);
+     const lo = Math.min(a, b);
+     const hi = Math.max(a, b);
+
+     if (hi < minOrd || lo > maxOrd) return null;
+     return { startOrd: lo, endOrd: hi };
+}
+
+function focusSoon(getEl: () => HTMLElement | null): void {
+     const run = () => getEl()?.focus();
+     if (typeof queueMicrotask === "function") {
+          queueMicrotask(run);
+          return;
+     }
+     setTimeout(run, 0);
 }
 
 export type ReaderViewportHandle = {
-    jumpToOrd: (ord: number, behavior?: ScrollMode) => void;
-    getCurrentOrd: () => number;
+     jumpToOrd: (ord: number, behavior?: ScrollMode) => void;
+     getCurrentOrd: () => number;
 };
 
 type Props = {
-    spine: SpineStats;
-    bookById: Map<string, BookRow>;
-    topContent?: React.ReactNode;
-    selectionRootRef?: React.MutableRefObject<HTMLDivElement | null> | null;
-    annotationSnapshot?: AnnotationSnapshot | null;
-    onPosition: (pos: ReaderPosition) => void;
-    onError?: (msg: string) => void;
-    onReady?: () => void;
+     spine: SpineStats;
+     bookById: Map<string, BookRow>;
+     topContent?: React.ReactNode;
+     selectionRootRef?: React.MutableRefObject<HTMLDivElement | null> | null;
+     annotationSnapshot?: AnnotationSnapshot | null;
+     onPosition: (pos: ReaderPosition) => void;
+     onError?: (msg: string) => void;
+     onReady?: () => void;
 };
 
-type PendingJump = { ord: number; behavior: ScrollMode };
-type BookGateState = { ord: number; bookId: string };
+type PendingJump = {
+     ord: number;
+     behavior: ScrollMode;
+};
 
-function BookGate(props: { book: BookRow | null; bookId: string; onContinue: () => void }) {
-    const { book, bookId, onContinue } = props;
-    const btnRef = useRef<HTMLButtonElement | null>(null);
-
-    useEffect(() => {
-        queueMicrotask(() => btnRef.current?.focus());
-    }, []);
-
-    return (
-        <div
-            role="dialog"
-            aria-modal="true"
-            aria-label={`Book: ${book?.name ?? bookId}`}
-            tabIndex={-1}
-            style={{
-                position: "absolute",
-                inset: 0,
-                zIndex: 30,
-                display: "grid",
-                placeItems: "center",
-                padding: 18,
-                background: "color-mix(in oklab, var(--bg) 72%, rgba(0,0,0,0.55))",
-                backdropFilter: "blur(10px)",
-                WebkitBackdropFilter: "blur(10px)",
-            }}
-            onKeyDown={(e) => {
-                const block = new Set([" ", "PageDown", "PageUp", "ArrowDown", "ArrowUp", "Home", "End"]);
-                if (block.has(e.key)) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    return;
-                }
-                if (e.key === "Escape" || e.key === "Enter") {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    onContinue();
-                }
-            }}
-        >
-            <div
-                style={{
-                    width: "min(860px, 100%)",
-                    borderRadius: 18,
-                    border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-                    background: "color-mix(in oklab, var(--bg) 82%, var(--panel))",
-                    boxShadow: "0 34px 110px rgba(0,0,0,0.34)",
-                    overflow: "hidden",
-                }}
-            >
-                <BookTitlePage book={book} bookId={bookId} />
-
-                <div
-                    style={{
-                        display: "flex",
-                        justifyContent: "center",
-                        padding: "14px 14px 18px",
-                        background:
-                            "linear-gradient(to bottom, transparent, color-mix(in oklab, var(--bg) 88%, var(--panel)))",
-                    }}
-                >
-                    <button
-                        ref={btnRef}
-                        type="button"
-                        onClick={onContinue}
-                        style={{
-                            height: 40,
-                            padding: "0 16px",
-                            borderRadius: 12,
-                            border: "1px solid color-mix(in oklab, var(--focus) 70%, var(--hairline))",
-                            background: "var(--focus)",
-                            color: "var(--fg)",
-                            fontSize: 12.6,
-                            fontWeight: 820,
-                            letterSpacing: "-0.01em",
-                            cursor: "pointer",
-                            boxShadow: "0 14px 34px color-mix(in oklab, var(--focus) 20%, transparent)",
-                        }}
-                    >
-                        Continue
-                    </button>
-                </div>
-            </div>
-        </div>
-    );
-}
+type BookGateState = {
+     ord: number;
+     bookId: string;
+};
 
 type ChunkState = {
-    verseMap: Map<number, SliceVerse>;
-    loadedChunks: Set<number>;
-    loadingChunks: Set<number>;
-    loadedOrder: number[];
+     verseMap: Map<number, SliceVerse>;
+     loadedChunks: Set<number>;
+     loadingChunks: Set<number>;
+     loadedOrder: number[];
 };
 
 function createChunkState(): ChunkState {
-    return {
-        verseMap: new Map(),
-        loadedChunks: new Set(),
-        loadingChunks: new Set(),
-        loadedOrder: [],
-    };
+     return {
+          verseMap: new Map(),
+          loadedChunks: new Set(),
+          loadingChunks: new Set(),
+          loadedOrder: [],
+     };
 }
 
 function buildAnnotationVerseIndex(
-    snapshot: AnnotationSnapshot | null | undefined,
-    minOrd: number,
-    maxOrd: number,
+     snapshot: AnnotationSnapshot | null | undefined,
+     minOrd: number,
+     maxOrd: number,
 ): Map<number, readonly Annotation[]> {
-    const buckets = new Map<number, Map<string, Annotation>>();
+     const buckets = new Map<number, Map<string, Annotation>>();
+     if (!snapshot) return new Map();
 
-    if (!snapshot) return new Map();
+     for (const annotation of snapshot.annotations.values()) {
+          if (annotation.deletedAt !== null) continue;
 
-    for (const annotation of snapshot.annotations.values()) {
-        if (annotation.deletedAt !== null) continue;
+          for (const span of annotation.spans) {
+               if (span.deletedAt !== null) continue;
 
-        for (const span of annotation.spans) {
-            if (span.deletedAt !== null) continue;
+               const bounds = normalizeSpanBounds(
+                    span.start.verseOrd,
+                    span.end.verseOrd,
+                    minOrd,
+                    maxOrd,
+               );
+               if (!bounds) continue;
 
-            const startOrd = clamp(span.start.verseOrd, minOrd, maxOrd);
-            const endOrd = clamp(span.end.verseOrd, minOrd, maxOrd);
+               for (let ord = bounds.startOrd; ord <= bounds.endOrd; ord += 1) {
+                    let bucket = buckets.get(ord);
+                    if (!bucket) {
+                         bucket = new Map<string, Annotation>();
+                         buckets.set(ord, bucket);
+                    }
+                    bucket.set(annotation.annotationId, annotation);
+               }
+          }
+     }
 
-            for (let ord = startOrd; ord <= endOrd; ord += 1) {
-                const bucket = buckets.get(ord) ?? new Map<string, Annotation>();
-                bucket.set(annotation.annotationId, annotation);
-                buckets.set(ord, bucket);
-            }
-        }
-    }
+     const out = new Map<number, readonly Annotation[]>();
+     for (const [ord, bucket] of buckets) {
+          out.set(
+               ord,
+               [...bucket.values()].sort((a, b) => {
+                    if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
+                    return a.annotationId.localeCompare(b.annotationId);
+               }),
+          );
+     }
 
-    const out = new Map<number, readonly Annotation[]>();
-    for (const [ord, bucket] of buckets) {
-        out.set(
-            ord,
-            [...bucket.values()].sort((a, b) => {
-                if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
-                return a.annotationId.localeCompare(b.annotationId);
-            }),
-        );
-    }
-
-    return out;
+     return out;
 }
 
-export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function ReaderViewport(props, ref) {
-    const {
-        spine,
-        bookById,
-        topContent,
-        selectionRootRef,
-        annotationSnapshot,
-        onPosition,
-        onError,
-        onReady,
-    } = props;
+function BookGate(props: {
+     book: BookRow | null;
+     bookId: string;
+     onContinue: () => void;
+}) {
+     const { book, bookId, onContinue } = props;
+     const btnRef = useRef<HTMLButtonElement | null>(null);
 
-    const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+     useEffect(() => {
+          focusSoon(() => btnRef.current);
+     }, []);
 
-    const chunkRef = useRef<ChunkState>(createChunkState());
-    const [dataTick, setDataTick] = useState(0);
-
-    const measuredAtRef = useRef<WeakMap<Element, number>>(new WeakMap());
-    const bumpTick = useCallback(() => setDataTick((t) => t + 1), []);
-
-    const derivedCount = useMemo(() => {
-        const min = spine.verseOrdMin;
-        const max = spine.verseOrdMax;
-        return max >= min ? max - min + 1 : 0;
-    }, [spine.verseOrdMin, spine.verseOrdMax]);
-
-    const count = useMemo(() => {
-        const c = Number.isFinite(spine.verseCount) ? spine.verseCount : 0;
-        if (c <= 0) return derivedCount;
-        if (derivedCount > 0 && c !== derivedCount) return derivedCount;
-        return c;
-    }, [spine.verseCount, derivedCount]);
-
-    const initialOrd = useMemo(
-        () => clamp(spine.verseOrdMin, spine.verseOrdMin, spine.verseOrdMax),
-        [spine.verseOrdMin, spine.verseOrdMax],
-    );
-
-    const [posOrd, setPosOrd] = useState<number>(initialOrd);
-    const posOrdRef = useRef<number>(initialOrd);
-
-    const pendingJumpRef = useRef<PendingJump | null>(null);
-    const readyOnceRef = useRef(false);
-    const runIdRef = useRef(0);
-
-    const inFlightRef = useRef<Map<number, AbortController>>(new Map());
-    const abortAllInFlight = useCallback(() => {
-        for (const controller of inFlightRef.current.values()) controller.abort();
-        inFlightRef.current.clear();
-    }, []);
-
-    const [gate, setGate] = useState<BookGateState | null>(null);
-    const gateRef = useRef<BookGateState | null>(null);
-    const lastGatedBookIdRef = useRef<string | null>(null);
-    const gateCooldownRef = useRef<number>(0);
-
-    const annotationIndex = useMemo(
-        () => buildAnnotationVerseIndex(annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax),
-        [annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax],
-    );
-
-    const loadedTranslationId = useMemo(() => {
-        for (const row of chunkRef.current.verseMap.values()) {
-            const translationId = getRowTranslationId(row);
-            if (translationId) return translationId;
-        }
-        return null;
-    }, [dataTick]);
-
-    const setSelectionRootEl = useCallback(
-        (el: HTMLDivElement | null) => {
-            if (selectionRootRef) {
-                selectionRootRef.current = el;
-            }
-        },
-        [selectionRootRef],
-    );
-
-    useEffect(() => {
-        posOrdRef.current = posOrd;
-    }, [posOrd]);
-
-    useEffect(() => {
-        gateRef.current = gate;
-    }, [gate]);
-
-    const evictFarChunks = useCallback(
-        (keepOrd: number): void => {
-            const state = chunkRef.current;
-            const keepChunk = chunkStart(clamp(keepOrd, spine.verseOrdMin, spine.verseOrdMax));
-            const list = state.loadedOrder;
-
-            while (list.length > MAX_CHUNKS_IN_MEMORY) {
-                let farIdx = 0;
-                let farDist = -1;
-
-                for (let i = 0; i < list.length; i += 1) {
-                    const c = list[i]!;
-                    const d = Math.abs(c - keepChunk);
-                    if (d > farDist) {
-                        farDist = d;
-                        farIdx = i;
+     return (
+          <div
+               role="dialog"
+               aria-modal="true"
+               aria-label={`Book: ${book?.name ?? bookId}`}
+               tabIndex={-1}
+               style={{
+                    position: "absolute",
+                    inset: 0,
+                    zIndex: 30,
+                    display: "grid",
+                    placeItems: "center",
+                    padding: 18,
+                    background: "color-mix(in oklab, var(--bg) 72%, rgba(0,0,0,0.55))",
+                    backdropFilter: "blur(10px)",
+                    WebkitBackdropFilter: "blur(10px)",
+               }}
+               onKeyDown={(event) => {
+                    if (GATE_BLOCK_KEYS.has(event.key)) {
+                         event.preventDefault();
+                         event.stopPropagation();
+                         return;
                     }
-                }
 
-                const victim = list.splice(farIdx, 1)[0]!;
-                state.loadedChunks.delete(victim);
-
-                const startOrd = victim;
-                const endOrd = Math.min(victim + CHUNK - 1, spine.verseOrdMax);
-                for (let ord = startOrd; ord <= endOrd; ord += 1) {
-                    state.verseMap.delete(ord);
-                }
-            }
-        },
-        [spine.verseOrdMin, spine.verseOrdMax],
-    );
-
-    const ensureChunk = useCallback(
-        async (startOrd: number, keepOrd?: number): Promise<void> => {
-            const s = clamp(startOrd, spine.verseOrdMin, spine.verseOrdMax);
-            const chunk = chunkStart(s);
-
-            const state = chunkRef.current;
-            if (state.loadedChunks.has(chunk)) return;
-            if (state.loadingChunks.has(chunk)) return;
-
-            const myRunId = runIdRef.current;
-
-            state.loadingChunks.add(chunk);
-
-            const controller = new AbortController();
-            inFlightRef.current.set(chunk, controller);
-
-            try {
-                const res = await apiGetSlice(chunk, CHUNK, { signal: controller.signal });
-                if (runIdRef.current !== myRunId) return;
-                if (controller.signal.aborted) return;
-
-                for (const verse of res.verses) {
-                    state.verseMap.set(verse.verseOrd, verse);
-                }
-
-                state.loadedChunks.add(chunk);
-                state.loadedOrder.push(chunk);
-
-                evictFarChunks(keepOrd ?? posOrdRef.current);
-                bumpTick();
-            } catch (e: unknown) {
-                if (runIdRef.current !== myRunId) return;
-                if (controller.signal.aborted) return;
-                onError?.(e instanceof Error ? e.message : String(e));
-            } finally {
-                state.loadingChunks.delete(chunk);
-                inFlightRef.current.delete(chunk);
-            }
-        },
-        [bumpTick, evictFarChunks, onError, spine.verseOrdMin, spine.verseOrdMax],
-    );
-
-    useEffect(() => {
-        abortAllInFlight();
-        runIdRef.current += 1;
-
-        chunkRef.current = createChunkState();
-        measuredAtRef.current = new WeakMap();
-
-        setPosOrd(initialOrd);
-        posOrdRef.current = initialOrd;
-
-        setGate(null);
-        gateRef.current = null;
-        lastGatedBookIdRef.current = null;
-        gateCooldownRef.current = 0;
-
-        pendingJumpRef.current = null;
-        readyOnceRef.current = false;
-
-        void ensureChunk(chunkStart(initialOrd), initialOrd);
-        bumpTick();
-    }, [initialOrd, ensureChunk, bumpTick, abortAllInFlight]);
-
-    useEffect(() => {
-        return () => abortAllInFlight();
-    }, [abortAllInFlight]);
-
-    useEffect(() => {
-        if (!scrollEl) return;
-        void ensureChunk(chunkStart(initialOrd), initialOrd);
-    }, [scrollEl, ensureChunk, initialOrd]);
-
-    const rowVirtualizer = useVirtualizer({
-        count,
-        getScrollElement: () => scrollEl,
-        estimateSize: () => EST_ROW_PX,
-        overscan: 18,
-        getItemKey: (index) => String(spine.verseOrdMin + index),
-    });
-
-    const virtualItems = rowVirtualizer.getVirtualItems();
-    const firstIndex = virtualItems[0]?.index ?? 0;
-    const lastIndex = virtualItems.length ? virtualItems[virtualItems.length - 1]!.index : 0;
-
-    const jumpToOrd = useCallback(
-        (ord: number, behavior: ScrollMode = "auto") => {
-            const targetOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
-            const idx = targetOrd - spine.verseOrdMin;
-
-            void ensureChunk(chunkStart(targetOrd), targetOrd);
-
-            if (!scrollEl) {
-                pendingJumpRef.current = { ord: targetOrd, behavior };
-                return;
-            }
-
-            requestAnimationFrame(() => {
-                rowVirtualizer.scrollToIndex(idx, { align: "start", behavior });
-            });
-        },
-        [ensureChunk, rowVirtualizer, scrollEl, spine.verseOrdMin, spine.verseOrdMax],
-    );
-
-    useImperativeHandle(
-        ref,
-        () => ({
-            jumpToOrd,
-            getCurrentOrd: () => posOrdRef.current,
-        }),
-        [jumpToOrd],
-    );
-
-    useEffect(() => {
-        if (!scrollEl) return;
-
-        if (!readyOnceRef.current) {
-            readyOnceRef.current = true;
-            void ensureChunk(chunkStart(initialOrd), initialOrd);
-            onReady?.();
-        }
-
-        const pending = pendingJumpRef.current;
-        if (pending) {
-            pendingJumpRef.current = null;
-            jumpToOrd(pending.ord, pending.behavior);
-        }
-    }, [scrollEl, jumpToOrd, onReady, ensureChunk, initialOrd]);
-
-    useEffect(() => {
-        if (!virtualItems.length) return;
-
-        const firstOrd = spine.verseOrdMin + firstIndex;
-        const lastOrd = spine.verseOrdMin + lastIndex;
-
-        const start = chunkStart(firstOrd);
-        const end = chunkStart(lastOrd);
-
-        for (let c = start; c <= end; c += CHUNK) void ensureChunk(c, firstOrd);
-
-        for (let k = 1; k <= PREFETCH_CHUNKS_AHEAD; k += 1) {
-            const ahead = end + k * CHUNK;
-            if (ahead <= spine.verseOrdMax) void ensureChunk(ahead, lastOrd);
-        }
-
-        for (let k = 1; k <= PREFETCH_CHUNKS_BEHIND; k += 1) {
-            const behind = start - k * CHUNK;
-            if (behind >= spine.verseOrdMin) void ensureChunk(behind, firstOrd);
-        }
-    }, [firstIndex, lastIndex, ensureChunk, spine.verseOrdMin, spine.verseOrdMax, virtualItems.length]);
-
-    useEffect(() => {
-        if (!scrollEl) return;
-
-        const prevOverflowY = scrollEl.style.overflowY;
-        const prevOverscroll = (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior;
-        const prevScrollBehavior = scrollEl.style.scrollBehavior;
-
-        if (gate) {
-            scrollEl.style.overflowY = "hidden";
-            (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior = "contain";
-            scrollEl.style.scrollBehavior = "auto";
-        } else {
-            scrollEl.style.overflowY = prevOverflowY;
-            (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior = prevOverscroll;
-            scrollEl.style.scrollBehavior = prevScrollBehavior;
-        }
-
-        return () => {
-            scrollEl.style.overflowY = prevOverflowY;
-            (scrollEl.style as CSSStyleDeclaration & { overscrollBehavior?: string }).overscrollBehavior = prevOverscroll;
-            scrollEl.style.scrollBehavior = prevScrollBehavior;
-        };
-    }, [scrollEl, gate]);
-
-    const rafScrollRef = useRef<number>(0);
-
-    const computeAndSetTopOrd = useCallback(() => {
-        rafScrollRef.current = 0;
-        if (!scrollEl || !virtualItems.length || gateRef.current) return;
-
-        const scrollTop = scrollEl.scrollTop;
-
-        let topItem = virtualItems[0]!;
-        for (let i = 0; i < virtualItems.length; i += 1) {
-            const item = virtualItems[i]!;
-            if (item.start + item.size > scrollTop + 1) {
-                topItem = item;
-                break;
-            }
-        }
-
-        const ord = spine.verseOrdMin + topItem.index;
-        if (posOrdRef.current !== ord) {
-            posOrdRef.current = ord;
-            setPosOrd(ord);
-        }
-
-        void ensureChunk(chunkStart(ord), ord);
-    }, [ensureChunk, scrollEl, spine.verseOrdMin, virtualItems]);
-
-    useLayoutEffect(() => {
-        if (!scrollEl || !virtualItems.length || gateRef.current) return;
-        computeAndSetTopOrd();
-    }, [scrollEl, virtualItems.length, firstIndex, lastIndex, computeAndSetTopOrd]);
-
-    useEffect(() => {
-        if (!scrollEl) return;
-
-        const onScroll = () => {
-            if (rafScrollRef.current) return;
-            rafScrollRef.current = window.requestAnimationFrame(computeAndSetTopOrd);
-        };
-
-        scrollEl.addEventListener("scroll", onScroll, { passive: true });
-        return () => {
-            scrollEl.removeEventListener("scroll", onScroll);
-            if (rafScrollRef.current) {
-                cancelAnimationFrame(rafScrollRef.current);
-                rafScrollRef.current = 0;
-            }
-        };
-    }, [scrollEl, computeAndSetTopOrd]);
-
-    const lastSentRef = useRef<{ ord: number; hasVerse: boolean }>({ ord: -1, hasVerse: false });
-
-    useEffect(() => {
-        const effectiveOrd = posOrdRef.current ?? initialOrd;
-        const verse = chunkRef.current.verseMap.get(effectiveOrd) ?? null;
-        const book = verse ? bookById.get(verse.bookId) ?? null : null;
-
-        const next = { ord: effectiveOrd, hasVerse: !!verse };
-        const prev = lastSentRef.current;
-        if (prev.ord === next.ord && prev.hasVerse === next.hasVerse) return;
-
-        lastSentRef.current = next;
-        onPosition({ ord: effectiveOrd, verse, book });
-    }, [posOrd, dataTick, bookById, onPosition, initialOrd]);
-
-    useEffect(() => {
-        if (!scrollEl || gateRef.current) return;
-
-        if (gateCooldownRef.current > 0) {
-            gateCooldownRef.current -= 1;
-            return;
-        }
-
-        const ord = posOrdRef.current;
-        const cur = chunkRef.current.verseMap.get(ord) ?? null;
-        if (!cur) return;
-
-        if (ord === spine.verseOrdMin) return;
-
-        const prev = chunkRef.current.verseMap.get(ord - 1) ?? null;
-        if (!prev) return;
-        if (prev.bookId === cur.bookId) return;
-
-        const bookId = cur.bookId;
-        if (lastGatedBookIdRef.current === bookId) return;
-        lastGatedBookIdRef.current = bookId;
-
-        const idx = ord - spine.verseOrdMin;
-        requestAnimationFrame(() => {
-            rowVirtualizer.scrollToIndex(idx, { align: "start", behavior: "auto" });
-            requestAnimationFrame(() => setGate({ ord, bookId }));
-        });
-    }, [scrollEl, posOrd, dataTick, rowVirtualizer, spine.verseOrdMin]);
-
-    const totalSize = rowVirtualizer.getTotalSize();
-
-    const renderRow = useCallback(
-        (verseOrd: number) => {
-            const row = chunkRef.current.verseMap.get(verseOrd) ?? null;
-
-            if (!row) {
-                return (
-                    <div style={sx.skelRow}>
-                        <div style={sx.verseNum}>…</div>
-                        <div style={sx.skelText} />
-                    </div>
-                );
-            }
-
-            const annotations = annotationIndex.get(verseOrd) ?? EMPTY_ANNOTATIONS;
-
-            return (
-                <VerseRow
-                    row={row}
-                    book={bookById.get(row.bookId) ?? null}
-                    annotations={annotations}
-                />
-            );
-        },
-        [annotationIndex, bookById],
-    );
-
-    const measureRowEl = useCallback(
-        (el: HTMLDivElement | null) => {
-            if (!el) return;
-            const wm = measuredAtRef.current;
-            const last = wm.get(el);
-            if (last === dataTick) return;
-            wm.set(el, dataTick);
-            rowVirtualizer.measureElement(el);
-        },
-        [rowVirtualizer, dataTick],
-    );
-
-    return (
-        <div style={sx.body}>
-            <div ref={setScrollEl} style={sx.scroll}>
-                <div
-                    ref={setSelectionRootEl}
-                    className="container"
-                    style={sx.container}
-                    data-translation-id={loadedTranslationId ?? undefined}
-                >
-                    {topContent}
+                    if (event.key === "Escape" || event.key === "Enter") {
+                         event.preventDefault();
+                         event.stopPropagation();
+                         onContinue();
+                    }
+               }}
+          >
+               <div
+                    style={{
+                         width: "min(860px, 100%)",
+                         borderRadius: 18,
+                         border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+                         background: "color-mix(in oklab, var(--bg) 82%, var(--panel))",
+                         boxShadow: "0 34px 110px rgba(0,0,0,0.34)",
+                         overflow: "hidden",
+                    }}
+               >
+                    <BookTitlePage book={book} bookId={bookId} />
 
                     <div
-                        style={{
-                            height: totalSize,
-                            position: "relative",
-                            contain: "layout paint",
-                        }}
+                         style={{
+                              display: "flex",
+                              justifyContent: "center",
+                              padding: "14px 14px 18px",
+                              background:
+                                   "linear-gradient(to bottom, transparent, color-mix(in oklab, var(--bg) 88%, var(--panel)))",
+                         }}
                     >
-                        {virtualItems.map((v) => {
-                            const verseOrd = spine.verseOrdMin + v.index;
-                            return (
-                                <div
-                                    key={v.key}
-                                    ref={measureRowEl}
-                                    data-index={v.index}
-                                    style={{
-                                        position: "absolute",
-                                        top: 0,
-                                        left: 0,
-                                        width: "100%",
-                                        transform: `translate3d(0, ${v.start}px, 0)`,
-                                        willChange: "transform",
-                                    }}
-                                >
-                                    {renderRow(verseOrd)}
-                                </div>
-                            );
-                        })}
+                         <button
+                              ref={btnRef}
+                              type="button"
+                              onClick={onContinue}
+                              style={{
+                                   appearance: "none",
+                                   WebkitAppearance: "none",
+                                   height: 40,
+                                   padding: "0 16px",
+                                   borderRadius: 12,
+                                   border: "1px solid color-mix(in oklab, var(--focus) 70%, var(--hairline))",
+                                   background: "var(--focus)",
+                                   color: "var(--fg)",
+                                   fontSize: 12.6,
+                                   fontWeight: 820,
+                                   letterSpacing: "-0.01em",
+                                   cursor: "pointer",
+                                   boxShadow: "0 14px 34px color-mix(in oklab, var(--focus) 20%, transparent)",
+                              }}
+                         >
+                              Continue
+                         </button>
                     </div>
-                </div>
+               </div>
+          </div>
+     );
+}
 
-                {gate ? (
-                    <BookGate
-                        book={bookById.get(gate.bookId) ?? null}
-                        bookId={gate.bookId}
-                        onContinue={() => {
-                            const ord = gate.ord;
-                            setGate(null);
-                            gateRef.current = null;
-                            gateCooldownRef.current = 8;
+export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function ReaderViewport(
+     props,
+     ref,
+) {
+     const {
+          spine,
+          bookById,
+          topContent,
+          selectionRootRef,
+          annotationSnapshot,
+          onPosition,
+          onError,
+          onReady,
+     } = props;
 
-                            requestAnimationFrame(() => {
-                                const idx = ord - spine.verseOrdMin;
-                                rowVirtualizer.scrollToIndex(idx, { align: "start", behavior: "auto" });
-                            });
-                        }}
+     const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+     const [dataTick, setDataTick] = useState(0);
+     const [gate, setGate] = useState<BookGateState | null>(null);
+
+     const chunkRef = useRef<ChunkState>(createChunkState());
+     const measuredAtRef = useRef<WeakMap<Element, number>>(new WeakMap());
+
+     const initialOrd = useMemo(() => {
+          return clamp(spine.verseOrdMin, spine.verseOrdMin, spine.verseOrdMax);
+     }, [spine.verseOrdMin, spine.verseOrdMax]);
+
+     const posOrdRef = useRef<number>(initialOrd);
+     const [posOrd, setPosOrd] = useState<number>(initialOrd);
+
+     const pendingJumpRef = useRef<PendingJump | null>(null);
+     const readyOnceRef = useRef(false);
+     const runIdRef = useRef(0);
+
+     const inFlightRef = useRef<Map<number, AbortController>>(new Map());
+
+     const gateRef = useRef<BookGateState | null>(null);
+     const lastGatedBookIdRef = useRef<string | null>(null);
+     const gateCooldownRef = useRef(0);
+
+     const rafScrollRef = useRef(0);
+     const lastSentRef = useRef<{ ord: number; hasVerse: boolean }>({
+          ord: -1,
+          hasVerse: false,
+     });
+
+     const bumpTick = useCallback(() => {
+          setDataTick((t) => t + 1);
+     }, []);
+
+     const derivedCount = useMemo(() => {
+          const min = spine.verseOrdMin;
+          const max = spine.verseOrdMax;
+          return max >= min ? max - min + 1 : 0;
+     }, [spine.verseOrdMin, spine.verseOrdMax]);
+
+     const count = useMemo(() => {
+          const verseCount = Number.isFinite(spine.verseCount) ? spine.verseCount : 0;
+          if (verseCount <= 0) return derivedCount;
+          if (derivedCount > 0 && verseCount !== derivedCount) return derivedCount;
+          return verseCount;
+     }, [spine.verseCount, derivedCount]);
+
+     const annotationIndex = useMemo(() => {
+          return buildAnnotationVerseIndex(annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax);
+     }, [annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax]);
+
+     const loadedTranslationId = useMemo(() => {
+          for (const row of chunkRef.current.verseMap.values()) {
+               const translationId = getRowTranslationId(row);
+               if (translationId) return translationId;
+          }
+          return null;
+     }, [dataTick]);
+
+     const setSelectionRootEl = useCallback(
+          (el: HTMLDivElement | null) => {
+               if (selectionRootRef) {
+                    selectionRootRef.current = el;
+               }
+          },
+          [selectionRootRef],
+     );
+
+     const abortAllInFlight = useCallback(() => {
+          for (const controller of inFlightRef.current.values()) {
+               controller.abort();
+          }
+          inFlightRef.current.clear();
+          chunkRef.current.loadingChunks.clear();
+     }, []);
+
+     useEffect(() => {
+          posOrdRef.current = posOrd;
+     }, [posOrd]);
+
+     useEffect(() => {
+          gateRef.current = gate;
+     }, [gate]);
+
+     const evictFarChunks = useCallback(
+          (keepOrd: number): void => {
+               const state = chunkRef.current;
+               const keepChunk = chunkStart(clamp(keepOrd, spine.verseOrdMin, spine.verseOrdMax));
+
+               while (state.loadedOrder.length > MAX_CHUNKS_IN_MEMORY) {
+                    let farIdx = 0;
+                    let farDist = -1;
+
+                    for (let i = 0; i < state.loadedOrder.length; i += 1) {
+                         const loadedChunk = state.loadedOrder[i]!;
+                         const dist = Math.abs(loadedChunk - keepChunk);
+                         if (dist > farDist) {
+                              farDist = dist;
+                              farIdx = i;
+                         }
+                    }
+
+                    const victim = state.loadedOrder.splice(farIdx, 1)[0]!;
+                    state.loadedChunks.delete(victim);
+
+                    const startOrd = victim;
+                    const endOrd = Math.min(victim + CHUNK - 1, spine.verseOrdMax);
+
+                    for (let ord = startOrd; ord <= endOrd; ord += 1) {
+                         state.verseMap.delete(ord);
+                    }
+               }
+          },
+          [spine.verseOrdMin, spine.verseOrdMax],
+     );
+
+     const ensureChunk = useCallback(
+          async (startOrd: number, keepOrd?: number): Promise<void> => {
+               const safeOrd = clamp(startOrd, spine.verseOrdMin, spine.verseOrdMax);
+               const chunk = chunkStart(safeOrd);
+               const state = chunkRef.current;
+
+               if (state.loadedChunks.has(chunk)) return;
+               if (state.loadingChunks.has(chunk)) return;
+
+               const myRunId = runIdRef.current;
+               const controller = new AbortController();
+
+               state.loadingChunks.add(chunk);
+               inFlightRef.current.set(chunk, controller);
+
+               try {
+                    const res = await apiGetSlice(chunk, CHUNK, {
+                         signal: controller.signal,
+                    });
+
+                    if (runIdRef.current !== myRunId) return;
+                    if (controller.signal.aborted) return;
+
+                    for (const verse of res.verses) {
+                         state.verseMap.set(verse.verseOrd, verse);
+                    }
+
+                    state.loadedChunks.add(chunk);
+                    if (!state.loadedOrder.includes(chunk)) {
+                         state.loadedOrder.push(chunk);
+                    }
+
+                    evictFarChunks(keepOrd ?? posOrdRef.current);
+                    bumpTick();
+               } catch (error: unknown) {
+                    if (runIdRef.current !== myRunId) return;
+                    if (controller.signal.aborted) return;
+
+                    const message = error instanceof Error ? error.message : String(error);
+                    onError?.(message);
+               } finally {
+                    state.loadingChunks.delete(chunk);
+                    inFlightRef.current.delete(chunk);
+               }
+          },
+          [bumpTick, evictFarChunks, onError, spine.verseOrdMin, spine.verseOrdMax],
+     );
+
+     useEffect(() => {
+          abortAllInFlight();
+          runIdRef.current += 1;
+
+          chunkRef.current = createChunkState();
+          measuredAtRef.current = new WeakMap();
+
+          setPosOrd(initialOrd);
+          posOrdRef.current = initialOrd;
+
+          setGate(null);
+          gateRef.current = null;
+          lastGatedBookIdRef.current = null;
+          gateCooldownRef.current = 0;
+
+          pendingJumpRef.current = null;
+          readyOnceRef.current = false;
+          lastSentRef.current = { ord: -1, hasVerse: false };
+
+          void ensureChunk(chunkStart(initialOrd), initialOrd);
+          bumpTick();
+     }, [abortAllInFlight, bumpTick, ensureChunk, initialOrd]);
+
+     useEffect(() => {
+          return () => {
+               abortAllInFlight();
+               if (rafScrollRef.current) {
+                    cancelAnimationFrame(rafScrollRef.current);
+                    rafScrollRef.current = 0;
+               }
+          };
+     }, [abortAllInFlight]);
+
+     useEffect(() => {
+          if (!scrollEl) return;
+          void ensureChunk(chunkStart(initialOrd), initialOrd);
+     }, [scrollEl, ensureChunk, initialOrd]);
+
+     const rowVirtualizer = useVirtualizer({
+          count,
+          getScrollElement: () => scrollEl,
+          estimateSize: () => EST_ROW_PX,
+          overscan: 18,
+          getItemKey: (index) => String(spine.verseOrdMin + index),
+     });
+
+     const virtualItems = rowVirtualizer.getVirtualItems();
+     const firstIndex = virtualItems[0]?.index ?? 0;
+     const lastIndex = virtualItems.length ? virtualItems[virtualItems.length - 1]!.index : 0;
+
+     const jumpToOrd = useCallback(
+          (ord: number, behavior: ScrollMode = "auto") => {
+               const targetOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
+               const targetIndex = targetOrd - spine.verseOrdMin;
+
+               void ensureChunk(chunkStart(targetOrd), targetOrd);
+
+               if (!scrollEl) {
+                    pendingJumpRef.current = { ord: targetOrd, behavior };
+                    return;
+               }
+
+               requestAnimationFrame(() => {
+                    rowVirtualizer.scrollToIndex(targetIndex, {
+                         align: "start",
+                         behavior,
+                    });
+               });
+          },
+          [ensureChunk, rowVirtualizer, scrollEl, spine.verseOrdMin, spine.verseOrdMax],
+     );
+
+     useImperativeHandle(
+          ref,
+          () => ({
+               jumpToOrd,
+               getCurrentOrd: () => posOrdRef.current,
+          }),
+          [jumpToOrd],
+     );
+
+     useEffect(() => {
+          if (!scrollEl) return;
+
+          if (!readyOnceRef.current) {
+               readyOnceRef.current = true;
+               void ensureChunk(chunkStart(initialOrd), initialOrd);
+               onReady?.();
+          }
+
+          const pending = pendingJumpRef.current;
+          if (pending) {
+               pendingJumpRef.current = null;
+               jumpToOrd(pending.ord, pending.behavior);
+          }
+     }, [scrollEl, ensureChunk, initialOrd, jumpToOrd, onReady]);
+
+     useEffect(() => {
+          if (!virtualItems.length) return;
+
+          const firstOrd = spine.verseOrdMin + firstIndex;
+          const lastOrd = spine.verseOrdMin + lastIndex;
+
+          const startChunk = chunkStart(firstOrd);
+          const endChunk = chunkStart(lastOrd);
+
+          for (let chunk = startChunk; chunk <= endChunk; chunk += CHUNK) {
+               void ensureChunk(chunk, firstOrd);
+          }
+
+          for (let i = 1; i <= PREFETCH_CHUNKS_AHEAD; i += 1) {
+               const ahead = endChunk + i * CHUNK;
+               if (ahead <= spine.verseOrdMax) {
+                    void ensureChunk(ahead, lastOrd);
+               }
+          }
+
+          for (let i = 1; i <= PREFETCH_CHUNKS_BEHIND; i += 1) {
+               const behind = startChunk - i * CHUNK;
+               if (behind >= spine.verseOrdMin) {
+                    void ensureChunk(behind, firstOrd);
+               }
+          }
+     }, [
+          ensureChunk,
+          firstIndex,
+          lastIndex,
+          spine.verseOrdMax,
+          spine.verseOrdMin,
+          virtualItems.length,
+     ]);
+
+     useEffect(() => {
+          if (!scrollEl) return;
+
+          const prevOverflowY = scrollEl.style.overflowY;
+          const prevOverscrollBehavior = scrollEl.style.overscrollBehavior;
+          const prevScrollBehavior = scrollEl.style.scrollBehavior;
+
+          if (gate) {
+               scrollEl.style.overflowY = "hidden";
+               scrollEl.style.overscrollBehavior = "contain";
+               scrollEl.style.scrollBehavior = "auto";
+          } else {
+               scrollEl.style.overflowY = prevOverflowY;
+               scrollEl.style.overscrollBehavior = prevOverscrollBehavior;
+               scrollEl.style.scrollBehavior = prevScrollBehavior;
+          }
+
+          return () => {
+               scrollEl.style.overflowY = prevOverflowY;
+               scrollEl.style.overscrollBehavior = prevOverscrollBehavior;
+               scrollEl.style.scrollBehavior = prevScrollBehavior;
+          };
+     }, [gate, scrollEl]);
+
+     const computeAndSetTopOrd = useCallback(() => {
+          rafScrollRef.current = 0;
+
+          if (!scrollEl || !virtualItems.length || gateRef.current) return;
+
+          const scrollTop = scrollEl.scrollTop;
+          let topItem = virtualItems[0]!;
+
+          for (let i = 0; i < virtualItems.length; i += 1) {
+               const item = virtualItems[i]!;
+               if (item.start + item.size > scrollTop + 1) {
+                    topItem = item;
+                    break;
+               }
+          }
+
+          const ord = spine.verseOrdMin + topItem.index;
+          if (posOrdRef.current !== ord) {
+               posOrdRef.current = ord;
+               setPosOrd(ord);
+          }
+
+          void ensureChunk(chunkStart(ord), ord);
+     }, [ensureChunk, scrollEl, spine.verseOrdMin, virtualItems]);
+
+     useLayoutEffect(() => {
+          if (!scrollEl || !virtualItems.length || gateRef.current) return;
+          computeAndSetTopOrd();
+     }, [computeAndSetTopOrd, firstIndex, lastIndex, scrollEl, virtualItems.length]);
+
+     useEffect(() => {
+          if (!scrollEl) return;
+
+          const onScroll = () => {
+               if (rafScrollRef.current) return;
+               rafScrollRef.current = window.requestAnimationFrame(computeAndSetTopOrd);
+          };
+
+          scrollEl.addEventListener("scroll", onScroll, { passive: true });
+
+          return () => {
+               scrollEl.removeEventListener("scroll", onScroll);
+               if (rafScrollRef.current) {
+                    cancelAnimationFrame(rafScrollRef.current);
+                    rafScrollRef.current = 0;
+               }
+          };
+     }, [computeAndSetTopOrd, scrollEl]);
+
+     useEffect(() => {
+          const effectiveOrd = posOrdRef.current;
+          const verse = chunkRef.current.verseMap.get(effectiveOrd) ?? null;
+          const book = verse ? bookById.get(verse.bookId) ?? null : null;
+
+          const next = { ord: effectiveOrd, hasVerse: verse !== null };
+          const prev = lastSentRef.current;
+          if (prev.ord === next.ord && prev.hasVerse === next.hasVerse) return;
+
+          lastSentRef.current = next;
+          onPosition({ ord: effectiveOrd, verse, book });
+     }, [bookById, dataTick, onPosition, posOrd]);
+
+     useEffect(() => {
+          if (!scrollEl || gateRef.current) return;
+
+          if (gateCooldownRef.current > 0) {
+               gateCooldownRef.current -= 1;
+               return;
+          }
+
+          const ord = posOrdRef.current;
+          const current = chunkRef.current.verseMap.get(ord) ?? null;
+          if (!current) return;
+          if (ord === spine.verseOrdMin) return;
+
+          const previous = chunkRef.current.verseMap.get(ord - 1) ?? null;
+          if (!previous) return;
+          if (previous.bookId === current.bookId) return;
+
+          const bookId = current.bookId;
+          if (lastGatedBookIdRef.current === bookId) return;
+
+          lastGatedBookIdRef.current = bookId;
+          const index = ord - spine.verseOrdMin;
+
+          requestAnimationFrame(() => {
+               rowVirtualizer.scrollToIndex(index, {
+                    align: "start",
+                    behavior: "auto",
+               });
+
+               requestAnimationFrame(() => {
+                    setGate({ ord, bookId });
+               });
+          });
+     }, [dataTick, posOrd, rowVirtualizer, scrollEl, spine.verseOrdMin]);
+
+     const totalSize = rowVirtualizer.getTotalSize();
+
+     const renderRow = useCallback(
+          (verseOrd: number) => {
+               const row = chunkRef.current.verseMap.get(verseOrd) ?? null;
+
+               if (!row) {
+                    return (
+                         <div style={sx.skelRow}>
+                              <div style={sx.verseNum}>…</div>
+                              <div style={sx.skelText} />
+                         </div>
+                    );
+               }
+
+               const annotations = annotationIndex.get(verseOrd) ?? EMPTY_ANNOTATIONS;
+
+               return (
+                    <VerseRow
+                         row={row}
+                         book={bookById.get(row.bookId) ?? null}
+                         annotations={annotations}
                     />
-                ) : null}
-            </div>
-        </div>
-    );
+               );
+          },
+          [annotationIndex, bookById],
+     );
+
+     const measureRowEl = useCallback(
+          (el: HTMLDivElement | null) => {
+               if (!el) return;
+
+               const mark = measuredAtRef.current;
+               const lastMeasuredAt = mark.get(el);
+               if (lastMeasuredAt === dataTick) return;
+
+               mark.set(el, dataTick);
+               rowVirtualizer.measureElement(el);
+          },
+          [dataTick, rowVirtualizer],
+     );
+
+     return (
+          <div style={sx.body}>
+               <div ref={setScrollEl} style={sx.scroll}>
+                    <div
+                         ref={setSelectionRootEl}
+                         className="container"
+                         style={sx.container}
+                         data-translation-id={loadedTranslationId ?? undefined}
+                    >
+                         {topContent}
+
+                         <div
+                              style={{
+                                   position: "relative",
+                                   height: totalSize,
+                                   contain: "layout paint",
+                              }}
+                         >
+                              {virtualItems.map((item) => {
+                                   const verseOrd = spine.verseOrdMin + item.index;
+
+                                   return (
+                                        <div
+                                             key={item.key}
+                                             ref={measureRowEl}
+                                             data-index={item.index}
+                                             style={{
+                                                  position: "absolute",
+                                                  top: 0,
+                                                  left: 0,
+                                                  width: "100%",
+                                                  transform: `translate3d(0, ${item.start}px, 0)`,
+                                                  willChange: "transform",
+                                             }}
+                                        >
+                                             {renderRow(verseOrd)}
+                                        </div>
+                                   );
+                              })}
+                         </div>
+                    </div>
+
+                    {gate ? (
+                         <BookGate
+                              book={bookById.get(gate.bookId) ?? null}
+                              bookId={gate.bookId}
+                              onContinue={() => {
+                                   const ord = gate.ord;
+
+                                   setGate(null);
+                                   gateRef.current = null;
+                                   gateCooldownRef.current = GATE_COOLDOWN_TICKS;
+
+                                   requestAnimationFrame(() => {
+                                        const index = ord - spine.verseOrdMin;
+                                        rowVirtualizer.scrollToIndex(index, {
+                                             align: "start",
+                                             behavior: "auto",
+                                        });
+                                   });
+                              }}
+                         />
+                    ) : null}
+               </div>
+          </div>
+     );
 });
-```
 
-### apps/web/src/reader/ReaderDomSelectionResolver.ts
-
-```ts
-import type { DomSelectionResolver, DomSelectionTokenLocator } from "@biblia/annotation";
-
-const ATTR_VERSE_KEY = "data-verse-key";
-const ATTR_VERSE_ORD = "data-verse-ord";
-const ATTR_TOKEN_INDEX = "data-token-index";
-const ATTR_TOKEN_CHAR_START = "data-token-char-start";
-const ATTR_TOKEN_CHAR_END = "data-token-char-end";
-const ATTR_TRANSLATION_ID = "data-translation-id";
-
-function isElement(value: unknown): value is Element {
-    return typeof Element !== "undefined" && value instanceof Element;
-}
-
-function isTextNode(value: unknown): value is Text {
-    return typeof Text !== "undefined" && value instanceof Text;
-}
-
-function parseIntStrict(value: string | null): number | null {
-    if (typeof value !== "string") return null;
-    const trimmed = value.trim();
-    if (trimmed.length === 0) return null;
-    const n = Number(trimmed);
-    return Number.isInteger(n) ? n : null;
-}
-
-function clampInt(value: number, min: number, max: number): number {
-    if (!Number.isFinite(value)) return min;
-    const asInt = Math.trunc(value);
-    if (asInt < min) return min;
-    if (asInt > max) return max;
-    return asInt;
-}
-
-function findClosestElement(node: Node | null): Element | null {
-    if (!node) return null;
-    if (isElement(node)) return node;
-    return node.parentElement;
-}
-
-function findClosestAttrElement(node: Node | null, attr: string): HTMLElement | null {
-    let current = findClosestElement(node);
-    while (current) {
-        if (current instanceof HTMLElement && current.hasAttribute(attr)) {
-            return current;
-        }
-        current = current.parentElement;
-    }
-    return null;
-}
-
-function findVerseElement(node: Node | null): HTMLElement | null {
-    let current = findClosestElement(node);
-    while (current) {
-        if (
-            current instanceof HTMLElement &&
-            current.hasAttribute(ATTR_VERSE_KEY) &&
-            current.hasAttribute(ATTR_VERSE_ORD)
-        ) {
-            return current;
-        }
-        current = current.parentElement;
-    }
-    return null;
-}
-
-function getNodeTextLength(node: Node | null): number {
-    if (!node) return 0;
-    const text = node.textContent;
-    return typeof text === "string" ? text.length : 0;
-}
-
-function getTokenCharStart(tokenEl: HTMLElement | null): number | null {
-    if (!tokenEl) return null;
-    return parseIntStrict(tokenEl.getAttribute(ATTR_TOKEN_CHAR_START));
-}
-
-function getTokenCharEnd(tokenEl: HTMLElement | null): number | null {
-    if (!tokenEl) return null;
-    return parseIntStrict(tokenEl.getAttribute(ATTR_TOKEN_CHAR_END));
-}
-
-function normalizeString(value: string | null): string | null {
-    if (typeof value !== "string") return null;
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : null;
-}
-
-function resolveTokenRelativeOffset(node: Node, offset: number, tokenEl: HTMLElement): number {
-    const tokenTextLen = getNodeTextLength(tokenEl);
-    if (isTextNode(node)) {
-        return clampInt(offset, 0, getNodeTextLength(node));
-    }
-    return clampInt(offset, 0, tokenTextLen);
-}
-
-function resolveCharOffset(node: Node, offset: number, tokenEl: HTMLElement | null): number | null {
-    if (!tokenEl) {
-        if (isTextNode(node)) {
-            return clampInt(offset, 0, getNodeTextLength(node));
-        }
-        return null;
-    }
-
-    const tokenStart = getTokenCharStart(tokenEl);
-    const tokenEnd = getTokenCharEnd(tokenEl);
-
-    if (tokenStart == null && tokenEnd == null) {
-        return isTextNode(node) ? clampInt(offset, 0, getNodeTextLength(node)) : null;
-    }
-
-    if (tokenStart != null && tokenEnd != null) {
-        const width = Math.max(0, tokenEnd - tokenStart);
-        const local = resolveTokenRelativeOffset(node, offset, tokenEl);
-        return tokenStart + clampInt(local, 0, width);
-    }
-
-    if (tokenStart != null) {
-        return tokenStart + resolveTokenRelativeOffset(node, offset, tokenEl);
-    }
-
-    return tokenEnd;
-}
-
-export class ReaderDomSelectionResolver implements DomSelectionResolver {
-    resolveBoundary(node: Node, offset: number): DomSelectionTokenLocator | null {
-        const verseEl = findVerseElement(node);
-        if (!verseEl) return null;
-
-        const verseKey = normalizeString(verseEl.getAttribute(ATTR_VERSE_KEY));
-        const verseOrd = parseIntStrict(verseEl.getAttribute(ATTR_VERSE_ORD));
-        if (!verseKey || verseOrd == null || verseOrd < 1) {
-            return null;
-        }
-
-        const tokenEl = findClosestAttrElement(node, ATTR_TOKEN_INDEX);
-        const tokenIndex = tokenEl ? parseIntStrict(tokenEl.getAttribute(ATTR_TOKEN_INDEX)) : null;
-        const charOffset = resolveCharOffset(node, offset, tokenEl);
-
-        return {
-            verseOrd,
-            verseKey,
-            tokenIndex,
-            charOffset,
-        };
-    }
-
-    resolveTranslationId(root: Node): string | null {
-        const el = findClosestAttrElement(root, ATTR_TRANSLATION_ID);
-        return normalizeString(el?.getAttribute(ATTR_TRANSLATION_ID) ?? null);
-    }
-}
+ReaderViewport.displayName = "ReaderViewport";
 ```
 
 ### apps/web/src/reader/sx.ts
@@ -22873,27 +25658,57 @@ import type { CSSProperties } from "react";
 /**
  * Reader UI tokens (inline styles)
  *
- * Hardening notes:
- * - true center column with shrinkable middle
- * - safe-area aware
- * - scroll viewport remains absolute/inset:0 for virtualizer stability
- * - fixed invalid focus token usage
- * - prefers dvh over vh for viewport correctness
+ * Hardened / improved:
+ * - stable virtualized reader viewport
+ * - safe-area aware shell/header/body
+ * - explicit z/layer tokens
+ * - true shrinkable center header column
+ * - calmer premium row states
+ * - no invalid / non-portable inline style tokens
+ * - explicit row wrapper surface for verse containers
+ * - safer cross-browser fallbacks for inline React CSSProperties
+ *
+ * Notes:
+ * - keep layout-critical surfaces simple and deterministic
+ * - avoid size containment on virtualized row wrappers
+ * - inline styles only: no pseudo selectors, no unsupported token tricks
+ * - values are chosen to cooperate with base.css tokens
  */
 
-const RADIUS = 14;
+type SxMap = Readonly<Record<string, CSSProperties>>;
 
-const HAIRLINE = "color-mix(in oklab, var(--hairline) 92%, transparent)";
-const PANEL_WASH = "color-mix(in oklab, var(--panel) 22%, transparent)";
-const PANEL_WASH_FOCUS = "color-mix(in oklab, var(--panel) 26%, transparent)";
-const FOCUS_RING_WASH = "color-mix(in oklab, var(--focusRing) 90%, transparent)";
+const RADIUS_PX = 14;
+const HEADER_Z = 60;
+
+const mix = (value: string) => `color-mix(in oklab, ${value})`;
+
+const HAIRLINE = mix("var(--hairline) 92%, transparent");
+const HAIRLINE_STRONG = mix("var(--hairline) 98%, transparent");
+const PANEL_WASH = mix("var(--panel) 22%, transparent");
+const PANEL_WASH_FOCUS = mix("var(--panel) 26%, transparent");
+const PANEL_WASH_SELECTED = mix("var(--panel) 30%, transparent");
+const FOCUS_RING_WASH = mix("var(--focusRing) 90%, transparent");
+const PANEL_BG_SOFT = mix("var(--panel) 90%, transparent");
+const PANEL_BG_SOFT_HOVER = mix("var(--panel) 94%, transparent");
+const HEADER_BG = mix("var(--bg) 88%, transparent");
+const SKELETON_BG = mix("var(--hairline) 92%, transparent");
+const SCROLLBAR_THUMB = mix("var(--hairline) 86%, transparent");
 
 const SAFE_TOP = "env(safe-area-inset-top, 0px)";
-const SAFE_BOT = "env(safe-area-inset-bottom, 0px)";
-const SAFE_L = "env(safe-area-inset-left, 0px)";
-const SAFE_R = "env(safe-area-inset-right, 0px)";
+const SAFE_BOTTOM = "env(safe-area-inset-bottom, 0px)";
+const SAFE_LEFT = "env(safe-area-inset-left, 0px)";
+const SAFE_RIGHT = "env(safe-area-inset-right, 0px)";
 
-export const sx: Record<string, CSSProperties> = {
+const HEADER_HORIZONTAL_PAD = 12;
+const BODY_HORIZONTAL_PAD = 16;
+const HEADER_TOP_PAD = 10;
+const HEADER_BOTTOM_PAD = 10;
+const SCROLL_TOP_PAD = 18;
+const SCROLL_BOTTOM_PAD = 96;
+
+const ROW_SCROLL_MARGIN_TOP = `calc(72px + ${SAFE_TOP})`;
+
+export const sx = {
     /* ---------- Shell ---------- */
     page: {
         height: "100dvh",
@@ -22910,16 +25725,16 @@ export const sx: Record<string, CSSProperties> = {
     topBar: {
         position: "sticky",
         top: 0,
-        zIndex: 60,
+        zIndex: HEADER_Z,
         display: "grid",
         gridTemplateColumns: "auto minmax(0, 1fr) auto",
         alignItems: "center",
         columnGap: 12,
-        paddingTop: `calc(10px + ${SAFE_TOP})`,
-        paddingBottom: 10,
-        paddingLeft: `calc(12px + ${SAFE_L})`,
-        paddingRight: `calc(12px + ${SAFE_R})`,
-        background: "color-mix(in oklab, var(--bg) 88%, transparent)",
+        paddingTop: `calc(${HEADER_TOP_PAD}px + ${SAFE_TOP})`,
+        paddingBottom: HEADER_BOTTOM_PAD,
+        paddingLeft: `calc(${HEADER_HORIZONTAL_PAD}px + ${SAFE_LEFT})`,
+        paddingRight: `calc(${HEADER_HORIZONTAL_PAD}px + ${SAFE_RIGHT})`,
+        background: HEADER_BG,
         backdropFilter: "blur(12px)",
         WebkitBackdropFilter: "blur(12px)",
         borderBottom: `1px solid ${HAIRLINE}`,
@@ -22931,9 +25746,9 @@ export const sx: Record<string, CSSProperties> = {
         display: "flex",
         alignItems: "center",
         justifyContent: "flex-start",
+        gap: 10,
         minWidth: 0,
         minHeight: 40,
-        gap: 10,
     },
 
     topCenter: {
@@ -22941,7 +25756,7 @@ export const sx: Record<string, CSSProperties> = {
         alignItems: "center",
         justifyContent: "center",
         minWidth: 0,
-        textAlign: "initial",
+        textAlign: "center",
     },
 
     topRight: {
@@ -22971,38 +25786,41 @@ export const sx: Record<string, CSSProperties> = {
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
+        minWidth: 0,
         paddingLeft: 2,
         flex: "0 0 auto",
     },
 
     backBtn: {
+        appearance: "none",
+        WebkitAppearance: "none",
         fontSize: 12,
-        padding: "7px 12px",
-        borderRadius: 999,
-        border: `1px solid ${HAIRLINE}`,
-        background: "color-mix(in oklab, var(--panel) 90%, transparent)",
-        color: "inherit",
-        cursor: "pointer",
         lineHeight: 1,
-        userSelect: "none",
         whiteSpace: "nowrap",
+        userSelect: "none",
+        cursor: "pointer",
+        color: "inherit",
+        background: PANEL_BG_SOFT,
+        border: `1px solid ${HAIRLINE}`,
+        borderRadius: 999,
+        padding: "7px 12px",
         boxSizing: "border-box",
         boxShadow: "0 8px 18px rgba(0,0,0,0.055)",
-        transition:
-            "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease",
         outline: "none",
         WebkitTapHighlightColor: "transparent",
+        transition:
+             "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease",
     },
 
     backBtnHover: {
-        background: "color-mix(in oklab, var(--panel) 94%, transparent)",
-        borderColor: "color-mix(in oklab, var(--hairline) 98%, transparent)",
+        background: PANEL_BG_SOFT_HOVER,
+        borderColor: HAIRLINE_STRONG,
         boxShadow: "0 10px 20px rgba(0,0,0,0.07)",
         transform: "translateY(-0.5px)",
     },
 
     backBtnActive: {
-        transform: "translateY(0px)",
+        transform: "translateY(0)",
         boxShadow: "0 6px 14px rgba(0,0,0,0.06)",
         opacity: 0.96,
     },
@@ -23021,30 +25839,31 @@ export const sx: Record<string, CSSProperties> = {
         inset: 0,
         overflowX: "hidden",
         overflowY: "auto",
-        paddingTop: 18,
-        paddingBottom: `calc(96px + ${SAFE_BOT})`,
+        paddingTop: SCROLL_TOP_PAD,
+        paddingBottom: `calc(${SCROLL_BOTTOM_PAD}px + ${SAFE_BOTTOM})`,
         overscrollBehaviorY: "contain",
         scrollbarGutter: "stable",
+        scrollbarWidth: "thin",
+        scrollbarColor: `${SCROLLBAR_THUMB} transparent`,
         WebkitOverflowScrolling: "touch",
         touchAction: "pan-y",
-        scrollbarWidth: "thin",
-        scrollbarColor: "color-mix(in oklab, var(--hairline) 86%, transparent) transparent",
         transform: "translateZ(0)",
     },
 
     container: {
-        paddingLeft: `calc(16px + ${SAFE_L})`,
-        paddingRight: `calc(16px + ${SAFE_R})`,
         width: "100%",
         maxWidth: "var(--bpReaderMeasure, 840px)",
+        minWidth: 0,
         marginInline: "auto",
+        paddingLeft: `calc(${BODY_HORIZONTAL_PAD}px + ${SAFE_LEFT})`,
+        paddingRight: `calc(${BODY_HORIZONTAL_PAD}px + ${SAFE_RIGHT})`,
         boxSizing: "border-box",
     },
 
     msg: {
+        padding: "18px 0",
         fontSize: 12,
         color: "var(--muted)",
-        padding: "18px 0",
         whiteSpace: "pre-wrap",
     },
 
@@ -23053,6 +25872,7 @@ export const sx: Record<string, CSSProperties> = {
         padding: "16px 2px 12px",
         marginTop: 6,
         borderBottom: `1px solid ${HAIRLINE}`,
+        scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
     },
 
     bookKicker: {
@@ -23066,15 +25886,17 @@ export const sx: Record<string, CSSProperties> = {
     bookTitle: {
         marginTop: 9,
         fontSize: 24,
-        letterSpacing: "-0.03em",
         fontWeight: 650,
         lineHeight: 1.15,
+        letterSpacing: "-0.03em",
+        textWrap: "balance",
     },
 
     chapterHeader: {
         padding: "12px 2px 10px",
         marginTop: 14,
         borderBottom: `1px solid ${HAIRLINE}`,
+        scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
     },
 
     chapterKicker: {
@@ -23087,23 +25909,36 @@ export const sx: Record<string, CSSProperties> = {
     chapterTitle: {
         marginTop: 8,
         fontSize: 16,
-        letterSpacing: "-0.02em",
         fontWeight: 650,
         lineHeight: 1.2,
+        letterSpacing: "-0.02em",
+        textWrap: "balance",
     },
 
     /* ---------- Verse rows ---------- */
+    verseRowWrap: {
+        padding: 0,
+        margin: 0,
+        minWidth: 0,
+        width: "100%",
+        boxSizing: "border-box",
+    },
+
     verseRow: {
         display: "grid",
         gridTemplateColumns: "34px minmax(0, 1fr)",
         gap: 12,
         alignItems: "start",
-        borderRadius: RADIUS,
+        borderRadius: RADIUS_PX,
         padding: "9px 6px",
         boxSizing: "border-box",
         background: "transparent",
         transition: "background 140ms ease, transform 140ms ease, box-shadow 140ms ease",
         WebkitTapHighlightColor: "transparent",
+        scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
+        width: "100%",
+        minWidth: 0,
+        outline: "none",
     },
 
     verseRowHover: {
@@ -23116,19 +25951,20 @@ export const sx: Record<string, CSSProperties> = {
     },
 
     verseRowSelected: {
-        background: "color-mix(in oklab, var(--panel) 30%, transparent)",
-        boxShadow: "0 0 0 1px color-mix(in oklab, var(--hairline) 96%, transparent)",
+        background: PANEL_WASH_SELECTED,
+        boxShadow: `0 0 0 1px ${HAIRLINE_STRONG}`,
     },
 
     verseNum: {
+        paddingTop: 6,
         fontSize: 10,
+        textAlign: "right",
         color: "var(--muted)",
         letterSpacing: "0.14em",
-        textAlign: "right",
-        paddingTop: 6,
-        userSelect: "none",
         fontVariantNumeric: "tabular-nums",
+        userSelect: "none",
         opacity: 0.9,
+        minWidth: 0,
     },
 
     verseText: {
@@ -23143,19 +25979,21 @@ export const sx: Record<string, CSSProperties> = {
         gridTemplateColumns: "34px minmax(0, 1fr)",
         gap: 12,
         alignItems: "start",
-        borderRadius: RADIUS,
+        borderRadius: RADIUS_PX,
         padding: "9px 6px",
-        opacity: 0.55,
         boxSizing: "border-box",
+        opacity: 0.55,
+        width: "100%",
+        minWidth: 0,
     },
 
     skelText: {
         height: 14,
-        borderRadius: 9,
-        background: "color-mix(in oklab, var(--hairline) 92%, transparent)",
         marginTop: 6,
+        borderRadius: 9,
+        background: SKELETON_BG,
     },
-};
+} satisfies SxMap;
 ```
 
 ### apps/web/src/reader/types.ts
@@ -23170,16 +26008,16 @@ import type { TypographyFont } from "./typography";
  *
  * Design goals:
  * - JSON-safe, transport-friendly
- * - Canon anchored (verseKey + verseOrd are immutable anchors)
- * - Token-ready selection + annotation
- * - Overlay-ready with deterministic anchoring
- * - Local-first + sync-friendly
+ * - canon anchored (verseKey + verseOrd are immutable anchors)
+ * - token-ready selection + annotation
+ * - overlay-ready with deterministic anchoring
+ * - local-first + sync-friendly
  *
  * Principles:
- * - Layout is ephemeral
- * - Anchors are semantic
- * - Pixel geometry is a projection cache only
- * - Runtime code may derive richer projections, but these types stay transport-safe
+ * - layout is ephemeral
+ * - anchors are semantic
+ * - pixel geometry is a projection cache only
+ * - runtime code may derive richer projections, but these types stay transport-safe
  */
 
 /* =============================================================================
@@ -23230,7 +26068,16 @@ export type TokenizerRef = Readonly<{
     version?: string | null;
 }>;
 
-export type SliceVerseToken = Readonly<{
+/**
+ * Canonical token shape for the reader slice payload.
+ *
+ * Notes:
+ * - Keep this flat and transport-safe.
+ * - Supports both semantic anchoring and DOM projection.
+ * - `token` is the rendered token text exactly as emitted by the tokenizer.
+ * - char offsets are local to the verse text payload.
+ */
+export type SliceToken = Readonly<{
     tokenIndex: number;
     token: string;
     tokenNorm?: string | null;
@@ -23239,6 +26086,12 @@ export type SliceVerseToken = Readonly<{
     charEnd?: number | null;
     tokenTag?: string | null;
 }>;
+
+/**
+ * Backward-compatible alias.
+ * Older code may still import `SliceVerseToken`.
+ */
+export type SliceVerseToken = SliceToken;
 
 export type SliceVerse = Readonly<{
     verseKey: VerseKey;
@@ -23252,9 +26105,9 @@ export type SliceVerse = Readonly<{
 
     translation?: TranslationRef | null;
     tokenizer?: TokenizerRef | null;
-    tokens?: ReadonlyArray<SliceVerseToken> | null;
+    tokens?: ReadonlyArray<SliceToken> | null;
 
-    updatedAt: string | null;
+    updatedAt: IsoDateTimeString | null;
 }>;
 
 export type ReaderPosition = Readonly<{
@@ -23558,6 +26411,7 @@ export type BookIndexMap = ReadonlyMap<BookId, BookRow>;
 ### apps/web/src/reader/typography.ts
 
 ```ts
+// cspell:words Literata literata Segoe Noto sfmono
 // apps/web/src/reader/typography.ts
 //
 // Biblia.to — reader typography + layout tuning
@@ -23567,8 +26421,9 @@ export type BookIndexMap = ReadonlyMap<BookId, BookRow>;
 // - Normalize + clamp deterministically
 // - Migrate older saves cleanly
 // - One authoritative apply() to <html>
-// - Explicit modern font presets (Inter, Literata, Quicksand)
+// - Explicit modern font presets with richer metadata
 // - Stable helpers for virtualizer / measurement calm
+// - Hardened storage / migration / SSR safety
 
 export type TypographyFont =
      | "inter"
@@ -23580,18 +26435,63 @@ export type TypographyFont =
      | "custom_1"
      | "custom_2";
 
+export type TypographyCategory =
+     | "sans"
+     | "serif"
+     | "rounded"
+     | "mono"
+     | "custom";
+
 export type ReaderTypography = Readonly<{
     font: TypographyFont;
-    sizePx: number;   // 12..30
-    weight: number;   // 200..700
-    leading: number;  // 0.95..2.1
+    sizePx: number; // 12..30
+    weight: number; // 200..700
+    leading: number; // 0.95..2.1
     measurePx: number; // 535..980
 }>;
 
+export type TypographyLimits = Readonly<{
+    sizePx: Readonly<{ lo: number; hi: number; step: number }>;
+    weight: Readonly<{ lo: number; hi: number; step: number }>;
+    leading: Readonly<{ lo: number; hi: number; digits: number }>;
+    measurePx: Readonly<{ lo: number; hi: number; step: number }>;
+}>;
+
+export type FontPreset = Readonly<{
+    label: string;
+    css: string;
+    category: TypographyCategory;
+    previewText: string;
+    uiFamily?: string;
+    aliases?: readonly string[];
+}>;
+
+export type FontOption = Readonly<{
+    id: TypographyFont;
+    label: string;
+    cssFamily: string;
+    previewFamily: string;
+    category: TypographyCategory;
+    previewText: string;
+}>;
+
+type MutableTypographyPatch = {
+    font?: TypographyFont;
+    sizePx?: number;
+    weight?: number;
+    leading?: number;
+    measurePx?: number;
+};
+
+type TypographyEnvelopeV1 = Readonly<{
+    v: 1;
+    t: ReaderTypography;
+}>;
+
 /**
- * New default:
+ * Default:
  * - Inter is the default modern reading-first sans
- * - slightly calmer measure than before
+ * - calmer measure for scripture
  */
 export const DEFAULT_TYPOGRAPHY: ReaderTypography = Object.freeze({
     font: "inter",
@@ -23603,89 +26503,147 @@ export const DEFAULT_TYPOGRAPHY: ReaderTypography = Object.freeze({
 
 const STORAGE_KEY_V2 = "bp_reader_typography_v2";
 const STORAGE_KEY_V1 = "bp_reader_typography_v1";
-const LEGACY_KEYS = Object.freeze(["bp_reader_typography", "bp_typography"]);
+const LEGACY_KEYS = Object.freeze([
+    "bp_reader_typography",
+    "bp_typography",
+]);
 
-type TypographyEnvelopeV1 = Readonly<{
-    v: 1;
-    t: ReaderTypography;
-}>;
-
-const LIMITS = Object.freeze({
-    sizePx: { lo: 12, hi: 30, step: 1 },
-    weight: { lo: 200, hi: 700, step: 1 },
-    leading: { lo: 0.95, hi: 2.1, digits: 2 },
-    measurePx: { lo: 535, hi: 980, step: 1 },
+const LIMITS: TypographyLimits = Object.freeze({
+    sizePx: Object.freeze({ lo: 12, hi: 30, step: 1 }),
+    weight: Object.freeze({ lo: 200, hi: 700, step: 1 }),
+    leading: Object.freeze({ lo: 0.95, hi: 2.1, digits: 2 }),
+    measurePx: Object.freeze({ lo: 535, hi: 980, step: 1 }),
 });
 
-export const FONT_PRESETS: Readonly<
-     Record<
-          TypographyFont,
-          Readonly<{
-              label: string;
-              css: string;
-              category: "sans" | "serif" | "rounded" | "mono" | "custom";
-          }>
-     >
-> = Object.freeze({
-    inter: {
+const FONT_ORDER = Object.freeze([
+    "inter",
+    "literata",
+    "quicksand",
+    "book",
+    "human",
+    "mono",
+    "custom_1",
+    "custom_2",
+] satisfies readonly TypographyFont[]);
+
+export const FONT_PRESETS: Readonly<Record<TypographyFont, FontPreset>> = Object.freeze({
+    inter: Object.freeze({
         label: "Inter",
         css: "var(--font-sans)",
         category: "sans",
-    },
+        previewText: "Blessed are the pure in heart.",
+        uiFamily: "var(--font-sans)",
+        aliases: Object.freeze([
+            "sans",
+            "ui sans",
+            "modern sans",
+            "inter variable",
+            "--font-sans",
+        ]),
+    }),
 
-    literata: {
+    literata: Object.freeze({
         label: "Literata",
         css: "var(--font-serif)",
         category: "serif",
-    },
+        previewText: "In the beginning God created the heaven and the earth.",
+        uiFamily: "var(--font-serif)",
+        aliases: Object.freeze([
+            "serif",
+            "book serif",
+            "literata variable",
+            "--font-serif",
+        ]),
+    }),
 
-    quicksand: {
+    quicksand: Object.freeze({
         label: "Quicksand",
         css: "var(--font-rounded)",
         category: "rounded",
-    },
+        previewText: "Let there be light.",
+        uiFamily: "var(--font-rounded)",
+        aliases: Object.freeze([
+            "rounded",
+            "soft sans",
+            "friendly",
+            "--font-rounded",
+        ]),
+    }),
 
-    book: {
+    book: Object.freeze({
         label: "Book Serif",
         css: 'ui-serif, Charter, "Iowan Old Style", Georgia, "Times New Roman", Times, serif',
         category: "serif",
-    },
+        previewText: "The Lord is my shepherd; I shall not want.",
+        uiFamily: 'ui-serif, Charter, "Iowan Old Style", Georgia, serif',
+        aliases: Object.freeze([
+            "charter",
+            "iowan",
+            "georgia",
+            "times",
+            "traditional serif",
+        ]),
+    }),
 
-    human: {
+    human: Object.freeze({
         label: "Human Sans",
         css: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", sans-serif',
         category: "sans",
-    },
+        previewText: "The earth was without form, and void.",
+        uiFamily: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif',
+        aliases: Object.freeze([
+            "system",
+            "system-ui",
+            "ui-sans",
+            "humanist sans",
+            "roboto",
+            "segoe",
+            "noto sans",
+        ]),
+    }),
 
-    mono: {
+    mono: Object.freeze({
         label: "Reader Mono",
         css: 'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace',
         category: "mono",
-    },
+        previewText: "GEN 1:1  In the beginning God created...",
+        uiFamily: 'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace',
+        aliases: Object.freeze([
+            "mono",
+            "monospace",
+            "menlo",
+            "monaco",
+            "consolas",
+            "sfmono",
+        ]),
+    }),
 
-    custom_1: {
+    custom_1: Object.freeze({
         label: "Custom 1",
         css: "var(--font-custom-1, var(--font-sans))",
         category: "custom",
-    },
+        previewText: "Custom family preview one.",
+        uiFamily: "var(--font-custom-1, var(--font-sans))",
+        aliases: Object.freeze([
+            "custom 1",
+            "custom_1",
+            "--font-custom-1",
+        ]),
+    }),
 
-    custom_2: {
+    custom_2: Object.freeze({
         label: "Custom 2",
         css: "var(--font-custom-2, var(--font-serif))",
         category: "custom",
-    },
+        previewText: "Custom family preview two.",
+        uiFamily: "var(--font-custom-2, var(--font-serif))",
+        aliases: Object.freeze([
+            "custom 2",
+            "custom_2",
+            "--font-custom-2",
+        ]),
+    }),
 });
-
-type FontOption = Readonly<{
-    id: TypographyFont;
-    label: string;
-    cssFamily: string;
-    category: "sans" | "serif" | "rounded" | "mono" | "custom";
-}>;
-
-/* ──────────────────────────────────────────────────────────────
-   Internal helpers
-────────────────────────────────────────────────────────────── */
 
 let lastAppliedSignature: string | null = null;
 let lastAppliedEnabled = false;
@@ -23696,6 +26654,11 @@ function isBrowser(): boolean {
 
 function isDocumentAvailable(): boolean {
     return typeof document !== "undefined";
+}
+
+function currentRoot(): HTMLElement | null {
+    if (!isDocumentAvailable()) return null;
+    return document.documentElement;
 }
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -23716,9 +26679,9 @@ function clampFloat(n: number, lo: number, hi: number, digits: number): number {
 function toNumber(x: unknown): number | null {
     if (typeof x === "number" && Number.isFinite(x)) return x;
     if (typeof x === "string") {
-        const t = x.trim();
-        if (!t) return null;
-        const n = Number(t);
+        const trimmed = x.trim();
+        if (!trimmed) return null;
+        const n = Number(trimmed);
         return Number.isFinite(n) ? n : null;
     }
     return null;
@@ -23769,69 +26732,64 @@ function safeLocalStorageRemove(key: string): void {
 }
 
 function isTypographyFont(x: string): x is TypographyFont {
-    return (
-         x === "inter" ||
-         x === "literata" ||
-         x === "quicksand" ||
-         x === "book" ||
-         x === "human" ||
-         x === "mono" ||
-         x === "custom_1" ||
-         x === "custom_2"
-    );
+    switch (x) {
+        case "inter":
+        case "literata":
+        case "quicksand":
+        case "book":
+        case "human":
+        case "mono":
+        case "custom_1":
+        case "custom_2":
+            return true;
+        default:
+            return false;
+    }
+}
+
+function stringIncludesAny(haystack: string, needles: readonly string[]): boolean {
+    for (const needle of needles) {
+        if (needle && haystack.includes(needle)) return true;
+    }
+    return false;
 }
 
 function normalizeFont(raw: unknown): TypographyFont {
     const s = (toString(raw) ?? "").trim().toLowerCase();
     if (!s) return DEFAULT_TYPOGRAPHY.font;
-
     if (isTypographyFont(s)) return s;
 
-    // Migrate older ids / synonyms
+    for (const id of FONT_ORDER) {
+        const preset = FONT_PRESETS[id];
+        if (s === id) return id;
+        if (s === preset.label.trim().toLowerCase()) return id;
+        if (s === preset.css.trim().toLowerCase()) return id;
+        if (preset.aliases && stringIncludesAny(s, preset.aliases)) return id;
+        if (s.includes(id.replace("_", " "))) return id;
+    }
+
     if (s === "sans") return "inter";
     if (s === "serif") return "literata";
     if (s === "rounded") return "quicksand";
 
-    // Human names / css fragments
-    if (s.includes("inter")) return "inter";
-    if (s.includes("literata")) return "literata";
-    if (s.includes("quicksand")) return "quicksand";
-
-    if (s.includes("charter") || s.includes("iowan") || s.includes("times") || s.includes("georgia")) {
-        return "book";
-    }
-
-    if (
-         s.includes("ui-sans") ||
-         s.includes("system-ui") ||
-         s.includes("segoe") ||
-         s.includes("roboto") ||
-         s.includes("noto sans")
-    ) {
-        return "human";
-    }
-
-    if (
-         s.includes("mono") ||
-         s.includes("menlo") ||
-         s.includes("monaco") ||
-         s.includes("consolas") ||
-         s.includes("sfmono")
-    ) {
-        return "mono";
-    }
-
-    if (s.includes("custom 1") || s.includes("custom_1")) return "custom_1";
-    if (s.includes("custom 2") || s.includes("custom_2")) return "custom_2";
-
     return DEFAULT_TYPOGRAPHY.font;
 }
 
-function normalizeTypography(t: Partial<ReaderTypography> | null | undefined): ReaderTypography {
+function normalizeTypography(
+     t: Partial<ReaderTypography> | null | undefined,
+): ReaderTypography {
     return Object.freeze({
         font: normalizeFont(t?.font),
-        sizePx: clampInt(toNumber(t?.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx, LIMITS.sizePx.lo, LIMITS.sizePx.hi),
-        weight: clampInt(toNumber(t?.weight) ?? DEFAULT_TYPOGRAPHY.weight, LIMITS.weight.lo, LIMITS.weight.hi),
+        sizePx: clampInt(
+             toNumber(t?.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx,
+             LIMITS.sizePx.lo,
+             LIMITS.sizePx.hi,
+        ),
+        weight: clampInt(
+             toNumber(t?.weight) ?? DEFAULT_TYPOGRAPHY.weight,
+             LIMITS.weight.lo,
+             LIMITS.weight.hi,
+        ),
         leading: clampFloat(
              toNumber(t?.leading) ?? DEFAULT_TYPOGRAPHY.leading,
              LIMITS.leading.lo,
@@ -23856,11 +26814,6 @@ function unwrapTypographyPayload(parsed: unknown): ReaderTypography | null {
     return normalizeTypography(parsed as Partial<ReaderTypography>);
 }
 
-function currentRoot(): HTMLElement | null {
-    if (!isDocumentAvailable()) return null;
-    return document.documentElement;
-}
-
 function removeTypographyVars(root: HTMLElement): void {
     root.style.removeProperty("--bpScriptureFont");
     root.style.removeProperty("--bpScriptureSize");
@@ -23869,42 +26822,17 @@ function removeTypographyVars(root: HTMLElement): void {
     root.style.removeProperty("--bpReaderMeasure");
 }
 
-function fontLoadProbe(t: ReaderTypography): string {
-    const family = getFontCssFamily(t.font);
-
-    if (t.font === "inter" || t.font === "human" || t.font === "custom_1") {
-        return `${t.weight} ${t.sizePx}px ${family}`;
-    }
-
-    if (t.font === "mono") {
-        return `${t.weight} ${t.sizePx}px ${family}`;
-    }
-
-    return `${t.weight} ${t.sizePx}px ${family}`;
-}
-
-/* ──────────────────────────────────────────────────────────────
-   Public helpers
-────────────────────────────────────────────────────────────── */
-
-export function typographyLimits() {
+export function typographyLimits(): TypographyLimits {
     return LIMITS;
 }
 
 export function typographySignature(t: ReaderTypography): string {
-    return `f=${t.font}|s=${t.sizePx}|w=${t.weight}|l=${t.leading}|m=${t.measurePx}`;
-}
-
-export function getFontLabel(font: TypographyFont): string {
-    return FONT_PRESETS[font]?.label ?? font;
+    const normalized = normalizeTypography(t);
+    return `f=${normalized.font}|s=${normalized.sizePx}|w=${normalized.weight}|l=${normalized.leading}|m=${normalized.measurePx}`;
 }
 
 export function getFontCssFamily(font: TypographyFont): string {
     return FONT_PRESETS[font]?.css ?? "var(--font-sans)";
-}
-
-export function getFontCategory(font: TypographyFont): FontOption["category"] {
-    return FONT_PRESETS[font]?.category ?? "sans";
 }
 
 export function normalizeReaderTypography(
@@ -23913,12 +26841,76 @@ export function normalizeReaderTypography(
     return normalizeTypography(t ?? undefined);
 }
 
-export function isDefaultTypography(t: ReaderTypography): boolean {
-    return typographySignature(normalizeTypography(t)) === typographySignature(DEFAULT_TYPOGRAPHY);
+export function coerceTypographyPatch(
+     patch: Partial<ReaderTypography> | null | undefined,
+): Partial<ReaderTypography> {
+    if (!patch) return {};
+
+    const out: MutableTypographyPatch = {};
+
+    if (patch.font != null) {
+        out.font = normalizeFont(patch.font);
+    }
+
+    if (patch.sizePx != null) {
+        out.sizePx = clampInt(
+             toNumber(patch.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx,
+             LIMITS.sizePx.lo,
+             LIMITS.sizePx.hi,
+        );
+    }
+
+    if (patch.weight != null) {
+        out.weight = clampInt(
+             toNumber(patch.weight) ?? DEFAULT_TYPOGRAPHY.weight,
+             LIMITS.weight.lo,
+             LIMITS.weight.hi,
+        );
+    }
+
+    if (patch.leading != null) {
+        out.leading = clampFloat(
+             toNumber(patch.leading) ?? DEFAULT_TYPOGRAPHY.leading,
+             LIMITS.leading.lo,
+             LIMITS.leading.hi,
+             LIMITS.leading.digits,
+        );
+    }
+
+    if (patch.measurePx != null) {
+        out.measurePx = clampInt(
+             toNumber(patch.measurePx) ?? DEFAULT_TYPOGRAPHY.measurePx,
+             LIMITS.measurePx.lo,
+             LIMITS.measurePx.hi,
+        );
+    }
+
+    return out;
+}
+
+export function updateTypography(
+     base: ReaderTypography,
+     patch: Partial<ReaderTypography>,
+): ReaderTypography {
+    return normalizeTypography({
+        ...normalizeTypography(base),
+        ...coerceTypographyPatch(patch),
+    });
+}
+
+export function fontOptions(): FontOption[] {
+    return FONT_ORDER.map((id) => ({
+        id,
+        label: FONT_PRESETS[id].label,
+        cssFamily: FONT_PRESETS[id].css,
+        previewFamily: FONT_PRESETS[id].uiFamily ?? FONT_PRESETS[id].css,
+        category: FONT_PRESETS[id].category,
+        previewText: FONT_PRESETS[id].previewText,
+    }));
 }
 
 /**
- * Try v2 → v1 → legacy keys, normalize, and migrate to v2.
+ * Try v2 → v1 → legacy keys, normalize, migrate to v2 envelope.
  */
 export function loadReaderTypography(): ReaderTypography | null {
     const tryKey = (key: string): ReaderTypography | null => {
@@ -23932,7 +26924,7 @@ export function loadReaderTypography(): ReaderTypography | null {
 
     const v1 = tryKey(STORAGE_KEY_V1);
     if (v1) {
-        saveReaderTypography(v1);
+        saveReaderTypographyEnvelope(v1);
         safeLocalStorageRemove(STORAGE_KEY_V1);
         return v1;
     }
@@ -23940,7 +26932,7 @@ export function loadReaderTypography(): ReaderTypography | null {
     for (const key of LEGACY_KEYS) {
         const migrated = tryKey(key);
         if (migrated) {
-            saveReaderTypography(migrated);
+            saveReaderTypographyEnvelope(migrated);
             safeLocalStorageRemove(key);
             return migrated;
         }
@@ -23950,18 +26942,22 @@ export function loadReaderTypography(): ReaderTypography | null {
 }
 
 export function saveReaderTypography(t: ReaderTypography): void {
-    const normalized = normalizeTypography(t);
-    safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(normalized));
+    saveReaderTypographyEnvelope(t);
 }
 
 export function saveReaderTypographyEnvelope(t: ReaderTypography): void {
     const normalized = normalizeTypography(t);
-    const env: TypographyEnvelopeV1 = { v: 1, t: normalized };
+    const env: TypographyEnvelopeV1 = Object.freeze({ v: 1, t: normalized });
     safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(env));
 }
 
 export function clearReaderTypography(): void {
     safeLocalStorageRemove(STORAGE_KEY_V2);
+    safeLocalStorageRemove(STORAGE_KEY_V1);
+
+    for (const key of LEGACY_KEYS) {
+        safeLocalStorageRemove(key);
+    }
 }
 
 export function applyReaderTypography(t: ReaderTypography | null): void {
@@ -23999,51 +26995,22 @@ export function applyReaderTypographyFromStorage(): ReaderTypography | null {
     return t;
 }
 
-export function updateTypography(base: ReaderTypography, patch: Partial<ReaderTypography>): ReaderTypography {
-    return normalizeTypography({ ...normalizeTypography(base), ...patch });
-}
-
-export function fontOptions(): FontOption[] {
-    return (Object.keys(FONT_PRESETS) as TypographyFont[]).map((id) => ({
-        id,
-        label: FONT_PRESETS[id].label,
-        cssFamily: FONT_PRESETS[id].css,
-        category: FONT_PRESETS[id].category,
-    }));
-}
-
-export function fontOptionsByCategory() {
-    const out: Record<FontOption["category"], FontOption[]> = {
-        sans: [],
-        serif: [],
-        rounded: [],
-        mono: [],
-        custom: [],
-    };
-
-    for (const option of fontOptions()) {
-        out[option.category].push(option);
-    }
-
-    return out;
-}
-
 /**
- * Best-effort font readiness wait.
- * Useful after a font switch before measuring text / virtual rows / overlays.
+ * Best-effort wait for document fonts readiness.
  */
 export async function waitForFontsIfSupported(timeoutMs = 700): Promise<void> {
     if (!isDocumentAvailable()) return;
 
-    const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
-    if (!fonts || typeof fonts.ready?.then !== "function") return;
+    const doc = document as Document & { fonts?: FontFaceSet };
+    const fonts = doc.fonts;
+    if (!fonts) return;
 
     let timeoutId: number | null = null;
 
     await Promise.race([
         fonts.ready.then(() => undefined).catch(() => undefined),
         new Promise<void>((resolve) => {
-            timeoutId = window.setTimeout(() => resolve(), timeoutMs);
+            timeoutId = window.setTimeout(resolve, timeoutMs);
         }),
     ]);
 
@@ -24051,108 +27018,12 @@ export async function waitForFontsIfSupported(timeoutMs = 700): Promise<void> {
         window.clearTimeout(timeoutId);
     }
 }
-
-/**
- * Stronger helper: apply, then wait for fonts.
- * Useful when changing font from a picker and wanting calmer layout.
- */
-export async function applyReaderTypographyAndWait(
-     t: ReaderTypography | null,
-     timeoutMs = 700,
-): Promise<void> {
-    applyReaderTypography(t);
-
-    if (!t || !isDocumentAvailable()) return;
-
-    const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
-    if (!fonts) {
-        await waitForFontsIfSupported(timeoutMs);
-        return;
-    }
-
-    try {
-        const normalized = normalizeTypography(t);
-        const probe = fontLoadProbe(normalized);
-
-        const loadPromise =
-             typeof fonts.load === "function"
-                  ? Promise.allSettled([
-                      fonts.load(probe, "The quick brown fox jumps over the lazy dog 0123456789"),
-                      fonts.ready,
-                  ]).then(() => undefined)
-                  : fonts.ready.then(() => undefined);
-
-        let timeoutId: number | null = null;
-
-        await Promise.race([
-            loadPromise,
-            new Promise<void>((resolve) => {
-                timeoutId = window.setTimeout(() => resolve(), timeoutMs);
-            }),
-        ]);
-
-        if (timeoutId != null) {
-            window.clearTimeout(timeoutId);
-        }
-    } catch {
-        await waitForFontsIfSupported(timeoutMs);
-    }
-}
-
-/**
- * Useful for devtools / reset buttons / external normalization.
- */
-export function coerceTypographyPatch(
-     patch: Partial<ReaderTypography> | null | undefined,
-): Partial<ReaderTypography> {
-    if (!patch) return {};
-
-    return {
-        ...(patch.font != null ? { font: normalizeFont(patch.font) } : null),
-        ...(patch.sizePx != null
-             ? {
-                 sizePx: clampInt(
-                      toNumber(patch.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx,
-                      LIMITS.sizePx.lo,
-                      LIMITS.sizePx.hi,
-                 ),
-             }
-             : null),
-        ...(patch.weight != null
-             ? {
-                 weight: clampInt(
-                      toNumber(patch.weight) ?? DEFAULT_TYPOGRAPHY.weight,
-                      LIMITS.weight.lo,
-                      LIMITS.weight.hi,
-                 ),
-             }
-             : null),
-        ...(patch.leading != null
-             ? {
-                 leading: clampFloat(
-                      toNumber(patch.leading) ?? DEFAULT_TYPOGRAPHY.leading,
-                      LIMITS.leading.lo,
-                      LIMITS.leading.hi,
-                      LIMITS.leading.digits,
-                 ),
-             }
-             : null),
-        ...(patch.measurePx != null
-             ? {
-                 measurePx: clampInt(
-                      toNumber(patch.measurePx) ?? DEFAULT_TYPOGRAPHY.measurePx,
-                      LIMITS.measurePx.lo,
-                      LIMITS.measurePx.hi,
-                 ),
-             }
-             : null),
-    };
-}
 ```
 
 ### apps/web/src/reader/useReaderAnnotations.ts
 
 ```ts
+// apps/web/src/reader/useReaderAnnotations.ts
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
     domSelectionToAnchorInput,
@@ -24163,9 +27034,9 @@ import {
     getReaderAnnotationStore,
     type ReaderAnnotationStore,
 } from "./annotationStore";
-import { ReaderDomSelectionResolver } from "./selectionResolver";
+import { ReaderDomSelectionResolver } from "./ReaderDomSelectionResolver";
 
-export type ReaderAnnotationsApi = {
+export type ReaderAnnotationsApi = Readonly<{
     store: ReaderAnnotationStore;
     snapshot: AnnotationSnapshot;
     selection: SelectionAnchorInput | null;
@@ -24174,15 +27045,17 @@ export type ReaderAnnotationsApi = {
     createHighlight: () => string | null;
     createBookmark: () => string | null;
     createNote: (body?: string | null, title?: string | null) => string | null;
-};
+}>;
+
+type SupportedAnnotationKind = "HIGHLIGHT" | "NOTE" | "BOOKMARK";
+
+type CreateAnnotationExtras = Readonly<{
+    body?: string | null;
+    title?: string | null;
+}>;
 
 function canUseDom(): boolean {
-    return typeof document !== "undefined" && typeof window !== "undefined";
-}
-
-function isNodeWithinRoot(root: HTMLElement, node: Node | null): boolean {
-    if (!node) return false;
-    return node === root || root.contains(node);
+    return typeof window !== "undefined" && typeof document !== "undefined";
 }
 
 function getActiveSelection(): Selection | null {
@@ -24199,33 +27072,48 @@ function clearDomSelection(): void {
     try {
         document.getSelection()?.removeAllRanges();
     } catch {
-        // ignore
+        // ignore selection-clear failures
     }
 }
 
+function isNodeWithinRoot(root: HTMLElement, node: Node | null): boolean {
+    if (!node) return false;
+    return node === root || root.contains(node);
+}
+
+function normalizeMaybeString(value: string | null | undefined): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
 function selectionEquals(
-    a: SelectionAnchorInput | null,
-    b: SelectionAnchorInput | null,
+     a: SelectionAnchorInput | null,
+     b: SelectionAnchorInput | null,
 ): boolean {
     if (a === b) return true;
     if (!a || !b) return false;
 
     return (
-        a.start.verseOrd === b.start.verseOrd &&
-        a.start.verseKey === b.start.verseKey &&
-        a.start.tokenIndex === b.start.tokenIndex &&
-        a.start.charOffset === b.start.charOffset &&
-        a.end.verseOrd === b.end.verseOrd &&
-        a.end.verseKey === b.end.verseKey &&
-        a.end.tokenIndex === b.end.tokenIndex &&
-        a.end.charOffset === b.end.charOffset &&
-        a.text === b.text &&
-        a.translationId === b.translationId
+         a.start.verseOrd === b.start.verseOrd &&
+         a.start.verseKey === b.start.verseKey &&
+         a.start.tokenIndex === b.start.tokenIndex &&
+         a.start.charOffset === b.start.charOffset &&
+         a.end.verseOrd === b.end.verseOrd &&
+         a.end.verseKey === b.end.verseKey &&
+         a.end.tokenIndex === b.end.tokenIndex &&
+         a.end.charOffset === b.end.charOffset &&
+         a.text === b.text &&
+         a.translationId === b.translationId
     );
 }
 
+function getStableRoot(rootRef: React.RefObject<HTMLElement | null>): HTMLElement | null {
+    return rootRef.current;
+}
+
 export function useReaderAnnotations(
-    rootRef: React.RefObject<HTMLElement | null>,
+     rootRef: React.RefObject<HTMLElement | null>,
 ): ReaderAnnotationsApi {
     const store = useMemo(() => getReaderAnnotationStore(), []);
     const resolver = useMemo(() => new ReaderDomSelectionResolver(), []);
@@ -24234,7 +27122,11 @@ export function useReaderAnnotations(
     const [selection, setSelection] = useState<SelectionAnchorInput | null>(null);
 
     const selectionRef = useRef<SelectionAnchorInput | null>(selection);
-    selectionRef.current = selection;
+    const rootNodeRef = useRef<HTMLElement | null>(null);
+
+    useEffect(() => {
+        selectionRef.current = selection;
+    }, [selection]);
 
     const setSelectionSafe = useCallback((next: SelectionAnchorInput | null): void => {
         if (selectionEquals(selectionRef.current, next)) return;
@@ -24242,61 +27134,60 @@ export function useReaderAnnotations(
         setSelection(next);
     }, []);
 
-    const clearSelection = useCallback((): void => {
-        clearDomSelection();
-        setSelectionSafe(null);
-    }, [setSelectionSafe]);
-
     const readSelection = useCallback((): void => {
-        const root = rootRef.current;
-        if (!root) {
+        const root = getStableRoot(rootRef);
+        rootNodeRef.current = root;
+
+        if (!root || !canUseDom()) {
             setSelectionSafe(null);
             return;
         }
 
-        const sel = getActiveSelection();
-        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+        const domSelection = getActiveSelection();
+        if (!domSelection || domSelection.rangeCount === 0 || domSelection.isCollapsed) {
             setSelectionSafe(null);
             return;
         }
 
         let range: Range;
         try {
-            range = sel.getRangeAt(0);
+            range = domSelection.getRangeAt(0);
         } catch {
             setSelectionSafe(null);
             return;
         }
 
-        const { commonAncestorContainer } = range;
-        if (!isNodeWithinRoot(root, commonAncestorContainer)) {
+        const commonAncestor = range.commonAncestorContainer;
+        if (!isNodeWithinRoot(root, commonAncestor)) {
             setSelectionSafe(null);
             return;
         }
 
-        const next = domSelectionToAnchorInput(sel, resolver);
+        const next = domSelectionToAnchorInput(domSelection, resolver);
         setSelectionSafe(next);
     }, [resolver, rootRef, setSelectionSafe]);
 
+    const clearSelection = useCallback((): void => {
+        clearDomSelection();
+        setSelectionSafe(null);
+    }, [setSelectionSafe]);
+
     const createAnnotationFromSelection = useCallback(
-        (
-            kind: "HIGHLIGHT" | "NOTE" | "BOOKMARK",
-            extras?: { body?: string | null; title?: string | null },
-        ): string | null => {
-            const current = selectionRef.current;
-            if (!current) return null;
+         (kind: SupportedAnnotationKind, extras?: CreateAnnotationExtras): string | null => {
+             const currentSelection = selectionRef.current;
+             if (!currentSelection) return null;
 
-            const annotationId = store.createTextAnnotation({
-                selection: current,
-                kind,
-                body: extras?.body ?? null,
-                title: extras?.title ?? null,
-            });
+             const annotationId = store.createTextAnnotation({
+                 selection: currentSelection,
+                 kind,
+                 body: normalizeMaybeString(extras?.body),
+                 title: normalizeMaybeString(extras?.title),
+             });
 
-            clearSelection();
-            return annotationId;
-        },
-        [clearSelection, store],
+             clearSelection();
+             return annotationId;
+         },
+         [clearSelection, store],
     );
 
     useEffect(() => {
@@ -24308,32 +27199,18 @@ export function useReaderAnnotations(
     useEffect(() => {
         if (!canUseDom()) return;
 
-        const onSelectionChange = (): void => {
+        const syncRootRef = (): HTMLElement | null => {
+            const root = getStableRoot(rootRef);
+            rootNodeRef.current = root;
+            return root;
+        };
+
+        const handleSelectionRelevantEvent = (): void => {
             readSelection();
         };
 
-        const onPointerUp = (): void => {
-            readSelection();
-        };
-
-        const onMouseUp = (): void => {
-            readSelection();
-        };
-
-        const onTouchEnd = (): void => {
-            readSelection();
-        };
-
-        const onKeyUp = (): void => {
-            readSelection();
-        };
-
-        const onFocusIn = (): void => {
-            readSelection();
-        };
-
-        const onFocusOut = (event: FocusEvent): void => {
-            const root = rootRef.current;
+        const handleFocusOut = (event: FocusEvent): void => {
+            const root = syncRootRef();
             if (!root) {
                 setSelectionSafe(null);
                 return;
@@ -24347,28 +27224,37 @@ export function useReaderAnnotations(
             readSelection();
         };
 
-        const root = rootRef.current;
+        const attachRootListeners = (root: HTMLElement | null): void => {
+            if (!root) return;
+            root.addEventListener("focusin", handleSelectionRelevantEvent);
+            root.addEventListener("focusout", handleFocusOut);
+        };
 
-        document.addEventListener("selectionchange", onSelectionChange);
-        document.addEventListener("pointerup", onPointerUp);
-        document.addEventListener("mouseup", onMouseUp);
-        document.addEventListener("touchend", onTouchEnd);
-        document.addEventListener("keyup", onKeyUp);
+        const detachRootListeners = (root: HTMLElement | null): void => {
+            if (!root) return;
+            root.removeEventListener("focusin", handleSelectionRelevantEvent);
+            root.removeEventListener("focusout", handleFocusOut);
+        };
 
-        root?.addEventListener("focusin", onFocusIn);
-        root?.addEventListener("focusout", onFocusOut);
+        const root = syncRootRef();
 
+        document.addEventListener("selectionchange", handleSelectionRelevantEvent);
+        document.addEventListener("pointerup", handleSelectionRelevantEvent);
+        document.addEventListener("mouseup", handleSelectionRelevantEvent);
+        document.addEventListener("touchend", handleSelectionRelevantEvent);
+        document.addEventListener("keyup", handleSelectionRelevantEvent);
+
+        attachRootListeners(root);
         readSelection();
 
         return () => {
-            document.removeEventListener("selectionchange", onSelectionChange);
-            document.removeEventListener("pointerup", onPointerUp);
-            document.removeEventListener("mouseup", onMouseUp);
-            document.removeEventListener("touchend", onTouchEnd);
-            document.removeEventListener("keyup", onKeyUp);
+            document.removeEventListener("selectionchange", handleSelectionRelevantEvent);
+            document.removeEventListener("pointerup", handleSelectionRelevantEvent);
+            document.removeEventListener("mouseup", handleSelectionRelevantEvent);
+            document.removeEventListener("touchend", handleSelectionRelevantEvent);
+            document.removeEventListener("keyup", handleSelectionRelevantEvent);
 
-            root?.removeEventListener("focusin", onFocusIn);
-            root?.removeEventListener("focusout", onFocusOut);
+            detachRootListeners(rootNodeRef.current);
         };
     }, [readSelection, rootRef, setSelectionSafe]);
 
@@ -24381,10 +27267,10 @@ export function useReaderAnnotations(
         createHighlight: () => createAnnotationFromSelection("HIGHLIGHT"),
         createBookmark: () => createAnnotationFromSelection("BOOKMARK"),
         createNote: (body, title) =>
-            createAnnotationFromSelection("NOTE", {
-                body: body ?? null,
-                title: title ?? null,
-            }),
+             createAnnotationFromSelection("NOTE", {
+                 body: body ?? null,
+                 title: title ?? null,
+             }),
     };
 }
 ```
@@ -24392,19 +27278,28 @@ export function useReaderAnnotations(
 ### apps/web/src/reader/VerseRow.tsx
 
 ```tsx
+// apps/web/src/reader/VerseRow.tsx
 import React, { useCallback, useMemo, useState } from "react";
 import type { Annotation } from "@biblia/annotation";
 import type { BookRow } from "../api";
 import { ReaderAnnotationOverlay } from "./ReaderAnnotationOverlay";
-import type { SliceVerse } from "./types";
+import type { SliceToken, SliceVerse } from "./types";
 import { sx } from "./sx";
 import { BookTitlePage } from "./BookTitlePage";
 
-type Props = {
+type Props = Readonly<{
     row: SliceVerse;
     book: BookRow | null;
     annotations?: readonly Annotation[];
-};
+}>;
+
+type TokenMeta = Readonly<{
+    tokenIndex: number;
+    tokenKind?: string;
+    charStart?: number;
+    charEnd?: number;
+    text: string;
+}>;
 
 function readMaybeString(value: unknown): string | null {
     if (typeof value !== "string") return null;
@@ -24412,35 +27307,138 @@ function readMaybeString(value: unknown): string | null {
     return trimmed.length > 0 ? trimmed : null;
 }
 
+function readMaybeNumber(value: unknown): number | null {
+    if (typeof value !== "number" || !Number.isFinite(value)) return null;
+    return Math.trunc(value);
+}
+
+function getRecord(value: unknown): Record<string, unknown> {
+    return value != null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
 function getRowTranslationId(row: SliceVerse): string | null {
-    const record = row as unknown as Record<string, unknown>;
+    const record = getRecord(row);
+    return readMaybeString(record.translationId) ?? readMaybeString(record.translation_id) ?? null;
+}
+
+function getRowVerseOrd(row: SliceVerse): number {
+    const record = getRecord(row);
+    return readMaybeNumber(record.verseOrd) ?? readMaybeNumber(record.verse_ord) ?? 0;
+}
+
+function getRowVerseKey(row: SliceVerse): string {
+    const record = getRecord(row);
     return (
-        readMaybeString(record.translationId) ??
-        readMaybeString(record.translation_id) ??
-        null
+         readMaybeString(record.verseKey) ??
+         readMaybeString(record.verse_key) ??
+         `${row.bookId}.${row.chapter}.${row.verse}`
     );
+}
+
+function getTokenIndex(token: SliceToken, fallback: number): number {
+    const record = getRecord(token);
+    return readMaybeNumber(record.tokenIndex) ?? readMaybeNumber(record.token_index) ?? fallback;
+}
+
+function getTokenKind(token: SliceToken): string | undefined {
+    const record = getRecord(token);
+    return readMaybeString(record.tokenKind) ?? readMaybeString(record.token_kind) ?? undefined;
+}
+
+function getTokenCharStart(token: SliceToken): number | undefined {
+    const record = getRecord(token);
+    return readMaybeNumber(record.charStart) ?? readMaybeNumber(record.char_start) ?? undefined;
+}
+
+function getTokenCharEnd(token: SliceToken): number | undefined {
+    const record = getRecord(token);
+    return readMaybeNumber(record.charEnd) ?? readMaybeNumber(record.char_end) ?? undefined;
+}
+
+function getTokenText(token: SliceToken): string {
+    const record = getRecord(token);
+    return readMaybeString(record.token) ?? readMaybeString(record.text) ?? "";
+}
+
+function buildVerseAriaLabel(bookLabel: string, chapter: number, verse: number): string {
+    return `${bookLabel} ${chapter}:${verse}`;
+}
+
+function buildVerseTextPlain(row: SliceVerse, tokens: readonly TokenMeta[] | null): string {
+    if (tokens && tokens.length > 0) {
+        return tokens.map((token) => token.text).join("");
+    }
+    return row.text ?? "";
+}
+
+function normalizeTokens(row: SliceVerse): readonly TokenMeta[] | null {
+    if (!Array.isArray(row.tokens) || row.tokens.length === 0) return null;
+
+    return row.tokens.map((token, index) => ({
+        tokenIndex: getTokenIndex(token, index),
+        tokenKind: getTokenKind(token),
+        charStart: getTokenCharStart(token),
+        charEnd: getTokenCharEnd(token),
+        text: getTokenText(token),
+    }));
+}
+
+function shouldHideTokenFromAT(tokenKind: string | undefined): boolean {
+    return tokenKind === "SPACE" || tokenKind === "LINEBREAK";
 }
 
 export const VerseRow = React.memo(function VerseRow(props: Props) {
     const { row, book, annotations = [] } = props;
 
-    const isBookStart = row.chapter === 1 && row.verse === 1;
-    const isChapterStart = row.verse === 1;
-
     const [hovered, setHovered] = useState(false);
     const [focused, setFocused] = useState(false);
 
-    const isInteractive = annotations.length > 0;
-    const translationId = getRowTranslationId(row);
-    const verseTextId = `ord-${row.verseOrd}-text`;
+    const verseOrd = useMemo(() => getRowVerseOrd(row), [row]);
+    const verseKey = useMemo(() => getRowVerseKey(row), [row]);
+    const translationId = useMemo(() => getRowTranslationId(row), [row]);
 
-    const onEnter = useCallback((e: React.PointerEvent) => {
-        if (e.pointerType === "touch") return;
+    const normalizedTokens = useMemo(() => normalizeTokens(row), [row]);
+    const hasTokens = !!normalizedTokens && normalizedTokens.length > 0;
+    const hasAnnotations = annotations.length > 0;
+
+    const isBookStart = row.chapter === 1 && row.verse === 1;
+    const isChapterStart = row.verse === 1;
+
+    const rootId = verseOrd > 0 ? `ord-${verseOrd}` : `verse-${verseKey}`;
+    const verseTextId = `${rootId}-text`;
+
+    const bookLabel = useMemo(() => readMaybeString(book?.name) ?? row.bookId, [book?.name, row.bookId]);
+
+    const ariaLabel = useMemo(
+         () => buildVerseAriaLabel(bookLabel, row.chapter, row.verse),
+         [bookLabel, row.chapter, row.verse],
+    );
+
+    const plainVerseText = useMemo(
+         () => buildVerseTextPlain(row, normalizedTokens),
+         [normalizedTokens, row],
+    );
+
+    const rowStyle = useMemo<React.CSSProperties>(() => {
+        const isSelected = hasAnnotations;
+        return {
+            ...sx.verseRow,
+            ...(hovered ? sx.verseRowHover : {}),
+            ...(focused ? sx.verseRowFocus : {}),
+            ...(isSelected ? sx.verseRowSelected : {}),
+            position: "relative",
+            isolation: "isolate",
+            cursor: "text",
+        };
+    }, [focused, hasAnnotations, hovered]);
+
+    const onPointerEnter = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        if (event.pointerType === "touch") return;
         setHovered(true);
     }, []);
 
-    const onLeave = useCallback((e: React.PointerEvent) => {
-        if (e.pointerType === "touch") return;
+    const onPointerLeave = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        if (event.pointerType === "touch") return;
         setHovered(false);
     }, []);
 
@@ -24452,114 +27450,138 @@ export const VerseRow = React.memo(function VerseRow(props: Props) {
         setFocused(false);
     }, []);
 
-    const bookLabel = (book?.name ?? row.bookId).toString();
-    const ariaLabel = useMemo(() => `${bookLabel} ${row.chapter}:${row.verse}`, [bookLabel, row.chapter, row.verse]);
+    const onMouseDown = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+        if (event.defaultPrevented) return;
+        if (event.button !== 0) return;
+        if (event.detail > 1) return;
 
-    const rowStyle = useMemo<React.CSSProperties>(() => {
-        const base = sx.verseRow;
-        const hover = hovered ? sx.verseRowHover : undefined;
-        const focus = focused ? sx.verseRowFocus : undefined;
-        return {
-            ...base,
-            ...(hover ?? {}),
-            ...(focus ?? {}),
-            position: "relative",
-            isolation: "isolate",
-        };
-    }, [hovered, focused]);
+        const target = event.target as HTMLElement | null;
+        if (!target) return;
 
-    const tokens = row.tokens ?? null;
+        const interactive = target.closest(
+             "button, a, input, textarea, select, summary, [role='button'], [contenteditable='true']",
+        );
+        if (interactive) return;
+
+        event.currentTarget.focus({ preventScroll: true });
+    }, []);
 
     const verseBody = useMemo(() => {
-        if (!tokens || tokens.length === 0) {
+        if (!hasTokens || !normalizedTokens) {
             return row.text ?? "";
         }
 
         return (
-            <>
-                {tokens.map((token) => {
-                    const key = `${row.verseOrd}:${token.tokenIndex}`;
-                    return (
-                        <span
-                            key={key}
-                            data-token-index={token.tokenIndex}
-                            data-token-kind={token.tokenKind ?? undefined}
-                            data-token-char-start={token.charStart ?? undefined}
-                            data-token-char-end={token.charEnd ?? undefined}
-                        >
-                            {token.token}
+             <>
+                 {normalizedTokens.map((token, index) => {
+                     const isWhitespaceOnly =
+                          token.tokenKind === "SPACE" ||
+                          token.tokenKind === "LINEBREAK" ||
+                          token.text.trim().length === 0;
+
+                     return (
+                          <span
+                               key={`${verseOrd}:${token.tokenIndex}:${index}`}
+                               data-token-index={token.tokenIndex}
+                               data-token-kind={token.tokenKind}
+                               data-token-char-start={token.charStart}
+                               data-token-char-end={token.charEnd}
+                               aria-hidden={shouldHideTokenFromAT(token.tokenKind) ? true : undefined}
+                               style={isWhitespaceOnly ? undefined : tokenSpanStyle}
+                          >
+                            {token.text}
                         </span>
-                    );
-                })}
-            </>
+                     );
+                 })}
+             </>
         );
-    }, [tokens, row.text, row.verseOrd]);
+    }, [hasTokens, normalizedTokens, row.text, verseOrd]);
 
     return (
-        <div
-            id={`ord-${row.verseOrd}`}
-            data-ord={row.verseOrd}
-            data-verse-ord={row.verseOrd}
-            data-verse-key={row.verseKey}
-            data-book={row.bookId}
-            data-chapter={row.chapter}
-            data-verse={row.verse}
-            data-translation-id={translationId ?? undefined}
-            data-has-tokens={tokens && tokens.length > 0 ? "1" : "0"}
-            style={{ padding: 0 }}
-        >
-            {isBookStart ? <BookTitlePage book={book} bookId={row.bookId} /> : null}
+         <div
+              id={rootId}
+              data-ord={verseOrd || undefined}
+              data-verse-ord={verseOrd || undefined}
+              data-verse-key={verseKey}
+              data-book={row.bookId}
+              data-chapter={row.chapter}
+              data-verse={row.verse}
+              data-translation-id={translationId ?? undefined}
+              data-has-tokens={hasTokens ? "1" : "0"}
+              style={sx.verseRowWrap}
+         >
+             {isBookStart ? <BookTitlePage book={book} bookId={row.bookId} /> : null}
 
-            {isChapterStart ? (
-                <div style={sx.chapterHeader}>
-                    <div style={sx.chapterKicker}>CHAPTER</div>
-                    <div style={sx.chapterTitle}>
-                        {bookLabel} {row.chapter}
-                    </div>
-                </div>
-            ) : null}
+             {isChapterStart ? (
+                  <div style={sx.chapterHeader}>
+                      <div style={sx.chapterKicker}>CHAPTER</div>
+                      <div style={sx.chapterTitle}>
+                          {bookLabel} {row.chapter}
+                      </div>
+                  </div>
+             ) : null}
 
-            <div
-                role="article"
-                aria-roledescription="verse"
-                aria-label={ariaLabel}
-                aria-describedby={verseTextId}
-                tabIndex={0}
-                style={rowStyle}
-                onPointerEnter={onEnter}
-                onPointerLeave={onLeave}
-                onFocus={onFocus}
-                onBlur={onBlur}
-                data-has-annotations={isInteractive ? "1" : "0"}
-            >
-                <ReaderAnnotationOverlay annotations={annotations} />
+             <div
+                  role="article"
+                  aria-roledescription="verse"
+                  aria-label={ariaLabel}
+                  aria-describedby={verseTextId}
+                  tabIndex={0}
+                  style={rowStyle}
+                  onPointerEnter={onPointerEnter}
+                  onPointerLeave={onPointerLeave}
+                  onFocus={onFocus}
+                  onBlur={onBlur}
+                  onMouseDown={onMouseDown}
+                  data-has-annotations={hasAnnotations ? "1" : "0"}
+                  data-selected={hasAnnotations ? "1" : "0"}
+             >
+                 <ReaderAnnotationOverlay annotations={annotations} />
 
-                <div style={sx.verseNum} aria-hidden="true">
-                    {row.verse}
-                </div>
+                 <div style={sx.verseNum} aria-hidden="true">
+                     {row.verse}
+                 </div>
 
-                <div
-                    id={verseTextId}
-                    className="scripture"
-                    style={sx.verseText}
-                    data-verse-ord={row.verseOrd}
-                    data-verse-key={row.verseKey}
-                    data-translation-id={translationId ?? undefined}
-                >
-                    {verseBody}
-                </div>
-            </div>
-        </div>
+                 <div
+                      id={verseTextId}
+                      className="scripture"
+                      style={sx.verseText}
+                      data-verse-ord={verseOrd || undefined}
+                      data-verse-key={verseKey}
+                      data-translation-id={translationId ?? undefined}
+                      aria-label={plainVerseText}
+                 >
+                     {verseBody}
+                 </div>
+             </div>
+         </div>
     );
 });
+
+const tokenSpanStyle: React.CSSProperties = {
+    whiteSpace: "pre-wrap",
+};
 ```
 
 ### apps/web/src/Search.tsx
 
 ```tsx
 // apps/web/src/Search.tsx
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { apiGetBooks, apiSearch, type BookRow, type SearchPayload, type SearchResult } from "./api";
+import React, {
+    useCallback,
+    useEffect,
+    useId,
+    useMemo,
+    useRef,
+    useState,
+} from "react";
+import {
+    apiGetBooks,
+    apiSearch,
+    type BookRow,
+    type SearchPayload,
+    type SearchResult,
+} from "./api";
 
 export type ReaderLocation = {
     bookId: string;
@@ -24576,7 +27598,24 @@ type Props = {
     autoFocus?: boolean;
 };
 
-type RefParse = { ok: true; loc: ReaderLocation; label: string } | { ok: false };
+type RefParse =
+     | { ok: true; loc: ReaderLocation; label: string }
+     | { ok: false };
+
+type SearchItem =
+     | { kind: "ref"; key: string; label: string; loc: ReaderLocation }
+     | { kind: "result"; key: string; label: string; result: SearchResult }
+     | { kind: "history"; key: string; label: string; q: string };
+
+type HistoryItem = {
+    q: string;
+    at: number;
+};
+
+const HISTORY_KEY = "bp_search_history_v1";
+const MAX_HISTORY = 14;
+const SEARCH_DEBOUNCE_MS = 180;
+const MAX_RESULTS = 30;
 
 function normalizeSpaces(s: string): string {
     return s.replace(/\s+/g, " ").trim();
@@ -24605,16 +27644,15 @@ function parseAbbrs(abbrs: string | null): string[] {
 
     if (Array.isArray(v)) {
         return v
-            .map((x) => (typeof x === "string" ? x : ""))
-            .map((s) => s.trim())
-            .filter(Boolean);
+             .map((x) => (typeof x === "string" ? x : ""))
+             .map((s) => s.trim())
+             .filter(Boolean);
     }
 
-    // fallback: comma / pipe separated string
     return abbrs
-        .split(/[,|]/g)
-        .map((s) => s.trim())
-        .filter(Boolean);
+         .split(/[,|]/g)
+         .map((s) => s.trim())
+         .filter(Boolean);
 }
 
 function buildBookLookup(books: BookRow[]): Map<string, string> {
@@ -24645,10 +27683,6 @@ function parseRef(books: BookRow[] | null, raw: string): RefParse {
     const q = normalizeSpaces(insertSpaceBeforeDigits(raw));
     if (!q) return { ok: false };
 
-    // patterns:
-    //  - "John 3"
-    //  - "John 3:16"
-    //  - "1 Cor 13:4"
     const m = q.match(/^(.+?)\s+(\d+)(?::(\d+))?$/);
     if (!m) return { ok: false };
 
@@ -24660,6 +27694,7 @@ function parseRef(books: BookRow[] | null, raw: string): RefParse {
     if (verse != null && (!Number.isFinite(verse) || verse < 1)) return { ok: false };
 
     if (!books) return { ok: false };
+
     const lookup = buildBookLookup(books);
     const bookId = lookup.get(book);
     if (!bookId) return { ok: false };
@@ -24667,11 +27702,6 @@ function parseRef(books: BookRow[] | null, raw: string): RefParse {
     const label = verse != null ? `${bookId} ${chapter}:${verse}` : `${bookId} ${chapter}`;
     return { ok: true, label, loc: { bookId, chapter, verse } };
 }
-
-/* ---------------- Search history ---------------- */
-type HistoryItem = { q: string; at: number };
-const HISTORY_KEY = "bp_search_history_v1";
-const MAX_HISTORY = 14;
 
 function isHistoryItem(v: unknown): v is HistoryItem {
     if (!v || typeof v !== "object") return false;
@@ -24685,32 +27715,47 @@ function loadHistory(): HistoryItem[] {
     if (!Array.isArray(raw)) return [];
 
     return raw
-        .filter(isHistoryItem)
-        .map((x) => ({ q: normalizeSpaces(x.q), at: x.at }))
-        .filter((x) => x.q.length > 0 && Number.isFinite(x.at))
-        .sort((a, b) => b.at - a.at)
-        .slice(0, MAX_HISTORY);
+         .filter(isHistoryItem)
+         .map((x) => ({ q: normalizeSpaces(x.q), at: x.at }))
+         .filter((x) => x.q.length > 0 && Number.isFinite(x.at))
+         .sort((a, b) => b.at - a.at)
+         .slice(0, MAX_HISTORY);
 }
 
-function saveHistory(q: string): void {
+function persistHistory(history: HistoryItem[]): void {
     if (typeof window === "undefined") return;
+    try {
+        window.localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    } catch {
+        // ignore
+    }
+}
 
+function saveHistory(q: string): HistoryItem[] {
     const qq = normalizeSpaces(q);
-    if (!qq) return;
+    if (!qq) return loadHistory();
 
     const now = Date.now();
     const cur = loadHistory();
-    const merged = [{ q: qq, at: now }, ...cur.filter((it) => it.q.toLowerCase() !== qq.toLowerCase())].slice(
-        0,
-        MAX_HISTORY,
-    );
 
-    try {
-        window.localStorage.setItem(HISTORY_KEY, JSON.stringify(merged));
-    } catch {}
+    const merged = [
+        { q: qq, at: now },
+        ...cur.filter((it) => it.q.toLowerCase() !== qq.toLowerCase()),
+    ].slice(0, MAX_HISTORY);
+
+    persistHistory(merged);
+    return merged;
 }
 
-/* ---------------- Snippet helper ---------------- */
+function clearHistory(): void {
+    if (typeof window === "undefined") return;
+    try {
+        window.localStorage.removeItem(HISTORY_KEY);
+    } catch {
+        // ignore
+    }
+}
+
 function splitSnippet(snippet: string): Array<{ text: string; hi: boolean }> {
     const parts: Array<{ text: string; hi: boolean }> = [];
     const re = /<em>(.*?)<\/em>/gi;
@@ -24729,7 +27774,39 @@ function splitSnippet(snippet: string): Array<{ text: string; hi: boolean }> {
 
     if (last < snippet.length) parts.push({ text: snippet.slice(last), hi: false });
 
-    return parts.map((p) => ({ ...p, text: p.text.replace(/<\/?[^>]+>/g, "") }));
+    return parts.map((p) => ({
+        ...p,
+        text: p.text.replace(/<\/?[^>]+>/g, ""),
+    }));
+}
+
+function eventComposedPath(e: Event): EventTarget[] | null {
+    const maybe = e as Event & { composedPath?: () => EventTarget[] };
+    return typeof maybe.composedPath === "function" ? maybe.composedPath() : null;
+}
+
+function pathContainsNode(path: EventTarget[] | null, node: Node | null): boolean {
+    if (!path || !node) return false;
+    for (const entry of path) {
+        if (entry === node) return true;
+    }
+    return false;
+}
+
+function isWithinEventTarget(
+     target: Node | null,
+     path: EventTarget[] | null,
+     el: HTMLElement | null,
+): boolean {
+    if (!el) return false;
+    if (target && el.contains(target)) return true;
+    return pathContainsNode(path, el);
+}
+
+function itemMetaLabel(kind: SearchItem["kind"], payload: SearchPayload | null): string {
+    if (kind === "ref") return "ref";
+    if (kind === "history") return "history";
+    return payload?.mode ?? "search";
 }
 
 export function Search(props: Props) {
@@ -24737,7 +27814,12 @@ export function Search(props: Props) {
 
     const inputRef = useRef<HTMLInputElement | null>(null);
     const panelRef = useRef<HTMLDivElement | null>(null);
+    const wrapRef = useRef<HTMLDivElement | null>(null);
     const listRef = useRef<HTMLDivElement | null>(null);
+    const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+    const requestSeqRef = useRef(0);
+
+    const listboxId = useId();
 
     const [books, setBooks] = useState<BookRow[] | null>(null);
     const [q, setQ] = useState(props.initialQuery ?? "");
@@ -24746,21 +27828,21 @@ export function Search(props: Props) {
     const [payload, setPayload] = useState<SearchPayload | null>(null);
     const [err, setErr] = useState<string | null>(null);
     const [activeIdx, setActiveIdx] = useState(0);
-
-    const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
     const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory());
 
     useEffect(() => {
         let alive = true;
+
         apiGetBooks()
-            .then((r) => {
-                if (!alive) return;
-                setBooks(r.books);
-            })
-            .catch(() => {
-                if (!alive) return;
-                setBooks(null);
-            });
+             .then((r) => {
+                 if (!alive) return;
+                 setBooks(r.books);
+             })
+             .catch(() => {
+                 if (!alive) return;
+                 setBooks(null);
+             });
+
         return () => {
             alive = false;
         };
@@ -24780,13 +27862,22 @@ export function Search(props: Props) {
         setFocused(true);
     }, [autoFocus]);
 
-    // Query -> search (debounced)
     useEffect(() => {
         const qq = q.trim();
+        const myReqId = ++requestSeqRef.current;
+
         if (!qq) {
             setPayload(null);
             setErr(null);
             setLoading(false);
+            setActiveIdx(0);
+            return;
+        }
+
+        if (ref.ok) {
+            setLoading(false);
+            setPayload(null);
+            setErr(null);
             setActiveIdx(0);
             return;
         }
@@ -24798,59 +27889,98 @@ export function Search(props: Props) {
         setErr(null);
 
         const timer = window.setTimeout(() => {
-            // ✅ apiSearch signature: (q, limit?, opts?)
-            apiSearch(qq, 30, { signal: ctrl.signal })
-                .then((r) => {
-                    if (!alive) return;
-                    setPayload(r);
-                    setLoading(false);
-                    setErr(null);
-                    setActiveIdx(0);
-                })
-                .catch((e) => {
-                    if (!alive) return;
-                    if (String((e as any)?.name ?? "") === "AbortError") return;
-                    setPayload(null);
-                    setErr(String((e as any)?.message ?? e));
-                    setLoading(false);
-                });
-        }, 180);
+            apiSearch(qq, MAX_RESULTS, { signal: ctrl.signal })
+                 .then((r) => {
+                     if (!alive) return;
+                     if (myReqId !== requestSeqRef.current) return;
+                     setPayload(r);
+                     setLoading(false);
+                     setErr(null);
+                     setActiveIdx(0);
+                 })
+                 .catch((e: unknown) => {
+                     if (!alive) return;
+                     if (myReqId !== requestSeqRef.current) return;
+
+                     const name =
+                          typeof e === "object" &&
+                          e !== null &&
+                          "name" in e &&
+                          typeof (e as { name?: unknown }).name === "string"
+                               ? (e as { name: string }).name
+                               : "";
+
+                     if (name === "AbortError") return;
+
+                     const message =
+                          typeof e === "object" &&
+                          e !== null &&
+                          "message" in e &&
+                          typeof (e as { message?: unknown }).message === "string"
+                               ? (e as { message: string }).message
+                               : String(e);
+
+                     setPayload(null);
+                     setErr(message);
+                     setLoading(false);
+                 });
+        }, SEARCH_DEBOUNCE_MS);
 
         return () => {
             alive = false;
             ctrl.abort();
             clearTimeout(timer);
         };
-    }, [q]);
+    }, [q, ref.ok]);
+
+    const hasTypedQuery = q.trim().length > 0;
+    const hasVisibleHistory = focused && !hasTypedQuery && history.length > 0;
 
     const results = payload?.results ?? [];
 
-    // ✅ stability: do NOT open dropdown on focus when query is empty
-    const showPanel = focused && (q.trim().length > 0 || loading || err != null);
-
     const items = useMemo(() => {
-        const list: Array<
-            | { kind: "ref"; label: string; loc: ReaderLocation }
-            | { kind: "result"; label: string; result: SearchResult }
-            | { kind: "history"; label: string; q: string }
-        > = [];
+        const list: SearchItem[] = [];
 
-        if (ref.ok) list.push({ kind: "ref", label: `Go to ${ref.label}`, loc: ref.loc });
+        if (ref.ok) {
+            list.push({
+                kind: "ref",
+                key: `ref:${ref.label}`,
+                label: `Go to ${ref.label}`,
+                loc: ref.loc,
+            });
+            return list;
+        }
 
-        if (!q.trim()) {
-            // history is *stored* but not shown until user types (keeps landing stable)
+        if (!hasTypedQuery) {
+            for (const it of history) {
+                list.push({
+                    kind: "history",
+                    key: `history:${it.q.toLowerCase()}`,
+                    label: it.q,
+                    q: it.q,
+                });
+            }
             return list;
         }
 
         for (const r of results) {
             const fullBook = bookNameById.get(r.bookId) ?? r.bookId;
-            list.push({ kind: "result", label: `${fullBook} ${r.chapter}:${r.verse}`, result: r });
+            list.push({
+                kind: "result",
+                key: `result:${r.bookId}:${r.chapter}:${r.verse}:${r.verseKey ?? ""}`,
+                label: `${fullBook} ${r.chapter}:${r.verse}`,
+                result: r,
+            });
         }
 
         return list;
-    }, [ref, results, bookNameById, q]);
+    }, [ref, hasTypedQuery, history, results, bookNameById]);
 
-    // Keep active option visible WITHOUT scrollIntoView (avoids page jumps)
+    useEffect(() => {
+        if (activeIdx < items.length) return;
+        setActiveIdx(items.length > 0 ? items.length - 1 : 0);
+    }, [activeIdx, items.length]);
+
     useEffect(() => {
         const el = itemRefs.current[activeIdx];
         const list = listRef.current;
@@ -24865,119 +27995,158 @@ export function Search(props: Props) {
         else if (bottom > viewBottom) list.scrollTop = bottom - list.clientHeight;
     }, [activeIdx]);
 
-    // Click outside -> close
+    const showPanel = focused && (hasTypedQuery || hasVisibleHistory || loading || err != null);
+
     useEffect(() => {
         if (!showPanel) return;
 
-        const onDown = (e: MouseEvent) => {
-            const panel = panelRef.current;
-            const input = inputRef.current;
-            const t = e.target instanceof Node ? e.target : null;
-            if (!t) return;
-            if (panel && panel.contains(t)) return;
-            if (input && input.contains(t)) return;
-            setFocused(false);
+        const onPointerDownCapture = (e: PointerEvent) => {
+            const target = e.target as Node | null;
+            const path = eventComposedPath(e);
+
+            const insideWrap = isWithinEventTarget(target, path, wrapRef.current);
+            const insideInput = isWithinEventTarget(target, path, inputRef.current);
+
+            if (!insideWrap && !insideInput) {
+                setFocused(false);
+            }
         };
 
-        window.addEventListener("mousedown", onDown, { capture: true });
-        return () => window.removeEventListener("mousedown", onDown, { capture: true } as any);
+        document.addEventListener("pointerdown", onPointerDownCapture, { capture: true });
+        return () => {
+            document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
+        };
     }, [showPanel]);
 
-    function commitSelection(idx: number): void {
-        const item = items[idx];
-        if (!item) return;
+    const commitSelection = useCallback(
+         (idx: number): void => {
+             const item = items[idx];
+             if (!item) return;
 
-        if (item.kind === "ref") {
-            saveHistory(q);
-            setHistory(loadHistory());
-            onNavigate(item.loc);
-            setFocused(false);
-            inputRef.current?.blur();
-            return;
-        }
+             if (item.kind === "ref") {
+                 const nextHistory = saveHistory(q);
+                 setHistory(nextHistory);
+                 onNavigate(item.loc);
+                 setFocused(false);
+                 inputRef.current?.blur();
+                 return;
+             }
 
-        if (item.kind === "result") {
-            saveHistory(q);
-            setHistory(loadHistory());
-            const r = item.result;
-            onNavigate({ bookId: r.bookId, chapter: r.chapter, verse: r.verse });
-            setFocused(false);
-            inputRef.current?.blur();
-            return;
-        }
+             if (item.kind === "result") {
+                 const nextHistory = saveHistory(q);
+                 setHistory(nextHistory);
+                 const r = item.result;
+                 onNavigate({ bookId: r.bookId, chapter: r.chapter, verse: r.verse });
+                 setFocused(false);
+                 inputRef.current?.blur();
+                 return;
+             }
 
-        if (item.kind === "history") {
-            setQ(item.q);
-            inputRef.current?.focus();
-        }
-    }
+             if (item.kind === "history") {
+                 setQ(item.q);
+                 setFocused(true);
+                 queueMicrotask(() => inputRef.current?.focus());
+             }
+         },
+         [items, onNavigate, q],
+    );
 
-    function onInputKeyDown(e: React.KeyboardEvent<HTMLInputElement>): void {
-        if (e.key === "Escape") {
-            e.preventDefault();
-            if (q.trim()) {
-                setQ("");
-                setPayload(null);
-                setErr(null);
-                setActiveIdx(0);
-                return;
-            }
-            setFocused(false);
-            inputRef.current?.blur();
-            return;
-        }
+    const clearQuery = useCallback(() => {
+        setQ("");
+        setPayload(null);
+        setErr(null);
+        setLoading(false);
+        setActiveIdx(0);
+    }, []);
 
-        if (e.key === "Enter") {
-            e.preventDefault();
+    const onInputKeyDown = useCallback(
+         (e: React.KeyboardEvent<HTMLInputElement>): void => {
+             if (e.key === "Escape") {
+                 e.preventDefault();
 
-            if (!q.trim()) {
-                onStartReading?.();
-                setFocused(false);
-                inputRef.current?.blur();
-                return;
-            }
+                 if (q.trim()) {
+                     clearQuery();
+                     return;
+                 }
 
-            if (items.length > 0) {
-                commitSelection(activeIdx);
-                return;
-            }
+                 setFocused(false);
+                 inputRef.current?.blur();
+                 return;
+             }
 
-            if (ref.ok) {
-                saveHistory(q);
-                setHistory(loadHistory());
-                onNavigate(ref.loc);
-                setFocused(false);
-                inputRef.current?.blur();
-            }
-            return;
-        }
+             if (e.key === "Enter") {
+                 e.preventDefault();
 
-        if (e.key === "ArrowDown") {
-            if (!showPanel) return;
-            e.preventDefault();
-            setActiveIdx((i) => Math.min(items.length - 1, Math.max(0, i + 1)));
-            return;
-        }
+                 if (!q.trim()) {
+                     if (items.length > 0) {
+                         commitSelection(activeIdx);
+                         return;
+                     }
 
-        if (e.key === "ArrowUp") {
-            if (!showPanel) return;
-            e.preventDefault();
-            setActiveIdx((i) => Math.max(0, i - 1));
-            return;
-        }
-    }
+                     onStartReading?.();
+                     setFocused(false);
+                     inputRef.current?.blur();
+                     return;
+                 }
+
+                 if (items.length > 0) {
+                     commitSelection(activeIdx);
+                     return;
+                 }
+
+                 if (ref.ok) {
+                     const nextHistory = saveHistory(q);
+                     setHistory(nextHistory);
+                     onNavigate(ref.loc);
+                     setFocused(false);
+                     inputRef.current?.blur();
+                 }
+
+                 return;
+             }
+
+             if (e.key === "ArrowDown") {
+                 if (!showPanel || items.length === 0) return;
+                 e.preventDefault();
+                 setActiveIdx((i) => Math.min(items.length - 1, Math.max(0, i + 1)));
+                 return;
+             }
+
+             if (e.key === "ArrowUp") {
+                 if (!showPanel || items.length === 0) return;
+                 e.preventDefault();
+                 setActiveIdx((i) => Math.max(0, i - 1));
+                 return;
+             }
+
+             if (e.key === "Home" && showPanel && items.length > 0) {
+                 e.preventDefault();
+                 setActiveIdx(0);
+                 return;
+             }
+
+             if (e.key === "End" && showPanel && items.length > 0) {
+                 e.preventDefault();
+                 setActiveIdx(items.length - 1);
+             }
+         },
+         [q, items, activeIdx, ref, showPanel, clearQuery, commitSelection, onNavigate, onStartReading],
+    );
 
     const searchRowStyle: React.CSSProperties = {
         ...(styles.searchRow ?? {}),
         ...(focused ? (styles.searchRowFocused ?? {}) : null),
     };
 
-    const maxW = (styles.searchWrap?.maxWidth as any) ?? (styles.searchRow?.maxWidth as any) ?? 440;
+    const maxW =
+         styles.searchWrap?.maxWidth ??
+         styles.searchRow?.maxWidth ??
+         440;
 
     const wrapStyle: React.CSSProperties = {
         position: "relative",
         width: "100%",
-        maxWidth: maxW,
+        maxWidth: typeof maxW === "number" || typeof maxW === "string" ? maxW : 440,
         ...(styles.searchWrap ?? null),
     };
 
@@ -24987,109 +28156,173 @@ export function Search(props: Props) {
     };
 
     const hintText = props.hint ?? "";
+    const activeDescendant =
+         showPanel && items[activeIdx] ? `${listboxId}-option-${activeIdx}` : undefined;
 
     return (
-        <div style={wrapStyle}>
-            <div
-                style={searchRowStyle}
-                aria-label="Search"
-                onPointerDown={(e) => {
-                    // keeps focus stable without weird selection / blur side-effects
-                    e.preventDefault();
-                    inputRef.current?.focus();
-                }}
-            >
-        <span style={styles.searchIcon} aria-hidden>
-          ⌕
-        </span>
+         <div ref={wrapRef} style={wrapStyle}>
+             <div
+                  style={searchRowStyle}
+                  aria-label="Search"
+                  onPointerDown={(e) => {
+                      e.preventDefault();
+                      inputRef.current?.focus();
+                  }}
+             >
+                <span style={styles.searchIcon} aria-hidden>
+                    ⌕
+                </span>
 
-                <input
-                    ref={inputRef}
-                    value={q}
-                    onChange={(e) => setQ(e.target.value)}
-                    placeholder="Search… (or John 3:16)"
-                    style={{ ...styles.searchInput, maxWidth: "100%" }}
-                    aria-label="Search scripture"
-                    spellCheck={false}
-                    inputMode="search"
-                    onFocus={() => setFocused(true)}
-                    onKeyDown={onInputKeyDown}
-                />
-            </div>
+                 <input
+                      ref={inputRef}
+                      value={q}
+                      onChange={(e) => setQ(e.target.value)}
+                      placeholder="Search… (or John 3:16)"
+                      style={{ ...styles.searchInput, maxWidth: "100%" }}
+                      aria-label="Search scripture"
+                      aria-expanded={showPanel}
+                      aria-controls={showPanel ? listboxId : undefined}
+                      aria-activedescendant={activeDescendant}
+                      aria-autocomplete="list"
+                      role="combobox"
+                      spellCheck={false}
+                      inputMode="search"
+                      onFocus={() => setFocused(true)}
+                      onKeyDown={onInputKeyDown}
+                 />
 
-            {/* ✅ stability: reserve hint height so center-layout never re-centers/jitters */}
-            <div style={{ ...sx.hintSlot, ...(showPanel ? sx.hintHidden : null) }} aria-hidden={showPanel}>
-                {hintText ? <div style={sx.hint}>{hintText}</div> : null}
-            </div>
+                 {q.trim() ? (
+                      <button
+                           type="button"
+                           style={sx.clearBtn}
+                           aria-label="Clear search"
+                           onPointerDown={(e) => e.preventDefault()}
+                           onClick={() => {
+                               clearQuery();
+                               inputRef.current?.focus();
+                           }}
+                      >
+                          ✕
+                      </button>
+                 ) : null}
+             </div>
 
-            {showPanel ? (
-                <div ref={panelRef} style={panelStyle} role="listbox" aria-label="Search results">
-                    {err ? (
-                        <div style={sx.panelMsg}>{err}</div>
-                    ) : loading ? (
-                        <div style={sx.panelMsg}>Searching…</div>
-                    ) : q.trim() ? (
-                        <div style={sx.panelMsg}>
-                            {items.length ? `${items.length}${items.length === 1 ? " result" : " results"}` : "No results."}
-                            <span style={sx.panelMeta}> {payload?.mode ?? "search"}</span>
-                        </div>
-                    ) : (
-                        <div style={sx.panelMsg}>Type to search.</div>
-                    )}
+             <div
+                  style={{ ...sx.hintSlot, ...(showPanel ? sx.hintHidden : null) }}
+                  aria-hidden={showPanel}
+             >
+                 {hintText ? <div style={sx.hint}>{hintText}</div> : null}
+             </div>
 
-                    {items.length > 0 && (
-                        <div ref={listRef} style={sx.list}>
-                            {items.map((it, idx) => {
-                                const active = idx === activeIdx;
-                                return (
-                                    <button
-                                        key={`${it.kind}:${idx}`}
-                                        ref={(el) => {
-                                            itemRefs.current[idx] = el;
-                                        }}
+             {showPanel ? (
+                  <div ref={panelRef} style={panelStyle}>
+                      <div style={sx.panelMsg}>
+                          {err ? (
+                               <span>{err}</span>
+                          ) : loading ? (
+                               <span>Searching…</span>
+                          ) : !hasTypedQuery && hasVisibleHistory ? (
+                               <>
+                                   <span>Recent searches</span>
+                                   <button
                                         type="button"
-                                        style={{ ...sx.item, ...(active ? sx.itemActive : null) }}
-                                        onMouseEnter={() => setActiveIdx(idx)}
-                                        onMouseDown={(e) => {
-                                            e.preventDefault();
-                                            commitSelection(idx);
+                                        style={sx.inlineBtn}
+                                        onPointerDown={(e) => e.preventDefault()}
+                                        onClick={() => {
+                                            clearHistory();
+                                            setHistory([]);
+                                            setActiveIdx(0);
+                                            inputRef.current?.focus();
                                         }}
-                                        role="option"
-                                        aria-selected={active}
-                                    >
-                                        <div style={sx.itemTop}>
-                                            <span style={sx.itemLabel}>{it.label}</span>
-                                            <span style={sx.itemMeta}>{it.kind === "ref" ? "ref" : payload?.mode ?? "search"}</span>
-                                        </div>
+                                   >
+                                       Clear
+                                   </button>
+                               </>
+                          ) : ref.ok ? (
+                               <>
+                                   <span>Direct reference match</span>
+                                   <span style={sx.panelMeta}>ref</span>
+                               </>
+                          ) : hasTypedQuery ? (
+                               <>
+                                <span>
+                                    {items.length
+                                         ? `${items.length}${items.length === 1 ? " result" : " results"}`
+                                         : "No results."}
+                                </span>
+                                   <span style={sx.panelMeta}>{payload?.mode ?? "search"}</span>
+                               </>
+                          ) : (
+                               <span>Type to search.</span>
+                          )}
+                      </div>
 
-                                        {it.kind === "result" && it.result?.snippet && (
-                                            <div style={sx.snippet}>
-                                                {splitSnippet(it.result.snippet).map((seg, i) => (
-                                                    <span key={i} style={seg.hi ? sx.hi : undefined}>
-                            {seg.text}
-                          </span>
-                                                ))}
+                      {items.length > 0 ? (
+                           <div
+                                id={listboxId}
+                                ref={listRef}
+                                style={sx.list}
+                                role="listbox"
+                                aria-label="Search results"
+                           >
+                               {items.map((it, idx) => {
+                                   const active = idx === activeIdx;
+                                   const meta = itemMetaLabel(it.kind, payload);
+
+                                   return (
+                                        <button
+                                             key={it.key}
+                                             id={`${listboxId}-option-${idx}`}
+                                             ref={(el) => {
+                                                 itemRefs.current[idx] = el;
+                                             }}
+                                             type="button"
+                                             style={{ ...sx.item, ...(active ? sx.itemActive : null) }}
+                                             onMouseEnter={() => setActiveIdx(idx)}
+                                             onPointerDown={(e) => {
+                                                 e.preventDefault();
+                                                 commitSelection(idx);
+                                             }}
+                                             role="option"
+                                             aria-selected={active}
+                                        >
+                                            <div style={sx.itemTop}>
+                                                <span style={sx.itemLabel}>{it.label}</span>
+                                                <span style={sx.itemMeta}>{meta}</span>
                                             </div>
-                                        )}
-                                    </button>
-                                );
-                            })}
-                        </div>
-                    )}
 
-                    <div style={sx.footer}>
-                        <span style={sx.footerText}>↑↓</span>
-                        <span style={sx.footerSep}>navigate</span>
-                        <span style={sx.footerDot}>•</span>
-                        <span style={sx.footerText}>Enter</span>
-                        <span style={sx.footerSep}>open</span>
-                        <span style={sx.footerDot}>•</span>
-                        <span style={sx.footerText}>Esc</span>
-                        <span style={sx.footerSep}>clear</span>
-                    </div>
-                </div>
-            ) : null}
-        </div>
+                                            {it.kind === "result" && it.result.snippet ? (
+                                                 <div style={sx.snippet}>
+                                                     {splitSnippet(it.result.snippet).map((seg, i) => (
+                                                          <span key={i} style={seg.hi ? sx.hi : undefined}>
+                                                        {seg.text}
+                                                    </span>
+                                                     ))}
+                                                 </div>
+                                            ) : null}
+
+                                            {it.kind === "history" ? (
+                                                 <div style={sx.historySub}>Press Enter to reuse this search.</div>
+                                            ) : null}
+                                        </button>
+                                   );
+                               })}
+                           </div>
+                      ) : null}
+
+                      <div style={sx.footer}>
+                          <span style={sx.footerText}>↑↓</span>
+                          <span style={sx.footerSep}>navigate</span>
+                          <span style={sx.footerDot}>•</span>
+                          <span style={sx.footerText}>Enter</span>
+                          <span style={sx.footerSep}>open</span>
+                          <span style={sx.footerDot}>•</span>
+                          <span style={sx.footerText}>Esc</span>
+                          <span style={sx.footerSep}>{q.trim() ? "clear" : "close"}</span>
+                      </div>
+                  </div>
+             ) : null}
+         </div>
     );
 }
 
@@ -25125,6 +28358,7 @@ const sx: Record<string, React.CSSProperties> = {
         textTransform: "uppercase",
         opacity: 0.85,
         userSelect: "none",
+        whiteSpace: "nowrap",
     },
     list: {
         display: "flex",
@@ -25152,7 +28386,10 @@ const sx: Record<string, React.CSSProperties> = {
         justifyContent: "space-between",
         gap: 10,
     },
-    itemLabel: { fontSize: 13.2, letterSpacing: "0.01em" },
+    itemLabel: {
+        fontSize: 13.2,
+        letterSpacing: "0.01em",
+    },
     itemMeta: {
         fontSize: 10,
         color: "var(--muted)",
@@ -25167,7 +28404,16 @@ const sx: Record<string, React.CSSProperties> = {
         color: "var(--muted)",
         lineHeight: 1.55,
     },
-    hi: { color: "var(--fg)", fontWeight: 550 },
+    historySub: {
+        marginTop: 5,
+        fontSize: 11.6,
+        color: "var(--muted)",
+        lineHeight: 1.4,
+    },
+    hi: {
+        color: "var(--fg)",
+        fontWeight: 550,
+    },
     footer: {
         borderTop: "1px solid var(--hairline)",
         padding: "9px 14px",
@@ -25179,11 +28425,20 @@ const sx: Record<string, React.CSSProperties> = {
         background: "var(--overlay2)",
         fontSize: 10.2,
     },
-    footerText: { fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase" },
-    footerSep: { fontSize: 10, opacity: 0.75 },
-    footerDot: { opacity: 0.5, fontSize: 10, paddingInline: 4 },
-
-    // reserves vertical space so Home stays perfectly still (centered layout won’t “re-center”)
+    footerText: {
+        fontSize: 10,
+        letterSpacing: "0.12em",
+        textTransform: "uppercase",
+    },
+    footerSep: {
+        fontSize: 10,
+        opacity: 0.75,
+    },
+    footerDot: {
+        opacity: 0.5,
+        fontSize: 10,
+        paddingInline: 4,
+    },
     hintSlot: {
         height: 18,
         marginTop: 8,
@@ -25202,6 +28457,34 @@ const sx: Record<string, React.CSSProperties> = {
         overflow: "hidden",
         textOverflow: "ellipsis",
     },
+    clearBtn: {
+        border: "none",
+        background: "transparent",
+        color: "var(--muted)",
+        cursor: "pointer",
+        padding: 0,
+        marginLeft: 8,
+        fontSize: 12,
+        lineHeight: 1,
+        width: 18,
+        height: 18,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        borderRadius: 999,
+        flex: "0 0 auto",
+    },
+    inlineBtn: {
+        border: "none",
+        background: "transparent",
+        color: "var(--fg)",
+        cursor: "pointer",
+        padding: 0,
+        fontSize: 11.5,
+        lineHeight: 1.2,
+        textDecoration: "underline",
+        textUnderlineOffset: "0.14em",
+    },
 };
 ```
 
@@ -25212,19 +28495,15 @@ const sx: Record<string, React.CSSProperties> = {
 // Biblia.to — Theme system (MONOCHROME ONLY — ZERO hue accents)
 //
 // Guarantees:
-// - No “accent color” (no red, no blue, no green). Strict neutral grayscale only.
-// - System theme follows OS UNTIL user explicitly chooses.
+// - No hue accents. Strict neutral grayscale only.
+// - System theme follows OS until user explicitly chooses.
 // - Cross-tab sync via storage event.
-// - No deprecated mq.addListener/removeListener usage.
+// - No deprecated MediaQueryList addListener/removeListener usage.
 // - Stable API surface (setMode supports value or updater).
 // - Reduced-motion tracked live.
 // - meta[name="theme-color"] updated.
-// - CSS vars applied to :root; optional selection style injected.
-//
-// Notes:
-// - This file intentionally does NOT “own” all base.css tokens. It sets a core subset
-//   (bg/fg/panel/hairline/muted/overlays/rings/shadows/scrollbars/toggle).
-// - base.css can define additional derived tokens using color-mix when available.
+// - CSS vars applied to :root; selection style injected.
+// - Deterministic, SSR-safe, hardened document sync.
 
 import React, {
     createContext,
@@ -25237,8 +28516,6 @@ import React, {
 } from "react";
 
 export type Mode = "light" | "dark";
-
-// CSSProperties doesn’t include custom CSS vars; extend it safely.
 export type CssVarStyle = React.CSSProperties & Record<string, string | number>;
 
 type ThemeConfig = Readonly<{
@@ -25254,13 +28531,29 @@ type ThemeCtx = Readonly<{
     reducedMotion: boolean;
     hasExplicitChoice: boolean;
     setMode: (next: Mode | ((prev: Mode) => Mode)) => void;
-    clearChoice: () => void; // revert to system + removes storage
+    clearChoice: () => void;
     toggle: () => void;
 }>;
 
+type ToggleSize = "sm" | "md" | "lg";
+
 const ThemeContext = createContext<ThemeCtx | null>(null);
 
-/* --------------------------------- storage -------------------------------- */
+const DEFAULT_STORAGE_KEY = "bp_theme_v3";
+const LEGACY_STORAGE_KEYS = ["bp_theme", "bp_theme_v2"] as const;
+
+const STYLE_ID_SELECTION = "bp-theme-selection-style";
+
+/* -------------------------------- utilities -------------------------------- */
+
+function isBrowser(): boolean {
+    return typeof window !== "undefined" && typeof document !== "undefined";
+}
+
+function isMode(value: unknown): value is Mode {
+    return value === "light" || value === "dark";
+}
+
 function safeGet(key: string): string | null {
     try {
         return typeof window === "undefined" ? null : window.localStorage.getItem(key);
@@ -25287,42 +28580,33 @@ function safeRemove(key: string): void {
 
 function readStoredMode(storageKey: string): Mode | null {
     const saved = safeGet(storageKey);
-    if (saved === "light" || saved === "dark") return saved;
-    return null;
+    return isMode(saved) ? saved : null;
 }
 
 function getSystemMode(): Mode {
-    if (typeof window === "undefined") return "light";
+    if (typeof window === "undefined" || !window.matchMedia) return "light";
     try {
-        return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
+        return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
     } catch {
         return "light";
     }
 }
 
-/* ----------------------------- media subscriptions ----------------------------- */
-function subscribeMediaQuery(query: string, onChange: (matches: boolean) => void): () => void {
+function subscribeMediaQuery(
+     query: string,
+     onChange: (matches: boolean) => void,
+): () => void {
     if (typeof window === "undefined" || !window.matchMedia) return () => {};
+
     const mq = window.matchMedia(query);
+    const handler = (event: MediaQueryListEvent) => onChange(event.matches);
 
-    const handler = () => onChange(!!mq.matches);
-    handler();
+    onChange(mq.matches);
+    mq.addEventListener("change", handler);
 
-    if (mq.addEventListener) {
-        mq.addEventListener("change", handler);
-        return () => mq.removeEventListener("change", handler);
-    }
-
-    // legacy fallback (avoid TS deprecated signatures by using any)
-    const anyMq = mq as any;
-    if (typeof anyMq.addListener === "function") {
-        anyMq.addListener(handler);
-        return () => {
-            if (typeof anyMq.removeListener === "function") anyMq.removeListener(handler);
-        };
-    }
-
-    return () => {};
+    return () => {
+        mq.removeEventListener("change", handler);
+    };
 }
 
 function subscribePrefersReducedMotion(onChange: (reduced: boolean) => void): () => void {
@@ -25337,14 +28621,102 @@ function subscribeForcedColors(onChange: (forced: boolean) => void): () => void 
     return subscribeMediaQuery("(forced-colors: active)", onChange);
 }
 
-/* --------------------------------- meta theme color -------------------------------- */
 function setMetaThemeColor(hex: string): void {
     if (typeof document === "undefined") return;
-    const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute("content", hex);
+
+    let meta = document.querySelector('meta[name="theme-color"]') as HTMLMetaElement | null;
+    if (!meta) {
+        meta = document.createElement("meta");
+        meta.name = "theme-color";
+        document.head.appendChild(meta);
+    }
+    meta.content = hex;
 }
 
-/* --------------------------------- theme vars -------------------------------- */
+function applyCssVars(vars: CssVarStyle): void {
+    if (typeof document === "undefined") return;
+
+    const root = document.documentElement;
+    for (const [key, value] of Object.entries(vars)) {
+        if (!key.startsWith("--")) continue;
+        root.style.setProperty(key, String(value));
+    }
+}
+
+function installSelectionColor(vars: CssVarStyle): void {
+    if (typeof document === "undefined") return;
+
+    const selection = String(vars["--selection"] ?? "").trim();
+    if (!selection) return;
+
+    let el = document.getElementById(STYLE_ID_SELECTION) as HTMLStyleElement | null;
+    if (!el) {
+        el = document.createElement("style");
+        el.id = STYLE_ID_SELECTION;
+        document.head.appendChild(el);
+    }
+
+    el.textContent = `::selection{background:${selection};}::-moz-selection{background:${selection};}`;
+}
+
+function setRootAttrs(mode: Mode, reducedMotion: boolean, forcedColors: boolean): void {
+    if (typeof document === "undefined") return;
+
+    const root = document.documentElement;
+    root.setAttribute("data-theme", mode);
+    root.setAttribute("data-reduced-motion", reducedMotion ? "1" : "0");
+    root.setAttribute("data-forced-colors", forcedColors ? "1" : "0");
+    root.style.colorScheme = mode;
+}
+
+function syncDocumentTheme(args: {
+    mode: Mode;
+    vars: CssVarStyle;
+    reducedMotion: boolean;
+    forcedColors: boolean;
+    metaThemeColorLight: string;
+    metaThemeColorDark: string;
+}): void {
+    const {
+        mode,
+        vars,
+        reducedMotion,
+        forcedColors,
+        metaThemeColorLight,
+        metaThemeColorDark,
+    } = args;
+
+    setRootAttrs(mode, reducedMotion, forcedColors);
+    setMetaThemeColor(mode === "dark" ? metaThemeColorDark : metaThemeColorLight);
+    applyCssVars(vars);
+    installSelectionColor(vars);
+}
+
+function migrateLegacyThemeKeys(storageKey: string): Mode | null {
+    const current = readStoredMode(storageKey);
+    if (current) return current;
+
+    for (const legacyKey of LEGACY_STORAGE_KEYS) {
+        if (legacyKey === storageKey) continue;
+        const old = readStoredMode(legacyKey);
+        if (!old) continue;
+
+        safeSet(storageKey, old);
+        safeRemove(legacyKey);
+        return old;
+    }
+
+    return null;
+}
+
+function dims(size: ToggleSize) {
+    if (size === "sm") return { W: 40, H: 24, PAD: 2 };
+    if (size === "lg") return { W: 50, H: 30, PAD: 2 };
+    return { W: 44, H: 26, PAD: 2 };
+}
+
+/* -------------------------------- theme vars -------------------------------- */
+
 /**
  * Strict monochrome only. No hue.
  * Light is paper-ish neutral. Dark is ink-like neutral.
@@ -25352,158 +28724,87 @@ function setMetaThemeColor(hex: string): void {
 export function getThemeVars(mode: Mode): CssVarStyle {
     if (mode === "dark") {
         return {
-            ["--bg" as any]: "#0b0b0c",
-            ["--fg" as any]: "#f4f3f1",
-            ["--muted" as any]: "rgba(244,243,241,0.64)",
-            ["--muted2" as any]: "rgba(244,243,241,0.50)",
+            "--bg": "#0b0b0c",
+            "--fg": "#f4f3f1",
+            "--muted": "rgba(244,243,241,0.64)",
+            "--muted2": "rgba(244,243,241,0.50)",
 
-            ["--hairline" as any]: "rgba(255,255,255,0.10)",
-            ["--hairline2" as any]: "rgba(255,255,255,0.07)",
+            "--hairline": "rgba(255,255,255,0.10)",
+            "--hairline2": "rgba(255,255,255,0.07)",
 
-            ["--panel" as any]: "rgba(255,255,255,0.045)",
-            ["--panel2" as any]: "rgba(255,255,255,0.065)",
+            "--panel": "rgba(255,255,255,0.045)",
+            "--panel2": "rgba(255,255,255,0.065)",
 
-            ["--overlay" as any]: "rgba(12,12,13,0.76)",
-            ["--overlay2" as any]: "rgba(12,12,13,0.88)",
+            "--overlay": "rgba(12,12,13,0.76)",
+            "--overlay2": "rgba(12,12,13,0.88)",
 
-            ["--activeBg" as any]: "rgba(255,255,255,0.065)",
-            ["--selection" as any]: "rgba(244,243,241,0.20)",
+            "--activeBg": "rgba(255,255,255,0.065)",
+            "--selection": "rgba(244,243,241,0.20)",
 
-            // Focus/rings (neutral)
-            ["--focusRing" as any]: "rgba(255,255,255,0.14)",
-            ["--ring" as any]: "rgba(255,255,255,0.18)",
-            ["--focusShadow" as any]: "0 0 0 7px rgba(255,255,255,0.08)",
+            "--focusRing": "rgba(255,255,255,0.14)",
+            "--ring": "rgba(255,255,255,0.18)",
+            "--focusShadow": "0 0 0 7px rgba(255,255,255,0.08)",
 
-            // Shadows
-            ["--shadowSoft" as any]: "0 10px 36px rgba(0,0,0,0.36)",
-            ["--shadowPop" as any]: "0 26px 110px rgba(0,0,0,0.58)",
-            ["--shadowInset" as any]: "inset 0 1px 0 rgba(255,255,255,0.06)",
+            "--shadowSoft": "0 10px 36px rgba(0,0,0,0.36)",
+            "--shadowPop": "0 26px 110px rgba(0,0,0,0.58)",
+            "--shadowInset": "inset 0 1px 0 rgba(255,255,255,0.06)",
 
-            // Scrollbars
-            ["--scrollTrack" as any]: "rgba(255,255,255,0.08)",
-            ["--scrollThumb" as any]: "rgba(255,255,255,0.18)",
-            ["--scrollThumbHover" as any]: "rgba(255,255,255,0.28)",
+            "--scrollTrack": "rgba(255,255,255,0.08)",
+            "--scrollThumb": "rgba(255,255,255,0.18)",
+            "--scrollThumbHover": "rgba(255,255,255,0.28)",
 
-            // Toggle (monochrome)
-            ["--toggleTrack" as any]: "rgba(255,255,255,0.06)",
-            ["--toggleTrackOn" as any]: "rgba(255,255,255,0.28)",
-            ["--toggleInset" as any]: "inset 0 0 0 1px rgba(255,255,255,0.10)",
-            ["--toggleInsetOn" as any]: "inset 0 0 0 1px rgba(255,255,255,0.45)",
-            ["--toggleKnob" as any]: "rgba(255,255,255,0.96)",
-            ["--toggleKnobShadow" as any]:
-                "0 10px 22px rgba(0,0,0,0.32), 0 0 0 1px rgba(0,0,0,0.20)",
+            "--toggleTrack": "rgba(255,255,255,0.06)",
+            "--toggleTrackOn": "rgba(255,255,255,0.28)",
+            "--toggleInset": "inset 0 0 0 1px rgba(255,255,255,0.10)",
+            "--toggleInsetOn": "inset 0 0 0 1px rgba(255,255,255,0.45)",
+            "--toggleKnob": "rgba(255,255,255,0.96)",
+            "--toggleKnobShadow":
+                 "0 10px 22px rgba(0,0,0,0.32), 0 0 0 1px rgba(0,0,0,0.20)",
         };
     }
 
     return {
-        ["--bg" as any]: "#f6f2ea",
-        ["--fg" as any]: "#15110e",
-        ["--muted" as any]: "rgba(21,17,14,0.58)",
-        ["--muted2" as any]: "rgba(21,17,14,0.44)",
+        "--bg": "#f6f2ea",
+        "--fg": "#15110e",
+        "--muted": "rgba(21,17,14,0.58)",
+        "--muted2": "rgba(21,17,14,0.44)",
 
-        ["--hairline" as any]: "rgba(21,17,14,0.09)",
-        ["--hairline2" as any]: "rgba(21,17,14,0.065)",
+        "--hairline": "rgba(21,17,14,0.09)",
+        "--hairline2": "rgba(21,17,14,0.065)",
 
-        ["--panel" as any]: "rgba(20,14,10,0.028)",
-        ["--panel2" as any]: "rgba(20,14,10,0.045)",
+        "--panel": "rgba(20,14,10,0.028)",
+        "--panel2": "rgba(20,14,10,0.045)",
 
-        ["--overlay" as any]: "rgba(246,242,234,0.86)",
-        ["--overlay2" as any]: "rgba(246,242,234,0.94)",
+        "--overlay": "rgba(246,242,234,0.86)",
+        "--overlay2": "rgba(246,242,234,0.94)",
 
-        ["--activeBg" as any]: "rgba(21,17,14,0.045)",
-        ["--selection" as any]: "rgba(21,17,14,0.14)",
+        "--activeBg": "rgba(21,17,14,0.045)",
+        "--selection": "rgba(21,17,14,0.14)",
 
-        ["--focusRing" as any]: "rgba(21,17,14,0.10)",
-        ["--ring" as any]: "rgba(0,0,0,0.16)",
-        ["--focusShadow" as any]: "0 0 0 6px rgba(21,17,14,0.08)",
+        "--focusRing": "rgba(21,17,14,0.10)",
+        "--ring": "rgba(0,0,0,0.16)",
+        "--focusShadow": "0 0 0 6px rgba(21,17,14,0.08)",
 
-        ["--shadowSoft" as any]: "0 10px 34px rgba(18,12,10,0.075)",
-        ["--shadowPop" as any]: "0 24px 90px rgba(18,12,10,0.14)",
-        ["--shadowInset" as any]: "inset 0 1px 0 rgba(255,255,255,0.38)",
+        "--shadowSoft": "0 10px 34px rgba(18,12,10,0.075)",
+        "--shadowPop": "0 24px 90px rgba(18,12,10,0.14)",
+        "--shadowInset": "inset 0 1px 0 rgba(255,255,255,0.38)",
 
-        ["--scrollTrack" as any]: "rgba(21,17,14,0.06)",
-        ["--scrollThumb" as any]: "rgba(21,17,14,0.18)",
-        ["--scrollThumbHover" as any]: "rgba(21,17,14,0.28)",
+        "--scrollTrack": "rgba(21,17,14,0.06)",
+        "--scrollThumb": "rgba(21,17,14,0.18)",
+        "--scrollThumbHover": "rgba(21,17,14,0.28)",
 
-        ["--toggleTrack" as any]: "rgba(21,17,14,0.045)",
-        ["--toggleTrackOn" as any]: "rgba(0,0,0,0.22)",
-        ["--toggleInset" as any]: "inset 0 0 0 1px rgba(21,17,14,0.08)",
-        ["--toggleInsetOn" as any]: "inset 0 0 0 1px rgba(0,0,0,0.40)",
-        ["--toggleKnob" as any]: "rgba(255,255,255,0.92)",
-        ["--toggleKnobShadow" as any]:
-            "0 10px 22px rgba(18,12,10,0.14), 0 0 0 1px rgba(21,17,14,0.08)",
-    };
-}
-
-function applyCssVars(vars: CssVarStyle): void {
-    if (typeof document === "undefined") return;
-    const root = document.documentElement;
-    for (const [k, v] of Object.entries(vars)) {
-        if (!k.startsWith("--")) continue;
-        root.style.setProperty(k, String(v));
-    }
-}
-
-function installSelectionColor(vars: CssVarStyle): void {
-    if (typeof document === "undefined") return;
-    const sel = String((vars as any)["--selection"] ?? "");
-    if (!sel) return;
-
-    const id = "bp_theme_selection_style";
-    let el = document.getElementById(id) as HTMLStyleElement | null;
-    if (!el) {
-        el = document.createElement("style");
-        el.id = id;
-        document.head.appendChild(el);
-    }
-    el.textContent = `::selection{background:${sel};}::-moz-selection{background:${sel};}`;
-}
-
-function setRootAttrs(mode: Mode, reducedMotion: boolean, forcedColors: boolean): void {
-    if (typeof document === "undefined") return;
-    const root = document.documentElement;
-    root.setAttribute("data-theme", mode);
-    root.setAttribute("data-reduced-motion", reducedMotion ? "1" : "0");
-    root.setAttribute("data-forced-colors", forcedColors ? "1" : "0");
-}
-
-/* -------------------------- system + cross-tab sync -------------------------- */
-function setupThemeSync(
-    storageKey: string,
-    setModeInternal: React.Dispatch<React.SetStateAction<Mode>>,
-    hasExplicitRef: React.RefObject<boolean>,
-): () => void {
-    if (typeof window === "undefined") return () => {};
-
-    const onStorage = (e: StorageEvent) => {
-        if (e.key !== storageKey) return;
-
-        const v = e.newValue;
-        if (v === "light" || v === "dark") {
-            hasExplicitRef.current = true;
-            setModeInternal(v);
-            return;
-        }
-
-        // key removed -> revert to system
-        hasExplicitRef.current = false;
-        setModeInternal(getSystemMode());
-    };
-
-    window.addEventListener("storage", onStorage);
-
-    const disposeSystem = subscribePrefersDark(() => {
-        if (hasExplicitRef.current) return; // user choice wins
-        setModeInternal(getSystemMode());
-    });
-
-    return () => {
-        window.removeEventListener("storage", onStorage);
-        disposeSystem();
+        "--toggleTrack": "rgba(21,17,14,0.045)",
+        "--toggleTrackOn": "rgba(0,0,0,0.22)",
+        "--toggleInset": "inset 0 0 0 1px rgba(21,17,14,0.08)",
+        "--toggleInsetOn": "inset 0 0 0 1px rgba(0,0,0,0.40)",
+        "--toggleKnob": "rgba(255,255,255,0.92)",
+        "--toggleKnobShadow":
+             "0 10px 22px rgba(18,12,10,0.14), 0 0 0 1px rgba(21,17,14,0.08)",
     };
 }
 
 /* -------------------------------- provider -------------------------------- */
+
 export function ThemeProvider(props: {
     children: React.ReactNode;
     storageKey?: string;
@@ -25511,40 +28812,44 @@ export function ThemeProvider(props: {
     metaThemeColorDark?: string;
 }) {
     const config: ThemeConfig = useMemo(
-        () => ({
-            storageKey: props.storageKey ?? "bp_theme_v3",
-            metaThemeColorLight: props.metaThemeColorLight ?? "#f6f2ea",
-            metaThemeColorDark: props.metaThemeColorDark ?? "#0b0b0c",
-        }),
-        [props.storageKey, props.metaThemeColorLight, props.metaThemeColorDark],
+         () => ({
+             storageKey: props.storageKey ?? DEFAULT_STORAGE_KEY,
+             metaThemeColorLight: props.metaThemeColorLight ?? "#f6f2ea",
+             metaThemeColorDark: props.metaThemeColorDark ?? "#0b0b0c",
+         }),
+         [props.storageKey, props.metaThemeColorLight, props.metaThemeColorDark],
     );
+
+    const initialStored = useMemo(() => {
+        const migrated = migrateLegacyThemeKeys(config.storageKey);
+        return migrated ?? readStoredMode(config.storageKey);
+    }, [config.storageKey]);
 
     const [reducedMotion, setReducedMotion] = useState(false);
     const [forcedColors, setForcedColors] = useState(false);
 
-    useEffect(() => subscribePrefersReducedMotion(setReducedMotion), []);
-    useEffect(() => subscribeForcedColors(setForcedColors), []);
-
-    // If there is stored value at boot, that's an explicit choice.
-    const hasExplicitRef = useRef<boolean>(!!readStoredMode(config.storageKey));
+    const hasExplicitRef = useRef<boolean>(!!initialStored);
 
     const [modeInternal, setModeInternal] = useState<Mode>(() => {
-        const saved = readStoredMode(config.storageKey);
-        return saved ?? getSystemMode();
+        return initialStored ?? getSystemMode();
     });
 
     const vars = useMemo(() => getThemeVars(modeInternal), [modeInternal]);
 
+    useEffect(() => subscribePrefersReducedMotion(setReducedMotion), []);
+    useEffect(() => subscribeForcedColors(setForcedColors), []);
+
     const setMode = useCallback(
-        (next: Mode | ((prev: Mode) => Mode)) => {
-            hasExplicitRef.current = true;
-            setModeInternal((prev) => {
-                const resolved = typeof next === "function" ? (next as (p: Mode) => Mode)(prev) : next;
-                safeSet(config.storageKey, resolved);
-                return resolved;
-            });
-        },
-        [config.storageKey],
+         (next: Mode | ((prev: Mode) => Mode)) => {
+             hasExplicitRef.current = true;
+
+             setModeInternal((prev) => {
+                 const resolved = typeof next === "function" ? next(prev) : next;
+                 safeSet(config.storageKey, resolved);
+                 return resolved;
+             });
+         },
+         [config.storageKey],
     );
 
     const clearChoice = useCallback(() => {
@@ -25557,55 +28862,66 @@ export function ThemeProvider(props: {
         setMode((m) => (m === "dark" ? "light" : "dark"));
     }, [setMode]);
 
-    // Apply document attrs + vars (single effect, deterministic ordering)
     useEffect(() => {
-        setRootAttrs(modeInternal, reducedMotion, forcedColors);
-        setMetaThemeColor(modeInternal === "dark" ? config.metaThemeColorDark : config.metaThemeColorLight);
-        applyCssVars(vars);
-        installSelectionColor(vars);
+        syncDocumentTheme({
+            mode: modeInternal,
+            vars,
+            reducedMotion,
+            forcedColors,
+            metaThemeColorLight: config.metaThemeColorLight,
+            metaThemeColorDark: config.metaThemeColorDark,
+        });
     }, [
         modeInternal,
         vars,
         reducedMotion,
         forcedColors,
-        config.metaThemeColorDark,
         config.metaThemeColorLight,
+        config.metaThemeColorDark,
     ]);
 
-    // Cross-tab + system sync
-    useEffect(() => setupThemeSync(config.storageKey, setModeInternal, hasExplicitRef), [config.storageKey]);
-
-    // Old key migrations (keep tight + safe)
     useEffect(() => {
-        const candidates = ["bp_theme", "bp_theme_v2"];
-        const cur = readStoredMode(config.storageKey);
-        if (cur) return;
+        if (!isBrowser()) return;
 
-        for (const k of candidates) {
-            if (k === config.storageKey) continue;
-            const old = readStoredMode(k);
-            if (old) {
-                safeSet(config.storageKey, old);
-                safeRemove(k);
+        const onStorage = (e: StorageEvent) => {
+            if (e.key !== config.storageKey) return;
+
+            const v = e.newValue;
+            if (isMode(v)) {
                 hasExplicitRef.current = true;
-                setModeInternal(old);
-                break;
+                setModeInternal(v);
+                return;
             }
-        }
+
+            hasExplicitRef.current = false;
+            setModeInternal(getSystemMode());
+        };
+
+        const disposeSystem = subscribePrefersDark(() => {
+            if (hasExplicitRef.current) return;
+            setModeInternal(getSystemMode());
+        });
+
+        window.addEventListener("storage", onStorage);
+
+        return () => {
+            window.removeEventListener("storage", onStorage);
+            disposeSystem();
+        };
     }, [config.storageKey]);
 
     const value: ThemeCtx = useMemo(
-        () => ({
-            mode: modeInternal,
-            isDark: modeInternal === "dark",
-            vars,
-            reducedMotion,
-            hasExplicitChoice: hasExplicitRef.current,
-            setMode,
-            clearChoice,
-            toggle,
-        }),
-        [modeInternal, vars, reducedMotion, setMode, clearChoice, toggle],
+         () => ({
+             mode: modeInternal,
+             isDark: modeInternal === "dark",
+             vars,
+             reducedMotion,
+             hasExplicitChoice: hasExplicitRef.current,
+             setMode,
+             clearChoice,
+             toggle,
+         }),
+         [modeInternal, vars, reducedMotion, setMode, clearChoice, toggle],
     );
 
     return <ThemeContext.Provider value={value}>{props.children}</ThemeContext.Provider>;
@@ -25617,44 +28933,41 @@ export function useTheme(): ThemeCtx {
     return ctx;
 }
 
-/** Root wrapper that injects CSS vars + smooth transition (optional) */
+/* -------------------------------- shell -------------------------------- */
+
 export function ThemeShell(props: { children: React.ReactNode; style?: React.CSSProperties }) {
     const { vars, reducedMotion } = useTheme();
 
-    const shellStyle = useMemo(
-        () => ({
-            minHeight: "100vh",
-            background: "var(--bg)",
-            color: "var(--fg)",
-            transition: reducedMotion
-                ? undefined
-                : "background-color 320ms ease, color 320ms ease, border-color 320ms ease, box-shadow 320ms ease",
-            ...vars,
-            ...(props.style ?? {}),
-        }),
-        [vars, props.style, reducedMotion],
+    const shellStyle = useMemo<React.CSSProperties>(
+         () => ({
+             minHeight: "100vh",
+             background: "var(--bg)",
+             color: "var(--fg)",
+             transition: reducedMotion
+                  ? undefined
+                  : "background-color 320ms ease, color 320ms ease, border-color 320ms ease, box-shadow 320ms ease",
+             ...vars,
+             ...(props.style ?? {}),
+         }),
+         [vars, props.style, reducedMotion],
     );
 
     return <div style={shellStyle}>{props.children}</div>;
 }
 
+/* ----------------------------- hover support ----------------------------- */
+
+function useSupportsHover(): boolean {
+    const [hover, setHover] = useState(false);
+
+    useEffect(() => {
+        return subscribeMediaQuery("(hover: hover)", setHover);
+    }, []);
+
+    return hover;
+}
+
 /* ----------------------------- Toggle control ------------------------------ */
-type ToggleSize = "sm" | "md" | "lg";
-
-function dims(size: ToggleSize) {
-    if (size === "sm") return { W: 40, H: 24, PAD: 2 };
-    if (size === "lg") return { W: 50, H: 30, PAD: 2 };
-    return { W: 44, H: 26, PAD: 2 };
-}
-
-function supportsHover(): boolean {
-    if (typeof window === "undefined") return false;
-    try {
-        return !!window.matchMedia?.("(hover:hover)")?.matches;
-    } catch {
-        return false;
-    }
-}
 
 export function ThemeToggleSwitch(props: {
     styles?: Record<string, React.CSSProperties>;
@@ -25665,6 +28978,7 @@ export function ThemeToggleSwitch(props: {
     ariaLabel?: string;
 }) {
     const ctx = useTheme();
+
     const mode = props.mode ?? ctx.mode;
     const onToggle = props.onToggle ?? ctx.toggle;
     const size = props.size ?? "md";
@@ -25679,74 +28993,85 @@ export function ThemeToggleSwitch(props: {
     const [focus, setFocus] = useState(false);
 
     const isOn = mode === "dark";
-    const hoverOk = useMemo(() => supportsHover(), []);
+    const hoverOk = useSupportsHover();
 
     const baseTrack = props.styles?.themePill ?? defaults.track;
     const baseKnob = props.styles?.themeDot ?? defaults.knob;
 
-    const trackStyle: React.CSSProperties = {
-        ...baseTrack,
-        boxSizing: "border-box",
-        width: W,
-        height: H,
-        padding: PAD,
-        borderRadius: 999,
-        background: isOn ? "var(--toggleTrackOn)" : "var(--toggleTrack)",
-        border: "1px solid var(--hairline)",
-        boxShadow: [
-            isOn ? "var(--toggleInsetOn)" : "var(--toggleInset)",
-            focus ? `0 0 0 3px var(--ring)` : "",
-            hover && hoverOk ? "0 10px 26px rgba(0,0,0,0.10)" : "",
-        ]
-            .filter(Boolean)
-            .join(", "),
-        transform: press ? "scale(0.985)" : hover && hoverOk ? "scale(1.01)" : "scale(1)",
-        opacity: press ? 0.965 : 1,
-        outline: "none",
-    };
+    const trackStyle: React.CSSProperties = useMemo(
+         () => ({
+             ...baseTrack,
+             boxSizing: "border-box",
+             width: W,
+             height: H,
+             padding: PAD,
+             borderRadius: 999,
+             background: isOn ? "var(--toggleTrackOn)" : "var(--toggleTrack)",
+             border: "1px solid var(--hairline)",
+             boxShadow: [
+                 isOn ? "var(--toggleInsetOn)" : "var(--toggleInset)",
+                 focus ? "0 0 0 3px var(--ring)" : "",
+                 hover && hoverOk ? "0 10px 26px rgba(0,0,0,0.10)" : "",
+             ]
+                  .filter(Boolean)
+                  .join(", "),
+             transform: press ? "scale(0.985)" : hover && hoverOk ? "scale(1.01)" : "scale(1)",
+             opacity: press ? 0.965 : 1,
+             outline: "none",
+         }),
+         [baseTrack, W, H, PAD, isOn, focus, hover, hoverOk, press],
+    );
 
-    const knobStyle: React.CSSProperties = {
-        ...baseKnob,
-        width: KNOB,
-        height: KNOB,
-        borderRadius: 999,
-        background: "var(--toggleKnob)",
-        boxShadow: "var(--toggleKnobShadow)",
-        transform: `translateX(${isOn ? TRAVEL : 0}px) ${press ? "scale(0.98)" : "scale(1)"}`,
-        backgroundImage: "linear-gradient(180deg, rgba(255,255,255,0.98), rgba(255,255,255,0.88))",
-    };
+    const knobStyle: React.CSSProperties = useMemo(
+         () => ({
+             ...baseKnob,
+             width: KNOB,
+             height: KNOB,
+             borderRadius: 999,
+             background: "var(--toggleKnob)",
+             boxShadow: "var(--toggleKnobShadow)",
+             transform: `translateX(${isOn ? TRAVEL : 0}px) ${press ? "scale(0.98)" : "scale(1)"}`,
+             backgroundImage:
+                  "linear-gradient(180deg, rgba(255,255,255,0.98), rgba(255,255,255,0.88))",
+         }),
+         [baseKnob, KNOB, isOn, TRAVEL, press],
+    );
 
-    const onKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
-        if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            onToggle();
-        }
-    };
+    const onKeyDown = useCallback(
+         (e: React.KeyboardEvent<HTMLButtonElement>) => {
+             if (e.key === "Enter" || e.key === " ") {
+                 e.preventDefault();
+                 onToggle();
+             }
+         },
+         [onToggle],
+    );
 
     return (
-        <button
-            type="button"
-            role="switch"
-            aria-checked={isOn}
-            onClick={onToggle}
-            onKeyDown={onKeyDown}
-            style={trackStyle}
-            aria-label={props.ariaLabel ?? (isOn ? "Switch to light theme" : "Switch to dark theme")}
-            title={props.title ?? (isOn ? "Light" : "Dark")}
-            onMouseEnter={() => setHover(true)}
-            onMouseLeave={() => {
-                setHover(false);
-                setPress(false);
-            }}
-            onMouseDown={() => setPress(true)}
-            onMouseUp={() => setPress(false)}
-            onTouchStart={() => setPress(true)}
-            onTouchEnd={() => setPress(false)}
-            onFocus={() => setFocus(true)}
-            onBlur={() => setFocus(false)}
-        >
-            <span aria-hidden style={knobStyle} />
-        </button>
+         <button
+              type="button"
+              role="switch"
+              aria-checked={isOn}
+              onClick={onToggle}
+              onKeyDown={onKeyDown}
+              style={trackStyle}
+              aria-label={props.ariaLabel ?? (isOn ? "Switch to light theme" : "Switch to dark theme")}
+              title={props.title ?? (isOn ? "Light" : "Dark")}
+              onMouseEnter={() => setHover(true)}
+              onMouseLeave={() => {
+                  setHover(false);
+                  setPress(false);
+              }}
+              onMouseDown={() => setPress(true)}
+              onMouseUp={() => setPress(false)}
+              onTouchStart={() => setPress(true)}
+              onTouchEnd={() => setPress(false)}
+              onTouchCancel={() => setPress(false)}
+              onFocus={() => setFocus(true)}
+              onBlur={() => setFocus(false)}
+         >
+             <span aria-hidden style={knobStyle} />
+         </button>
     );
 }
 
@@ -25758,13 +29083,13 @@ export function ThemeTogglePill(props: {
     title?: string;
 }) {
     return (
-        <ThemeToggleSwitch
-            styles={props.styles}
-            mode={props.mode}
-            onToggle={props.onToggle}
-            size={props.size}
-            title={props.title}
-        />
+         <ThemeToggleSwitch
+              styles={props.styles}
+              mode={props.mode}
+              onToggle={props.onToggle}
+              size={props.size}
+              title={props.title}
+         />
     );
 }
 
@@ -25775,7 +29100,7 @@ const defaults: { track: React.CSSProperties; knob: React.CSSProperties } = {
         alignItems: "center",
         justifyContent: "flex-start",
         transition:
-            "transform 140ms ease, opacity 140ms ease, background 180ms ease, box-shadow 180ms ease",
+             "transform 140ms ease, opacity 140ms ease, background 180ms ease, box-shadow 180ms ease",
         userSelect: "none",
         WebkitTapHighlightColor: "transparent",
     },
@@ -25862,17 +29187,17 @@ export default defineConfig({
 
 ### biblia.to-code-export.md
 
-> TRUNCATED: file was 958335 bytes; showing first 48000 chars
+> TRUNCATED: file was 1075429 bytes; showing first 48000 chars
 
 ```md
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-07T23:21:34.783Z
+Generated: 2026-03-08T03:11:00.325Z
 Root: /Users/dan/Desktop/Biblia-Populi
 Total files: 70
-Total raw bytes (all included files): 1844926
+Total raw bytes (all included files): 2101829
 Truncated/skipped files: 1
-Export time: 13ms
+Export time: 11ms
 
 ## Notes
 
@@ -30184,6 +33509,7 @@ void main().catch((e) => {
 ```ts
 // scripts/dev.ts
 // Biblia.to — root dev runner (Bun-first, production-grade)
+//
 // Run from repo root:
 //   bun run dev
 //
@@ -30192,94 +33518,67 @@ void main().catch((e) => {
 // - apps/web (bun run dev)
 //
 // Features:
-// - Bun-only process management (no child_process)
-// - DB bootstrap (db:bootstrap or migrate+seed) unless BP_DEV_SKIP_DB=1
-// - Optional OSIS import via BP_DEV_IMPORT_OSIS=/abs/or/relative/path.xml
-// - Optional DB verify via BP_DEV_VERIFY_DB=1
-// - Optional API health wait before starting web
-// - Prefixed child stdout/stderr logs
-// - Graceful shutdown with escalation
-// - Better repo/package/script sanity checks
-// - Optional per-service disable switches
+// - Bun-only process management
+// - repo-root discovery (does not blindly trust process.cwd())
+// - DB bootstrap unless BP_DEV_SKIP_DB=1
+// - optional OSIS import + verify
+// - API port preflight to prevent false-positive health checks / EADDRINUSE confusion
+// - optional API health wait before starting web
+// - prefixed child stdout/stderr logs
+// - graceful shutdown with escalation
+// - stronger package/script sanity checks
 //
-// Env knobs:
-//   BP_DEV_SKIP_DB=1
-//   BP_DEV_VERIFY_DB=1
-//   BP_DEV_IMPORT_OSIS=./resources/kjv.xml
-//   BP_DEV_IMPORT_SET_DEFAULT=1
-//
-//   BP_DEV_NO_API=1
-//   BP_DEV_NO_WEB=1
-//
-//   BP_DEV_API_SCRIPT=dev
-//   BP_DEV_WEB_SCRIPT=dev
-//
-//   BP_DEV_VITE_API_BASE=http://localhost:3000
-//
-//   BP_DEV_WAIT_FOR_API=1                (default: 1)
-//   BP_DEV_API_HEALTH_URL=http://localhost:3000/health
-//   BP_DEV_API_HEALTH_TIMEOUT_MS=45000
-//   BP_DEV_API_HEALTH_INTERVAL_MS=350
-//
-//   BP_DEV_SHUTDOWN_GRACE_MS=2500
-//
-// Notes:
-// - Run from repo root.
-// - Assumes apps/api and apps/web are Bun projects with package.json scripts.
-// - If one long-running child exits, the runner shuts the other down.
+// Important fix:
+// - if the API port is already in use before starting the child, fail fast with a clear error.
+//   This prevents the old "health check passed against some other process" bug.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as process from "node:process";
 
 type BunSubprocess = ReturnType<typeof Bun.spawn>;
-
 type ServiceName = "api" | "web";
 
-type Proc = {
+type Proc = Readonly<{
     name: ServiceName;
     proc: BunSubprocess;
     stdoutDone: Promise<void>;
     stderrDone: Promise<void>;
-};
+}>;
 
-type PackageJson = {
+type PackageJson = Readonly<{
     name?: string;
     scripts?: Record<string, string>;
-};
+}>;
 
-const ROOT = process.cwd();
-const API_CWD = path.join(ROOT, "apps", "api");
-const WEB_CWD = path.join(ROOT, "apps", "web");
+type RepoPaths = Readonly<{
+    root: string;
+    api: string;
+    web: string;
+}>;
 
 const DEV_NAME = "Biblia.to Dev";
 
 const procs: Proc[] = [];
 let shuttingDown = false;
-let shutdownRequestedBy: string | null = null;
 let finalized = false;
+let shutdownReason: string | null = null;
 
 /* -------------------------------------------------------------------------- */
-/*                                   helpers                                  */
+/* env / misc helpers                                                          */
 /* -------------------------------------------------------------------------- */
 
 function envStr(name: string, fallback = ""): string {
-    const v = process.env[name];
-    if (typeof v !== "string") return fallback;
-    const s = v.trim();
-    return s || fallback;
-}
-
-function envInt(name: string, fallback: number): number {
-    const raw = envStr(name, "");
-    if (!raw) return fallback;
-    const n = Number(raw);
-    return Number.isFinite(n) ? Math.trunc(n) : fallback;
+    const value = process.env[name];
+    if (typeof value !== "string") return fallback;
+    const trimmed = value.trim();
+    return trimmed || fallback;
 }
 
 function envBool(name: string, fallback = false): boolean {
     const raw = envStr(name, "");
     if (!raw) return fallback;
+
     switch (raw.toLowerCase()) {
         case "1":
         case "true":
@@ -30296,6 +33595,13 @@ function envBool(name: string, fallback = false): boolean {
     }
 }
 
+function envInt(name: string, fallback: number): number {
+    const raw = envStr(name, "");
+    if (!raw) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
 function nowStamp(): string {
     const d = new Date();
     const hh = String(d.getHours()).padStart(2, "0");
@@ -30305,24 +33611,29 @@ function nowStamp(): string {
 }
 
 function log(...args: unknown[]): void {
+    // eslint-disable-next-line no-console
     console.log(`[dev ${nowStamp()}]`, ...args);
 }
 
 function warn(...args: unknown[]): void {
+    // eslint-disable-next-line no-console
     console.warn(`[dev ${nowStamp()}]`, ...args);
 }
 
 function errlog(...args: unknown[]): void {
+    // eslint-disable-next-line no-console
     console.error(`[dev ${nowStamp()}]`, ...args);
 }
 
 function serviceLog(name: ServiceName, stream: "stdout" | "stderr", line: string): void {
     const prefix = `[${name}:${stream}]`;
     if (stream === "stderr") {
+        // eslint-disable-next-line no-console
         console.error(prefix, line);
-    } else {
-        console.log(prefix, line);
+        return;
     }
+    // eslint-disable-next-line no-console
+    console.log(prefix, line);
 }
 
 function bunBin(): string {
@@ -30347,8 +33658,8 @@ function dirExists(p: string): boolean {
     }
 }
 
-function normalizeAbs(p: string): string {
-    return path.isAbsolute(p) ? path.normalize(p) : path.resolve(ROOT, p);
+function normalizeAbs(root: string, p: string): string {
+    return path.isAbsolute(p) ? path.normalize(p) : path.resolve(root, p);
 }
 
 function readJsonFile<T>(filePath: string): T | null {
@@ -30373,18 +33684,65 @@ function hasScript(pkgDir: string, scriptName: string): boolean {
     return Boolean(pkg.scripts && Object.prototype.hasOwnProperty.call(pkg.scripts, scriptName));
 }
 
-function assertRepoShape(): void {
-    if (!dirExists(API_CWD)) {
-        throw new Error(`apps/api not found at ${API_CWD} (run from repo root)`);
+function waitMs(ms: number): Promise<void> {
+    return Bun.sleep(ms);
+}
+
+function formatUnknownError(error: unknown): string {
+    if (error instanceof Error && error.message.trim()) return error.message.trim();
+    if (typeof error === "string" && error.trim()) return error.trim();
+    return String(error);
+}
+
+/* -------------------------------------------------------------------------- */
+/* repo discovery                                                               */
+/* -------------------------------------------------------------------------- */
+
+function looksLikeRepoRoot(dir: string): boolean {
+    return (
+         dirExists(path.join(dir, "apps")) &&
+         dirExists(path.join(dir, "apps", "api")) &&
+         dirExists(path.join(dir, "apps", "web")) &&
+         fileExists(path.join(dir, "package.json"))
+    );
+}
+
+function findRepoRoot(): string {
+    let cur = process.cwd();
+
+    for (let i = 0; i < 12; i += 1) {
+        if (looksLikeRepoRoot(cur)) return cur;
+        const parent = path.dirname(cur);
+        if (parent === cur) break;
+        cur = parent;
     }
-    if (!dirExists(WEB_CWD)) {
-        throw new Error(`apps/web not found at ${WEB_CWD} (run from repo root)`);
+
+    throw new Error(
+         `Could not locate repo root from cwd=${process.cwd()} (expected apps/api + apps/web + package.json)`,
+    );
+}
+
+function resolveRepoPaths(): RepoPaths {
+    const root = findRepoRoot();
+    return Object.freeze({
+        root,
+        api: path.join(root, "apps", "api"),
+        web: path.join(root, "apps", "web"),
+    });
+}
+
+function assertRepoShape(paths: RepoPaths): void {
+    if (!dirExists(paths.api)) {
+        throw new Error(`apps/api not found at ${paths.api}`);
     }
-    if (!fileExists(path.join(API_CWD, "package.json"))) {
-        throw new Error(`missing package.json in ${API_CWD}`);
+    if (!dirExists(paths.web)) {
+        throw new Error(`apps/web not found at ${paths.web}`);
     }
-    if (!fileExists(path.join(WEB_CWD, "package.json"))) {
-        throw new Error(`missing package.json in ${WEB_CWD}`);
+    if (!fileExists(path.join(paths.api, "package.json"))) {
+        throw new Error(`missing package.json in ${paths.api}`);
+    }
+    if (!fileExists(path.join(paths.web, "package.json"))) {
+        throw new Error(`missing package.json in ${paths.web}`);
     }
 }
 
@@ -30394,14 +33752,14 @@ function assertScript(pkgDir: string, scriptName: string, label: string): void {
     }
 }
 
-function resolveOsisPath(raw: string): string {
-    return normalizeAbs(raw);
-}
+/* -------------------------------------------------------------------------- */
+/* stream pumping                                                               */
+/* -------------------------------------------------------------------------- */
 
 async function pumpStream(
-    name: ServiceName,
-    streamName: "stdout" | "stderr",
-    stream: ReadableStream<Uint8Array> | null | undefined,
+     name: ServiceName,
+     streamName: "stdout" | "stderr",
+     stream: ReadableStream<Uint8Array> | null | undefined,
 ): Promise<void> {
     if (!stream) return;
 
@@ -30416,7 +33774,7 @@ async function pumpStream(
 
             carry += decoder.decode(value, { stream: true });
 
-            for (;;) {
+            while (true) {
                 const nl = carry.indexOf("\n");
                 if (nl < 0) break;
 
@@ -30430,10 +33788,12 @@ async function pumpStream(
 
         carry += decoder.decode();
         const finalLine = carry.replace(/\r$/, "");
-        if (finalLine.length > 0) serviceLog(name, streamName, finalLine);
-    } catch (e) {
+        if (finalLine.length > 0) {
+            serviceLog(name, streamName, finalLine);
+        }
+    } catch (error) {
         if (!shuttingDown) {
-            errlog(`${name} ${streamName} pump failed:`, e);
+            errlog(`${name} ${streamName} pump failed:`, formatUnknownError(error));
         }
     } finally {
         try {
@@ -30444,15 +33804,19 @@ async function pumpStream(
     }
 }
 
+/* -------------------------------------------------------------------------- */
+/* subprocess helpers                                                           */
+/* -------------------------------------------------------------------------- */
+
 async function runOnce(
-    name: string,
-    cwd: string,
-    cmd: string[],
-    extraEnv?: Record<string, string>,
+     name: string,
+     cwd: string,
+     cmd: string[],
+     extraEnv?: Record<string, string>,
 ): Promise<void> {
     log(`> (${name}) ${cmd.join(" ")}`);
 
-    const p = Bun.spawn({
+    const proc = Bun.spawn({
         cmd,
         cwd,
         env: { ...process.env, ...(extraEnv ?? {}) },
@@ -30460,17 +33824,17 @@ async function runOnce(
         stderr: "inherit",
     });
 
-    const code = await p.exited;
+    const code = await proc.exited;
     if (code !== 0) {
         throw new Error(`${name} failed (exit ${code})`);
     }
 }
 
 function runLong(
-    name: ServiceName,
-    cwd: string,
-    cmd: string[],
-    extraEnv?: Record<string, string>,
+     name: ServiceName,
+     cwd: string,
+     cmd: string[],
+     extraEnv?: Record<string, string>,
 ): Proc {
     log(`+ (${name}) ${cmd.join(" ")}`);
 
@@ -30482,6 +33846,8 @@ function runLong(
         stderr: "pipe",
     });
 
+    log(`${name} pid=${proc.pid}`);
+
     const stdoutDone = pumpStream(name, "stdout", proc.stdout);
     const stderrDone = pumpStream(name, "stderr", proc.stderr);
 
@@ -30489,77 +33855,77 @@ function runLong(
         if (shuttingDown) return;
 
         const exitCode = typeof code === "number" ? code : 1;
-        if (exitCode === 0) {
-            errlog(`${name} exited unexpectedly with code 0`);
-        } else {
-            errlog(`${name} exited with code ${exitCode}`);
-        }
-
+        errlog(`${name} exited with code ${exitCode}`);
         void shutdown(exitCode === 0 ? 1 : exitCode, `${name} exited`);
     });
 
     return { name, proc, stdoutDone, stderrDone };
 }
 
-async function waitMs(ms: number): Promise<void> {
-    await Bun.sleep(ms);
+/* -------------------------------------------------------------------------- */
+/* network / health helpers                                                     */
+/* -------------------------------------------------------------------------- */
+
+function parsePortFromUrl(rawUrl: string): number | null {
+    try {
+        const url = new URL(rawUrl);
+        if (url.port) {
+            const n = Number(url.port);
+            return Number.isInteger(n) && n > 0 ? n : null;
+        }
+        if (url.protocol === "http:") return 80;
+        if (url.protocol === "https:") return 443;
+        return null;
+    } catch {
+        return null;
+    }
 }
 
-async function shutdown(exitCode = 0, reason = "shutdown"): Promise<never> {
-    if (finalized) {
-        process.exit(exitCode);
-    }
-
-    if (shuttingDown) {
-        if (!shutdownRequestedBy) shutdownRequestedBy = reason;
-        return new Promise<never>(() => {
-            /* never resolves */
+async function isTcpPortOpen(host: string, port: number): Promise<boolean> {
+    try {
+        const socket = await Bun.connect({
+            hostname: host,
+            port,
+            socket: {
+                data() {
+                    socket.end();
+                },
+                open() {
+                    socket.end();
+                },
+                close() {
+                    // no-op
+                },
+                error() {
+                    // no-op
+                },
+            },
         });
+
+        socket.end();
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function assertApiPortFreeBeforeSpawn(): Promise<void> {
+    const enabled = envBool("BP_DEV_WAIT_FOR_API", true);
+    if (!enabled) return;
+
+    const url = envStr("BP_DEV_API_HEALTH_URL", "http://localhost:3000/health");
+    const port = parsePortFromUrl(url);
+    if (!port) {
+        warn(`could not infer API port from BP_DEV_API_HEALTH_URL=${url}; skipping preflight port check`);
+        return;
     }
 
-    shuttingDown = true;
-    shutdownRequestedBy = reason;
-
-    const graceMs = Math.max(100, envInt("BP_DEV_SHUTDOWN_GRACE_MS", 2500));
-    log(`shutting down (${reason})...`);
-
-    for (const p of procs) {
-        try {
-            p.proc.kill("SIGTERM");
-        } catch {
-            // ignore
-        }
+    const occupied = await isTcpPortOpen("127.0.0.1", port);
+    if (occupied) {
+        throw new Error(
+             `API port ${port} is already in use before startup. Kill the existing process or change the port.`
+        );
     }
-
-    const waitAll = Promise.allSettled(
-        procs.map(async (p) => {
-            try {
-                await Promise.race([
-                    p.proc.exited,
-                    waitMs(graceMs),
-                ]);
-            } catch {
-                // ignore
-            }
-        }),
-    );
-
-    await waitAll;
-
-    for (const p of procs) {
-        try {
-            p.proc.kill("SIGKILL");
-        } catch {
-            // ignore
-        }
-    }
-
-    await Promise.allSettled(
-        procs.flatMap((p) => [p.stdoutDone, p.stderrDone]),
-    );
-
-    finalized = true;
-    process.exit(exitCode);
 }
 
 async function waitForApiHealth(): Promise<void> {
@@ -30570,7 +33936,7 @@ async function waitForApiHealth(): Promise<void> {
     }
 
     const url = envStr("BP_DEV_API_HEALTH_URL", "http://localhost:3000/health");
-    const timeoutMs = Math.max(1000, envInt("BP_DEV_API_HEALTH_TIMEOUT_MS", 45_000));
+    const timeoutMs = Math.max(1_000, envInt("BP_DEV_API_HEALTH_TIMEOUT_MS", 45_000));
     const intervalMs = Math.max(100, envInt("BP_DEV_API_HEALTH_INTERVAL_MS", 350));
 
     log(`waiting for API health: ${url}`);
@@ -30582,7 +33948,9 @@ async function waitForApiHealth(): Promise<void> {
         try {
             const res = await fetch(url, {
                 method: "GET",
-                headers: { accept: "application/json,text/plain,*/*" },
+                headers: {
+                    accept: "application/json,text/plain,*/*",
+                },
             });
 
             if (res.ok) {
@@ -30591,39 +33959,107 @@ async function waitForApiHealth(): Promise<void> {
             }
 
             lastErr = new Error(`health returned ${res.status}`);
-        } catch (e) {
-            lastErr = e;
+        } catch (error) {
+            lastErr = error;
         }
 
         await waitMs(intervalMs);
     }
 
-    throw new Error(`API health check timed out after ${timeoutMs}ms (${String(lastErr ?? "unknown error")})`);
+    throw new Error(
+         `API health check timed out after ${timeoutMs}ms (${formatUnknownError(lastErr ?? "unknown error")})`,
+    );
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                 bootstrap                                   */
+/* shutdown                                                                     */
 /* -------------------------------------------------------------------------- */
 
-async function bootstrapDb(bunPath: string): Promise<void> {
+async function shutdown(exitCode = 0, reason = "shutdown"): Promise<never> {
+    if (finalized) {
+        process.exit(exitCode);
+    }
+
+    if (shuttingDown) {
+        return new Promise<never>(() => {
+            // intentionally never resolves; primary shutdown path owns exit
+        });
+    }
+
+    shuttingDown = true;
+    shutdownReason = reason;
+
+    const graceMs = Math.max(100, envInt("BP_DEV_SHUTDOWN_GRACE_MS", 2_500));
+    log(`shutting down (${reason})...`);
+
+    for (const entry of procs) {
+        try {
+            entry.proc.kill("SIGTERM");
+        } catch {
+            // ignore
+        }
+    }
+
+    await Promise.allSettled(
+         procs.map(async (entry) => {
+             try {
+                 await Promise.race([entry.proc.exited, waitMs(graceMs)]);
+             } catch {
+                 // ignore
+             }
+         }),
+    );
+
+    for (const entry of procs) {
+        try {
+            entry.proc.kill("SIGKILL");
+        } catch {
+            // ignore
+        }
+    }
+
+    await Promise.allSettled(procs.flatMap((entry) => [entry.stdoutDone, entry.stderrDone]));
+
+    finalized = true;
+    process.exit(exitCode);
+}
+
+/* -------------------------------------------------------------------------- */
+/* bootstrap                                                                    */
+/* -------------------------------------------------------------------------- */
+
+function resolveOsisPath(root: string, raw: string): string {
+    return normalizeAbs(root, raw);
+}
+
+async function bootstrapDb(bunPath: string, paths: RepoPaths): Promise<void> {
     if (envBool("BP_DEV_SKIP_DB")) {
         log("BP_DEV_SKIP_DB=1 -> skipping DB bootstrap");
         return;
     }
 
-    if (hasScript(API_CWD, "db:bootstrap")) {
-        await runOnce("api:db:bootstrap", API_CWD, [bunPath, "run", "db:bootstrap"]);
+    const apiCwd = paths.api;
+
+    if (hasScript(apiCwd, "db:bootstrap")) {
+        await runOnce("api:db:bootstrap", apiCwd, [bunPath, "run", "db:bootstrap"]);
     } else {
         warn(`apps/api has no "db:bootstrap"; falling back to db:migrate + db:seed`);
 
-        if (hasScript(API_CWD, "db:migrate")) {
-            await runOnce("api:db:migrate", API_CWD, [bunPath, "run", "db:migrate"]);
+        const hasMigrate = hasScript(apiCwd, "db:migrate");
+        const hasSeed = hasScript(apiCwd, "db:seed");
+
+        if (!hasMigrate && !hasSeed) {
+            throw new Error(`apps/api has neither "db:bootstrap" nor "db:migrate"/"db:seed"`);
+        }
+
+        if (hasMigrate) {
+            await runOnce("api:db:migrate", apiCwd, [bunPath, "run", "db:migrate"]);
         } else {
             warn(`apps/api missing "db:migrate"`);
         }
 
-        if (hasScript(API_CWD, "db:seed")) {
-            await runOnce("api:db:seed", API_CWD, [bunPath, "run", "db:seed"]);
+        if (hasSeed) {
+            await runOnce("api:db:seed", apiCwd, [bunPath, "run", "db:seed"]);
         } else {
             warn(`apps/api missing "db:seed"`);
         }
@@ -30631,34 +34067,38 @@ async function bootstrapDb(bunPath: string): Promise<void> {
 
     const osisRaw = envStr("BP_DEV_IMPORT_OSIS", "");
     if (osisRaw) {
-        const osisPath = resolveOsisPath(osisRaw);
+        const osisPath = resolveOsisPath(paths.root, osisRaw);
 
         if (!fileExists(osisPath)) {
             warn(`BP_DEV_IMPORT_OSIS set but file does not exist: ${osisPath}`);
-        } else if (hasScript(API_CWD, "import:osis")) {
+        } else if (hasScript(apiCwd, "import:osis")) {
             const extraEnv: Record<string, string> = {};
-
             if (envBool("BP_DEV_IMPORT_SET_DEFAULT")) {
                 extraEnv.BP_IMPORT_SET_DEFAULT = "1";
             }
 
-            await runOnce("api:import:osis", API_CWD, [bunPath, "run", "import:osis", osisPath], extraEnv);
+            await runOnce("api:import:osis", apiCwd, [bunPath, "run", "import:osis", osisPath], extraEnv);
         } else {
             warn(`apps/api has no "import:osis" script; skipping OSIS import`);
         }
     }
 
-    if (envBool("BP_DEV_VERIFY_DB") && hasScript(API_CWD, "db:verify")) {
-        await runOnce("api:db:verify", API_CWD, [bunPath, "run", "db:verify"]);
+    if (envBool("BP_DEV_VERIFY_DB")) {
+        if (hasScript(apiCwd, "db:verify")) {
+            await runOnce("api:db:verify", apiCwd, [bunPath, "run", "db:verify"]);
+        } else {
+            warn(`BP_DEV_VERIFY_DB=1 but apps/api has no "db:verify" script`);
+        }
     }
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                    main                                     */
+/* main                                                                         */
 /* -------------------------------------------------------------------------- */
 
 async function main(): Promise<void> {
     const bunPath = bunBin();
+    const paths = resolveRepoPaths();
 
     const noApi = envBool("BP_DEV_NO_API");
     const noWeb = envBool("BP_DEV_NO_WEB");
@@ -30667,31 +34107,30 @@ async function main(): Promise<void> {
     const webScript = envStr("BP_DEV_WEB_SCRIPT", "dev");
 
     log(`=== ${DEV_NAME} ===`);
-    log("ROOT:", ROOT);
-    log("API :", API_CWD);
-    log("WEB :", WEB_CWD);
+    log("ROOT:", paths.root);
+    log("API :", paths.api);
+    log("WEB :", paths.web);
     log("BUN :", bunPath);
 
-    assertRepoShape();
-
-    if (!noApi) assertScript(API_CWD, apiScript, "apps/api");
-    if (!noWeb) assertScript(WEB_CWD, webScript, "apps/web");
+    assertRepoShape(paths);
 
     if (noApi && noWeb) {
         throw new Error("both BP_DEV_NO_API=1 and BP_DEV_NO_WEB=1 were set; nothing to run");
     }
 
     if (!noApi) {
-        await bootstrapDb(bunPath);
-    } else {
-        log("BP_DEV_NO_API=1 -> skipping API bootstrap and API process start");
+        assertScript(paths.api, apiScript, "apps/api");
+    }
+    if (!noWeb) {
+        assertScript(paths.web, webScript, "apps/web");
     }
 
-    const viteApiBase = envStr("BP_DEV_VITE_API_BASE", "");
-    const webEnv = viteApiBase ? { VITE_API_BASE: viteApiBase } : undefined;
-
     if (!noApi) {
-        procs.push(runLong("api", API_CWD, [bunPath, "run", apiScript]));
+        await bootstrapDb(bunPath, paths);
+        await assertApiPortFreeBeforeSpawn();
+        procs.push(runLong("api", paths.api, [bunPath, "run", apiScript]));
+    } else {
+        log("BP_DEV_NO_API=1 -> skipping API bootstrap and API process start");
     }
 
     if (!noApi && !noWeb) {
@@ -30699,7 +34138,9 @@ async function main(): Promise<void> {
     }
 
     if (!noWeb) {
-        procs.push(runLong("web", WEB_CWD, [bunPath, "run", webScript], webEnv));
+        const viteApiBase = envStr("BP_DEV_VITE_API_BASE", "");
+        const webEnv = viteApiBase ? { VITE_API_BASE: viteApiBase } : undefined;
+        procs.push(runLong("web", paths.web, [bunPath, "run", webScript], webEnv));
     } else {
         log("BP_DEV_NO_WEB=1 -> skipping web process start");
     }
@@ -30708,7 +34149,7 @@ async function main(): Promise<void> {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                              process lifecycle                              */
+/* lifecycle                                                                    */
 /* -------------------------------------------------------------------------- */
 
 process.on("SIGINT", () => {
@@ -30719,18 +34160,21 @@ process.on("SIGTERM", () => {
     void shutdown(0, "SIGTERM");
 });
 
-process.on("uncaughtException", (e) => {
-    errlog("uncaughtException:", e);
+process.on("uncaughtException", (error) => {
+    errlog("uncaughtException:", formatUnknownError(error));
     void shutdown(1, "uncaughtException");
 });
 
-process.on("unhandledRejection", (e) => {
-    errlog("unhandledRejection:", e);
+process.on("unhandledRejection", (error) => {
+    errlog("unhandledRejection:", formatUnknownError(error));
     void shutdown(1, "unhandledRejection");
 });
 
-void main().catch((e) => {
-    errlog("fatal:", e);
+void main().catch((error) => {
+    errlog("fatal:", formatUnknownError(error));
+    if (shutdownReason) {
+        errlog("shutdown reason:", shutdownReason);
+    }
     void shutdown(1, "startup failure");
 });
 ```

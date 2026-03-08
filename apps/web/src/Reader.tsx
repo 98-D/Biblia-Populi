@@ -1,3 +1,4 @@
+// apps/web/src/Reader.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiGetBooks, apiGetSpine, apiResolveLoc, type BookRow } from "./api";
 import type { ReaderLocation } from "./Search";
@@ -9,19 +10,39 @@ import type { ReaderViewportHandle } from "./reader/ReaderViewport";
 import { applyReaderTypographyFromStorage } from "./reader/typography";
 import { useReaderAnnotations } from "./reader/useReaderAnnotations";
 
-type Props = {
+type Props = Readonly<{
     styles: Record<string, React.CSSProperties>;
     onBackHome: () => void;
     initialLocation?: ReaderLocation;
     mode?: Mode;
     onToggleTheme?: () => void;
-};
+}>;
+
+type ScrollMode = "auto" | "smooth";
 
 const LS_LAST_ORD = "bp_last_pos_ord_v1";
 const LS_LAST_LOC = "bp_last_pos_loc_v1";
 
+type PendingJump = Readonly<{
+    ord: number;
+    behavior: ScrollMode;
+}>;
+
+type StoredLocation = Readonly<{
+    bookId: string;
+    chapter: number;
+    verse: number | null;
+}>;
+
+const INITIAL_POSITION: ReaderPosition = {
+    ord: 1,
+    verse: null,
+    book: null,
+};
+
 function safeGetLS(key: string): string | null {
     try {
+        if (typeof localStorage === "undefined") return null;
         return localStorage.getItem(key);
     } catch {
         return null;
@@ -30,6 +51,7 @@ function safeGetLS(key: string): string | null {
 
 function safeSetLS(key: string, value: string): void {
     try {
+        if (typeof localStorage === "undefined") return;
         localStorage.setItem(key, value);
     } catch {
         // ignore
@@ -37,22 +59,66 @@ function safeSetLS(key: string, value: string): void {
 }
 
 function clampOrd(ord: number, spine: SpineStats): number {
-    const n = Math.floor(ord);
+    const n = Math.trunc(ord);
     return Math.max(spine.verseOrdMin, Math.min(spine.verseOrdMax, n));
 }
 
-function parseFiniteInt(s: string | null): number | null {
-    if (!s) return null;
-    const n = Number(s);
+function parseFiniteInt(value: string | null): number | null {
+    if (!value) return null;
+    const n = Number(value);
     if (!Number.isFinite(n)) return null;
-    return Math.floor(n);
+    return Math.trunc(n);
 }
-
-type PendingJump = { ord: number; behavior: "auto" | "smooth" };
 
 function makeLocKey(loc?: ReaderLocation): string {
     if (!loc) return "";
     return `${loc.bookId}:${loc.chapter}:${loc.verse ?? ""}`;
+}
+
+function isStoredLocation(value: unknown): value is StoredLocation {
+    if (!value || typeof value !== "object") return false;
+    const v = value as Record<string, unknown>;
+
+    if (typeof v.bookId !== "string" || v.bookId.trim() === "") return false;
+    if (typeof v.chapter !== "number" || !Number.isFinite(v.chapter) || v.chapter < 1) return false;
+    if (v.verse !== null && (typeof v.verse !== "number" || !Number.isFinite(v.verse) || v.verse < 1)) return false;
+
+    return true;
+}
+
+function parseStoredLocation(raw: string | null): StoredLocation | null {
+    if (!raw) return null;
+
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        return isStoredLocation(parsed)
+             ? {
+                 bookId: parsed.bookId.trim().toUpperCase(),
+                 chapter: Math.trunc(parsed.chapter),
+                 verse: parsed.verse == null ? null : Math.trunc(parsed.verse),
+             }
+             : null;
+    } catch {
+        return null;
+    }
+}
+
+function sameVerse(
+     a: ReaderPosition["verse"] | null | undefined,
+     b: ReaderPosition["verse"] | null | undefined,
+): boolean {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    return a.bookId === b.bookId && a.chapter === b.chapter && a.verse === b.verse;
+}
+
+function sameBook(
+     a: ReaderPosition["book"] | null | undefined,
+     b: ReaderPosition["book"] | null | undefined,
+): boolean {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    return a.bookId === b.bookId;
 }
 
 export function Reader(props: Props) {
@@ -61,7 +127,7 @@ export function Reader(props: Props) {
     const [books, setBooks] = useState<BookRow[] | null>(null);
     const [spine, setSpine] = useState<SpineStats | null>(null);
     const [err, setErr] = useState<string | null>(null);
-    const [pos, setPos] = useState<ReaderPosition>(() => ({ ord: 1, verse: null, book: null }));
+    const [pos, setPos] = useState<ReaderPosition>(INITIAL_POSITION);
 
     const viewportHandleRef = useRef<ReaderViewportHandle | null>(null);
     const [viewportHandle, setViewportHandle] = useState<ReaderViewportHandle | null>(null);
@@ -69,11 +135,11 @@ export function Reader(props: Props) {
 
     const pendingJumpRef = useRef<PendingJump | null>(null);
     const didRestoreRef = useRef(false);
-    const appliedInitialKeyRef = useRef<string>("");
+    const appliedInitialKeyRef = useRef("");
+    const loadSeqRef = useRef(0);
     const resolveSeqRef = useRef(0);
 
     const selectionRootRef = useRef<HTMLDivElement | null>(null);
-
     const annotations = useReaderAnnotations(selectionRootRef);
 
     useEffect(() => {
@@ -85,97 +151,105 @@ export function Reader(props: Props) {
     }, [spine?.verseOrdMin, spine?.verseOrdMax, spine?.verseCount]);
 
     useEffect(() => {
-        const ac = new AbortController();
+        const seq = ++loadSeqRef.current;
         let alive = true;
 
         (async () => {
             try {
-                const [b, s] = await Promise.all([apiGetBooks(), apiGetSpine()]);
-                if (!alive || ac.signal.aborted) return;
-                setBooks(b.books);
-                setSpine(s);
+                setErr(null);
+                const [bookRes, spineRes] = await Promise.all([apiGetBooks(), apiGetSpine()]);
+                if (!alive || seq !== loadSeqRef.current) return;
+
+                setBooks(bookRes.books);
+                setSpine(spineRes);
             } catch (e: unknown) {
+                if (!alive || seq !== loadSeqRef.current) return;
                 const msg = e instanceof Error ? e.message : String(e);
-                if (!alive || ac.signal.aborted) return;
                 setErr(msg);
             }
         })();
 
         return () => {
             alive = false;
-            ac.abort();
         };
     }, []);
 
     const bookById = useMemo(() => {
-        const m = new Map<string, BookRow>();
-        for (const b of books ?? []) m.set(b.bookId, b);
-        return m;
+        const map = new Map<string, BookRow>();
+        for (const book of books ?? []) {
+            map.set(book.bookId, book);
+        }
+        return map;
     }, [books]);
 
     const posLabel = useMemo(() => {
         if (!spine) return "…";
         if (!pos.verse) return `#${pos.ord}`;
+
         const bookName = pos.book?.name ?? pos.verse.bookId;
         return `${bookName} ${pos.verse.chapter}:${pos.verse.verse}`;
-    }, [spine, pos.ord, pos.verse, pos.book]);
+    }, [spine, pos]);
 
     const canJumpNow = !!(spine && viewportReady && viewportHandle);
 
-    const setViewportRef = useCallback((h: ReaderViewportHandle | null) => {
-        viewportHandleRef.current = h;
-        setViewportHandle(h);
+    const setViewportRef = useCallback((handle: ReaderViewportHandle | null) => {
+        viewportHandleRef.current = handle;
+        setViewportHandle(handle);
     }, []);
 
     const jumpToOrd = useCallback(
-        (ord: number, behavior: "auto" | "smooth") => {
-            if (!spine) return;
-            const clamped = clampOrd(ord, spine);
+         (ord: number, behavior: ScrollMode) => {
+             if (!spine) return;
 
-            if (viewportHandle && viewportReady) {
-                viewportHandle.jumpToOrd(clamped, behavior);
-            } else {
-                pendingJumpRef.current = { ord: clamped, behavior };
-            }
-        },
-        [spine, viewportHandle, viewportReady],
+             const clamped = clampOrd(ord, spine);
+             const handle = viewportHandleRef.current;
+
+             if (handle && viewportReady) {
+                 handle.jumpToOrd(clamped, behavior);
+                 return;
+             }
+
+             pendingJumpRef.current = { ord: clamped, behavior };
+         },
+         [spine, viewportReady],
     );
 
     const resolveAndJump = useCallback(
-        async (bookId: string, chapter: number, verse: number | null, behavior: "auto" | "smooth") => {
-            if (!bookId) return;
+         async (bookId: string, chapter: number, verse: number | null, behavior: ScrollMode) => {
+             const cleanBookId = bookId.trim().toUpperCase();
+             if (!cleanBookId || chapter < 1) return;
 
-            annotations.clearSelection();
-            setErr(null);
+             annotations.clearSelection();
+             setErr(null);
 
-            const seq = ++resolveSeqRef.current;
+             const seq = ++resolveSeqRef.current;
 
-            try {
-                const loc = await apiResolveLoc(bookId, chapter, verse);
-                if (seq !== resolveSeqRef.current) return;
-                if (!loc?.verseOrd) return;
+             try {
+                 const loc = await apiResolveLoc(cleanBookId, chapter, verse);
+                 if (seq !== resolveSeqRef.current) return;
+                 if (!loc?.verseOrd || !Number.isFinite(loc.verseOrd)) return;
 
-                jumpToOrd(loc.verseOrd, behavior);
+                 jumpToOrd(loc.verseOrd, behavior);
 
-                safeSetLS(
-                    LS_LAST_LOC,
-                    JSON.stringify({
-                        bookId,
-                        chapter,
-                        verse: verse ?? null,
-                    }),
-                );
-            } catch (e: unknown) {
-                if (seq !== resolveSeqRef.current) return;
-                const msg = e instanceof Error ? e.message : String(e);
-                setErr(msg);
-            }
-        },
-        [annotations, jumpToOrd],
+                 safeSetLS(
+                      LS_LAST_LOC,
+                      JSON.stringify({
+                          bookId: cleanBookId,
+                          chapter,
+                          verse: verse ?? null,
+                      } satisfies StoredLocation),
+                 );
+             } catch (e: unknown) {
+                 if (seq !== resolveSeqRef.current) return;
+                 const msg = e instanceof Error ? e.message : String(e);
+                 setErr(msg);
+             }
+         },
+         [annotations, jumpToOrd],
     );
 
     useEffect(() => {
-        if (!spine) return;
+        if (!spine || !initialLocation) return;
 
         const key = makeLocKey(initialLocation);
         if (!key) return;
@@ -183,10 +257,12 @@ export function Reader(props: Props) {
 
         appliedInitialKeyRef.current = key;
 
-        const loc = initialLocation;
-        if (!loc) return;
-
-        void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "auto");
+        void resolveAndJump(
+             initialLocation.bookId,
+             initialLocation.chapter,
+             initialLocation.verse ?? null,
+             "auto",
+        );
     }, [spine, initialLocation, resolveAndJump]);
 
     useEffect(() => {
@@ -196,11 +272,17 @@ export function Reader(props: Props) {
 
         didRestoreRef.current = true;
 
+        const storedLoc = parseStoredLocation(safeGetLS(LS_LAST_LOC));
+        if (storedLoc) {
+            void resolveAndJump(storedLoc.bookId, storedLoc.chapter, storedLoc.verse, "auto");
+            return;
+        }
+
         const ordRaw = parseFiniteInt(safeGetLS(LS_LAST_ORD));
         if (ordRaw == null) return;
 
         jumpToOrd(ordRaw, "auto");
-    }, [spine, initialLocation, jumpToOrd]);
+    }, [spine, initialLocation, jumpToOrd, resolveAndJump]);
 
     useEffect(() => {
         if (!canJumpNow) return;
@@ -228,46 +310,31 @@ export function Reader(props: Props) {
         setViewportReady(true);
     }, []);
 
-    const handleError = useCallback((m: string) => {
-        setErr(m);
+    const handleError = useCallback((message: string) => {
+        setErr(message);
     }, []);
 
-    const handlePosition = useCallback((p: ReaderPosition) => {
+    const handlePosition = useCallback((next: ReaderPosition) => {
         setPos((prev) => {
-            const prevV = prev.verse;
-            const nextV = p.verse;
-
-            const sameOrd = prev.ord === p.ord;
-
-            const sameVerse =
-                prevV === nextV ||
-                (!!prevV &&
-                    !!nextV &&
-                    prevV.bookId === nextV.bookId &&
-                    prevV.chapter === nextV.chapter &&
-                    prevV.verse === nextV.verse);
-
-            const sameBook =
-                prev.book === p.book ||
-                (!!prev.book && !!p.book && prev.book.bookId === p.book.bookId);
-
-            if (sameOrd && sameVerse && sameBook) return prev;
-            return p;
+            if (prev.ord === next.ord && sameVerse(prev.verse, next.verse) && sameBook(prev.book, next.book)) {
+                return prev;
+            }
+            return next;
         });
     }, []);
 
     const handleJumpRef = useCallback(
-        (bookId: string, chapter: number, verse: number | null) => {
-            void resolveAndJump(bookId, chapter, verse, "smooth");
-        },
-        [resolveAndJump],
+         (bookId: string, chapter: number, verse: number | null) => {
+             void resolveAndJump(bookId, chapter, verse, "smooth");
+         },
+         [resolveAndJump],
     );
 
     const handleNavigate = useCallback(
-        (loc: ReaderLocation) => {
-            void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "smooth");
-        },
-        [resolveAndJump],
+         (loc: ReaderLocation) => {
+             void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "smooth");
+         },
+         [resolveAndJump],
     );
 
     const handleBackHome = useCallback(() => {
@@ -276,50 +343,46 @@ export function Reader(props: Props) {
     }, [annotations, onBackHome]);
 
     const topContent = useMemo(
-        () => (
-            <ReaderSelectionToolbar
-                selection={annotations.selection}
-                onHighlight={() => {
-                    annotations.createHighlight();
-                }}
-                onBookmark={() => {
-                    annotations.createBookmark();
-                }}
-                onNote={() => {
-                    annotations.createNote(null, "New note");
-                }}
-                onClear={annotations.clearSelection}
-            />
-        ),
-        [annotations],
+         () => (
+              <ReaderSelectionToolbar
+                   selection={annotations.selection}
+                   onHighlight={annotations.createHighlight}
+                   onBookmark={annotations.createBookmark}
+                   onNote={() => {
+                       annotations.createNote(null, "New note");
+                   }}
+                   onClear={annotations.clearSelection}
+              />
+         ),
+         [annotations],
     );
 
     return (
-        <ReaderShell
-            styles={styles}
-            books={books}
-            onBackHome={handleBackHome}
-            current={{
-                label: posLabel,
-                ord: pos.ord,
-                bookId: pos.verse?.bookId ?? null,
-                chapter: pos.verse?.chapter ?? null,
-                verse: pos.verse?.verse ?? null,
-            }}
-            onJumpRef={handleJumpRef}
-            onNavigate={handleNavigate}
-            mode={mode}
-            onToggleTheme={onToggleTheme}
-            spine={spine}
-            bookById={bookById}
-            viewportRef={setViewportRef}
-            selectionRootRef={selectionRootRef}
-            annotationSnapshot={annotations.snapshot}
-            topContent={topContent}
-            onPosition={handlePosition}
-            onError={handleError}
-            onReady={handleReady}
-            err={err}
-        />
+         <ReaderShell
+              styles={styles}
+              books={books}
+              onBackHome={handleBackHome}
+              current={{
+                  label: posLabel,
+                  ord: pos.ord,
+                  bookId: pos.verse?.bookId ?? null,
+                  chapter: pos.verse?.chapter ?? null,
+                  verse: pos.verse?.verse ?? null,
+              }}
+              onJumpRef={handleJumpRef}
+              onNavigate={handleNavigate}
+              mode={mode}
+              onToggleTheme={onToggleTheme}
+              spine={spine}
+              bookById={bookById}
+              viewportRef={setViewportRef}
+              selectionRootRef={selectionRootRef}
+              annotationSnapshot={annotations.snapshot}
+              topContent={topContent}
+              onPosition={handlePosition}
+              onError={handleError}
+              onReady={handleReady}
+              err={err}
+         />
     );
 }

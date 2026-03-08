@@ -1,3 +1,4 @@
+// cspell:words Literata literata Segoe Noto sfmono
 // apps/web/src/reader/typography.ts
 //
 // Biblia.to — reader typography + layout tuning
@@ -7,8 +8,9 @@
 // - Normalize + clamp deterministically
 // - Migrate older saves cleanly
 // - One authoritative apply() to <html>
-// - Explicit modern font presets (Inter, Literata, Quicksand)
+// - Explicit modern font presets with richer metadata
 // - Stable helpers for virtualizer / measurement calm
+// - Hardened storage / migration / SSR safety
 
 export type TypographyFont =
      | "inter"
@@ -20,18 +22,63 @@ export type TypographyFont =
      | "custom_1"
      | "custom_2";
 
+export type TypographyCategory =
+     | "sans"
+     | "serif"
+     | "rounded"
+     | "mono"
+     | "custom";
+
 export type ReaderTypography = Readonly<{
     font: TypographyFont;
-    sizePx: number;   // 12..30
-    weight: number;   // 200..700
-    leading: number;  // 0.95..2.1
+    sizePx: number; // 12..30
+    weight: number; // 200..700
+    leading: number; // 0.95..2.1
     measurePx: number; // 535..980
 }>;
 
+export type TypographyLimits = Readonly<{
+    sizePx: Readonly<{ lo: number; hi: number; step: number }>;
+    weight: Readonly<{ lo: number; hi: number; step: number }>;
+    leading: Readonly<{ lo: number; hi: number; digits: number }>;
+    measurePx: Readonly<{ lo: number; hi: number; step: number }>;
+}>;
+
+export type FontPreset = Readonly<{
+    label: string;
+    css: string;
+    category: TypographyCategory;
+    previewText: string;
+    uiFamily?: string;
+    aliases?: readonly string[];
+}>;
+
+export type FontOption = Readonly<{
+    id: TypographyFont;
+    label: string;
+    cssFamily: string;
+    previewFamily: string;
+    category: TypographyCategory;
+    previewText: string;
+}>;
+
+type MutableTypographyPatch = {
+    font?: TypographyFont;
+    sizePx?: number;
+    weight?: number;
+    leading?: number;
+    measurePx?: number;
+};
+
+type TypographyEnvelopeV1 = Readonly<{
+    v: 1;
+    t: ReaderTypography;
+}>;
+
 /**
- * New default:
+ * Default:
  * - Inter is the default modern reading-first sans
- * - slightly calmer measure than before
+ * - calmer measure for scripture
  */
 export const DEFAULT_TYPOGRAPHY: ReaderTypography = Object.freeze({
     font: "inter",
@@ -43,89 +90,147 @@ export const DEFAULT_TYPOGRAPHY: ReaderTypography = Object.freeze({
 
 const STORAGE_KEY_V2 = "bp_reader_typography_v2";
 const STORAGE_KEY_V1 = "bp_reader_typography_v1";
-const LEGACY_KEYS = Object.freeze(["bp_reader_typography", "bp_typography"]);
+const LEGACY_KEYS = Object.freeze([
+    "bp_reader_typography",
+    "bp_typography",
+]);
 
-type TypographyEnvelopeV1 = Readonly<{
-    v: 1;
-    t: ReaderTypography;
-}>;
-
-const LIMITS = Object.freeze({
-    sizePx: { lo: 12, hi: 30, step: 1 },
-    weight: { lo: 200, hi: 700, step: 1 },
-    leading: { lo: 0.95, hi: 2.1, digits: 2 },
-    measurePx: { lo: 535, hi: 980, step: 1 },
+const LIMITS: TypographyLimits = Object.freeze({
+    sizePx: Object.freeze({ lo: 12, hi: 30, step: 1 }),
+    weight: Object.freeze({ lo: 200, hi: 700, step: 1 }),
+    leading: Object.freeze({ lo: 0.95, hi: 2.1, digits: 2 }),
+    measurePx: Object.freeze({ lo: 535, hi: 980, step: 1 }),
 });
 
-export const FONT_PRESETS: Readonly<
-     Record<
-          TypographyFont,
-          Readonly<{
-              label: string;
-              css: string;
-              category: "sans" | "serif" | "rounded" | "mono" | "custom";
-          }>
-     >
-> = Object.freeze({
-    inter: {
+const FONT_ORDER = Object.freeze([
+    "inter",
+    "literata",
+    "quicksand",
+    "book",
+    "human",
+    "mono",
+    "custom_1",
+    "custom_2",
+] satisfies readonly TypographyFont[]);
+
+export const FONT_PRESETS: Readonly<Record<TypographyFont, FontPreset>> = Object.freeze({
+    inter: Object.freeze({
         label: "Inter",
         css: "var(--font-sans)",
         category: "sans",
-    },
+        previewText: "Blessed are the pure in heart.",
+        uiFamily: "var(--font-sans)",
+        aliases: Object.freeze([
+            "sans",
+            "ui sans",
+            "modern sans",
+            "inter variable",
+            "--font-sans",
+        ]),
+    }),
 
-    literata: {
+    literata: Object.freeze({
         label: "Literata",
         css: "var(--font-serif)",
         category: "serif",
-    },
+        previewText: "In the beginning God created the heaven and the earth.",
+        uiFamily: "var(--font-serif)",
+        aliases: Object.freeze([
+            "serif",
+            "book serif",
+            "literata variable",
+            "--font-serif",
+        ]),
+    }),
 
-    quicksand: {
+    quicksand: Object.freeze({
         label: "Quicksand",
         css: "var(--font-rounded)",
         category: "rounded",
-    },
+        previewText: "Let there be light.",
+        uiFamily: "var(--font-rounded)",
+        aliases: Object.freeze([
+            "rounded",
+            "soft sans",
+            "friendly",
+            "--font-rounded",
+        ]),
+    }),
 
-    book: {
+    book: Object.freeze({
         label: "Book Serif",
         css: 'ui-serif, Charter, "Iowan Old Style", Georgia, "Times New Roman", Times, serif',
         category: "serif",
-    },
+        previewText: "The Lord is my shepherd; I shall not want.",
+        uiFamily: 'ui-serif, Charter, "Iowan Old Style", Georgia, serif',
+        aliases: Object.freeze([
+            "charter",
+            "iowan",
+            "georgia",
+            "times",
+            "traditional serif",
+        ]),
+    }),
 
-    human: {
+    human: Object.freeze({
         label: "Human Sans",
         css: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", sans-serif',
         category: "sans",
-    },
+        previewText: "The earth was without form, and void.",
+        uiFamily: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif',
+        aliases: Object.freeze([
+            "system",
+            "system-ui",
+            "ui-sans",
+            "humanist sans",
+            "roboto",
+            "segoe",
+            "noto sans",
+        ]),
+    }),
 
-    mono: {
+    mono: Object.freeze({
         label: "Reader Mono",
         css: 'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace',
         category: "mono",
-    },
+        previewText: "GEN 1:1  In the beginning God created...",
+        uiFamily: 'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace',
+        aliases: Object.freeze([
+            "mono",
+            "monospace",
+            "menlo",
+            "monaco",
+            "consolas",
+            "sfmono",
+        ]),
+    }),
 
-    custom_1: {
+    custom_1: Object.freeze({
         label: "Custom 1",
         css: "var(--font-custom-1, var(--font-sans))",
         category: "custom",
-    },
+        previewText: "Custom family preview one.",
+        uiFamily: "var(--font-custom-1, var(--font-sans))",
+        aliases: Object.freeze([
+            "custom 1",
+            "custom_1",
+            "--font-custom-1",
+        ]),
+    }),
 
-    custom_2: {
+    custom_2: Object.freeze({
         label: "Custom 2",
         css: "var(--font-custom-2, var(--font-serif))",
         category: "custom",
-    },
+        previewText: "Custom family preview two.",
+        uiFamily: "var(--font-custom-2, var(--font-serif))",
+        aliases: Object.freeze([
+            "custom 2",
+            "custom_2",
+            "--font-custom-2",
+        ]),
+    }),
 });
-
-type FontOption = Readonly<{
-    id: TypographyFont;
-    label: string;
-    cssFamily: string;
-    category: "sans" | "serif" | "rounded" | "mono" | "custom";
-}>;
-
-/* ──────────────────────────────────────────────────────────────
-   Internal helpers
-────────────────────────────────────────────────────────────── */
 
 let lastAppliedSignature: string | null = null;
 let lastAppliedEnabled = false;
@@ -136,6 +241,11 @@ function isBrowser(): boolean {
 
 function isDocumentAvailable(): boolean {
     return typeof document !== "undefined";
+}
+
+function currentRoot(): HTMLElement | null {
+    if (!isDocumentAvailable()) return null;
+    return document.documentElement;
 }
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -156,9 +266,9 @@ function clampFloat(n: number, lo: number, hi: number, digits: number): number {
 function toNumber(x: unknown): number | null {
     if (typeof x === "number" && Number.isFinite(x)) return x;
     if (typeof x === "string") {
-        const t = x.trim();
-        if (!t) return null;
-        const n = Number(t);
+        const trimmed = x.trim();
+        if (!trimmed) return null;
+        const n = Number(trimmed);
         return Number.isFinite(n) ? n : null;
     }
     return null;
@@ -209,69 +319,64 @@ function safeLocalStorageRemove(key: string): void {
 }
 
 function isTypographyFont(x: string): x is TypographyFont {
-    return (
-         x === "inter" ||
-         x === "literata" ||
-         x === "quicksand" ||
-         x === "book" ||
-         x === "human" ||
-         x === "mono" ||
-         x === "custom_1" ||
-         x === "custom_2"
-    );
+    switch (x) {
+        case "inter":
+        case "literata":
+        case "quicksand":
+        case "book":
+        case "human":
+        case "mono":
+        case "custom_1":
+        case "custom_2":
+            return true;
+        default:
+            return false;
+    }
+}
+
+function stringIncludesAny(haystack: string, needles: readonly string[]): boolean {
+    for (const needle of needles) {
+        if (needle && haystack.includes(needle)) return true;
+    }
+    return false;
 }
 
 function normalizeFont(raw: unknown): TypographyFont {
     const s = (toString(raw) ?? "").trim().toLowerCase();
     if (!s) return DEFAULT_TYPOGRAPHY.font;
-
     if (isTypographyFont(s)) return s;
 
-    // Migrate older ids / synonyms
+    for (const id of FONT_ORDER) {
+        const preset = FONT_PRESETS[id];
+        if (s === id) return id;
+        if (s === preset.label.trim().toLowerCase()) return id;
+        if (s === preset.css.trim().toLowerCase()) return id;
+        if (preset.aliases && stringIncludesAny(s, preset.aliases)) return id;
+        if (s.includes(id.replace("_", " "))) return id;
+    }
+
     if (s === "sans") return "inter";
     if (s === "serif") return "literata";
     if (s === "rounded") return "quicksand";
 
-    // Human names / css fragments
-    if (s.includes("inter")) return "inter";
-    if (s.includes("literata")) return "literata";
-    if (s.includes("quicksand")) return "quicksand";
-
-    if (s.includes("charter") || s.includes("iowan") || s.includes("times") || s.includes("georgia")) {
-        return "book";
-    }
-
-    if (
-         s.includes("ui-sans") ||
-         s.includes("system-ui") ||
-         s.includes("segoe") ||
-         s.includes("roboto") ||
-         s.includes("noto sans")
-    ) {
-        return "human";
-    }
-
-    if (
-         s.includes("mono") ||
-         s.includes("menlo") ||
-         s.includes("monaco") ||
-         s.includes("consolas") ||
-         s.includes("sfmono")
-    ) {
-        return "mono";
-    }
-
-    if (s.includes("custom 1") || s.includes("custom_1")) return "custom_1";
-    if (s.includes("custom 2") || s.includes("custom_2")) return "custom_2";
-
     return DEFAULT_TYPOGRAPHY.font;
 }
 
-function normalizeTypography(t: Partial<ReaderTypography> | null | undefined): ReaderTypography {
+function normalizeTypography(
+     t: Partial<ReaderTypography> | null | undefined,
+): ReaderTypography {
     return Object.freeze({
         font: normalizeFont(t?.font),
-        sizePx: clampInt(toNumber(t?.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx, LIMITS.sizePx.lo, LIMITS.sizePx.hi),
-        weight: clampInt(toNumber(t?.weight) ?? DEFAULT_TYPOGRAPHY.weight, LIMITS.weight.lo, LIMITS.weight.hi),
+        sizePx: clampInt(
+             toNumber(t?.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx,
+             LIMITS.sizePx.lo,
+             LIMITS.sizePx.hi,
+        ),
+        weight: clampInt(
+             toNumber(t?.weight) ?? DEFAULT_TYPOGRAPHY.weight,
+             LIMITS.weight.lo,
+             LIMITS.weight.hi,
+        ),
         leading: clampFloat(
              toNumber(t?.leading) ?? DEFAULT_TYPOGRAPHY.leading,
              LIMITS.leading.lo,
@@ -296,11 +401,6 @@ function unwrapTypographyPayload(parsed: unknown): ReaderTypography | null {
     return normalizeTypography(parsed as Partial<ReaderTypography>);
 }
 
-function currentRoot(): HTMLElement | null {
-    if (!isDocumentAvailable()) return null;
-    return document.documentElement;
-}
-
 function removeTypographyVars(root: HTMLElement): void {
     root.style.removeProperty("--bpScriptureFont");
     root.style.removeProperty("--bpScriptureSize");
@@ -309,42 +409,17 @@ function removeTypographyVars(root: HTMLElement): void {
     root.style.removeProperty("--bpReaderMeasure");
 }
 
-function fontLoadProbe(t: ReaderTypography): string {
-    const family = getFontCssFamily(t.font);
-
-    if (t.font === "inter" || t.font === "human" || t.font === "custom_1") {
-        return `${t.weight} ${t.sizePx}px ${family}`;
-    }
-
-    if (t.font === "mono") {
-        return `${t.weight} ${t.sizePx}px ${family}`;
-    }
-
-    return `${t.weight} ${t.sizePx}px ${family}`;
-}
-
-/* ──────────────────────────────────────────────────────────────
-   Public helpers
-────────────────────────────────────────────────────────────── */
-
-export function typographyLimits() {
+export function typographyLimits(): TypographyLimits {
     return LIMITS;
 }
 
 export function typographySignature(t: ReaderTypography): string {
-    return `f=${t.font}|s=${t.sizePx}|w=${t.weight}|l=${t.leading}|m=${t.measurePx}`;
-}
-
-export function getFontLabel(font: TypographyFont): string {
-    return FONT_PRESETS[font]?.label ?? font;
+    const normalized = normalizeTypography(t);
+    return `f=${normalized.font}|s=${normalized.sizePx}|w=${normalized.weight}|l=${normalized.leading}|m=${normalized.measurePx}`;
 }
 
 export function getFontCssFamily(font: TypographyFont): string {
     return FONT_PRESETS[font]?.css ?? "var(--font-sans)";
-}
-
-export function getFontCategory(font: TypographyFont): FontOption["category"] {
-    return FONT_PRESETS[font]?.category ?? "sans";
 }
 
 export function normalizeReaderTypography(
@@ -353,12 +428,76 @@ export function normalizeReaderTypography(
     return normalizeTypography(t ?? undefined);
 }
 
-export function isDefaultTypography(t: ReaderTypography): boolean {
-    return typographySignature(normalizeTypography(t)) === typographySignature(DEFAULT_TYPOGRAPHY);
+export function coerceTypographyPatch(
+     patch: Partial<ReaderTypography> | null | undefined,
+): Partial<ReaderTypography> {
+    if (!patch) return {};
+
+    const out: MutableTypographyPatch = {};
+
+    if (patch.font != null) {
+        out.font = normalizeFont(patch.font);
+    }
+
+    if (patch.sizePx != null) {
+        out.sizePx = clampInt(
+             toNumber(patch.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx,
+             LIMITS.sizePx.lo,
+             LIMITS.sizePx.hi,
+        );
+    }
+
+    if (patch.weight != null) {
+        out.weight = clampInt(
+             toNumber(patch.weight) ?? DEFAULT_TYPOGRAPHY.weight,
+             LIMITS.weight.lo,
+             LIMITS.weight.hi,
+        );
+    }
+
+    if (patch.leading != null) {
+        out.leading = clampFloat(
+             toNumber(patch.leading) ?? DEFAULT_TYPOGRAPHY.leading,
+             LIMITS.leading.lo,
+             LIMITS.leading.hi,
+             LIMITS.leading.digits,
+        );
+    }
+
+    if (patch.measurePx != null) {
+        out.measurePx = clampInt(
+             toNumber(patch.measurePx) ?? DEFAULT_TYPOGRAPHY.measurePx,
+             LIMITS.measurePx.lo,
+             LIMITS.measurePx.hi,
+        );
+    }
+
+    return out;
+}
+
+export function updateTypography(
+     base: ReaderTypography,
+     patch: Partial<ReaderTypography>,
+): ReaderTypography {
+    return normalizeTypography({
+        ...normalizeTypography(base),
+        ...coerceTypographyPatch(patch),
+    });
+}
+
+export function fontOptions(): FontOption[] {
+    return FONT_ORDER.map((id) => ({
+        id,
+        label: FONT_PRESETS[id].label,
+        cssFamily: FONT_PRESETS[id].css,
+        previewFamily: FONT_PRESETS[id].uiFamily ?? FONT_PRESETS[id].css,
+        category: FONT_PRESETS[id].category,
+        previewText: FONT_PRESETS[id].previewText,
+    }));
 }
 
 /**
- * Try v2 → v1 → legacy keys, normalize, and migrate to v2.
+ * Try v2 → v1 → legacy keys, normalize, migrate to v2 envelope.
  */
 export function loadReaderTypography(): ReaderTypography | null {
     const tryKey = (key: string): ReaderTypography | null => {
@@ -372,7 +511,7 @@ export function loadReaderTypography(): ReaderTypography | null {
 
     const v1 = tryKey(STORAGE_KEY_V1);
     if (v1) {
-        saveReaderTypography(v1);
+        saveReaderTypographyEnvelope(v1);
         safeLocalStorageRemove(STORAGE_KEY_V1);
         return v1;
     }
@@ -380,7 +519,7 @@ export function loadReaderTypography(): ReaderTypography | null {
     for (const key of LEGACY_KEYS) {
         const migrated = tryKey(key);
         if (migrated) {
-            saveReaderTypography(migrated);
+            saveReaderTypographyEnvelope(migrated);
             safeLocalStorageRemove(key);
             return migrated;
         }
@@ -390,18 +529,22 @@ export function loadReaderTypography(): ReaderTypography | null {
 }
 
 export function saveReaderTypography(t: ReaderTypography): void {
-    const normalized = normalizeTypography(t);
-    safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(normalized));
+    saveReaderTypographyEnvelope(t);
 }
 
 export function saveReaderTypographyEnvelope(t: ReaderTypography): void {
     const normalized = normalizeTypography(t);
-    const env: TypographyEnvelopeV1 = { v: 1, t: normalized };
+    const env: TypographyEnvelopeV1 = Object.freeze({ v: 1, t: normalized });
     safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(env));
 }
 
 export function clearReaderTypography(): void {
     safeLocalStorageRemove(STORAGE_KEY_V2);
+    safeLocalStorageRemove(STORAGE_KEY_V1);
+
+    for (const key of LEGACY_KEYS) {
+        safeLocalStorageRemove(key);
+    }
 }
 
 export function applyReaderTypography(t: ReaderTypography | null): void {
@@ -439,152 +582,26 @@ export function applyReaderTypographyFromStorage(): ReaderTypography | null {
     return t;
 }
 
-export function updateTypography(base: ReaderTypography, patch: Partial<ReaderTypography>): ReaderTypography {
-    return normalizeTypography({ ...normalizeTypography(base), ...patch });
-}
-
-export function fontOptions(): FontOption[] {
-    return (Object.keys(FONT_PRESETS) as TypographyFont[]).map((id) => ({
-        id,
-        label: FONT_PRESETS[id].label,
-        cssFamily: FONT_PRESETS[id].css,
-        category: FONT_PRESETS[id].category,
-    }));
-}
-
-export function fontOptionsByCategory() {
-    const out: Record<FontOption["category"], FontOption[]> = {
-        sans: [],
-        serif: [],
-        rounded: [],
-        mono: [],
-        custom: [],
-    };
-
-    for (const option of fontOptions()) {
-        out[option.category].push(option);
-    }
-
-    return out;
-}
-
 /**
- * Best-effort font readiness wait.
- * Useful after a font switch before measuring text / virtual rows / overlays.
+ * Best-effort wait for document fonts readiness.
  */
 export async function waitForFontsIfSupported(timeoutMs = 700): Promise<void> {
     if (!isDocumentAvailable()) return;
 
-    const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
-    if (!fonts || typeof fonts.ready?.then !== "function") return;
+    const doc = document as Document & { fonts?: FontFaceSet };
+    const fonts = doc.fonts;
+    if (!fonts) return;
 
     let timeoutId: number | null = null;
 
     await Promise.race([
         fonts.ready.then(() => undefined).catch(() => undefined),
         new Promise<void>((resolve) => {
-            timeoutId = window.setTimeout(() => resolve(), timeoutMs);
+            timeoutId = window.setTimeout(resolve, timeoutMs);
         }),
     ]);
 
     if (timeoutId != null) {
         window.clearTimeout(timeoutId);
     }
-}
-
-/**
- * Stronger helper: apply, then wait for fonts.
- * Useful when changing font from a picker and wanting calmer layout.
- */
-export async function applyReaderTypographyAndWait(
-     t: ReaderTypography | null,
-     timeoutMs = 700,
-): Promise<void> {
-    applyReaderTypography(t);
-
-    if (!t || !isDocumentAvailable()) return;
-
-    const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
-    if (!fonts) {
-        await waitForFontsIfSupported(timeoutMs);
-        return;
-    }
-
-    try {
-        const normalized = normalizeTypography(t);
-        const probe = fontLoadProbe(normalized);
-
-        const loadPromise =
-             typeof fonts.load === "function"
-                  ? Promise.allSettled([
-                      fonts.load(probe, "The quick brown fox jumps over the lazy dog 0123456789"),
-                      fonts.ready,
-                  ]).then(() => undefined)
-                  : fonts.ready.then(() => undefined);
-
-        let timeoutId: number | null = null;
-
-        await Promise.race([
-            loadPromise,
-            new Promise<void>((resolve) => {
-                timeoutId = window.setTimeout(() => resolve(), timeoutMs);
-            }),
-        ]);
-
-        if (timeoutId != null) {
-            window.clearTimeout(timeoutId);
-        }
-    } catch {
-        await waitForFontsIfSupported(timeoutMs);
-    }
-}
-
-/**
- * Useful for devtools / reset buttons / external normalization.
- */
-export function coerceTypographyPatch(
-     patch: Partial<ReaderTypography> | null | undefined,
-): Partial<ReaderTypography> {
-    if (!patch) return {};
-
-    return {
-        ...(patch.font != null ? { font: normalizeFont(patch.font) } : null),
-        ...(patch.sizePx != null
-             ? {
-                 sizePx: clampInt(
-                      toNumber(patch.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx,
-                      LIMITS.sizePx.lo,
-                      LIMITS.sizePx.hi,
-                 ),
-             }
-             : null),
-        ...(patch.weight != null
-             ? {
-                 weight: clampInt(
-                      toNumber(patch.weight) ?? DEFAULT_TYPOGRAPHY.weight,
-                      LIMITS.weight.lo,
-                      LIMITS.weight.hi,
-                 ),
-             }
-             : null),
-        ...(patch.leading != null
-             ? {
-                 leading: clampFloat(
-                      toNumber(patch.leading) ?? DEFAULT_TYPOGRAPHY.leading,
-                      LIMITS.leading.lo,
-                      LIMITS.leading.hi,
-                      LIMITS.leading.digits,
-                 ),
-             }
-             : null),
-        ...(patch.measurePx != null
-             ? {
-                 measurePx: clampInt(
-                      toNumber(patch.measurePx) ?? DEFAULT_TYPOGRAPHY.measurePx,
-                      LIMITS.measurePx.lo,
-                      LIMITS.measurePx.hi,
-                 ),
-             }
-             : null),
-    };
 }

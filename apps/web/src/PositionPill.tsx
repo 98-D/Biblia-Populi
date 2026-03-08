@@ -1,18 +1,28 @@
+// cspell:words oklab
 // apps/web/src/PositionPill.tsx
 // Biblia.to — Position Pill (Book / Chapter / Verse picker)
 //
-// Deep upgrades in this pass:
-// - Zero "any" casts in event unsubs; no deprecated mq signatures.
-// - Bulletproof outside-click handling (no scrollbar mis-close; supports touch/pen).
-// - Keyboard UX: arrows to move between columns; Enter commits; Esc closes; Home/End jump.
-// - Accessibility: proper listbox/option semantics + roving tabindex + aria-activedescendant.
-// - Focus restore to pill on close; remembers last focused column.
-// - Robust async chapters loading with AbortController + per-book cache + stale guard.
-// - Safer positioning: auto reflow on resize/scroll/visualViewport; clamps within viewport.
-// - Fixes tiny bugs: removed stray imports; removed unused pending flags; consistent phases.
-// - Keeps monochrome-only visuals (no hue). Popover CSS injection uses only theme vars.
+// Hardened / micropolished:
+// - no deprecated MediaQueryList listener APIs
+// - no unsafe event-unsubscribe casts
+// - robust outside-click handling via composedPath()
+// - focus restore to pill on close
+// - roving focus + listbox semantics
+// - async chapter loading with per-book cache + AbortController + stale guard
+// - viewport-clamped popover with resize / scroll / visualViewport reflow
+// - monochrome-only visuals
+// - calmer open/close animation + button press states
+// - fixed custom CSS var typing on inline styles
+// - deduplicated focus/scroll movement logic
 
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { apiGetChapters, type BookRow, type ChaptersPayload } from "./api";
 
@@ -29,47 +39,64 @@ type Props = {
   onJump: (bookId: string, chapter: number, verse: number | null) => void;
 };
 
+type WheelOption = Readonly<{
+  key: string;
+  label: string;
+  value: number;
+}>;
+
+type PopPos = Readonly<{
+  left: number;
+  top: number;
+  height: number;
+  width: number;
+}>;
+
+type Col = "book" | "chapter" | "verse";
+type Phase = "opening" | "open" | "closing";
+type CssVarStyle = React.CSSProperties & Record<`--${string}`, string | number>;
+
 /* ---------------- Compact + paper-like ---------------- */
+
 const SCALE = 0.84;
 const S = (n: number) => Math.round(n * SCALE);
 
 const POPOVER_W = S(440);
 const COL_NARROW_W = S(92);
 const POPOVER_MAX_H = S(330);
+const POPOVER_MIN_H = S(200);
 const POPOVER_MARGIN = 14;
 const LIST_PAD = S(10);
 
-// Pill stability: fixed width (no jitter)
 const PILL_W_CLOSED = S(216);
 const PILL_W_OPEN = S(226);
 const NUM_COL_W = S(62);
 const PILL_PAD_X = S(9);
 const PILL_GAP = S(6);
 
-// Micro delay to prevent accidental close on scrollbars/drags outside
 const CLOSE_DELAY_MS = 110;
-
-// phase timings
 const OPEN_MS = 150;
 const CLOSE_MS = 145;
 
-type WheelOption = { key: string; label: string; value: number };
-type PopPos = Readonly<{ left: number; top: number; height: number; width: number }>;
-
-type Col = "book" | "chapter" | "verse";
-
-function pressedStyle(styles: Record<string, React.CSSProperties>): React.CSSProperties | null {
-  return (styles as any).btnPressed ?? (styles as any).buttonPressed ?? null;
-}
+const POP_ID = "bp-pos-popover";
+const CSS_SENTINEL_ATTR = "data-bp-pos-popover-css";
 
 function clampInt(n: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, n));
+  if (!Number.isFinite(n)) return lo;
+  return Math.max(lo, Math.min(hi, Math.trunc(n)));
 }
 
 function buildNumberOptions(min: number, max: number): WheelOption[] {
   const out: WheelOption[] = [];
-  for (let i = min; i <= max; i++) out.push({ key: String(i), label: String(i), value: i });
+  for (let i = min; i <= max; i += 1) {
+    out.push({ key: String(i), label: String(i), value: i });
+  }
   return out;
+}
+
+function pressedStyle(styles: Record<string, React.CSSProperties>): React.CSSProperties | null {
+  const record = styles as Record<string, React.CSSProperties | undefined>;
+  return record.btnPressed ?? record.buttonPressed ?? null;
 }
 
 function computePopoverPos(anchor: DOMRect, desiredWidth: number): PopPos {
@@ -85,85 +112,105 @@ function computePopoverPos(anchor: DOMRect, desiredWidth: number): PopPos {
   const belowAvail = vh - belowTop - margin;
   const cap = Math.min(POPOVER_MAX_H, vh - margin * 2);
 
-  if (belowAvail >= S(200)) {
-    return { left, top: belowTop, height: Math.min(cap, belowAvail), width };
+  if (belowAvail >= POPOVER_MIN_H) {
+    return {
+      left,
+      top: belowTop,
+      height: Math.min(cap, belowAvail),
+      width,
+    };
   }
 
-  const top = clampInt(Math.round(anchor.top - 12 - cap), margin, Math.max(margin, vh - cap - margin));
+  const top = clampInt(
+       Math.round(anchor.top - 12 - cap),
+       margin,
+       Math.max(margin, vh - cap - margin),
+  );
   const aboveAvail = Math.round(anchor.top - top - 12);
-  return { left, top, height: Math.min(cap, Math.max(S(200), aboveAvail)), width };
+
+  return {
+    left,
+    top,
+    height: Math.min(cap, Math.max(POPOVER_MIN_H, aboveAvail)),
+    width,
+  };
 }
 
 function subscribeMediaQuery(query: string, onChange: (matches: boolean) => void): () => void {
   if (typeof window === "undefined" || !window.matchMedia) return () => {};
+
   const mq = window.matchMedia(query);
+  const handler = (event: MediaQueryListEvent) => onChange(event.matches);
 
-  const handler = () => onChange(!!mq.matches);
-  handler();
+  onChange(mq.matches);
+  mq.addEventListener("change", handler);
 
-  if (mq.addEventListener) {
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }
-
-  // legacy fallback without TS deprecated signatures
-  const anyMq = mq as any;
-  if (typeof anyMq.addListener === "function") {
-    anyMq.addListener(handler);
-    return () => {
-      if (typeof anyMq.removeListener === "function") anyMq.removeListener(handler);
-    };
-  }
-
-  return () => {};
+  return () => {
+    mq.removeEventListener("change", handler);
+  };
 }
 
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(false);
-  useEffect(() => subscribeMediaQuery("(prefers-reduced-motion: reduce)", (m) => setReduced(!!m)), []);
+
+  useEffect(() => {
+    return subscribeMediaQuery("(prefers-reduced-motion: reduce)", setReduced);
+  }, []);
+
   return reduced;
 }
 
 function useLatestRef<T>(value: T) {
   const r = useRef(value);
+
   useEffect(() => {
     r.current = value;
   }, [value]);
+
   return r;
 }
 
 function injectPopoverCssOnce(): void {
-  const k = "data-bp-pos-popover-css";
-  if (typeof document === "undefined" || document.querySelector(`style[${k}="1"]`)) return;
+  if (typeof document === "undefined") return;
+  if (document.querySelector(`style[${CSS_SENTINEL_ATTR}="1"]`)) return;
 
   const el = document.createElement("style");
-  el.setAttribute(k, "1");
-
-  // ZERO hue: only neutral vars / grayscale mixes
+  el.setAttribute(CSS_SENTINEL_ATTR, "1");
   el.textContent = `
-#bp-pos-popover .bp-scroll { scrollbar-width: thin; scrollbar-color: var(--hairline) transparent; }
-#bp-pos-popover .bp-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
-#bp-pos-popover .bp-scroll::-webkit-scrollbar-track { background: transparent !important; }
-#bp-pos-popover .bp-scroll::-webkit-scrollbar-thumb {
+#${POP_ID} .bp-scroll { scrollbar-width: thin; scrollbar-color: var(--hairline) transparent; }
+#${POP_ID} .bp-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+#${POP_ID} .bp-scroll::-webkit-scrollbar-track { background: transparent !important; }
+#${POP_ID} .bp-scroll::-webkit-scrollbar-thumb {
   background: var(--hairline);
   border-radius: 999px;
   border: 2px solid transparent;
   background-clip: padding-box;
 }
-#bp-pos-popover .bp-scroll::-webkit-scrollbar-thumb:hover { background: var(--focusRing); }
+#${POP_ID} .bp-scroll::-webkit-scrollbar-thumb:hover { background: var(--focusRing); }
 
-#bp-pos-popover button.bp-row { transition: background 150ms ease, box-shadow 150ms ease, transform 110ms ease; }
-#bp-pos-popover button.bp-row:active { transform: scale(0.982); }
-#bp-pos-popover button.bp-row:hover { background: color-mix(in oklab, var(--panel) 22%, transparent); }
-#bp-pos-popover button.bp-row:focus-visible { outline: none; box-shadow: inset 0 0 0 1px var(--bpAccentRing), 0 0 0 3px color-mix(in oklab, var(--bpAccentRing) 55%, transparent); }
+#${POP_ID} button.bp-row {
+  transition: background 150ms ease, box-shadow 150ms ease, transform 110ms ease;
+}
+#${POP_ID} button.bp-row:active { transform: scale(0.982); }
+#${POP_ID} button.bp-row:hover { background: color-mix(in oklab, var(--panel) 22%, transparent); }
+#${POP_ID} button.bp-row:focus-visible {
+  outline: none;
+  box-shadow:
+    inset 0 0 0 1px var(--bpAccentRing),
+    0 0 0 3px color-mix(in oklab, var(--bpAccentRing) 55%, transparent);
+}
 
-#bp-pos-popover button.bp-go { transition: transform 160ms cubic-bezier(0.23, 1.0, 0.32, 1.0), box-shadow 160ms ease, opacity 160ms ease; }
-#bp-pos-popover button.bp-go:active { transform: scale(0.955) translateY(1px); }
+#${POP_ID} button.bp-go {
+  transition:
+    transform 160ms cubic-bezier(0.23, 1.0, 0.32, 1.0),
+    box-shadow 160ms ease,
+    opacity 160ms ease;
+}
+#${POP_ID} button.bp-go:active { transform: scale(0.955) translateY(1px); }
 `;
   document.head.appendChild(el);
 }
 
-/* --------------------------- Roving focus helpers --------------------------- */
 function nextIndex(cur: number, delta: number, len: number): number {
   if (len <= 0) return 0;
   const n = cur + delta;
@@ -172,7 +219,6 @@ function nextIndex(cur: number, delta: number, len: number): number {
   return n;
 }
 
-/** Accepts undefined because Map.get() returns T | undefined */
 function scrollIntoViewCentered(el: HTMLElement | null | undefined): void {
   if (!el) return;
   try {
@@ -182,19 +228,25 @@ function scrollIntoViewCentered(el: HTMLElement | null | undefined): void {
   }
 }
 
+function eventComposedPath(e: Event): EventTarget[] | null {
+  const maybe = e as Event & { composedPath?: () => EventTarget[] };
+  return typeof maybe.composedPath === "function" ? maybe.composedPath() : null;
+}
+
+function targetWithinNode(target: Node | null, path: EventTarget[] | null, node: Node | null): boolean {
+  if (!node) return false;
+  if (target && node.contains(target)) return true;
+  if (!path) return false;
+
+  for (const entry of path) {
+    if (entry === node) return true;
+  }
+  return false;
+}
+
 /* --------------------------- List Item --------------------------- */
-const ListItem = React.memo(function ListItem({
-                                                active,
-                                                onClick,
-                                                children,
-                                                tight = false,
-                                                mapRef,
-                                                itemKey,
-                                                ariaLabel,
-                                                tabIndex,
-                                                id,
-                                                onFocus,
-                                              }: {
+
+const ListItem = React.memo(function ListItem(props: {
   active: boolean;
   onClick: () => void;
   children: React.ReactNode;
@@ -206,41 +258,59 @@ const ListItem = React.memo(function ListItem({
   id?: string;
   onFocus?: () => void;
 }) {
+  const {
+    active,
+    onClick,
+    children,
+    tight = false,
+    mapRef,
+    itemKey,
+    ariaLabel,
+    tabIndex,
+    id,
+    onFocus,
+  } = props;
+
   const ref = useRef<HTMLButtonElement>(null);
   const baseStyle = tight ? sx.itemTight : sx.item;
 
   useEffect(() => {
     if (!mapRef || !itemKey) return;
+
     mapRef.current?.set(itemKey, ref.current);
     return () => {
-      if (mapRef.current?.get(itemKey) === ref.current) mapRef.current?.set(itemKey, null);
+      if (mapRef.current?.get(itemKey) === ref.current) {
+        mapRef.current?.set(itemKey, null);
+      }
     };
   }, [mapRef, itemKey]);
 
   return (
-      <button
-          id={id}
-          type="button"
-          className="bp-row"
-          ref={ref}
-          style={{ ...baseStyle, ...(active ? sx.itemActive : null) }}
-          onPointerDown={(e) => {
-            if (e.pointerType !== "mouse") e.preventDefault();
-          }}
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={onClick}
-          onFocus={onFocus}
-          aria-label={ariaLabel}
-          role="option"
-          aria-selected={active}
-          tabIndex={tabIndex}
-      >
-        {active && <span style={sx.activeBar} aria-hidden />}
-        {children}
-        <span style={{ ...sx.selDot, ...(active ? sx.selDotOn : null) }} aria-hidden />
-      </button>
+       <button
+            id={id}
+            type="button"
+            className="bp-row"
+            ref={ref}
+            style={{ ...baseStyle, ...(active ? sx.itemActive : null) }}
+            onPointerDown={(e) => {
+              if (e.pointerType !== "mouse") e.preventDefault();
+            }}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={onClick}
+            onFocus={onFocus}
+            aria-label={ariaLabel}
+            role="option"
+            aria-selected={active}
+            tabIndex={tabIndex}
+       >
+         {active ? <span style={sx.activeBar} aria-hidden /> : null}
+         {children}
+         <span style={{ ...sx.selDot, ...(active ? sx.selDotOn : null) }} aria-hidden />
+       </button>
   );
 });
+
+/* --------------------------- Component --------------------------- */
 
 export function PositionPill({ styles, books, current, onJump }: Props) {
   const reducedMotion = usePrefersReducedMotion();
@@ -249,40 +319,46 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   const anchorRef = useRef<HTMLButtonElement | null>(null);
   const popoverElRef = useRef<HTMLDivElement | null>(null);
 
+  const bookBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+  const chapBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+  const verseBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
+
+  const chaptersCacheRef = useRef<Map<string, ChaptersPayload>>(new Map());
+  const abortRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef(0);
+  const closeTimerRef = useRef<number | null>(null);
+
   const [open, setOpen] = useState(false);
-  const [phase, setPhase] = useState<"opening" | "open" | "closing">("opening");
+  const [phase, setPhase] = useState<Phase>("opening");
   const [popPos, setPopPos] = useState<PopPos | null>(null);
 
   const [pressPill, setPressPill] = useState(false);
   const [pressGo, setPressGo] = useState(false);
 
-  const closeTimerRef = useRef<number | null>(null);
-  const clearCloseTimer = useCallback(() => {
-    if (closeTimerRef.current != null) {
-      window.clearTimeout(closeTimerRef.current);
-      closeTimerRef.current = null;
-    }
-  }, []);
-
-  const bookBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-  const chapBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-  const verseBtnMapRef = useRef<Map<string, HTMLButtonElement | null>>(new Map());
-
-  const openRef = useLatestRef(open);
-  const phaseRef = useLatestRef(phase);
-
-  // last active column for keyboard UX
   const [activeCol, setActiveCol] = useState<Col>("book");
-  const activeColRef = useLatestRef(activeCol);
-
-  // For roving focus indices
   const [activeBookIdx, setActiveBookIdx] = useState(0);
   const [activeChapIdx, setActiveChapIdx] = useState(0);
   const [activeVerseIdx, setActiveVerseIdx] = useState(0);
 
+  const [bookId, setBookId] = useState<string>(current.bookId ?? list[0]?.bookId ?? "GEN");
+  const [chapter, setChapter] = useState<number>(current.chapter ?? 1);
+  const [verse, setVerse] = useState<number | null>(current.verse ?? null);
+
+  const [pendingChapter, setPendingChapter] = useState(false);
+  const [pendingVerse, setPendingVerse] = useState(false);
+  const [chaptersMeta, setChaptersMeta] = useState<ChaptersPayload | null>(null);
+
+  const openRef = useLatestRef(open);
+  const phaseRef = useLatestRef(phase);
+  const activeColRef = useLatestRef(activeCol);
+
   useEffect(() => {
     injectPopoverCssOnce();
   }, []);
+
+  const currentBookId = current.bookId ?? list[0]?.bookId ?? "GEN";
+  const currentChap = current.chapter ?? 1;
+  const currentVerse = current.verse ?? null;
 
   const bookNameById = useMemo(() => {
     const m = new Map<string, string>();
@@ -290,39 +366,29 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     return m;
   }, [list]);
 
-  const currentBookId = current.bookId ?? list[0]?.bookId ?? "GEN";
-  const currentBookName = (current.bookId ? bookNameById.get(current.bookId) : null) ?? currentBookId ?? "…";
-  const currentChap = current.chapter ?? 1;
-  const currentVerse = current.verse ?? null;
+  const currentBookName =
+       (current.bookId ? bookNameById.get(current.bookId) : null) ??
+       currentBookId ??
+       "…";
 
-  const pillLabel = useMemo(() => {
-    return currentVerse == null ? `${currentBookName} ${currentChap}` : `${currentBookName} ${currentChap}:${currentVerse}`;
-  }, [currentBookName, currentChap, currentVerse]);
+  const selectedBook = useMemo(
+       () => list.find((b) => b.bookId === bookId) ?? null,
+       [list, bookId],
+  );
 
-  const [bookId, setBookId] = useState<string>(currentBookId);
-  const [chapter, setChapter] = useState<number>(currentChap);
-  const [verse, setVerse] = useState<number | null>(currentVerse);
-
-  const [pendingChapter, setPendingChapter] = useState<boolean>(false);
-  const [pendingVerse, setPendingVerse] = useState<boolean>(false);
-
-  // Chapters: cache + abortable fetch
-  const chaptersCacheRef = useRef<Map<string, ChaptersPayload>>(new Map());
-  const abortRef = useRef<AbortController | null>(null);
-  const [chaptersMeta, setChaptersMeta] = useState<ChaptersPayload | null>(null);
-
-  const selectedBook = useMemo(() => list.find((b) => b.bookId === bookId) ?? null, [list, bookId]);
   const bookName = selectedBook?.name ?? bookId;
   const testamentTag = (selectedBook?.testament ?? "").toUpperCase();
   const chapterMax = selectedBook?.chapters ?? 999;
 
-  // ensure active book index stays valid
   useEffect(() => {
     const idx = Math.max(0, list.findIndex((b) => b.bookId === bookId));
     setActiveBookIdx(idx >= 0 ? idx : 0);
   }, [list, bookId]);
 
-  // Load chapters when open+book changes
+  useEffect(() => {
+    setChapter((c) => clampInt(c || 1, 1, chapterMax));
+  }, [chapterMax]);
+
   useEffect(() => {
     if (!open) return;
 
@@ -335,36 +401,31 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       return;
     }
 
+    const id = ++requestIdRef.current;
     const ac = new AbortController();
     abortRef.current = ac;
 
-    let alive = true;
-    apiGetChapters(bookId, { signal: ac.signal } as any)
-        .then((p) => {
-          if (!alive || ac.signal.aborted) return;
-          chaptersCacheRef.current.set(bookId, p);
-          setChaptersMeta(p);
-        })
-        .catch(() => {
-          if (!alive || ac.signal.aborted) return;
-          setChaptersMeta(null);
-        });
+    apiGetChapters(bookId, { signal: ac.signal })
+         .then((payload) => {
+           if (ac.signal.aborted) return;
+           if (id !== requestIdRef.current) return;
+           chaptersCacheRef.current.set(bookId, payload);
+           setChaptersMeta(payload);
+         })
+         .catch(() => {
+           if (ac.signal.aborted) return;
+           if (id !== requestIdRef.current) return;
+           setChaptersMeta(null);
+         });
 
     return () => {
-      alive = false;
       ac.abort();
     };
   }, [open, bookId]);
 
-  // Clamp chapter when book changes
-  useEffect(() => {
-    setChapter((c) => clampInt(c || 1, 1, chapterMax));
-  }, [chapterMax]);
-
   const verseMax = useMemo(() => {
-    const meta = chaptersMeta;
-    if (!meta) return 999;
-    const row = meta.chapters.find((c) => c.chapter === chapter);
+    if (!chaptersMeta) return 999;
+    const row = chaptersMeta.chapters.find((c) => c.chapter === chapter);
     return row?.verseCount ?? 999;
   }, [chaptersMeta, chapter]);
 
@@ -375,16 +436,23 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   const chapterOptions = useMemo(() => buildNumberOptions(1, chapterMax), [chapterMax]);
   const verseOptions = useMemo(() => buildNumberOptions(1, verseMax), [verseMax]);
 
-  // sync active indices for roving focus
   useEffect(() => {
     setActiveChapIdx(Math.max(0, Math.min(chapterOptions.length - 1, chapter - 1)));
   }, [chapterOptions.length, chapter]);
 
   useEffect(() => {
-    setActiveVerseIdx(verse == null ? 0 : Math.max(0, Math.min(verseOptions.length - 1, verse - 1)));
+    setActiveVerseIdx(
+         verse == null ? 0 : Math.max(0, Math.min(verseOptions.length - 1, verse - 1)),
+    );
   }, [verseOptions.length, verse]);
 
-  // Reset local state when closed (and restore focus to pill)
+  const clearCloseTimer = useCallback(() => {
+    if (closeTimerRef.current != null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     if (open) return;
 
@@ -394,36 +462,51 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setBookId(currentBookId);
     setChapter(currentChap);
     setVerse(currentVerse);
-
     setPendingChapter(false);
     setPendingVerse(false);
     setChaptersMeta(null);
-
     setActiveCol("book");
+
     clearCloseTimer();
 
-    // restore focus
-    const id = requestAnimationFrame(() => anchorRef.current?.focus());
+    const id = requestAnimationFrame(() => {
+      anchorRef.current?.focus();
+    });
     return () => cancelAnimationFrame(id);
   }, [open, currentBookId, currentChap, currentVerse, clearCloseTimer]);
 
-  const titleBookPart = bookName;
   const titleNumPart = useMemo(() => {
     if (pendingChapter) return "";
-    let s = ` ${chapter}`;
-    if (!pendingVerse && verse != null) s += `:${verse}`;
-    return s;
+    let out = ` ${chapter}`;
+    if (!pendingVerse && verse != null) out += `:${verse}`;
+    return out;
   }, [pendingChapter, pendingVerse, chapter, verse]);
-  const titleTagPart = testamentTag;
+
+  const pillLabel = useMemo(() => {
+    return currentVerse == null
+         ? `${currentBookName} ${currentChap}`
+         : `${currentBookName} ${currentChap}:${currentVerse}`;
+  }, [currentBookName, currentChap, currentVerse]);
 
   const closePopover = useCallback(() => {
     if (!openRef.current || phaseRef.current === "closing") return;
     setPhase("closing");
   }, [openRef, phaseRef]);
 
+  const openPopover = useCallback(() => {
+    clearCloseTimer();
+    setOpen(true);
+    setPhase("opening");
+  }, [clearCloseTimer]);
+
+  const toggleOpen = useCallback(() => {
+    if (openRef.current) closePopover();
+    else openPopover();
+  }, [openRef, closePopover, openPopover]);
+
   const commit = useCallback(() => {
     const ch = pendingChapter ? 1 : chapter;
-    const v: number | null = pendingVerse || verse == null ? null : verse;
+    const v = pendingVerse || verse == null ? null : verse;
     onJump(bookId, ch, v);
     closePopover();
   }, [bookId, chapter, verse, pendingChapter, pendingVerse, onJump, closePopover]);
@@ -450,31 +533,89 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setVerse(nextVerse);
   }, []);
 
-  const openPopover = useCallback(() => {
-    clearCloseTimer();
-    setOpen(true);
-    setPhase("opening");
-  }, [clearCloseTimer]);
+  const focusBookByIndex = useCallback(
+       (idx: number) => {
+         const id = list[idx]?.bookId;
+         const el = id ? bookBtnMapRef.current.get(id) : null;
+         el?.focus();
+         scrollIntoViewCentered(el);
+       },
+       [list],
+  );
 
-  const toggleOpen = useCallback(() => {
-    if (openRef.current) closePopover();
-    else openPopover();
-  }, [openRef, openPopover, closePopover]);
+  const focusChapterByIndex = useCallback(
+       (idx: number) => {
+         const n = chapterOptions[idx]?.value;
+         const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
+         el?.focus();
+         scrollIntoViewCentered(el);
+       },
+       [chapterOptions],
+  );
 
-  // Positioning (resize/scroll/vv)
+  const focusVerseByIndex = useCallback(
+       (idx: number) => {
+         const n = verseOptions[idx]?.value;
+         const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
+         el?.focus();
+         scrollIntoViewCentered(el);
+       },
+       [verseOptions],
+  );
+
+  const focusCurrentColumnSelection = useCallback(
+       (col: Col) => {
+         if (col === "book") {
+           focusBookByIndex(activeBookIdx);
+           return;
+         }
+         if (col === "chapter") {
+           focusChapterByIndex(activeChapIdx);
+           return;
+         }
+         focusVerseByIndex(activeVerseIdx);
+       },
+       [activeBookIdx, activeChapIdx, activeVerseIdx, focusBookByIndex, focusChapterByIndex, focusVerseByIndex],
+  );
+
+  const focusColumnBoundary = useCallback(
+       (col: Col, atEnd: boolean) => {
+         if (col === "book") {
+           const idx = atEnd ? Math.max(0, list.length - 1) : 0;
+           setActiveBookIdx(idx);
+           focusBookByIndex(idx);
+           return;
+         }
+
+         if (col === "chapter") {
+           const idx = atEnd ? Math.max(0, chapterOptions.length - 1) : 0;
+           setActiveChapIdx(idx);
+           focusChapterByIndex(idx);
+           return;
+         }
+
+         const idx = atEnd ? Math.max(0, verseOptions.length - 1) : 0;
+         setActiveVerseIdx(idx);
+         focusVerseByIndex(idx);
+       },
+       [list.length, chapterOptions.length, verseOptions.length, focusBookByIndex, focusChapterByIndex, focusVerseByIndex],
+  );
+
   useLayoutEffect(() => {
     if (!open) return;
     const a = anchorRef.current;
     if (!a) return;
 
     let raf = 0;
+
     const update = () => {
       cancelAnimationFrame(raf);
       raf = requestAnimationFrame(() => {
-        const r = a.getBoundingClientRect();
-        setPopPos(computePopoverPos(r, POPOVER_W));
+        const rect = a.getBoundingClientRect();
+        setPopPos(computePopoverPos(rect, POPOVER_W));
       });
     };
+
     update();
 
     window.addEventListener("resize", update, { passive: true });
@@ -493,7 +634,6 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     };
   }, [open]);
 
-  // Phase timing
   useEffect(() => {
     if (!open) return;
     if (reducedMotion) {
@@ -501,6 +641,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       return;
     }
     if (phase !== "opening") return;
+
     const id = window.setTimeout(() => setPhase("open"), OPEN_MS);
     return () => window.clearTimeout(id);
   }, [open, phase, reducedMotion]);
@@ -511,36 +652,34 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
       setOpen(false);
       return;
     }
+
     const id = window.setTimeout(() => setOpen(false), CLOSE_MS);
     return () => window.clearTimeout(id);
   }, [open, phase, reducedMotion]);
 
-  // Outside click + keyboard (capture)
   useEffect(() => {
     if (!open) return;
 
     const onPointerDownCapture = (e: PointerEvent) => {
-      const t = e.target as Node | null;
-      if (!t) return;
+      const target = e.target as Node | null;
+      const path = eventComposedPath(e);
 
-      const a = anchorRef.current;
-      const pop = popoverElRef.current;
+      const inAnchor = targetWithinNode(target, path, anchorRef.current);
+      const inPop = targetWithinNode(target, path, popoverElRef.current);
 
-      if (a && a.contains(t)) return;
-      if (pop && pop.contains(t)) return;
+      if (inAnchor || inPop) return;
 
       clearCloseTimer();
       closeTimerRef.current = window.setTimeout(() => closePopover(), CLOSE_DELAY_MS);
     };
 
-    const onKey = (e: KeyboardEvent) => {
+    const onKeyCapture = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
         closePopover();
         return;
       }
 
-      // If focus is inside the popover, support Enter to commit
       if (e.key === "Enter") {
         const pop = popoverElRef.current;
         const activeEl = document.activeElement;
@@ -552,20 +691,18 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     };
 
     document.addEventListener("pointerdown", onPointerDownCapture, { capture: true });
-    document.addEventListener("keydown", onKey, { capture: true });
+    document.addEventListener("keydown", onKeyCapture, { capture: true });
 
     return () => {
       document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
-      document.removeEventListener("keydown", onKey, { capture: true });
+      document.removeEventListener("keydown", onKeyCapture, { capture: true });
     };
   }, [open, commit, closePopover, clearCloseTimer, pendingChapter]);
 
-  // Focus management (after open)
   useEffect(() => {
     if (!open) return;
 
     const id = requestAnimationFrame(() => {
-      // Focus the currently selected book, and try to align the other columns too
       const bookEl = bookBtnMapRef.current.get(bookId) ?? null;
       bookEl?.focus();
       scrollIntoViewCentered(bookEl);
@@ -574,6 +711,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
         const chapEl = chapBtnMapRef.current.get(`c:${chapter}`) ?? null;
         scrollIntoViewCentered(chapEl);
       }
+
       if (!pendingVerse && verse != null) {
         const verseEl = verseBtnMapRef.current.get(`v:${verse}`) ?? null;
         scrollIntoViewCentered(verseEl);
@@ -599,338 +737,313 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   };
 
   const popAnim: React.CSSProperties = reducedMotion
-      ? { opacity: 1, transform: "none" }
-      : phase === "opening"
-          ? { opacity: 0, transform: "scale(0.975) translateY(6px)" }
-          : phase === "closing"
-              ? { opacity: 0, transform: "scale(0.988) translateY(4px)" }
-              : { opacity: 1, transform: "scale(1) translateY(0)" };
+       ? { opacity: 1, transform: "none" }
+       : phase === "opening"
+            ? { opacity: 0, transform: "scale(0.975) translateY(6px)" }
+            : phase === "closing"
+                 ? { opacity: 0, transform: "scale(0.988) translateY(4px)" }
+                 : { opacity: 1, transform: "scale(1) translateY(0)" };
 
   const popTransition = reducedMotion
-      ? undefined
-      : "opacity 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0)";
+       ? undefined
+       : "opacity 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0)";
 
-  // Monochrome accent derived from theme tokens (no hue)
-  const bpAccent = "var(--fg)";
-  const bpAccentSoft = "color-mix(in oklab, var(--panel) 26%, transparent)";
-  const bpAccentRing = "color-mix(in oklab, var(--focusRing) 72%, transparent)";
-
-  // Keyboard navigation inside popover (roving focus)
-  const onPopoverKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    const key = e.key;
-
-    const col: Col = activeColRef.current;
-    const isBooks = col === "book";
-    const isCh = col === "chapter";
-    const isV = col === "verse";
-
-    const moveCol = (next: Col) => {
-      setActiveCol(next);
-      requestAnimationFrame(() => {
-        if (next === "book") {
-          const b = list[activeBookIdx]?.bookId;
-          const el = b ? bookBtnMapRef.current.get(b) : null;
-          el?.focus();
-          scrollIntoViewCentered(el);
-        } else if (next === "chapter") {
-          const n = chapterOptions[activeChapIdx]?.value;
-          const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
-          el?.focus();
-          scrollIntoViewCentered(el);
-        } else {
-          const n = verseOptions[activeVerseIdx]?.value;
-          const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
-          el?.focus();
-          scrollIntoViewCentered(el);
-        }
-      });
-    };
-
-    const handleUpDown = (delta: number) => {
-      if (isBooks) {
-        const idx = nextIndex(activeBookIdx, delta, list.length);
-        setActiveBookIdx(idx);
-        const id = list[idx]?.bookId;
-        if (id) {
-          const el = bookBtnMapRef.current.get(id) ?? null;
-          el?.focus();
-          scrollIntoViewCentered(el);
-        }
-        e.preventDefault();
-        return;
-      }
-
-      if (isCh) {
-        const idx = nextIndex(activeChapIdx, delta, chapterOptions.length);
-        setActiveChapIdx(idx);
-        const n = chapterOptions[idx]?.value;
-        if (n != null) {
-          const el = chapBtnMapRef.current.get(`c:${n}`) ?? null;
-          el?.focus();
-          scrollIntoViewCentered(el);
-        }
-        e.preventDefault();
-        return;
-      }
-
-      // verse
-      const idx = nextIndex(activeVerseIdx, delta, verseOptions.length);
-      setActiveVerseIdx(idx);
-      const n = verseOptions[idx]?.value;
-      if (n != null) {
-        const el = verseBtnMapRef.current.get(`v:${n}`) ?? null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      }
-      e.preventDefault();
-    };
-
-    if (key === "ArrowLeft") {
-      if (isV) moveCol("chapter");
-      else if (isCh) moveCol("book");
-      e.preventDefault();
-      return;
-    }
-    if (key === "ArrowRight") {
-      if (isBooks) moveCol("chapter");
-      else if (isCh) moveCol("verse");
-      e.preventDefault();
-      return;
-    }
-    if (key === "ArrowUp") return handleUpDown(-1);
-    if (key === "ArrowDown") return handleUpDown(1);
-
-    if (key === "Home") {
-      if (isBooks) {
-        setActiveBookIdx(0);
-        const id = list[0]?.bookId;
-        const el = id ? bookBtnMapRef.current.get(id) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      } else if (isCh) {
-        setActiveChapIdx(0);
-        const n = chapterOptions[0]?.value;
-        const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      } else {
-        setActiveVerseIdx(0);
-        const n = verseOptions[0]?.value;
-        const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      }
-      e.preventDefault();
-      return;
-    }
-
-    if (key === "End") {
-      if (isBooks) {
-        const idx = Math.max(0, list.length - 1);
-        setActiveBookIdx(idx);
-        const id = list[idx]?.bookId;
-        const el = id ? bookBtnMapRef.current.get(id) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      } else if (isCh) {
-        const idx = Math.max(0, chapterOptions.length - 1);
-        setActiveChapIdx(idx);
-        const n = chapterOptions[idx]?.value;
-        const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      } else {
-        const idx = Math.max(0, verseOptions.length - 1);
-        setActiveVerseIdx(idx);
-        const n = verseOptions[idx]?.value;
-        const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
-        el?.focus();
-        scrollIntoViewCentered(el);
-      }
-      e.preventDefault();
-      return;
-    }
+  const popoverStyle: CssVarStyle = {
+    ...sx.popover,
+    left: popPos?.left ?? 0,
+    top: popPos?.top ?? 0,
+    width: popPos?.width ?? POPOVER_W,
+    height: popPos?.height ?? POPOVER_MIN_H,
+    ...popAnim,
+    transition: popTransition,
+    "--bpAccent": "var(--fg)",
+    "--bpAccentSoft": "color-mix(in oklab, var(--panel) 26%, transparent)",
+    "--bpAccentRing": "color-mix(in oklab, var(--focusRing) 72%, transparent)",
   };
 
+  const onPopoverKeyDown = useCallback(
+       (e: React.KeyboardEvent<HTMLDivElement>) => {
+         const key = e.key;
+         const col = activeColRef.current;
+         const isBooks = col === "book";
+         const isCh = col === "chapter";
+         const isV = col === "verse";
+
+         const moveCol = (next: Col) => {
+           setActiveCol(next);
+           requestAnimationFrame(() => {
+             focusCurrentColumnSelection(next);
+           });
+         };
+
+         const handleUpDown = (delta: number) => {
+           if (isBooks) {
+             const idx = nextIndex(activeBookIdx, delta, list.length);
+             setActiveBookIdx(idx);
+             focusBookByIndex(idx);
+             e.preventDefault();
+             return;
+           }
+
+           if (isCh) {
+             const idx = nextIndex(activeChapIdx, delta, chapterOptions.length);
+             setActiveChapIdx(idx);
+             focusChapterByIndex(idx);
+             e.preventDefault();
+             return;
+           }
+
+           const idx = nextIndex(activeVerseIdx, delta, verseOptions.length);
+           setActiveVerseIdx(idx);
+           focusVerseByIndex(idx);
+           e.preventDefault();
+         };
+
+         if (key === "ArrowLeft") {
+           if (isV) moveCol("chapter");
+           else if (isCh) moveCol("book");
+           e.preventDefault();
+           return;
+         }
+
+         if (key === "ArrowRight") {
+           if (isBooks) moveCol("chapter");
+           else if (isCh) moveCol("verse");
+           e.preventDefault();
+           return;
+         }
+
+         if (key === "ArrowUp") {
+           handleUpDown(-1);
+           return;
+         }
+
+         if (key === "ArrowDown") {
+           handleUpDown(1);
+           return;
+         }
+
+         if (key === "Home") {
+           focusColumnBoundary(col, false);
+           e.preventDefault();
+           return;
+         }
+
+         if (key === "End") {
+           focusColumnBoundary(col, true);
+           e.preventDefault();
+         }
+       },
+       [
+         activeBookIdx,
+         activeChapIdx,
+         activeVerseIdx,
+         activeColRef,
+         chapterOptions.length,
+         verseOptions.length,
+         list.length,
+         focusBookByIndex,
+         focusChapterByIndex,
+         focusVerseByIndex,
+         focusCurrentColumnSelection,
+         focusColumnBoundary,
+       ],
+  );
+
   const popover =
-      open && popPos
-          ? createPortal(
-              <div
-                  id="bp-pos-popover"
-                  ref={popoverElRef}
-                  style={{
-                    ...sx.popover,
-                    left: popPos.left,
-                    top: popPos.top,
-                    width: popPos.width,
-                    height: popPos.height,
-                    ...popAnim,
-                    transition: popTransition,
-                    ["--bpAccent" as any]: bpAccent,
-                    ["--bpAccentSoft" as any]: bpAccentSoft,
-                    ["--bpAccentRing" as any]: bpAccentRing,
-                  }}
-                  role="dialog"
-                  aria-label="Jump"
-                  aria-modal="false"
-                  onKeyDown={onPopoverKeyDown}
-              >
-                <div style={sx.topRow}>
-                  <div
-                      style={sx.titleWrap}
-                      aria-label="Selection summary"
-                      title={`${titleBookPart}${titleNumPart}${titleTagPart}`}
-                  >
-                    <span style={sx.titleBook}>{titleBookPart}</span>
-                    {titleNumPart && <span style={sx.titleNum}>{titleNumPart}</span>}
-                    {titleTagPart && <span style={sx.titleTag}>{titleTagPart}</span>}
-                  </div>
+       open && popPos
+            ? createPortal(
+                 <div
+                      id={POP_ID}
+                      ref={popoverElRef}
+                      style={popoverStyle}
+                      role="dialog"
+                      aria-label="Jump"
+                      aria-modal="false"
+                      onKeyDown={onPopoverKeyDown}
+                 >
+                   <div style={sx.topRow}>
+                     <div
+                          style={sx.titleWrap}
+                          aria-label="Selection summary"
+                          title={`${bookName}${titleNumPart}${testamentTag}`}
+                     >
+                       <span style={sx.titleBook}>{bookName}</span>
+                       {titleNumPart ? <span style={sx.titleNum}>{titleNumPart}</span> : null}
+                       {testamentTag ? <span style={sx.titleTag}>{testamentTag}</span> : null}
+                     </div>
 
-                  <button
-                      type="button"
-                      className="bp-go"
-                      style={goStyle}
-                      onClick={() => {
-                        if (canCommit) commit();
-                      }}
-                      disabled={!canCommit}
-                      onPointerDown={() => setPressGo(true)}
-                      onPointerUp={() => setPressGo(false)}
-                      onPointerCancel={() => setPressGo(false)}
-                      onPointerLeave={() => setPressGo(false)}
-                      aria-label="Confirm jump"
-                      title={canCommit ? "Confirm" : "Pick a chapter first"}
-                  >
-                    →
-                  </button>
-                </div>
+                     <button
+                          type="button"
+                          className="bp-go"
+                          style={goStyle}
+                          onClick={() => {
+                            if (canCommit) commit();
+                          }}
+                          disabled={!canCommit}
+                          onPointerDown={() => setPressGo(true)}
+                          onPointerUp={() => setPressGo(false)}
+                          onPointerCancel={() => setPressGo(false)}
+                          onPointerLeave={() => setPressGo(false)}
+                          aria-label="Confirm jump"
+                          title={canCommit ? "Confirm" : "Pick a chapter first"}
+                     >
+                       →
+                     </button>
+                   </div>
 
-                <div style={sx.bodyRow}>
-                  {/* Books */}
-                  <div style={sx.col}>
-                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
-                      {list.map((b, idx) => {
-                        const active = b.bookId === bookId;
-                        const tabIndex = activeCol === "book" && idx === activeBookIdx ? 0 : -1;
-                        return (
-                            <ListItem
-                                key={b.bookId}
-                                active={active}
-                                onClick={() => onPickBook(b.bookId)}
-                                mapRef={bookBtnMapRef}
-                                itemKey={b.bookId}
-                                ariaLabel={`Select ${b.name}`}
-                                tabIndex={tabIndex}
-                                onFocus={() => setActiveCol("book")}
-                            >
-                        <span style={sx.itemLine}>
-                          <span style={{ ...sx.itemTextBook, ...(active ? sx.itemTextActive : null) }}>{b.name}</span>
-                        </span>
-                            </ListItem>
-                        );
-                      })}
-                    </div>
-                  </div>
+                   <div style={sx.bodyRow}>
+                     <div style={sx.col}>
+                       <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
+                         {list.map((b, idx) => {
+                           const active = b.bookId === bookId;
+                           const tabIndex =
+                                activeCol === "book" && idx === activeBookIdx ? 0 : -1;
 
-                  {/* Chapters */}
-                  <div style={sx.colNarrow}>
-                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
-                      {chapterOptions.map((o, idx) => {
-                        const n = o.value;
-                        const active = !pendingChapter && n === chapter;
-                        const tabIndex = activeCol === "chapter" && idx === activeChapIdx ? 0 : -1;
-                        return (
-                            <ListItem
-                                key={o.key}
-                                active={active}
-                                onClick={() => onPickChapter(n)}
-                                tight
-                                mapRef={chapBtnMapRef}
-                                itemKey={`c:${n}`}
-                                ariaLabel={`Chapter ${n}`}
-                                tabIndex={tabIndex}
-                                onFocus={() => setActiveCol("chapter")}
-                            >
-                        <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
-                          <span style={sx.prefixLabel}>CH</span> {n}
-                        </span>
-                            </ListItem>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  {/* Verses */}
-                  <div style={sx.colNarrow}>
-                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Verses">
-                      {!chaptersMeta ? (
-                          <div style={sx.loadingBox}>Loading…</div>
-                      ) : (
-                          verseOptions.map((o, idx) => {
-                            const n = o.value;
-                            const active = !pendingVerse && verse === n;
-                            const tabIndex = activeCol === "verse" && idx === activeVerseIdx ? 0 : -1;
-                            return (
+                           return (
                                 <ListItem
-                                    key={o.key}
-                                    active={active}
-                                    onClick={() => onPickVerse(n)}
-                                    tight
-                                    mapRef={verseBtnMapRef}
-                                    itemKey={`v:${n}`}
-                                    ariaLabel={`Verse ${n}`}
-                                    tabIndex={tabIndex}
-                                    onFocus={() => setActiveCol("verse")}
+                                     key={b.bookId}
+                                     active={active}
+                                     onClick={() => onPickBook(b.bookId)}
+                                     mapRef={bookBtnMapRef}
+                                     itemKey={b.bookId}
+                                     ariaLabel={`Select ${b.name}`}
+                                     tabIndex={tabIndex}
+                                     onFocus={() => setActiveCol("book")}
                                 >
-                          <span style={{ ...sx.numText, ...(active ? sx.numTextActive : null) }}>
-                            <span style={sx.prefixLabel}>V</span> {n}
-                          </span>
+                                              <span style={sx.itemLine}>
+                                                  <span
+                                                       style={{
+                                                         ...sx.itemTextBook,
+                                                         ...(active ? sx.itemTextActive : null),
+                                                       }}
+                                                  >
+                                                      {b.name}
+                                                  </span>
+                                              </span>
                                 </ListItem>
-                            );
-                          })
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </div>,
-              document.body,
-          )
-          : null;
+                           );
+                         })}
+                       </div>
+                     </div>
+
+                     <div style={sx.colNarrow}>
+                       <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
+                         {chapterOptions.map((o, idx) => {
+                           const n = o.value;
+                           const active = !pendingChapter && n === chapter;
+                           const tabIndex =
+                                activeCol === "chapter" && idx === activeChapIdx ? 0 : -1;
+
+                           return (
+                                <ListItem
+                                     key={o.key}
+                                     active={active}
+                                     onClick={() => onPickChapter(n)}
+                                     tight
+                                     mapRef={chapBtnMapRef}
+                                     itemKey={`c:${n}`}
+                                     ariaLabel={`Chapter ${n}`}
+                                     tabIndex={tabIndex}
+                                     onFocus={() => setActiveCol("chapter")}
+                                >
+                                              <span
+                                                   style={{
+                                                     ...sx.numText,
+                                                     ...(active ? sx.numTextActive : null),
+                                                   }}
+                                              >
+                                                  <span style={sx.prefixLabel}>CH</span> {n}
+                                              </span>
+                                </ListItem>
+                           );
+                         })}
+                       </div>
+                     </div>
+
+                     <div style={sx.colNarrow}>
+                       <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Verses">
+                         {!chaptersMeta ? (
+                              <div style={sx.loadingBox}>Loading…</div>
+                         ) : (
+                              verseOptions.map((o, idx) => {
+                                const n = o.value;
+                                const active = !pendingVerse && verse === n;
+                                const tabIndex =
+                                     activeCol === "verse" && idx === activeVerseIdx ? 0 : -1;
+
+                                return (
+                                     <ListItem
+                                          key={o.key}
+                                          active={active}
+                                          onClick={() => onPickVerse(n)}
+                                          tight
+                                          mapRef={verseBtnMapRef}
+                                          itemKey={`v:${n}`}
+                                          ariaLabel={`Verse ${n}`}
+                                          tabIndex={tabIndex}
+                                          onFocus={() => setActiveCol("verse")}
+                                     >
+                                                  <span
+                                                       style={{
+                                                         ...sx.numText,
+                                                         ...(active ? sx.numTextActive : null),
+                                                       }}
+                                                  >
+                                                      <span style={sx.prefixLabel}>V</span> {n}
+                                                  </span>
+                                     </ListItem>
+                                );
+                              })
+                         )}
+                       </div>
+                     </div>
+                   </div>
+                 </div>,
+                 document.body,
+            )
+            : null;
 
   return (
-      <div style={sx.root}>
-        <button
-            ref={anchorRef}
-            type="button"
-            className="bp-pill"
-            style={pillStyle}
-            aria-label="Current position"
-            aria-haspopup="dialog"
-            aria-expanded={open}
-            onClick={toggleOpen}
-            onPointerDown={() => {
-              clearCloseTimer();
-              setPressPill(true);
-            }}
-            onPointerUp={() => setPressPill(false)}
-            onPointerCancel={() => setPressPill(false)}
-            onPointerLeave={() => setPressPill(false)}
-            title={pillLabel}
-        >
-          <span style={sx.pillTextStrong}>{currentBookName}</span>
-          <span style={sx.pillTextMuted}>{currentVerse == null ? `${currentChap}` : `${currentChap}:${currentVerse}`}</span>
-          <span style={sx.caret} aria-hidden>
-          ▾
-        </span>
-        </button>
+       <div style={sx.root}>
+         <button
+              ref={anchorRef}
+              type="button"
+              className="bp-pill"
+              style={pillStyle}
+              aria-label="Current position"
+              aria-haspopup="dialog"
+              aria-expanded={open}
+              onClick={toggleOpen}
+              onPointerDown={() => {
+                clearCloseTimer();
+                setPressPill(true);
+              }}
+              onPointerUp={() => setPressPill(false)}
+              onPointerCancel={() => setPressPill(false)}
+              onPointerLeave={() => setPressPill(false)}
+              title={pillLabel}
+         >
+           <span style={sx.pillTextStrong}>{currentBookName}</span>
+           <span style={sx.pillTextMuted}>
+                    {currentVerse == null ? `${currentChap}` : `${currentChap}:${currentVerse}`}
+                </span>
+           <span style={sx.caret} aria-hidden>
+                    ▾
+                </span>
+         </button>
 
-        {popover}
-      </div>
+         {popover}
+       </div>
   );
 }
 
 const sx: Record<string, React.CSSProperties> = {
-  root: { position: "relative", display: "flex", alignItems: "center" },
+  root: {
+    position: "relative",
+    display: "flex",
+    alignItems: "center",
+  },
 
   pill: {
     display: "inline-grid",
@@ -948,14 +1061,16 @@ const sx: Record<string, React.CSSProperties> = {
     lineHeight: 1,
     boxShadow: "0 6px 18px rgba(0,0,0,0.06)",
     transition:
-        "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
+         "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
     whiteSpace: "nowrap",
     textAlign: "left",
     WebkitTapHighlightColor: "transparent",
     outline: "none",
     willChange: "transform",
   },
-  pillPressedFallback: { transform: "scale(0.97)" },
+  pillPressedFallback: {
+    transform: "scale(0.97)",
+  },
   pillOpen: {
     boxShadow: "0 14px 42px rgba(0,0,0,0.12)",
     transform: "translateY(-1px)",
@@ -1076,8 +1191,13 @@ const sx: Record<string, React.CSSProperties> = {
     WebkitTapHighlightColor: "transparent",
     outline: "none",
   },
-  goBtnDisabled: { opacity: 0.52, cursor: "not-allowed" },
-  goPressedFallback: { transform: "scale(0.945)" },
+  goBtnDisabled: {
+    opacity: 0.52,
+    cursor: "not-allowed",
+  },
+  goPressedFallback: {
+    transform: "scale(0.945)",
+  },
 
   bodyRow: {
     display: "grid",
@@ -1087,8 +1207,18 @@ const sx: Record<string, React.CSSProperties> = {
     minHeight: 0,
     flex: "1 1 auto",
   },
-  col: { minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" },
-  colNarrow: { minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" },
+  col: {
+    minWidth: 0,
+    minHeight: 0,
+    display: "flex",
+    flexDirection: "column",
+  },
+  colNarrow: {
+    minWidth: 0,
+    minHeight: 0,
+    display: "flex",
+    flexDirection: "column",
+  },
 
   list: {
     borderRadius: S(12),
@@ -1153,7 +1283,12 @@ const sx: Record<string, React.CSSProperties> = {
     borderBottomLeftRadius: S(12),
   },
 
-  itemLine: { display: "inline-flex", alignItems: "baseline", gap: S(7), minWidth: 0 },
+  itemLine: {
+    display: "inline-flex",
+    alignItems: "baseline",
+    gap: S(7),
+    minWidth: 0,
+  },
   itemTextBook: {
     fontSize: 13.9 * SCALE,
     fontWeight: 600,
@@ -1165,7 +1300,10 @@ const sx: Record<string, React.CSSProperties> = {
     whiteSpace: "nowrap",
     minWidth: 0,
   },
-  itemTextActive: { opacity: 1, fontWeight: 670 },
+  itemTextActive: {
+    opacity: 1,
+    fontWeight: 670,
+  },
 
   numText: {
     fontSize: 13.7 * SCALE,
@@ -1175,7 +1313,10 @@ const sx: Record<string, React.CSSProperties> = {
     fontWeight: 560,
     fontVariantNumeric: "tabular-nums",
   },
-  numTextActive: { opacity: 1, fontWeight: 670 },
+  numTextActive: {
+    opacity: 1,
+    fontWeight: 670,
+  },
 
   prefixLabel: {
     fontSize: 10.8 * SCALE,

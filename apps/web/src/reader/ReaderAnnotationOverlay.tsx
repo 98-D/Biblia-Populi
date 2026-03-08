@@ -1,146 +1,217 @@
+// cspell:words oklab
 import React, { memo, useMemo } from "react";
+import type { CSSProperties } from "react";
 import type { Annotation } from "@biblia/annotation";
 
 type Props = {
-    annotations: readonly Annotation[];
+     annotations: readonly Annotation[];
 };
 
-function toneForKind(kind: Annotation["kind"]): {
-    tint: string;
-    rail: string;
-    dot: string;
-} {
-    switch (kind) {
-        case "BOOKMARK":
-            return {
-                tint: "color-mix(in oklab, #7ba9ff 10%, transparent)",
-                rail: "color-mix(in oklab, #5f92ff 70%, transparent)",
-                dot: "color-mix(in oklab, #5f92ff 82%, transparent)",
-            };
-        case "NOTE":
-            return {
-                tint: "color-mix(in oklab, #b191ff 10%, transparent)",
-                rail: "color-mix(in oklab, #9c75ff 70%, transparent)",
-                dot: "color-mix(in oklab, #9c75ff 82%, transparent)",
-            };
-        case "DRAWING":
-            return {
-                tint: "color-mix(in oklab, #7de0d0 10%, transparent)",
-                rail: "color-mix(in oklab, #42cdb7 70%, transparent)",
-                dot: "color-mix(in oklab, #42cdb7 82%, transparent)",
-            };
-        default:
-            return {
-                tint: "color-mix(in oklab, #efcf73 12%, transparent)",
-                rail: "color-mix(in oklab, #ddb54c 68%, transparent)",
-                dot: "color-mix(in oklab, #ddb54c 82%, transparent)",
-            };
-    }
+type Tone = Readonly<{
+     wash: string;
+     rail: string;
+     dot: string;
+     ring: string;
+}>;
+
+const MAX_MARKERS = 3;
+const CORNER_TOP = 8;
+const CORNER_RIGHT = 10;
+const RAIL_INSET_Y = 8;
+const RAIL_WIDTH = 2;
+const DOT_SIZE = 6;
+const STACK_BADGE_H = 18;
+
+function toneForKind(kind: Annotation["kind"]): Tone {
+     switch (kind) {
+          case "BOOKMARK":
+               return {
+                    wash: "color-mix(in oklab, #7ba9ff 8%, transparent)",
+                    rail: "color-mix(in oklab, #5f92ff 58%, transparent)",
+                    dot: "color-mix(in oklab, #5f92ff 74%, transparent)",
+                    ring: "color-mix(in oklab, white 60%, transparent)",
+               };
+          case "NOTE":
+               return {
+                    wash: "color-mix(in oklab, #b191ff 8%, transparent)",
+                    rail: "color-mix(in oklab, #9c75ff 58%, transparent)",
+                    dot: "color-mix(in oklab, #9c75ff 74%, transparent)",
+                    ring: "color-mix(in oklab, white 60%, transparent)",
+               };
+          case "DRAWING":
+               return {
+                    wash: "color-mix(in oklab, #7de0d0 8%, transparent)",
+                    rail: "color-mix(in oklab, #42cdb7 58%, transparent)",
+                    dot: "color-mix(in oklab, #42cdb7 74%, transparent)",
+                    ring: "color-mix(in oklab, white 60%, transparent)",
+               };
+          case "HIGHLIGHT":
+          default:
+               return {
+                    wash: "color-mix(in oklab, #efcf73 10%, transparent)",
+                    rail: "color-mix(in oklab, #ddb54c 56%, transparent)",
+                    dot: "color-mix(in oklab, #ddb54c 74%, transparent)",
+                    ring: "color-mix(in oklab, white 60%, transparent)",
+               };
+     }
 }
 
+function isLiveAnnotation(annotation: Annotation): boolean {
+     return annotation.deletedAt === null;
+}
+
+function hasKind(list: readonly Annotation[], kind: Annotation["kind"]): boolean {
+     return list.some((annotation) => annotation.kind === kind);
+}
+
+const sx: Record<string, CSSProperties> = {
+     root: {
+          position: "absolute",
+          inset: 0,
+          pointerEvents: "none",
+          borderRadius: 16,
+          overflow: "hidden",
+          zIndex: 0,
+     },
+
+     wash: {
+          position: "absolute",
+          inset: 0,
+          borderRadius: 16,
+     },
+
+     rail: {
+          position: "absolute",
+          left: 0,
+          top: RAIL_INSET_Y,
+          bottom: RAIL_INSET_Y,
+          width: RAIL_WIDTH,
+          borderRadius: 999,
+     },
+
+     markerRow: {
+          position: "absolute",
+          top: CORNER_TOP,
+          right: CORNER_RIGHT,
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 4,
+     },
+
+     dot: {
+          width: DOT_SIZE,
+          height: DOT_SIZE,
+          borderRadius: 999,
+          flex: "0 0 auto",
+     },
+
+     countBadge: {
+          minWidth: 18,
+          height: STACK_BADGE_H,
+          paddingInline: 5,
+          borderRadius: 999,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontSize: 10,
+          fontWeight: 700,
+          lineHeight: 1,
+          letterSpacing: "-0.01em",
+          userSelect: "none",
+     },
+};
+
 export const ReaderAnnotationOverlay = memo(function ReaderAnnotationOverlay(props: Props) {
-    const { annotations } = props;
+     const { annotations } = props;
 
-    const live = useMemo(
-        () => annotations.filter((annotation) => annotation.deletedAt === null),
-        [annotations],
-    );
+     const live = useMemo(
+          () => annotations.filter(isLiveAnnotation),
+          [annotations],
+     );
 
-    const primary = live[0] ?? null;
-    const hasHighlight = live.some((annotation) => annotation.kind === "HIGHLIGHT");
-    const hasBookmark = live.some((annotation) => annotation.kind === "BOOKMARK");
-    const hasNote = live.some((annotation) => annotation.kind === "NOTE");
-    const markerKinds = live.slice(0, 3).map((annotation) => annotation.kind);
+     const primary = live[0] ?? null;
 
-    if (!primary) return null;
+     const markerKinds = useMemo(
+          () => live.slice(0, MAX_MARKERS).map((annotation) => annotation.kind),
+          [live],
+     );
 
-    const tone = toneForKind(primary.kind);
+     const meta = useMemo(() => {
+          if (!primary) {
+               return {
+                    tone: null as Tone | null,
+                    hasHighlight: false,
+                    showRail: false,
+                    extraCount: 0,
+               };
+          }
 
-    return (
-        <div
-            aria-hidden="true"
-            style={{
-                position: "absolute",
-                inset: 0,
-                pointerEvents: "none",
-                borderRadius: 16,
-                overflow: "hidden",
-                zIndex: 0,
-            }}
-        >
-            {hasHighlight ? (
-                <div
-                    style={{
-                        position: "absolute",
-                        inset: 0,
-                        background: tone.tint,
-                        borderRadius: 16,
-                    }}
-                />
-            ) : null}
+          const tone = toneForKind(primary.kind);
+          const hasHighlight = hasKind(live, "HIGHLIGHT");
+          const showRail =
+               hasKind(live, "BOOKMARK") ||
+               hasKind(live, "NOTE") ||
+               hasKind(live, "DRAWING");
 
-            {(hasBookmark || hasNote || primary.kind === "DRAWING") ? (
-                <div
-                    style={{
-                        position: "absolute",
-                        left: 0,
-                        top: 8,
-                        bottom: 8,
-                        width: 3,
-                        borderRadius: 999,
-                        background: tone.rail,
-                    }}
-                />
-            ) : null}
+          return {
+               tone,
+               hasHighlight,
+               showRail,
+               extraCount: Math.max(0, live.length - MAX_MARKERS),
+          };
+     }, [live, primary]);
 
-            <div
-                style={{
-                    position: "absolute",
-                    top: 8,
-                    right: 10,
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: 5,
-                }}
-            >
-                {markerKinds.map((kind, index) => {
-                    const markerTone = toneForKind(kind);
-                    return (
-                        <span
-                            key={`${kind}-${index}`}
-                            style={{
-                                width: 7,
-                                height: 7,
-                                borderRadius: 999,
-                                background: markerTone.dot,
-                                boxShadow: "0 0 0 1px color-mix(in oklab, white 58%, transparent)",
-                            }}
-                        />
-                    );
-                })}
+     if (!primary || !meta.tone) return null;
 
-                {live.length > 3 ? (
-                    <span
-                        style={{
-                            minWidth: 18,
-                            height: 18,
-                            paddingInline: 5,
-                            borderRadius: 999,
-                            display: "inline-flex",
-                            alignItems: "center",
-                            justifyContent: "center",
-                            background: "color-mix(in oklab, var(--card, white) 92%, transparent)",
-                            color: "color-mix(in oklab, var(--text, #111) 70%, transparent)",
-                            fontSize: 10,
-                            fontWeight: 700,
-                            lineHeight: 1,
-                            border: "1px solid color-mix(in oklab, var(--border, rgba(127,127,127,0.2)) 84%, transparent)",
-                        }}
-                    >
-                        +{live.length - 3}
+     return (
+          <div aria-hidden="true" style={sx.root}>
+               {meta.hasHighlight ? (
+                    <div
+                         style={{
+                              ...sx.wash,
+                              background: meta.tone.wash,
+                         }}
+                    />
+               ) : null}
+
+               {meta.showRail ? (
+                    <div
+                         style={{
+                              ...sx.rail,
+                              background: meta.tone.rail,
+                         }}
+                    />
+               ) : null}
+
+               <div style={sx.markerRow}>
+                    {markerKinds.map((kind, index) => {
+                         const markerTone = toneForKind(kind);
+
+                         return (
+                              <span
+                                   key={`${kind}-${index}`}
+                                   style={{
+                                        ...sx.dot,
+                                        background: markerTone.dot,
+                                        boxShadow: `0 0 0 1px ${markerTone.ring}`,
+                                   }}
+                              />
+                         );
+                    })}
+
+                    {meta.extraCount > 0 ? (
+                         <span
+                              style={{
+                                   ...sx.countBadge,
+                                   background: "color-mix(in oklab, var(--card, white) 94%, transparent)",
+                                   color: "color-mix(in oklab, var(--text, #111) 62%, transparent)",
+                                   border: "1px solid color-mix(in oklab, var(--border, rgba(127,127,127,0.2)) 78%, transparent)",
+                              }}
+                         >
+                        +{meta.extraCount}
                     </span>
-                ) : null}
-            </div>
-        </div>
-    );
+                    ) : null}
+               </div>
+          </div>
+     );
 });

@@ -1,5 +1,5 @@
 // apps/web/src/reader/ReaderShell.tsx
-import React, { memo, useMemo } from "react";
+import React, { memo, useEffect, useMemo, useRef } from "react";
 import type { CSSProperties, MutableRefObject, ReactNode, Ref } from "react";
 import type { AnnotationSnapshot } from "@biblia/annotation";
 import type { BookRow } from "../api";
@@ -10,19 +10,19 @@ import { sx } from "./sx";
 import type { ReaderPosition, SpineStats } from "./types";
 import { ReaderViewport, type ReaderViewportHandle } from "./ReaderViewport";
 
-type CurrentPos = {
+type CurrentPos = Readonly<{
     label: string;
     ord: number;
     bookId: string | null;
     chapter: number | null;
     verse: number | null;
-};
+}>;
 
 type SpineValidation =
      | { ok: true }
      | { ok: false; msg: string };
 
-type Props = {
+type Props = Readonly<{
     styles: Record<string, CSSProperties>;
     books: BookRow[] | null;
 
@@ -48,7 +48,7 @@ type Props = {
     onReady?: () => void;
 
     err?: string | null;
-};
+}>;
 
 const MEASURE_WRAP_STYLE: CSSProperties = {
     maxWidth: "var(--bpReaderMeasure, 840px)",
@@ -56,6 +56,7 @@ const MEASURE_WRAP_STYLE: CSSProperties = {
     paddingInline: 18,
     boxSizing: "border-box",
     width: "100%",
+    minWidth: 0,
 };
 
 const ERR_BANNER_OUTER_STYLE: CSSProperties = {
@@ -71,6 +72,11 @@ const ERR_TEXT_STYLE: CSSProperties = {
     fontSize: 12,
     color: "var(--muted)",
     whiteSpace: "pre-wrap",
+};
+
+const LOADING_TEXT_STYLE: CSSProperties = {
+    ...sx.msg,
+    paddingTop: 22,
 };
 
 function isFiniteIntegerLike(value: unknown): value is number {
@@ -124,11 +130,11 @@ function buildViewportKey(spine: SpineStats | null): string {
     return `${spine.verseOrdMin}:${spine.verseOrdMax}:${spine.verseCount}`;
 }
 
-const MeasureWrap = memo(function MeasureWrap(props: { children: ReactNode }) {
+const MeasureWrap = memo(function MeasureWrap(props: Readonly<{ children: ReactNode }>) {
     return <div style={MEASURE_WRAP_STYLE}>{props.children}</div>;
 });
 
-const ErrBanner = memo(function ErrBanner(props: { msg: string }) {
+const ErrBanner = memo(function ErrBanner(props: Readonly<{ msg: string }>) {
     return (
          <div role="status" aria-live="polite" style={ERR_BANNER_OUTER_STYLE}>
              <MeasureWrap>
@@ -140,12 +146,12 @@ const ErrBanner = memo(function ErrBanner(props: { msg: string }) {
     );
 });
 
-const LoadingBody = memo(function LoadingBody() {
+const LoadingBody = memo(function LoadingBody(props: Readonly<{ msg?: string | null }>) {
     return (
          <div style={sx.body}>
              <MeasureWrap>
-                 <div style={sx.msg} role="status" aria-live="polite">
-                     Loading…
+                 <div style={LOADING_TEXT_STYLE} role="status" aria-live="polite">
+                     {props.msg ?? "Loading…"}
                  </div>
              </MeasureWrap>
          </div>
@@ -185,8 +191,35 @@ export function ReaderShell(props: Props) {
         return null;
     }, [err, spine, spineCheck]);
 
+    const reportedErrorRef = useRef<string | null>(null);
+    const readyCalledRef = useRef(false);
+
+    useEffect(() => {
+        if (!bannerMsg || !onError) return;
+        if (reportedErrorRef.current === bannerMsg) return;
+
+        reportedErrorRef.current = bannerMsg;
+        onError(bannerMsg);
+    }, [bannerMsg, onError]);
+
+    useEffect(() => {
+        if (!hasValidSpine) {
+            readyCalledRef.current = false;
+            return;
+        }
+        if (!spine) {
+            readyCalledRef.current = false;
+            return;
+        }
+        if (!onReady) return;
+        if (readyCalledRef.current) return;
+
+        readyCalledRef.current = true;
+        onReady();
+    }, [hasValidSpine, onReady, spine]);
+
     return (
-         <main style={sx.page} aria-busy={!hasValidSpine}>
+         <main style={sx.page} aria-busy={!hasValidSpine} aria-live="polite">
              <ReaderHeader
                   styles={styles}
                   books={books}
@@ -214,7 +247,7 @@ export function ReaderShell(props: Props) {
                        onReady={onReady}
                   />
              ) : (
-                  <LoadingBody />
+                  <LoadingBody msg={!spine && !err ? "Loading…" : undefined} />
              )}
          </main>
     );

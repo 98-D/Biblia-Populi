@@ -4,18 +4,21 @@ import type { CSSProperties } from "react";
 /**
  * Reader UI tokens (inline styles)
  *
- * Design goals:
+ * Hardened / improved:
  * - stable virtualized reader viewport
- * - safe-area aware shell/header
+ * - safe-area aware shell/header/body
+ * - explicit z/layer tokens
  * - true shrinkable center header column
- * - calm, premium row states
+ * - calmer premium row states
  * - no invalid / non-portable inline style tokens
  * - explicit row wrapper surface for verse containers
+ * - safer cross-browser fallbacks for inline React CSSProperties
  *
  * Notes:
- * - layout-critical surfaces stay simple and deterministic
- * - avoid adding size containment to virtualized row wrappers
- * - focus visuals use theme tokens only
+ * - keep layout-critical surfaces simple and deterministic
+ * - avoid size containment on virtualized row wrappers
+ * - inline styles only: no pseudo selectors, no unsupported token tricks
+ * - values are chosen to cooperate with base.css tokens
  */
 
 type SxMap = Readonly<Record<string, CSSProperties>>;
@@ -35,6 +38,7 @@ const PANEL_BG_SOFT = mix("var(--panel) 90%, transparent");
 const PANEL_BG_SOFT_HOVER = mix("var(--panel) 94%, transparent");
 const HEADER_BG = mix("var(--bg) 88%, transparent");
 const SKELETON_BG = mix("var(--hairline) 92%, transparent");
+const SCROLLBAR_THUMB = mix("var(--hairline) 86%, transparent");
 
 const SAFE_TOP = "env(safe-area-inset-top, 0px)";
 const SAFE_BOTTOM = "env(safe-area-inset-bottom, 0px)";
@@ -47,6 +51,8 @@ const HEADER_TOP_PAD = 10;
 const HEADER_BOTTOM_PAD = 10;
 const SCROLL_TOP_PAD = 18;
 const SCROLL_BOTTOM_PAD = 96;
+
+const ROW_SCROLL_MARGIN_TOP = `calc(72px + ${SAFE_TOP})`;
 
 export const sx = {
     /* ---------- Shell ---------- */
@@ -96,7 +102,7 @@ export const sx = {
         alignItems: "center",
         justifyContent: "center",
         minWidth: 0,
-        textAlign: "initial",
+        textAlign: "center",
     },
 
     topRight: {
@@ -184,7 +190,7 @@ export const sx = {
         overscrollBehaviorY: "contain",
         scrollbarGutter: "stable",
         scrollbarWidth: "thin",
-        scrollbarColor: `${mix("var(--hairline) 86%, transparent")} transparent`,
+        scrollbarColor: `${SCROLLBAR_THUMB} transparent`,
         WebkitOverflowScrolling: "touch",
         touchAction: "pan-y",
         transform: "translateZ(0)",
@@ -212,7 +218,7 @@ export const sx = {
         padding: "16px 2px 12px",
         marginTop: 6,
         borderBottom: `1px solid ${HAIRLINE}`,
-        scrollMarginTop: `calc(72px + ${SAFE_TOP})`,
+        scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
     },
 
     bookKicker: {
@@ -236,7 +242,7 @@ export const sx = {
         padding: "12px 2px 10px",
         marginTop: 14,
         borderBottom: `1px solid ${HAIRLINE}`,
-        scrollMarginTop: `calc(72px + ${SAFE_TOP})`,
+        scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
     },
 
     chapterKicker: {
@@ -275,7 +281,7 @@ export const sx = {
         background: "transparent",
         transition: "background 140ms ease, transform 140ms ease, box-shadow 140ms ease",
         WebkitTapHighlightColor: "transparent",
-        scrollMarginTop: `calc(72px + ${SAFE_TOP})`,
+        scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
         width: "100%",
         minWidth: 0,
         outline: "none",
