@@ -9,6 +9,7 @@ import React, {
     useRef,
     useState,
 } from "react";
+import { createPortal } from "react-dom";
 import {
     applyReaderTypography,
     clearReaderTypography,
@@ -25,17 +26,12 @@ import {
 /**
  * Biblia.to — Reader Typography Control
  *
- * Locked contract:
- * - measurePx always fixed to DEFAULT_TYPOGRAPHY.measurePx
- * - leading always fixed to DEFAULT_TYPOGRAPHY.leading
- * - user controls: enabled + font + size + weight
- *
- * Notes:
- * - stable storage/apply contract
- * - viewport-aware panel positioning
- * - touch + mouse friendly controls
- * - hard guard against stale/legacy measure/leading drift
- * - no deprecated MediaQueryList listener APIs
+ * Upgraded:
+ * - narrower / denser panel
+ * - more premium controls
+ * - press-and-hold acceleration for weight / size / font arrows
+ * - stable floating portal
+ * - locked typography contract (measure + leading fixed)
  */
 
 type FontOpt = ReturnType<typeof fontOptions>[number] & {
@@ -45,20 +41,35 @@ type FontOpt = ReturnType<typeof fontOptions>[number] & {
     previewText?: string;
 };
 
-type PanelSide = "bottom-right" | "bottom-left";
+type PanelPlacementX = "left" | "right";
+type PanelPlacementY = "top" | "bottom";
 
-const PANEL_W = 332;
-const PANEL_GAP = 10;
-const SAMPLE_TEXT = "In the beginning God created the heaven and the earth.";
+type PanelLayout = Readonly<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    placeX: PanelPlacementX;
+    placeY: PanelPlacementY;
+}>;
+
+const PANEL_W = 268;
+const PANEL_H = 236;
+const PANEL_MIN_W = 248;
+const PANEL_GAP = 8;
+const VIEWPORT_PAD = 10;
+
+const STYLE_ATTR = "data-bp-reader-typo-style";
+const PORTAL_PANEL_ID = "bp-reader-typo-panel";
+
+const HOLD_INITIAL_DELAY_MS = 260;
+const HOLD_REPEAT_START_MS = 120;
+const HOLD_REPEAT_FAST_MS = 52;
+const HOLD_ACCEL_AFTER_MS = 560;
 
 function clampNum(n: number, lo: number, hi: number): number {
     if (!Number.isFinite(n)) return lo;
     return Math.max(lo, Math.min(hi, n));
-}
-
-function roundToStep(n: number, step: number): number {
-    if (!Number.isFinite(n) || !Number.isFinite(step) || step <= 0) return n;
-    return Math.round(n / step) * step;
 }
 
 function normalizeLockedTypography(input: ReaderTypography): ReaderTypography {
@@ -75,25 +86,6 @@ function nextOf<T>(arr: readonly T[], current: T, dir: 1 | -1): T {
     return arr[n]!;
 }
 
-function fontFamilyForOpt(f: FontOpt | null): string {
-    if (!f) return "var(--font-serif)";
-    const fam = (f.previewFamily ?? f.cssFamily ?? f.family ?? String(f.id)).trim();
-    if (!fam) return "var(--font-serif)";
-    if (
-         fam.startsWith("var(") ||
-         fam.includes(",") ||
-         fam.startsWith("ui-") ||
-         fam.includes("system-ui")
-    ) {
-        return fam;
-    }
-    return `"${fam}", var(--font-serif), Georgia, Cambria, "Times New Roman", serif`;
-}
-
-function isRangeInput(el: Element | null): el is HTMLInputElement {
-    return !!el && el.tagName === "INPUT" && (el as HTMLInputElement).type === "range";
-}
-
 function eventComposedPath(e: Event): EventTarget[] | null {
     const maybe = e as Event & { composedPath?: () => EventTarget[] };
     return typeof maybe.composedPath === "function" ? maybe.composedPath() : null;
@@ -107,6 +99,63 @@ function pathContainsNode(path: EventTarget[] | null, node: Node | null): boolea
     return false;
 }
 
+function getViewportSize(): { width: number; height: number } {
+    if (typeof window === "undefined") return { width: 0, height: 0 };
+    const vv = window.visualViewport;
+    if (vv) {
+        return {
+            width: Math.round(vv.width),
+            height: Math.round(vv.height),
+        };
+    }
+    return {
+        width: window.innerWidth,
+        height: window.innerHeight,
+    };
+}
+
+function computePanelLayout(trigger: DOMRect, preferredWidth: number): PanelLayout {
+    const { width: viewportW, height: viewportH } = getViewportSize();
+
+    const width = Math.round(
+        clampNum(preferredWidth, PANEL_MIN_W, Math.max(PANEL_MIN_W, viewportW - VIEWPORT_PAD * 2)),
+    );
+    const height = Math.min(PANEL_H, Math.max(210, viewportH - VIEWPORT_PAD * 2));
+
+    const roomRight = viewportW - trigger.right - VIEWPORT_PAD;
+    const roomLeft = trigger.left - VIEWPORT_PAD;
+    const roomBelow = viewportH - trigger.bottom - PANEL_GAP - VIEWPORT_PAD;
+    const roomAbove = trigger.top - PANEL_GAP - VIEWPORT_PAD;
+
+    const placeX: PanelPlacementX =
+        roomRight >= width || roomRight >= roomLeft ? "right" : "left";
+    const placeY: PanelPlacementY =
+        roomBelow >= height || roomBelow >= roomAbove ? "bottom" : "top";
+
+    let left = placeX === "right" ? trigger.right - width : trigger.left;
+    left = clampNum(
+        Math.round(left),
+        VIEWPORT_PAD,
+        Math.max(VIEWPORT_PAD, viewportW - width - VIEWPORT_PAD),
+    );
+
+    let top = placeY === "bottom" ? trigger.bottom + PANEL_GAP : trigger.top - PANEL_GAP - height;
+    top = clampNum(
+        Math.round(top),
+        VIEWPORT_PAD,
+        Math.max(VIEWPORT_PAD, viewportH - height - VIEWPORT_PAD),
+    );
+
+    return {
+        left,
+        top,
+        width,
+        height,
+        placeX,
+        placeY,
+    };
+}
+
 function usePrefersReducedMotion(): boolean {
     const [reduced, setReduced] = useState(false);
 
@@ -118,10 +167,7 @@ function usePrefersReducedMotion(): boolean {
 
         setReduced(mq.matches);
         mq.addEventListener("change", onChange);
-
-        return () => {
-            mq.removeEventListener("change", onChange);
-        };
+        return () => mq.removeEventListener("change", onChange);
     }, []);
 
     return reduced;
@@ -139,78 +185,157 @@ function useInjectOnceStyle(cssText: string, attr: string): void {
     }, [cssText, attr]);
 }
 
-function useViewportPanelSide(
-     open: boolean,
-     triggerRef: React.RefObject<HTMLButtonElement | null>,
-): PanelSide {
-    const [side, setSide] = useState<PanelSide>("bottom-right");
+function useHoldToRepeat(action: () => void, enabled: boolean) {
+    const actionRef = useRef(action);
+    const enabledRef = useRef(enabled);
+    const timeoutRef = useRef<number | null>(null);
+    const intervalRef = useRef<number | null>(null);
+    const holdStartedAtRef = useRef<number>(0);
 
-    useLayoutEffect(() => {
-        if (!open || typeof window === "undefined") return;
+    useEffect(() => {
+        actionRef.current = action;
+    }, [action]);
 
-        const compute = () => {
-            const trigger = triggerRef.current;
-            if (!trigger) return;
+    useEffect(() => {
+        enabledRef.current = enabled;
+    }, [enabled]);
 
-            const rect = trigger.getBoundingClientRect();
-            const roomRight = window.innerWidth - rect.right;
-            const roomLeft = rect.left;
+    const clearTimers = useCallback(() => {
+        if (timeoutRef.current != null && typeof window !== "undefined") {
+            window.clearTimeout(timeoutRef.current);
+            timeoutRef.current = null;
+        }
+        if (intervalRef.current != null && typeof window !== "undefined") {
+            window.clearInterval(intervalRef.current);
+            intervalRef.current = null;
+        }
+    }, []);
 
-            if (roomRight >= PANEL_W || roomRight >= roomLeft) {
-                setSide("bottom-right");
-            } else {
-                setSide("bottom-left");
-            }
-        };
+    useEffect(() => clearTimers, [clearTimers]);
 
-        compute();
-        window.addEventListener("resize", compute);
+    const start = useCallback(() => {
+        if (!enabledRef.current || typeof window === "undefined") return;
 
-        return () => window.removeEventListener("resize", compute);
-    }, [open, triggerRef]);
+        clearTimers();
+        actionRef.current();
+        holdStartedAtRef.current = Date.now();
 
-    return side;
+        timeoutRef.current = window.setTimeout(() => {
+            let fast = false;
+
+            const tick = () => {
+                if (!enabledRef.current) {
+                    clearTimers();
+                    return;
+                }
+
+                actionRef.current();
+
+                const elapsed = Date.now() - holdStartedAtRef.current;
+                if (!fast && elapsed >= HOLD_ACCEL_AFTER_MS) {
+                    fast = true;
+                    if (intervalRef.current != null) {
+                        window.clearInterval(intervalRef.current);
+                    }
+                    intervalRef.current = window.setInterval(tick, HOLD_REPEAT_FAST_MS);
+                }
+            };
+
+            intervalRef.current = window.setInterval(tick, HOLD_REPEAT_START_MS);
+        }, HOLD_INITIAL_DELAY_MS);
+    }, [clearTimers]);
+
+    const stop = useCallback(() => {
+        clearTimers();
+    }, [clearTimers]);
+
+    return { start, stop };
 }
 
 function IconAa() {
     return <span style={{ fontWeight: 860, letterSpacing: "-0.06em" }}>Aa</span>;
 }
 
-function IconX() {
-    return <span style={{ fontSize: 14, lineHeight: 1 }}>✕</span>;
+function IconClose() {
+    return <span style={{ fontSize: 11, lineHeight: 1 }}>✕</span>;
 }
 
-function IconCheck(props: { on: boolean }) {
+function IconChevron(props: { dir: "left" | "right" }) {
+    return <span aria-hidden>{props.dir === "left" ? "‹" : "›"}</span>;
+}
+
+function ArrowButton(props: {
+    title: string;
+    dir: "left" | "right";
+    disabled?: boolean;
+    onTrigger: () => void;
+}) {
+    const { title, dir, disabled = false, onTrigger } = props;
+    const hold = useHoldToRepeat(onTrigger, !disabled);
+
     return (
-         <span
-              aria-hidden
-              style={{
-                  width: 14,
-                  height: 14,
-                  borderRadius: 999,
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  fontSize: 10,
-                  lineHeight: 1,
-                  border: "1px solid color-mix(in oklab, var(--hairline) 88%, transparent)",
-                  background: props.on
-                       ? "color-mix(in oklab, var(--focus) 92%, transparent)"
-                       : "transparent",
-                  color: props.on ? "#fff" : "transparent",
-                  flexShrink: 0,
-              }}
-         >
-            ✓
-        </span>
+        <button
+            type="button"
+            style={{ ...sx.arrowBtn, ...(disabled ? sx.arrowBtnDisabled : null) }}
+            onClick={(e) => {
+                e.preventDefault();
+            }}
+            onPointerDown={(e) => {
+                if (disabled) return;
+                if (e.button !== 0) return;
+                e.preventDefault();
+                hold.start();
+            }}
+            onPointerUp={hold.stop}
+            onPointerCancel={hold.stop}
+            onPointerLeave={hold.stop}
+            onBlur={hold.stop}
+            onContextMenu={(e) => e.preventDefault()}
+            disabled={disabled}
+            aria-label={title}
+            title={title}
+        >
+            <IconChevron dir={dir} />
+        </button>
     );
 }
 
-const FONT_PREVIEW_TEXTS = [
-    "Blessed are the pure in heart.",
-    "The earth was without form, and void.",
-    "The Lord is my shepherd; I shall not want.",
-] as const;
+function ControlCard(props: {
+    title: string;
+    value: string;
+    disabled?: boolean;
+    onPrev: () => void;
+    onNext: () => void;
+}) {
+    const { title, value, disabled, onPrev, onNext } = props;
+
+    return (
+        <div style={{ ...sx.controlCard, ...(disabled ? sx.controlCardDisabled : null) }}>
+            <div style={sx.controlMain}>
+                <ArrowButton
+                    title={`Previous ${title.toLowerCase()}`}
+                    dir="left"
+                    disabled={disabled}
+                    onTrigger={onPrev}
+                />
+
+                <div style={sx.controlCenter}>
+                    <div style={sx.controlKicker}>{title}</div>
+                    <div style={sx.controlValue} title={value}>
+                        {value}
+                    </div>
+                </div>
+
+                <ArrowButton
+                    title={`Next ${title.toLowerCase()}`}
+                    dir="right"
+                    disabled={disabled}
+                    onTrigger={onNext}
+                />
+            </div>
+        </div>
+    );
+}
 
 export function ReaderTypographyControl() {
     const storageLoadedRef = useRef<ReaderTypography | null>(null);
@@ -221,65 +346,87 @@ export function ReaderTypographyControl() {
     const stored = storageLoadedRef.current;
     const [enabled, setEnabled] = useState<boolean>(!!stored);
     const [t, setT] = useState<ReaderTypography>(
-         normalizeLockedTypography(stored ?? DEFAULT_TYPOGRAPHY),
+        normalizeLockedTypography(stored ?? DEFAULT_TYPOGRAPHY),
     );
     const [open, setOpen] = useState(false);
+    const [panelLayout, setPanelLayout] = useState<PanelLayout | null>(null);
 
     const rootRef = useRef<HTMLDivElement | null>(null);
     const triggerRef = useRef<HTMLButtonElement | null>(null);
     const panelRef = useRef<HTMLDivElement | null>(null);
-    const firstFontButtonRef = useRef<HTMLButtonElement | null>(null);
 
     const reducedMotion = usePrefersReducedMotion();
     const limits = useMemo(() => typographyLimits(), []);
     const fonts = useMemo(() => fontOptions() as FontOpt[], []);
-    const ids = useMemo(() => fonts.map((f) => f.id) as TypographyFont[], [fonts]);
-
-    const panelSide = useViewportPanelSide(open, triggerRef);
 
     const panelId = useId();
     const labelId = `${panelId}-label`;
     const descId = `${panelId}-desc`;
 
     useInjectOnceStyle(
-         `
-@keyframes bpTypoPop {
-  from { opacity: 0; transform: translateY(6px) scale(0.985); }
-  to   { opacity: 1; transform: translateY(0px) scale(1); }
+        `
+@keyframes bpTypoPopoverIn {
+  from { opacity: 0; transform: translateY(4px) scale(0.992); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+#${PORTAL_PANEL_ID}::-webkit-scrollbar { width: 8px; height: 8px; }
+#${PORTAL_PANEL_ID}::-webkit-scrollbar-track { background: transparent; }
+#${PORTAL_PANEL_ID}::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--hairline) 90%, transparent);
+  border-radius: 999px;
 }
 `,
-         "data-bp-typo-pop",
+        STYLE_ATTR,
     );
 
     const current = useMemo(() => normalizeLockedTypography(t), [t]);
 
     const currentFontIndex = useMemo(() => {
-        if (!fonts.length) return 0;
         const idx = fonts.findIndex((f) => f.id === current.font);
         return idx >= 0 ? idx : 0;
     }, [fonts, current.font]);
 
-    const currentFont = useMemo(() => {
-        if (!fonts.length) return null;
-        return fonts[currentFontIndex] ?? null;
-    }, [fonts, currentFontIndex]);
+    const currentFont = useMemo(() => fonts[currentFontIndex] ?? null, [fonts, currentFontIndex]);
+    const fontIds = useMemo(() => fonts.map((f) => f.id) as TypographyFont[], [fonts]);
 
-    const currentFontCss = useMemo(() => fontFamilyForOpt(currentFont), [currentFont]);
+    const sizeValues = useMemo(() => {
+        const out: number[] = [];
+        for (let n = limits.sizePx.lo; n <= limits.sizePx.hi; n += limits.sizePx.step) {
+            out.push(n);
+        }
+        return out;
+    }, [limits.sizePx.hi, limits.sizePx.lo, limits.sizePx.step]);
+
+    const weightValues = useMemo(() => {
+        const out: number[] = [];
+        for (let n = limits.weight.lo; n <= limits.weight.hi; n += limits.weight.step) {
+            out.push(n);
+        }
+        return out;
+    }, [limits.weight.hi, limits.weight.lo, limits.weight.step]);
 
     const summary = useMemo(() => {
         const font = currentFont?.label ?? String(current.font);
-        const size = `${Math.round(current.sizePx)}px`;
-        const weight = `${Math.round(current.weight)}`;
-        return `${font} · ${size} · ${weight}`;
+        return `${font} · ${Math.round(current.sizePx)}px · ${Math.round(current.weight)}`;
     }, [current, currentFont]);
+
+    const triggerLabel = enabled ? summary : "Typography off";
 
     const setPatch = useCallback((patch: Partial<ReaderTypography>) => {
         setEnabled(true);
         setT((prev) => normalizeLockedTypography(updateTypography(prev, patch)));
     }, []);
 
+    const recomputeLayout = useCallback(() => {
+        if (!open) return;
+        const trigger = triggerRef.current;
+        if (!trigger) return;
+        setPanelLayout(computePanelLayout(trigger.getBoundingClientRect(), PANEL_W));
+    }, [open]);
+
     const closePanel = useCallback(() => {
         setOpen(false);
+        setPanelLayout(null);
         queueMicrotask(() => {
             triggerRef.current?.focus();
         });
@@ -289,50 +436,42 @@ export function ReaderTypographyControl() {
         setEnabled(false);
         setT(normalizeLockedTypography(DEFAULT_TYPOGRAPHY));
         setOpen(false);
+        setPanelLayout(null);
         queueMicrotask(() => {
             triggerRef.current?.focus();
         });
     }, []);
 
     const cycleFont = useCallback(
-         (dir: -1 | 1) => {
-             if (!ids.length) return;
-             setPatch({ font: nextOf(ids, current.font, dir) });
-         },
-         [ids, current.font, setPatch],
+        (dir: -1 | 1) => {
+            if (!fontIds.length) return;
+            setPatch({ font: nextOf(fontIds, current.font, dir) });
+        },
+        [current.font, fontIds, setPatch],
     );
 
-    const applySizeDelta = useCallback(
-         (delta: number) => {
-             const step = limits.sizePx.step;
-             const next = clampNum(
-                  roundToStep(current.sizePx + delta * step, step),
-                  limits.sizePx.lo,
-                  limits.sizePx.hi,
-             );
-             setPatch({ sizePx: Math.round(next) });
-         },
-         [current.sizePx, limits.sizePx.hi, limits.sizePx.lo, limits.sizePx.step, setPatch],
+    const cycleSize = useCallback(
+        (dir: -1 | 1) => {
+            if (!sizeValues.length) return;
+            const cur = Math.round(current.sizePx);
+            setPatch({ sizePx: nextOf(sizeValues, cur, dir) });
+        },
+        [current.sizePx, setPatch, sizeValues],
     );
 
-    const applyWeightDelta = useCallback(
-         (delta: number) => {
-             const step = limits.weight.step;
-             const next = clampNum(
-                  roundToStep(current.weight + delta * step, step),
-                  limits.weight.lo,
-                  limits.weight.hi,
-             );
-             setPatch({ weight: Math.round(next) });
-         },
-         [current.weight, limits.weight.hi, limits.weight.lo, limits.weight.step, setPatch],
+    const cycleWeight = useCallback(
+        (dir: -1 | 1) => {
+            if (!weightValues.length) return;
+            const cur = Math.round(current.weight);
+            setPatch({ weight: nextOf(weightValues, cur, dir) });
+        },
+        [current.weight, setPatch, weightValues],
     );
 
     useEffect(() => {
         const locked = normalizeLockedTypography(current);
 
         if (!enabled) {
-            applyReaderTypography(null);
             clearReaderTypography();
             return;
         }
@@ -341,47 +480,71 @@ export function ReaderTypographyControl() {
         saveReaderTypography(locked);
 
         if (
-             locked.measurePx !== current.measurePx ||
-             locked.leading !== current.leading ||
-             locked.sizePx !== current.sizePx ||
-             locked.weight !== current.weight ||
-             locked.font !== current.font
+            locked.measurePx !== current.measurePx ||
+            locked.leading !== current.leading ||
+            locked.sizePx !== current.sizePx ||
+            locked.weight !== current.weight ||
+            locked.font !== current.font
         ) {
             setT(locked);
         }
     }, [enabled, current]);
 
+    useLayoutEffect(() => {
+        if (!open) return;
+        recomputeLayout();
+    }, [open, recomputeLayout]);
+
     useEffect(() => {
         if (!open) return;
-        queueMicrotask(() => {
-            if (firstFontButtonRef.current) {
-                firstFontButtonRef.current.focus();
-                return;
-            }
+
+        const id = requestAnimationFrame(() => {
+            recomputeLayout();
             panelRef.current?.focus();
         });
-    }, [open]);
+
+        return () => cancelAnimationFrame(id);
+    }, [open, recomputeLayout]);
+
+    useEffect(() => {
+        if (!open) return;
+
+        const update = () => recomputeLayout();
+        const vv = typeof window !== "undefined" ? window.visualViewport : null;
+
+        window.addEventListener("resize", update, { passive: true });
+        window.addEventListener("scroll", update, true);
+        vv?.addEventListener("resize", update, { passive: true });
+        vv?.addEventListener("scroll", update, { passive: true });
+
+        return () => {
+            window.removeEventListener("resize", update);
+            window.removeEventListener("scroll", update, true);
+            vv?.removeEventListener("resize", update);
+            vv?.removeEventListener("scroll", update);
+        };
+    }, [open, recomputeLayout]);
 
     useEffect(() => {
         if (!open) return;
 
         const onPointerDownCapture = (e: PointerEvent) => {
             const root = rootRef.current;
-            if (!root) return;
-
+            const panel = panelRef.current;
             const target = e.target as Node | null;
             const path = eventComposedPath(e);
-            const inside =
-                 !!(target && root.contains(target)) || pathContainsNode(path, root);
 
-            if (!inside) closePanel();
+            const insideRoot =
+                !!(target && root && root.contains(target)) || pathContainsNode(path, root);
+            const insidePanel =
+                !!(target && panel && panel.contains(target)) || pathContainsNode(path, panel);
+
+            if (!insideRoot && !insidePanel) closePanel();
         };
 
         document.addEventListener("pointerdown", onPointerDownCapture, { capture: true });
         return () => {
-            document.removeEventListener("pointerdown", onPointerDownCapture, {
-                capture: true,
-            });
+            document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
         };
     }, [open, closePanel]);
 
@@ -397,20 +560,6 @@ export function ReaderTypographyControl() {
 
             if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-            const activeEl = document.activeElement as Element | null;
-
-            if (isRangeInput(activeEl)) {
-                if (e.key === "Home" || e.key === "End") {
-                    const min = Number(activeEl.min);
-                    const max = Number(activeEl.max);
-                    activeEl.value = String(e.key === "Home" ? min : max);
-                    activeEl.dispatchEvent(new Event("input", { bubbles: true }));
-                    activeEl.dispatchEvent(new Event("change", { bubbles: true }));
-                    e.preventDefault();
-                }
-                return;
-            }
-
             switch (e.key) {
                 case "ArrowLeft":
                     cycleFont(-1);
@@ -421,20 +570,20 @@ export function ReaderTypographyControl() {
                     e.preventDefault();
                     return;
                 case "[":
-                    applySizeDelta(-1);
+                    cycleSize(-1);
                     e.preventDefault();
                     return;
                 case "]":
-                    applySizeDelta(1);
+                    cycleSize(1);
                     e.preventDefault();
                     return;
                 case "-":
-                    applyWeightDelta(-1);
+                    cycleWeight(-1);
                     e.preventDefault();
                     return;
                 case "=":
                 case "+":
-                    applyWeightDelta(1);
+                    cycleWeight(1);
                     e.preventDefault();
                     return;
                 default:
@@ -444,372 +593,157 @@ export function ReaderTypographyControl() {
 
         window.addEventListener("keydown", onKeyCapture, { capture: true });
         return () => window.removeEventListener("keydown", onKeyCapture, { capture: true });
-    }, [open, closePanel, cycleFont, applySizeDelta, applyWeightDelta]);
+    }, [open, closePanel, cycleFont, cycleSize, cycleWeight]);
 
     const panelStyle = useMemo<React.CSSProperties>(() => {
-        const base: React.CSSProperties = {
-            ...sx.panel,
-            ...(reducedMotion ? sx.panelNoMotion : null),
-        };
-
-        if (panelSide === "bottom-left") {
+        if (!panelLayout) {
             return {
-                ...base,
-                left: 0,
-                right: "auto",
-                transformOrigin: "top left",
+                ...sx.panel,
+                opacity: 0,
+                pointerEvents: "none",
             };
         }
 
-        return {
-            ...base,
-            right: 0,
-            left: "auto",
-            transformOrigin: "top right",
-        };
-    }, [panelSide, reducedMotion]);
+        const originX = panelLayout.placeX === "right" ? "right" : "left";
+        const originY = panelLayout.placeY === "bottom" ? "top" : "bottom";
 
-    const sliderStyle = enabled ? sx.range : { ...sx.range, ...sx.rangeDisabled };
+        return {
+            ...sx.panel,
+            ...(reducedMotion ? sx.panelNoMotion : null),
+            left: panelLayout.left,
+            top: panelLayout.top,
+            width: panelLayout.width,
+            height: panelLayout.height,
+            maxHeight: panelLayout.height,
+            transformOrigin: `${originY} ${originX}`,
+        };
+    }, [panelLayout, reducedMotion]);
+
+    const panelNode =
+        open && typeof document !== "undefined"
+            ? createPortal(
+                <div
+                    id={PORTAL_PANEL_ID}
+                    ref={panelRef}
+                    role="dialog"
+                    aria-modal="false"
+                    aria-labelledby={labelId}
+                    aria-describedby={descId}
+                    tabIndex={-1}
+                    style={panelStyle}
+                >
+                    <div style={sx.header}>
+                        <div style={sx.headerText}>
+                            <div id={labelId} style={sx.title}>
+                                Typography
+                            </div>
+                            <div id={descId} style={sx.subtitle}>
+                                Font, size, weight.
+                            </div>
+                        </div>
+
+                        <div style={sx.headerActions}>
+                            <button
+                                type="button"
+                                style={{
+                                    ...sx.toggleBtn,
+                                    ...(enabled ? sx.toggleBtnOn : sx.toggleBtnOff),
+                                }}
+                                onClick={() => setEnabled((v) => !v)}
+                                aria-pressed={enabled}
+                                title={enabled ? "Typography overrides on" : "Typography overrides off"}
+                            >
+                                {enabled ? "On" : "Off"}
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={closePanel}
+                                style={sx.iconBtn}
+                                aria-label="Close typography settings"
+                                title="Close"
+                            >
+                                <IconClose />
+                            </button>
+                        </div>
+                    </div>
+
+                    <div style={sx.body}>
+                        <div style={sx.stack}>
+                            <ControlCard
+                                title="Font"
+                                value={currentFont?.label ?? String(current.font)}
+                                disabled={!enabled}
+                                onPrev={() => cycleFont(-1)}
+                                onNext={() => cycleFont(1)}
+                            />
+
+                            <ControlCard
+                                title="Size"
+                                value={`${Math.round(current.sizePx)}px`}
+                                disabled={!enabled}
+                                onPrev={() => cycleSize(-1)}
+                                onNext={() => cycleSize(1)}
+                            />
+
+                            <ControlCard
+                                title="Weight"
+                                value={`${Math.round(current.weight)}`}
+                                disabled={!enabled}
+                                onPrev={() => cycleWeight(-1)}
+                                onNext={() => cycleWeight(1)}
+                            />
+                        </div>
+                    </div>
+
+                    <div style={sx.footer}>
+                        <button type="button" style={sx.resetBtn} onClick={resetToDefaults}>
+                            Reset
+                        </button>
+                        <button type="button" style={sx.doneBtn} onClick={closePanel}>
+                            Done
+                        </button>
+                    </div>
+                </div>,
+                document.body,
+            )
+            : null;
 
     return (
-         <div ref={rootRef} style={sx.root}>
-             <button
-                  ref={triggerRef}
-                  type="button"
-                  style={{
-                      ...sx.trigger,
-                      ...(open ? sx.triggerOpen : null),
-                      ...(enabled ? null : sx.triggerDisabled),
-                  }}
-                  onClick={() => setOpen((v) => !v)}
-                  aria-haspopup="dialog"
-                  aria-expanded={open}
-                  aria-controls={panelId}
-                  aria-label="Typography settings"
-                  title={`Typography (${summary})`}
-             >
+        <div ref={rootRef} style={sx.root}>
+            <button
+                ref={triggerRef}
+                type="button"
+                style={{
+                    ...sx.trigger,
+                    ...(open ? sx.triggerOpen : null),
+                    ...(enabled ? sx.triggerEnabled : sx.triggerDisabled),
+                }}
+                onClick={() => {
+                    setOpen((prev) => {
+                        const next = !prev;
+                        if (!next) setPanelLayout(null);
+                        return next;
+                    });
+                }}
+                aria-haspopup="dialog"
+                aria-expanded={open}
+                aria-controls={panelId}
+                aria-label="Typography settings"
+                title={triggerLabel}
+            >
                 <span style={sx.triggerGlyph}>
                     <IconAa />
                 </span>
-                 <span style={{ ...sx.dot, ...(enabled ? sx.dotOn : sx.dotOff) }} aria-hidden />
-             </button>
+                <span style={sx.triggerMeta}>
+                    <span style={sx.triggerMetaTop}>Type</span>
+                    <span style={sx.triggerMetaBottom}>{enabled ? "On" : "Off"}</span>
+                </span>
+                <span style={{ ...sx.dot, ...(enabled ? sx.dotOn : sx.dotOff) }} aria-hidden />
+            </button>
 
-             {open ? (
-                  <div
-                       id={panelId}
-                       ref={panelRef}
-                       role="dialog"
-                       aria-modal="false"
-                       aria-labelledby={labelId}
-                       aria-describedby={descId}
-                       tabIndex={-1}
-                       style={panelStyle}
-                  >
-                      <div style={sx.header}>
-                          <div style={sx.hTitleWrap}>
-                              <div id={labelId} style={sx.hTitle}>
-                                  Typography
-                              </div>
-                              <div id={descId} style={sx.hSub}>
-                                  Reader overrides for font, size, and weight.
-                              </div>
-                          </div>
-
-                          <div style={sx.hRight}>
-                              <label style={sx.switchLabel} title={enabled ? "Overrides on" : "Overrides off"}>
-                                  <input
-                                       type="checkbox"
-                                       checked={enabled}
-                                       onChange={() => setEnabled((v) => !v)}
-                                       style={sx.switchInput}
-                                       aria-label={
-                                           enabled
-                                                ? "Turn typography overrides off"
-                                                : "Turn typography overrides on"
-                                       }
-                                  />
-                                  <span
-                                       style={{
-                                           ...sx.switchTrack,
-                                           background: enabled
-                                                ? "color-mix(in oklab, var(--focus) 86%, transparent)"
-                                                : "color-mix(in oklab, var(--panel) 92%, transparent)",
-                                       }}
-                                       aria-hidden
-                                  />
-                                  <span
-                                       style={{
-                                           ...sx.switchThumb,
-                                           transform: enabled ? "translateX(12px)" : "translateX(0px)",
-                                       }}
-                                       aria-hidden
-                                  />
-                              </label>
-
-                              <button
-                                   type="button"
-                                   onClick={closePanel}
-                                   style={sx.iconBtn}
-                                   aria-label="Close"
-                              >
-                                  <IconX />
-                              </button>
-                          </div>
-                      </div>
-
-                      <div style={sx.summaryRow}>
-                          <div style={sx.summaryText} title={summary}>
-                              {summary}
-                          </div>
-                          <div style={sx.lockPill} title="Width and leading are locked">
-                              Locked layout
-                          </div>
-                      </div>
-
-                      <div
-                           style={{
-                               ...sx.sampleCard,
-                               ...(enabled ? null : sx.sampleCardDisabled),
-                           }}
-                           aria-hidden={!enabled}
-                      >
-                          <div style={sx.sampleMetaRow}>
-                              <span style={sx.sampleMetaLabel}>Live preview</span>
-                              <span style={sx.sampleMetaValue}>
-                                {Math.round(current.sizePx)}px · {Math.round(current.weight)}
-                            </span>
-                          </div>
-
-                          <div
-                               style={{
-                                   ...sx.sampleVerse,
-                                   fontFamily: currentFontCss,
-                                   fontSize: current.sizePx,
-                                   fontWeight: current.weight,
-                                   lineHeight: DEFAULT_TYPOGRAPHY.leading,
-                                   maxWidth: DEFAULT_TYPOGRAPHY.measurePx,
-                               }}
-                          >
-                              {SAMPLE_TEXT}
-                          </div>
-                      </div>
-
-                      {!enabled ? (
-                           <div style={sx.offRow}>
-                               <span style={sx.offPill}>Off</span>
-                               <span style={sx.offText}>Enable to apply reader typography overrides.</span>
-                           </div>
-                      ) : null}
-
-                      <div style={sx.body}>
-                          <div style={sx.sectionHead}>
-                              <div style={sx.sectionTitle}>Fonts</div>
-                              <div style={sx.sectionHint}>← → to cycle</div>
-                          </div>
-
-                          <div style={sx.fontNavRow}>
-                              <button
-                                   type="button"
-                                   style={{ ...sx.chevBtn, ...(enabled ? null : sx.chevBtnDisabled) }}
-                                   onClick={() => cycleFont(-1)}
-                                   disabled={!enabled || fonts.length === 0}
-                                   aria-label="Previous font"
-                                   title="Previous font"
-                              >
-                                  ‹
-                              </button>
-
-                              <div style={sx.fontIndexPill}>
-                                  {fonts.length ? `${currentFontIndex + 1}/${fonts.length}` : "0/0"}
-                              </div>
-
-                              <button
-                                   type="button"
-                                   style={{ ...sx.chevBtn, ...(enabled ? null : sx.chevBtnDisabled) }}
-                                   onClick={() => cycleFont(1)}
-                                   disabled={!enabled || fonts.length === 0}
-                                   aria-label="Next font"
-                                   title="Next font"
-                              >
-                                  ›
-                              </button>
-                          </div>
-
-                          <div style={sx.fontGrid} role="list" aria-label="Font choices">
-                              {fonts.map((font, index) => {
-                                  const selected = font.id === current.font;
-                                  const previewFamily = fontFamilyForOpt(font);
-                                  const previewText =
-                                       font.previewText?.trim() ||
-                                       FONT_PREVIEW_TEXTS[index % FONT_PREVIEW_TEXTS.length];
-
-                                  return (
-                                       <button
-                                            key={font.id}
-                                            ref={index === 0 ? firstFontButtonRef : undefined}
-                                            type="button"
-                                            role="listitem"
-                                            disabled={!enabled}
-                                            aria-pressed={selected}
-                                            onClick={() => setPatch({ font: font.id })}
-                                            title={font.label}
-                                            style={{
-                                                ...sx.fontCard,
-                                                ...(selected ? sx.fontCardSelected : null),
-                                                ...(enabled ? null : sx.fontCardDisabled),
-                                            }}
-                                       >
-                                           <div style={sx.fontCardTop}>
-                                               <IconCheck on={selected} />
-                                               <span style={sx.fontCardName}>{font.label}</span>
-                                           </div>
-
-                                           <div
-                                                style={{
-                                                    ...sx.fontCardSample,
-                                                    fontFamily: previewFamily,
-                                                    fontWeight: current.weight,
-                                                }}
-                                           >
-                                               {previewText}
-                                           </div>
-                                       </button>
-                                  );
-                              })}
-                          </div>
-
-                          <div style={sx.block}>
-                              <div style={sx.blockTop}>
-                                  <span style={sx.blockLabel}>Size</span>
-                                  <div style={sx.blockTopRight}>
-                                      <button
-                                           type="button"
-                                           style={{
-                                               ...sx.miniStepBtn,
-                                               ...(enabled ? null : sx.miniStepBtnDisabled),
-                                           }}
-                                           onClick={() => applySizeDelta(-1)}
-                                           disabled={!enabled}
-                                           aria-label="Decrease size"
-                                      >
-                                          −
-                                      </button>
-                                      <span style={sx.blockValue}>{Math.round(current.sizePx)}px</span>
-                                      <button
-                                           type="button"
-                                           style={{
-                                               ...sx.miniStepBtn,
-                                               ...(enabled ? null : sx.miniStepBtnDisabled),
-                                           }}
-                                           onClick={() => applySizeDelta(1)}
-                                           disabled={!enabled}
-                                           aria-label="Increase size"
-                                      >
-                                          +
-                                      </button>
-                                  </div>
-                              </div>
-
-                              <input
-                                   type="range"
-                                   min={limits.sizePx.lo}
-                                   max={limits.sizePx.hi}
-                                   step={limits.sizePx.step}
-                                   value={current.sizePx}
-                                   onChange={(e) =>
-                                        setPatch({
-                                            sizePx: Math.round(
-                                                 clampNum(
-                                                      Number(e.target.value),
-                                                      limits.sizePx.lo,
-                                                      limits.sizePx.hi,
-                                                 ),
-                                            ),
-                                        })
-                                   }
-                                   style={sliderStyle}
-                                   disabled={!enabled}
-                                   aria-label="Scripture font size"
-                              />
-
-                              <div style={sx.keyHint}>Keys: [ and ]</div>
-                          </div>
-
-                          <div style={sx.block}>
-                              <div style={sx.blockTop}>
-                                  <span style={sx.blockLabel}>Weight</span>
-                                  <div style={sx.blockTopRight}>
-                                      <button
-                                           type="button"
-                                           style={{
-                                               ...sx.miniStepBtn,
-                                               ...(enabled ? null : sx.miniStepBtnDisabled),
-                                           }}
-                                           onClick={() => applyWeightDelta(-1)}
-                                           disabled={!enabled}
-                                           aria-label="Decrease weight"
-                                      >
-                                          −
-                                      </button>
-                                      <span style={sx.blockValue}>{Math.round(current.weight)}</span>
-                                      <button
-                                           type="button"
-                                           style={{
-                                               ...sx.miniStepBtn,
-                                               ...(enabled ? null : sx.miniStepBtnDisabled),
-                                           }}
-                                           onClick={() => applyWeightDelta(1)}
-                                           disabled={!enabled}
-                                           aria-label="Increase weight"
-                                      >
-                                          +
-                                      </button>
-                                  </div>
-                              </div>
-
-                              <input
-                                   type="range"
-                                   min={limits.weight.lo}
-                                   max={limits.weight.hi}
-                                   step={limits.weight.step}
-                                   value={current.weight}
-                                   onChange={(e) =>
-                                        setPatch({
-                                            weight: Math.round(
-                                                 clampNum(
-                                                      Number(e.target.value),
-                                                      limits.weight.lo,
-                                                      limits.weight.hi,
-                                                 ),
-                                            ),
-                                        })
-                                   }
-                                   style={sliderStyle}
-                                   disabled={!enabled}
-                                   aria-label="Scripture font weight"
-                              />
-
-                              <div style={sx.keyHint}>Keys: - and +</div>
-                          </div>
-                      </div>
-
-                      <div style={sx.footer}>
-                          <button type="button" style={sx.doneBtn} onClick={closePanel}>
-                              Done
-                          </button>
-
-                          <button
-                               type="button"
-                               style={sx.resetBtn}
-                               onClick={resetToDefaults}
-                               title="Reset and turn off overrides"
-                          >
-                              Reset
-                          </button>
-                      </div>
-                  </div>
-             ) : null}
-         </div>
+            {panelNode}
+        </div>
     );
 }
 
@@ -821,73 +755,104 @@ const sx: Record<string, React.CSSProperties> = {
     },
 
     trigger: {
-        width: 32,
-        height: 32,
-        borderRadius: 12,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
+        height: 30,
+        minWidth: 76,
+        borderRadius: 11,
+        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 97%, transparent), color-mix(in oklab, var(--panel) 90%, var(--bg)))",
         display: "inline-flex",
         alignItems: "center",
-        justifyContent: "center",
+        gap: 8,
+        padding: "0 10px",
         cursor: "pointer",
         userSelect: "none",
-        boxShadow: "0 10px 26px rgba(0,0,0,0.075)",
+        boxShadow:
+            "0 1px 0 rgba(255,255,255,0.28) inset, 0 10px 24px rgba(0,0,0,0.075)",
         transition:
-             "transform 200ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 200ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
+            "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 140ms ease, background 140ms ease, opacity 140ms ease",
         position: "relative",
         outline: "none",
         WebkitTapHighlightColor: "transparent",
     },
     triggerOpen: {
-        transform: "translateY(-2px) scale(1.03)",
-        borderColor: "color-mix(in oklab, var(--focus) 70%, var(--hairline))",
-        boxShadow: "0 22px 62px rgba(0,0,0,0.18)",
-        background: "color-mix(in oklab, var(--panel) 86%, transparent)",
+        transform: "translateY(-1px)",
+        borderColor: "color-mix(in oklab, var(--focus) 58%, var(--hairline))",
+        boxShadow:
+            "0 1px 0 rgba(255,255,255,0.32) inset, 0 18px 34px rgba(0,0,0,0.14)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 99%, transparent), color-mix(in oklab, var(--panel) 92%, var(--bg)))",
+    },
+    triggerEnabled: {
+        opacity: 1,
     },
     triggerDisabled: {
-        opacity: 0.92,
+        opacity: 0.95,
     },
     triggerGlyph: {
-        fontSize: 13.5,
+        width: 16,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontSize: 13,
         fontWeight: 860,
         letterSpacing: "-0.05em",
+        flexShrink: 0,
+    },
+    triggerMeta: {
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "flex-start",
+        minWidth: 0,
+        lineHeight: 1.02,
+        gap: 1,
+    },
+    triggerMetaTop: {
+        fontSize: 9.4,
+        fontWeight: 760,
+        color: "var(--muted)",
+        letterSpacing: "-0.01em",
+    },
+    triggerMetaBottom: {
+        fontSize: 10.8,
+        fontWeight: 860,
+        letterSpacing: "-0.01em",
+        color: "var(--fg)",
     },
 
     dot: {
-        position: "absolute",
-        right: 6,
-        bottom: 6,
+        marginLeft: "auto",
         width: 7,
         height: 7,
         borderRadius: 999,
-        border: "1px solid color-mix(in oklab, var(--hairline) 75%, transparent)",
+        border: "1px solid color-mix(in oklab, var(--hairline) 70%, transparent)",
+        flexShrink: 0,
     },
     dotOn: {
-        background: "var(--focus)",
-        boxShadow: "0 0 0 4px color-mix(in oklab, var(--focus) 14%, transparent)",
+        background: "#22c55e",
+        boxShadow: "0 0 0 4px rgba(34,197,94,0.14)",
     },
     dotOff: {
         background: "color-mix(in oklab, var(--muted) 40%, transparent)",
     },
 
     panel: {
-        position: "absolute",
-        top: 32 + PANEL_GAP,
-        width: PANEL_W,
-        maxWidth: "min(360px, calc(100vw - 18px))",
-        borderRadius: 18,
+        position: "fixed",
+        zIndex: 99999,
+        borderRadius: 16,
         border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-        background: "color-mix(in oklab, var(--bg) 96%, var(--panel))",
-        boxShadow: "0 28px 80px rgba(0,0,0,0.22)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--bg) 99%, var(--panel)), color-mix(in oklab, var(--bg) 96%, var(--panel)))",
+        boxShadow:
+            "0 1px 0 rgba(255,255,255,0.26) inset, 0 28px 68px rgba(0,0,0,0.22)",
         overflow: "hidden",
-        zIndex: 9999,
-        padding: 10,
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
-        animation: "bpTypoPop 170ms cubic-bezier(0.23, 1, 0.32, 1) both",
-        backdropFilter: "blur(18px)",
-        WebkitBackdropFilter: "blur(18px)",
+        padding: 9,
+        display: "grid",
+        gridTemplateRows: "auto minmax(0, 1fr) auto",
+        gap: 7,
+        animation: "bpTypoPopoverIn 120ms cubic-bezier(0.23, 1, 0.32, 1) both",
+        backdropFilter: "blur(16px)",
+        WebkitBackdropFilter: "blur(16px)",
     },
     panelNoMotion: {
         animation: "none",
@@ -897,398 +862,207 @@ const sx: Record<string, React.CSSProperties> = {
         display: "flex",
         alignItems: "flex-start",
         justifyContent: "space-between",
-        gap: 10,
-        padding: "1px 1px 0",
+        gap: 8,
+        minHeight: 0,
     },
-    hTitleWrap: {
+    headerText: {
         display: "flex",
         flexDirection: "column",
-        gap: 2,
+        gap: 1,
         minWidth: 0,
     },
-    hTitle: {
-        fontSize: 13,
+    title: {
+        fontSize: 12.6,
         fontWeight: 860,
         letterSpacing: "-0.02em",
+        color: "var(--fg)",
     },
-    hSub: {
-        fontSize: 10.8,
+    subtitle: {
+        fontSize: 9.8,
         color: "var(--muted)",
-        lineHeight: 1.3,
+        lineHeight: 1.22,
+        maxWidth: 152,
     },
-    hRight: {
+    headerActions: {
         display: "flex",
         alignItems: "center",
-        gap: 6,
+        gap: 5,
         flexShrink: 0,
     },
 
-    summaryRow: {
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-        justifyContent: "space-between",
-        minWidth: 0,
-    },
-    summaryText: {
-        minWidth: 0,
-        fontSize: 10.8,
-        color: "var(--muted)",
-        letterSpacing: "-0.01em",
-        overflow: "hidden",
-        textOverflow: "ellipsis",
-        whiteSpace: "nowrap",
-    },
-    lockPill: {
-        flexShrink: 0,
-        fontSize: 10.1,
-        fontWeight: 780,
-        color: "var(--muted)",
-        padding: "4px 8px",
+    toggleBtn: {
+        height: 26,
+        minWidth: 44,
         borderRadius: 999,
-        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
+        border: "1px solid color-mix(in oklab, var(--hairline) 94%, transparent)",
+        padding: "0 9px",
+        fontSize: 10.4,
+        fontWeight: 860,
+        cursor: "pointer",
+        WebkitTapHighlightColor: "transparent",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.18) inset",
+        transition:
+            "background 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease, transform 140ms ease",
+    },
+    toggleBtnOn: {
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--fg) 100%, white 0%), color-mix(in oklab, var(--fg) 90%, black 10%))",
+        borderColor: "color-mix(in oklab, var(--fg) 88%, black 12%)",
+        color: "var(--bg)",
+        boxShadow: "0 10px 18px rgba(0,0,0,0.16)",
+    },
+    toggleBtnOff: {
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 98%, transparent), color-mix(in oklab, var(--panel) 92%, var(--bg)))",
+        borderColor: "color-mix(in oklab, var(--hairline) 94%, transparent)",
+        color: "var(--muted)",
     },
 
     iconBtn: {
-        width: 28,
-        height: 28,
+        width: 26,
+        height: 26,
         borderRadius: 999,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 86%, transparent)",
-        color: "var(--muted)",
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        cursor: "pointer",
-        transition:
-             "transform 140ms cubic-bezier(0.23, 1, 0.32, 1), background 140ms ease, border-color 140ms ease",
-        WebkitTapHighlightColor: "transparent",
-        userSelect: "none",
-    },
-
-    switchLabel: {
-        position: "relative",
-        width: 38,
-        height: 24,
-        borderRadius: 999,
-        border: "1px solid var(--hairline)",
-        background: "transparent",
-        cursor: "pointer",
-        padding: 0,
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        overflow: "hidden",
-        userSelect: "none",
-        WebkitTapHighlightColor: "transparent",
-    },
-    switchInput: {
-        position: "absolute",
-        inset: 0,
-        opacity: 0,
-        cursor: "pointer",
-    },
-    switchTrack: {
-        position: "absolute",
-        inset: 0,
-        borderRadius: 999,
-        transition: "background 180ms ease",
-    },
-    switchThumb: {
-        position: "absolute",
-        top: 3,
-        left: 3,
-        width: 18,
-        height: 18,
-        borderRadius: 999,
-        background: "var(--bg)",
-        border: "1px solid color-mix(in oklab, var(--hairline) 70%, transparent)",
-        boxShadow: "0 6px 14px rgba(0,0,0,0.16)",
-        transition: "transform 180ms cubic-bezier(0.23, 1, 0.32, 1)",
-    },
-
-    sampleCard: {
-        borderRadius: 14,
-        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        border: "1px solid color-mix(in oklab, var(--hairline) 96%, transparent)",
         background:
-             "linear-gradient(180deg, color-mix(in oklab, var(--panel) 96%, transparent), color-mix(in oklab, var(--bg) 94%, var(--panel)))",
-        padding: 10,
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
-    },
-    sampleCardDisabled: {
-        opacity: 0.66,
-    },
-    sampleMetaRow: {
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: 8,
-    },
-    sampleMetaLabel: {
-        fontSize: 10.8,
-        color: "var(--muted)",
-        fontWeight: 740,
-    },
-    sampleMetaValue: {
-        fontSize: 10.8,
-        color: "var(--muted)",
-        fontVariantNumeric: "tabular-nums",
-    },
-    sampleVerse: {
+            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 99%, transparent), color-mix(in oklab, var(--panel) 92%, var(--bg)))",
         color: "var(--fg)",
-        letterSpacing: "-0.01em",
-        wordBreak: "break-word",
-        textWrap: "pretty",
-    },
-
-    offRow: {
-        display: "flex",
+        display: "inline-flex",
         alignItems: "center",
-        gap: 8,
-        padding: "7px 9px",
-        borderRadius: 11,
-        border: "1px dashed color-mix(in oklab, var(--hairline) 92%, transparent)",
-        background: "color-mix(in oklab, var(--bg) 65%, transparent)",
-    },
-    offPill: {
-        fontSize: 10.2,
-        fontWeight: 820,
-        letterSpacing: "0.06em",
-        textTransform: "uppercase",
-        color: "var(--muted)",
-        padding: "4px 8px",
-        borderRadius: 999,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 90%, transparent)",
-    },
-    offText: {
-        fontSize: 11.2,
-        color: "var(--muted)",
+        justifyContent: "center",
+        cursor: "pointer",
+        WebkitTapHighlightColor: "transparent",
+        userSelect: "none",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.2) inset",
     },
 
     body: {
-        background: "color-mix(in oklab, var(--bg) 86%, var(--panel))",
-        borderRadius: 14,
-        border: "1px solid var(--hairline)",
-        padding: 9,
-        display: "flex",
-        flexDirection: "column",
-        gap: 10,
+        minHeight: 0,
+        overflow: "hidden",
     },
-
-    sectionHead: {
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: 8,
-    },
-    sectionTitle: {
-        fontSize: 11.7,
-        fontWeight: 840,
-        letterSpacing: "-0.01em",
-    },
-    sectionHint: {
-        fontSize: 10.5,
-        color: "var(--muted)",
-    },
-
-    fontNavRow: {
-        display: "flex",
-        alignItems: "center",
-        gap: 6,
-    },
-    fontIndexPill: {
-        flex: 1,
-        height: 30,
-        borderRadius: 10,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        fontSize: 11,
-        fontWeight: 760,
-        color: "var(--muted)",
-        fontVariantNumeric: "tabular-nums",
-    },
-
-    chevBtn: {
-        width: 30,
-        height: 30,
-        borderRadius: 10,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--bg) 72%, var(--panel))",
-        cursor: "pointer",
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        userSelect: "none",
-        WebkitTapHighlightColor: "transparent",
-        color: "var(--muted)",
-        fontSize: 18,
-        fontWeight: 760,
-        flexShrink: 0,
-    },
-    chevBtnDisabled: {
-        cursor: "not-allowed",
-        opacity: 0.55,
-    },
-
-    fontGrid: {
+    stack: {
+        height: "100%",
         display: "grid",
         gridTemplateColumns: "1fr",
+        gridAutoRows: "1fr",
         gap: 7,
-        maxHeight: 204,
-        overflowY: "auto",
-        paddingRight: 2,
-    },
-    fontCard: {
-        width: "100%",
-        borderRadius: 12,
-        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-        background: "color-mix(in oklab, var(--panel) 90%, transparent)",
-        padding: "9px 10px",
-        display: "flex",
-        flexDirection: "column",
-        gap: 7,
-        textAlign: "left",
-        cursor: "pointer",
-        WebkitTapHighlightColor: "transparent",
-    },
-    fontCardSelected: {
-        borderColor: "color-mix(in oklab, var(--focus) 68%, var(--hairline))",
-        boxShadow: "0 0 0 1px color-mix(in oklab, var(--focus) 18%, transparent) inset",
-        background: "color-mix(in oklab, var(--focus) 9%, var(--panel))",
-    },
-    fontCardDisabled: {
-        cursor: "not-allowed",
-        opacity: 0.62,
-    },
-    fontCardTop: {
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-    },
-    fontCardName: {
-        minWidth: 0,
-        fontSize: 11.5,
-        fontWeight: 820,
-        letterSpacing: "-0.01em",
-        overflow: "hidden",
-        textOverflow: "ellipsis",
-        whiteSpace: "nowrap",
-    },
-    fontCardSample: {
-        fontSize: 14.2,
-        lineHeight: 1.25,
-        color: "color-mix(in oklab, var(--fg) 94%, var(--muted) 6%)",
-        letterSpacing: "-0.01em",
-        textWrap: "pretty",
-        overflowWrap: "anywhere",
+        alignItems: "stretch",
     },
 
-    block: {
+    controlCard: {
         display: "flex",
         flexDirection: "column",
-        gap: 6,
+        justifyContent: "center",
+        borderRadius: 12,
+        border: "1px solid color-mix(in oklab, var(--hairline) 96%, transparent)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--bg) 90%, var(--panel)), color-mix(in oklab, var(--bg) 84%, var(--panel)))",
+        padding: 7,
+        minWidth: 0,
+        minHeight: 0,
+        boxShadow: "0 1px 0 rgba(255,255,255,0.12) inset",
     },
-    blockTop: {
-        display: "flex",
+    controlCardDisabled: {
+        opacity: 0.62,
+    },
+    controlMain: {
+        display: "grid",
+        gridTemplateColumns: "24px minmax(0,1fr) 24px",
         alignItems: "center",
-        justifyContent: "space-between",
-        gap: 10,
-    },
-    blockTopRight: {
-        display: "flex",
-        alignItems: "center",
         gap: 6,
+        minWidth: 0,
     },
-    blockLabel: {
-        fontSize: 11.6,
-        fontWeight: 820,
+    controlCenter: {
+        minWidth: 0,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: 1,
+    },
+    controlKicker: {
+        fontSize: 9.5,
+        fontWeight: 760,
+        color: "var(--muted)",
         letterSpacing: "-0.01em",
+        whiteSpace: "nowrap",
     },
-    blockValue: {
-        minWidth: 52,
+    controlValue: {
+        fontSize: 10.9,
+        fontWeight: 840,
+        color: "var(--fg)",
+        letterSpacing: "-0.01em",
+        whiteSpace: "nowrap",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
         textAlign: "center",
-        fontSize: 11.6,
-        color: "var(--focus)",
-        fontVariantNumeric: "tabular-nums",
-        fontWeight: 860,
+        width: "100%",
+        maxWidth: "100%",
     },
-    miniStepBtn: {
+
+    arrowBtn: {
         width: 24,
         height: 24,
         borderRadius: 8,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 90%, transparent)",
+        border: "1px solid color-mix(in oklab, var(--hairline) 84%, transparent)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--fg) 100%, white 0%), color-mix(in oklab, var(--fg) 88%, black 12%))",
+        color: "var(--bg)",
+        cursor: "pointer",
         display: "inline-flex",
         alignItems: "center",
         justifyContent: "center",
-        cursor: "pointer",
-        color: "var(--muted)",
         fontSize: 15,
-        fontWeight: 860,
-        padding: 0,
+        fontWeight: 900,
         flexShrink: 0,
+        WebkitTapHighlightColor: "transparent",
+        padding: 0,
+        boxShadow:
+            "0 1px 0 rgba(255,255,255,0.1) inset, 0 8px 16px rgba(0,0,0,0.16)",
+        userSelect: "none",
+        transition:
+            "transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease, filter 120ms ease",
     },
-    miniStepBtnDisabled: {
+    arrowBtnDisabled: {
         cursor: "not-allowed",
-        opacity: 0.55,
-    },
-
-    range: {
-        width: "100%",
-        accentColor: "var(--focus)",
-        cursor: "pointer",
-        height: 4,
-        borderRadius: 999,
-        background: "color-mix(in oklab, var(--hairline) 44%, transparent)",
-    },
-    rangeDisabled: {
-        cursor: "not-allowed",
-        opacity: 0.55,
-    },
-
-    keyHint: {
-        fontSize: 10.5,
-        color: "var(--muted)",
-        fontVariantNumeric: "tabular-nums",
+        opacity: 0.38,
+        boxShadow: "none",
     },
 
     footer: {
         display: "flex",
         alignItems: "center",
-        gap: 6,
-        paddingTop: 1,
+        justifyContent: "flex-end",
+        gap: 7,
+        minHeight: 0,
     },
     doneBtn: {
-        flex: 1,
-        height: 35,
-        borderRadius: 11,
-        border: "1px solid color-mix(in oklab, var(--focus) 70%, var(--hairline))",
-        background: "var(--focus)",
-        color: "#fff",
-        fontSize: 12.1,
+        height: 30,
+        minWidth: 66,
+        borderRadius: 10,
+        border: "1px solid color-mix(in oklab, var(--fg) 84%, black 16%)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--fg) 100%, white 0%), color-mix(in oklab, var(--fg) 88%, black 12%))",
+        color: "var(--bg)",
+        fontSize: 10.9,
         fontWeight: 860,
-        padding: "0 12px",
+        padding: "0 11px",
         cursor: "pointer",
-        boxShadow: "0 10px 22px color-mix(in oklab, var(--focus) 22%, transparent)",
+        boxShadow:
+            "0 1px 0 rgba(255,255,255,0.1) inset, 0 10px 18px rgba(0,0,0,0.16)",
         WebkitTapHighlightColor: "transparent",
     },
     resetBtn: {
-        height: 35,
-        borderRadius: 11,
-        border: "1px solid var(--hairline)",
-        background: "transparent",
+        height: 30,
+        minWidth: 62,
+        borderRadius: 10,
+        border: "1px solid color-mix(in oklab, var(--hairline) 94%, transparent)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 99%, transparent), color-mix(in oklab, var(--panel) 92%, var(--bg)))",
         color: "var(--muted)",
-        fontSize: 12,
-        fontWeight: 740,
-        padding: "0 12px",
+        fontSize: 10.7,
+        fontWeight: 780,
+        padding: "0 11px",
         cursor: "pointer",
         WebkitTapHighlightColor: "transparent",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.16) inset",
     },
 };

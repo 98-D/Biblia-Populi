@@ -1,14 +1,16 @@
 // apps/web/src/api.ts
-// Biblia.to — typed API client
+// Biblia.to — hardened typed API client
 //
-// Hardened goals:
-// - same-origin by default, optional VITE_API_BASE
+// Goals:
+// - same-origin by default, optional VITE_API_BASE override
 // - stable translation selection + reconciliation
-// - GET envelope decoding with proper 204/304 handling
-// - in-memory ETag cache that cannot "freeze on 304"
+// - GET envelope decoding with safe 204 / 304 handling
+// - in-memory ETag cache that cannot freeze on 304
 // - merged abort signals + timeout classification
 // - safer parsing / narrower envelope assumptions
 // - explicit diagnostics with request id + body snippet
+// - stricter query encoding / path hygiene
+// - deterministic cache-keying + cache invalidation hooks
 
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: { code: string; message: string } };
@@ -16,7 +18,7 @@ export type ApiRes<T> = ApiOk<T> | ApiErr;
 
 export type ApiCacheMode = "default" | "no-store" | "reload";
 
-export type ApiRequestOptions = {
+export type ApiRequestOptions = Readonly<{
     timeoutMs?: number;
     headers?: Record<string, string>;
     signal?: AbortSignal;
@@ -24,17 +26,17 @@ export type ApiRequestOptions = {
     credentials?: RequestCredentials;
     cacheMode?: ApiCacheMode;
     cacheTtlMs?: number;
-};
+}>;
 
 export type ApiErrorCode =
-     | "TIMEOUT"
-     | "NETWORK"
-     | "HTTP_ERROR"
-     | "BAD_RESPONSE"
-     | "NOT_JSON"
-     | "API_ERROR"
-     | "ABORTED"
-     | "CACHE_MISS";
+    | "TIMEOUT"
+    | "NETWORK"
+    | "HTTP_ERROR"
+    | "BAD_RESPONSE"
+    | "NOT_JSON"
+    | "API_ERROR"
+    | "ABORTED"
+    | "CACHE_MISS";
 
 export class ApiError extends Error {
     readonly code: ApiErrorCode;
@@ -45,15 +47,15 @@ export class ApiError extends Error {
     readonly requestId?: string;
 
     constructor(
-         code: ApiErrorCode,
-         message: string,
-         init?: {
-             status?: number;
-             url?: string;
-             method?: string;
-             bodyText?: string;
-             requestId?: string;
-         },
+        code: ApiErrorCode,
+        message: string,
+        init?: Readonly<{
+            status?: number;
+            url?: string;
+            method?: string;
+            bodyText?: string;
+            requestId?: string;
+        }>,
     ) {
         super(`${code}: ${message}`);
         this.name = "ApiError";
@@ -146,15 +148,15 @@ export type LinkRow = {
     targetKind: "ENTITY" | "EVENT" | "ROUTE" | "PLACE_GEO" | string;
     targetId: string;
     linkKind:
-         | "MENTIONS"
-         | "PRIMARY_SUBJECT"
-         | "LOCATION"
-         | "SETTING"
-         | "JOURNEY_STEP"
-         | "PARALLEL_ACCOUNT"
-         | "QUOTE_SOURCE"
-         | "QUOTE_TARGET"
-         | string;
+        | "MENTIONS"
+        | "PRIMARY_SUBJECT"
+        | "LOCATION"
+        | "SETTING"
+        | "JOURNEY_STEP"
+        | "PARALLEL_ACCOUNT"
+        | "QUOTE_SOURCE"
+        | "QUOTE_TARGET"
+        | string;
     weight: number;
     source: string;
     confidence: number | null;
@@ -201,8 +203,8 @@ export type SearchPayload = {
 };
 
 export type PersonPayload =
-     | null
-     | {
+    | null
+    | {
     entity: {
         entityId: string;
         kind: "PERSON" | string;
@@ -245,8 +247,8 @@ export type PersonPayload =
 };
 
 export type PlacePayload =
-     | null
-     | {
+    | null
+    | {
     entity: {
         entityId: string;
         kind: "PLACE" | string;
@@ -278,8 +280,8 @@ export type PlacePayload =
 };
 
 export type EventPayload =
-     | null
-     | {
+    | null
+    | {
     event: {
         eventId: string;
         canonicalTitle: string;
@@ -319,8 +321,8 @@ export type SlicePayload = {
 };
 
 export type LocPayload =
-     | null
-     | {
+    | null
+    | {
     verseKey: string;
     verseOrd: number;
     bookId: string;
@@ -340,25 +342,35 @@ function stripTrailingSlashes(value: string): string {
     return value.replace(/\/+$/g, "");
 }
 
+function stripLeadingSlashes(value: string): string {
+    return value.replace(/^\/+/g, "");
+}
+
 function isAbsoluteUrl(value: string): boolean {
     return /^https?:\/\//i.test(value);
 }
 
-function joinUrl(base: string, path: string): string {
-    const pathname = path.startsWith("/") ? path : `/${path}`;
-    const normalizedBase = stripTrailingSlashes(base.trim());
+function normalizeApiBase(raw: string): string {
+    const trimmed = raw.trim();
+    if (!trimmed) return "";
 
-    if (!normalizedBase) return pathname;
-
-    if (isAbsoluteUrl(normalizedBase)) {
-        return `${normalizedBase}${pathname}`;
+    if (isAbsoluteUrl(trimmed)) {
+        return stripTrailingSlashes(trimmed);
     }
 
-    const pathBase = normalizedBase.startsWith("/") ? normalizedBase : `/${normalizedBase}`;
-    return `${stripTrailingSlashes(pathBase)}${pathname}`;
+    const withLeading = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+    return stripTrailingSlashes(withLeading);
 }
 
-const API_BASE = joinUrl("", RAW_API_BASE);
+function joinUrl(base: string, path: string): string {
+    const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+    const normalizedBase = normalizeApiBase(base);
+
+    if (!normalizedBase) return normalizedPath;
+    return `${normalizedBase}${normalizedPath}`;
+}
+
+const API_BASE = normalizeApiBase(RAW_API_BASE);
 
 /* ------------------------ Translation selection -------------------------- */
 
@@ -435,7 +447,7 @@ export function setTranslationId(id: string | null): void {
 }
 
 export function reconcileTranslationId(
-     translations: TranslationMeta[] | undefined | null,
+    translations: TranslationMeta[] | undefined | null,
 ): string | null {
     const list = translations ?? [];
     if (list.length === 0) return getTranslationId();
@@ -446,9 +458,9 @@ export function reconcileTranslationId(
     }
 
     const defaultId =
-         list.find((t) => t.isDefault)?.translationId ??
-         list[0]?.translationId ??
-         null;
+        list.find((t) => t.isDefault)?.translationId ??
+        list[0]?.translationId ??
+        null;
 
     setTranslationId(defaultId);
     return defaultId;
@@ -484,15 +496,13 @@ function isObj(value: unknown): value is Record<string, unknown> {
 }
 
 function hasOwn<K extends string>(
-     value: Record<string, unknown>,
-     key: K,
+    value: Record<string, unknown>,
+    key: K,
 ): value is Record<K, unknown> {
     return Object.prototype.hasOwnProperty.call(value, key);
 }
 
-function tryParseJson(
-     text: string,
-): { ok: true; value: unknown } | { ok: false } {
+function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false } {
     if (!text) return { ok: true, value: null };
     try {
         return { ok: true, value: JSON.parse(text) as unknown };
@@ -542,16 +552,18 @@ type MergedSignal = {
     signal?: AbortSignal;
     cleanup: () => void;
     didTimeout: () => boolean;
+    wasExternallyAborted: () => boolean;
 };
 
 function mergeSignalsWithTimeout(
-     externalSignal: AbortSignal | undefined,
-     timeoutMs: number,
+    externalSignal: AbortSignal | undefined,
+    timeoutMs: number,
 ): MergedSignal {
     const timeoutCtrl = new AbortController();
     const mergedCtrl = new AbortController();
 
     let timedOut = false;
+    let externallyAborted = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const abortMerged = () => {
@@ -559,6 +571,7 @@ function mergeSignalsWithTimeout(
     };
 
     const onExternalAbort = () => {
+        externallyAborted = true;
         abortMerged();
     };
 
@@ -568,6 +581,7 @@ function mergeSignalsWithTimeout(
     };
 
     if (externalSignal?.aborted) {
+        externallyAborted = true;
         abortMerged();
     } else if (externalSignal) {
         externalSignal.addEventListener("abort", onExternalAbort, { once: true });
@@ -595,23 +609,28 @@ function mergeSignalsWithTimeout(
             timeoutCtrl.signal.removeEventListener("abort", onTimeoutAbort);
         },
         didTimeout: () => timedOut,
+        wasExternallyAborted: () => externallyAborted,
     };
 }
 
 function classifyFetchError(
-     error: unknown,
-     method: string,
-     url: string,
-     didTimeout: boolean,
+    error: unknown,
+    method: string,
+    url: string,
+    merged: Pick<MergedSignal, "didTimeout" | "wasExternallyAborted">,
 ): ApiError {
     if (error instanceof ApiError) return error;
 
     if (error && typeof error === "object" && "name" in error) {
         const name = String((error as { name?: unknown }).name ?? "");
         if (name === "AbortError") {
-            return didTimeout
-                 ? new ApiError("TIMEOUT", "Request took too long.", { method, url })
-                 : new ApiError("ABORTED", "Request aborted.", { method, url });
+            if (merged.didTimeout()) {
+                return new ApiError("TIMEOUT", "Request took too long.", { method, url });
+            }
+            if (merged.wasExternallyAborted()) {
+                return new ApiError("ABORTED", "Request aborted.", { method, url });
+            }
+            return new ApiError("ABORTED", "Request aborted.", { method, url });
         }
     }
 
@@ -651,13 +670,17 @@ function cachePut(key: string, etag: string, data: unknown): void {
     if (!cleanEtag) return;
 
     responseCache.set(
-         key,
-         Object.freeze({
-             at: Date.now(),
-             etag: cleanEtag,
-             data,
-         }),
+        key,
+        Object.freeze({
+            at: Date.now(),
+            etag: cleanEtag,
+            data,
+        }),
     );
+}
+
+function cacheDelete(key: string): void {
+    responseCache.delete(key);
 }
 
 function shouldCacheResponse(method: string, res: Response): boolean {
@@ -668,26 +691,57 @@ function shouldCacheResponse(method: string, res: Response): boolean {
 
 /* ----------------------------- Request core ------------------------------ */
 
+type HttpMethod = "GET" | "POST";
+
+function normalizeTimeoutMs(value: number | undefined): number {
+    if (!Number.isFinite(value ?? NaN)) return 12_000;
+    return Math.max(1, Math.trunc(value as number));
+}
+
+function normalizeCacheTtlMs(value: number | undefined): number {
+    if (!Number.isFinite(value ?? NaN)) return DEFAULT_CACHE_TTL_MS;
+    return Math.max(0, Math.trunc(value as number));
+}
+
+function buildHeaders(source: Record<string, string> | undefined): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (!source) return out;
+
+    for (const [key, value] of Object.entries(source)) {
+        out[key] = value;
+    }
+
+    return out;
+}
+
+async function readResponseBodyText(res: Response): Promise<string> {
+    try {
+        return await res.text();
+    } catch {
+        return "";
+    }
+}
+
 async function requestJson<T>(
-     method: "GET" | "POST",
-     path: string,
-     body: unknown | undefined,
-     opts: ApiRequestOptions = {},
+    method: HttpMethod,
+    path: string,
+    body: unknown | undefined,
+    opts: ApiRequestOptions = {},
 ): Promise<T> {
     const pathWithTranslation = withTranslation(path, opts);
     const url = joinUrl(API_BASE, pathWithTranslation);
 
-    const timeoutMs = opts.timeoutMs ?? 12_000;
+    const timeoutMs = normalizeTimeoutMs(opts.timeoutMs);
     const cacheMode = opts.cacheMode ?? "default";
-    const cacheTtlMs = opts.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+    const cacheTtlMs = normalizeCacheTtlMs(opts.cacheTtlMs);
     const credentials = opts.credentials ?? "same-origin";
 
     const merged = mergeSignalsWithTimeout(opts.signal, timeoutMs);
 
-    const headers: Record<string, string> = {
-        Accept: "application/json",
-        ...(opts.headers ?? {}),
-    };
+    const headers = buildHeaders(opts.headers);
+    if (headers.Accept == null) {
+        headers.Accept = "application/json";
+    }
 
     if (cacheMode === "no-store" && headers["Cache-Control"] == null) {
         headers["Cache-Control"] = "no-store";
@@ -703,11 +757,12 @@ async function requestJson<T>(
     }
 
     try {
-        const payload =
-             method === "POST" && body !== undefined ? JSON.stringify(body) : undefined;
-
-        if (method === "POST" && headers["Content-Type"] == null) {
-            headers["Content-Type"] = "application/json";
+        let payload: string | undefined;
+        if (method === "POST" && body !== undefined) {
+            payload = JSON.stringify(body);
+            if (headers["Content-Type"] == null) {
+                headers["Content-Type"] = "application/json";
+            }
         }
 
         const res = await fetch(url, {
@@ -722,15 +777,16 @@ async function requestJson<T>(
 
         if (res.status === 304) {
             if (!prior) {
+                cacheDelete(key);
                 throw new ApiError(
-                     "CACHE_MISS",
-                     "Server returned 304 but client has no cached response body.",
-                     {
-                         status: 304,
-                         method,
-                         url,
-                         requestId,
-                     },
+                    "CACHE_MISS",
+                    "Server returned 304 but client has no cached response body.",
+                    {
+                        status: 304,
+                        method,
+                        url,
+                        requestId,
+                    },
                 );
             }
             return prior.data as T;
@@ -740,7 +796,7 @@ async function requestJson<T>(
             return null as T;
         }
 
-        const text = await res.text();
+        const text = await readResponseBodyText(res);
         const parsed = tryParseJson(text);
 
         if (!res.ok) {
@@ -765,15 +821,15 @@ async function requestJson<T>(
 
         if (!parsed.ok) {
             throw new ApiError(
-                 isLikelyJson(res) ? "NOT_JSON" : "BAD_RESPONSE",
-                 "Expected JSON response but received non-JSON content.",
-                 {
-                     status: res.status,
-                     method,
-                     url,
-                     requestId,
-                     bodyText: bodySnippet(text),
-                 },
+                isLikelyJson(res) ? "NOT_JSON" : "BAD_RESPONSE",
+                "Expected JSON response but received non-JSON content.",
+                {
+                    status: res.status,
+                    method,
+                    url,
+                    requestId,
+                    bodyText: bodySnippet(text),
+                },
             );
         }
 
@@ -801,11 +857,13 @@ async function requestJson<T>(
 
         if (shouldCacheResponse(method, res)) {
             cachePut(key, res.headers.get("etag") ?? "", data);
+        } else if (method === "GET" && cacheMode !== "default") {
+            cacheDelete(key);
         }
 
         return data;
     } catch (error: unknown) {
-        throw classifyFetchError(error, method, url, merged.didTimeout());
+        throw classifyFetchError(error, method, url, merged);
     } finally {
         merged.cleanup();
     }
@@ -816,9 +874,9 @@ async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T
 }
 
 async function postJson<T>(
-     path: string,
-     body?: unknown,
-     opts: ApiRequestOptions = {},
+    path: string,
+    body?: unknown,
+    opts: ApiRequestOptions = {},
 ): Promise<T> {
     return requestJson<T>("POST", path, body, opts);
 }
@@ -838,29 +896,35 @@ export function apiGetBooks(opts?: ApiRequestOptions): Promise<{ books: BookRow[
 }
 
 export function apiGetChapters(
-     bookId: string,
-     opts?: ApiRequestOptions,
+    bookId: string,
+    opts?: ApiRequestOptions,
 ): Promise<ChaptersPayload> {
     return getJson(`/chapters/${encodeURIComponent(bookId)}`, opts);
 }
 
 export function apiGetChapter(
-     bookId: string,
-     chapter: number,
-     opts?: ApiRequestOptions,
+    bookId: string,
+    chapter: number,
+    opts?: ApiRequestOptions,
 ): Promise<ChapterPayload> {
     return getJson(
-         `/chapter/${encodeURIComponent(bookId)}/${encodeURIComponent(String(chapter))}`,
-         opts,
+        `/chapter/${encodeURIComponent(bookId)}/${encodeURIComponent(String(Math.trunc(chapter)))}`,
+        opts,
     );
 }
 
 export function apiSearch(
-     q: string,
-     limit = 30,
-     opts?: ApiRequestOptions,
+    q: string,
+    limit = 30,
+    opts?: ApiRequestOptions,
 ): Promise<SearchPayload> {
-    return getJson(addQuery("/search", { q, limit }), opts);
+    return getJson(
+        addQuery("/search", {
+            q,
+            limit: Math.max(1, Math.trunc(limit)),
+        }),
+        opts,
+    );
 }
 
 export function apiGetPerson(id: string, opts?: ApiRequestOptions): Promise<PersonPayload> {
@@ -880,26 +944,33 @@ export function apiGetSpine(opts?: ApiRequestOptions): Promise<SpineStats> {
 }
 
 export function apiGetSlice(
-     fromOrd: number,
-     limit = 240,
-     opts?: ApiRequestOptions,
+    fromOrd: number,
+    limit = 240,
+    opts?: ApiRequestOptions,
 ): Promise<SlicePayload> {
-    return getJson(addQuery("/slice", { fromOrd, limit }), opts);
+    return getJson(
+        addQuery("/slice", {
+            fromOrd: Math.trunc(fromOrd),
+            limit: Math.max(1, Math.trunc(limit)),
+        }),
+        opts,
+    );
 }
 
 export function apiResolveLoc(
-     bookId: string,
-     chapter: number,
-     verse: number | null,
-     opts?: ApiRequestOptions,
+    bookId: string,
+    chapter: number,
+    verse: number | null,
+    opts?: ApiRequestOptions,
 ): Promise<LocPayload> {
+    const cleanBookId = normalizeBookId(bookId);
     return getJson(
-         addQuery("/loc", {
-             bookId,
-             chapter,
-             ...(verse != null ? { verse } : {}),
-         }),
-         opts,
+        addQuery("/loc", {
+            bookId: cleanBookId,
+            chapter: Math.trunc(chapter),
+            ...(verse != null ? { verse: Math.trunc(verse) } : {}),
+        }),
+        opts,
     );
 }
 
@@ -912,6 +983,10 @@ export function apiAuthLogout(opts?: ApiRequestOptions): Promise<{ redirect: str
 }
 
 /* -------------------------- Convenience / debug -------------------------- */
+
+function normalizeBookId(bookId: string): string {
+    return bookId.trim().toUpperCase();
+}
 
 export function formatApiError(error: unknown): string {
     if (!(error instanceof ApiError)) {
@@ -932,4 +1007,13 @@ export function formatApiError(error: unknown): string {
 
 export function clearApiResponseCache(): void {
     responseCache.clear();
+}
+
+export function getApiBase(): string {
+    return API_BASE;
+}
+
+export function makeApiUrl(path: string): string {
+    const normalizedPath = `/${stripLeadingSlashes(path)}`;
+    return joinUrl(API_BASE, normalizedPath);
 }

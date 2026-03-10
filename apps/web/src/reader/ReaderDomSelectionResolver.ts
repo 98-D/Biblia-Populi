@@ -11,8 +11,6 @@ const ATTR_TOKEN_CHAR_START = "data-token-char-start";
 const ATTR_TOKEN_CHAR_END = "data-token-char-end";
 const ATTR_TRANSLATION_ID = "data-translation-id";
 
-type HTMLElementWithParent = HTMLElement & { parentElement: HTMLElement | null };
-
 function isElement(value: unknown): value is Element {
     return typeof Element !== "undefined" && value instanceof Element;
 }
@@ -67,11 +65,6 @@ function getClosestHTMLElement(node: Node | null): HTMLElement | null {
     return isHTMLElement(el) ? el : null;
 }
 
-function getParentHTMLElement(el: HTMLElement | null): HTMLElement | null {
-    if (!el) return null;
-    return (el as HTMLElementWithParent).parentElement;
-}
-
 function findClosestAttrElement(node: Node | null, attr: string): HTMLElement | null {
     let current = getClosestHTMLElement(node);
 
@@ -79,7 +72,7 @@ function findClosestAttrElement(node: Node | null, attr: string): HTMLElement | 
         if (current.hasAttribute(attr)) {
             return current;
         }
-        current = getParentHTMLElement(current);
+        current = current.parentElement;
     }
 
     return null;
@@ -92,7 +85,33 @@ function findVerseElement(node: Node | null): HTMLElement | null {
         if (current.hasAttribute(ATTR_VERSE_KEY) && current.hasAttribute(ATTR_VERSE_ORD)) {
             return current;
         }
-        current = getParentHTMLElement(current);
+        current = current.parentElement;
+    }
+
+    return null;
+}
+
+function isTokenElement(el: HTMLElement): boolean {
+    return (
+        el.hasAttribute(ATTR_TOKEN_INDEX) ||
+        el.hasAttribute(ATTR_TOKEN_CHAR_START) ||
+        el.hasAttribute(ATTR_TOKEN_CHAR_END)
+    );
+}
+
+function findTokenElement(node: Node | null, verseEl: HTMLElement | null): HTMLElement | null {
+    let current = getClosestHTMLElement(node);
+
+    while (current) {
+        if (verseEl && current === verseEl.parentElement) break;
+
+        if (isTokenElement(current)) {
+            if (!verseEl || verseEl.contains(current)) return current;
+            return null;
+        }
+
+        if (verseEl && current === verseEl) break;
+        current = current.parentElement;
     }
 
     return null;
@@ -129,34 +148,74 @@ function getTokenCharEnd(tokenEl: HTMLElement | null): number | null {
     return end;
 }
 
-function resolveOffsetWithinNode(node: Node, offset: number): number {
-    if (isTextNode(node)) {
-        return clampInt(offset, 0, getNodeTextLength(node));
+function sumTextLengthOfChildrenBefore(node: Node, childOffset: number): number {
+    const count = clampInt(childOffset, 0, node.childNodes.length);
+    let total = 0;
+
+    for (let i = 0; i < count; i += 1) {
+        total += getNodeTextLength(node.childNodes[i] ?? null);
     }
 
-    return clampInt(offset, 0, node.childNodes.length);
+    return total;
 }
 
 /**
- * Best-effort local offset inside a token.
+ * Computes a character offset relative to `ancestor` from DOM boundary `(node, offset)`.
  *
- * Important:
- * - We keep this conservative and deterministic.
- * - We do NOT try to fully reconstruct nested DOM text layout here.
- * - For text nodes inside token elements, raw text offset is already the calmest signal.
+ * Rules:
+ * - text node => offset is character offset within that text node
+ * - element node => offset is child-node boundary index
+ * - while walking upward, sum text lengths of preceding siblings
+ *
+ * Returns null if `node` is not contained inside `ancestor`.
  */
+function resolveOffsetRelativeToAncestor(
+    node: Node,
+    offset: number,
+    ancestor: HTMLElement,
+): number | null {
+    if (!ancestor.contains(node) && node !== ancestor) {
+        return null;
+    }
+
+    if (node === ancestor) {
+        if (isTextNode(node)) {
+            return clampInt(offset, 0, getNodeTextLength(node));
+        }
+        return sumTextLengthOfChildrenBefore(node, offset);
+    }
+
+    let total = 0;
+    let current: Node | null = node;
+
+    if (isTextNode(current)) {
+        total += clampInt(offset, 0, getNodeTextLength(current));
+    } else {
+        total += sumTextLengthOfChildrenBefore(current, offset);
+    }
+
+    while (current && current !== ancestor) {
+        const parent: Node | null = current.parentNode;
+        if (!parent) return null;
+
+        let sibling: Node | null = parent.firstChild;
+        while (sibling && sibling !== current) {
+            total += getNodeTextLength(sibling);
+            sibling = sibling.nextSibling;
+        }
+
+        current = parent;
+    }
+
+    if (current !== ancestor) return null;
+    return clampInt(total, 0, getNodeTextLength(ancestor));
+}
+
 function resolveTokenRelativeOffset(node: Node, offset: number, tokenEl: HTMLElement): number {
     const tokenTextLen = getNodeTextLength(tokenEl);
-
-    if (isTextNode(node)) {
-        return clampInt(offset, 0, getNodeTextLength(node));
-    }
-
-    if (node === tokenEl) {
-        return clampInt(resolveOffsetWithinNode(node, offset), 0, tokenTextLen);
-    }
-
-    return clampInt(offset, 0, tokenTextLen);
+    const relative = resolveOffsetRelativeToAncestor(node, offset, tokenEl);
+    if (relative == null) return 0;
+    return clampInt(relative, 0, tokenTextLen);
 }
 
 function resolveCharOffset(node: Node, offset: number, tokenEl: HTMLElement | null): number | null {
@@ -169,35 +228,59 @@ function resolveCharOffset(node: Node, offset: number, tokenEl: HTMLElement | nu
 
     const tokenStart = getTokenCharStart(tokenEl);
     const tokenEnd = getTokenCharEnd(tokenEl);
+    const local = resolveTokenRelativeOffset(node, offset, tokenEl);
 
     if (tokenStart == null && tokenEnd == null) {
-        if (isTextNode(node)) {
-            return clampInt(offset, 0, getNodeTextLength(node));
-        }
-        return null;
+        return local;
     }
 
     if (tokenStart != null && tokenEnd != null) {
         const lo = Math.min(tokenStart, tokenEnd);
         const hi = Math.max(tokenStart, tokenEnd);
         const width = Math.max(0, hi - lo);
-        const local = resolveTokenRelativeOffset(node, offset, tokenEl);
         return lo + clampInt(local, 0, width);
     }
 
     if (tokenStart != null) {
-        const local = resolveTokenRelativeOffset(node, offset, tokenEl);
         return tokenStart + Math.max(0, local);
     }
 
-    return tokenEnd;
+    if (tokenEnd != null) {
+        const tokenTextLen = getNodeTextLength(tokenEl);
+        const inferredStart = Math.max(0, tokenEnd - tokenTextLen);
+        const width = Math.max(0, tokenEnd - inferredStart);
+        return inferredStart + clampInt(local, 0, width);
+    }
+
+    return null;
+}
+
+function readTranslationIdFromVerseOrAncestors(
+    node: Node,
+    verseEl: HTMLElement | null,
+): string | null {
+    const verseScoped =
+        verseEl && verseEl.hasAttribute(ATTR_TRANSLATION_ID)
+            ? normalizeString(verseEl.getAttribute(ATTR_TRANSLATION_ID))
+            : null;
+
+    if (verseScoped) return verseScoped;
+
+    const nearest = findClosestAttrElement(node, ATTR_TRANSLATION_ID);
+    if (!nearest) return null;
+
+    if (verseEl && !nearest.contains(verseEl) && !verseEl.contains(nearest)) {
+        return null;
+    }
+
+    return normalizeString(nearest.getAttribute(ATTR_TRANSLATION_ID));
 }
 
 function buildLocator(
-     verseEl: HTMLElement,
-     tokenEl: HTMLElement | null,
-     node: Node,
-     offset: number,
+    verseEl: HTMLElement,
+    tokenEl: HTMLElement | null,
+    node: Node,
+    offset: number,
 ): DomSelectionTokenLocator | null {
     const verseKey = getVerseKey(verseEl);
     const verseOrd = getVerseOrd(verseEl);
@@ -222,13 +305,12 @@ export class ReaderDomSelectionResolver implements DomSelectionResolver {
         const verseEl = findVerseElement(node);
         if (!verseEl) return null;
 
-        const tokenEl = findClosestAttrElement(node, ATTR_TOKEN_INDEX);
+        const tokenEl = findTokenElement(node, verseEl);
         return buildLocator(verseEl, tokenEl, node, offset);
     }
 
-    resolveTranslationId(root: Node): string | null {
-        const el = findClosestAttrElement(root, ATTR_TRANSLATION_ID);
-        if (!el) return null;
-        return normalizeString(el.getAttribute(ATTR_TRANSLATION_ID));
+    resolveTranslationId(node: Node): string | null {
+        const verseEl = findVerseElement(node);
+        return readTranslationIdFromVerseOrAncestors(node, verseEl);
     }
 }

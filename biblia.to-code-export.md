@@ -1,11 +1,11 @@
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-08T03:13:39.054Z
-Root: /Users/dan/Desktop/Biblia-Populi
+Generated: 2026-03-10T17:48:29.479Z
+Root: C:\Users\dannydekker\Desktop\Biblia-Populi
 Total files: 70
-Total raw bytes (all included files): 2098385
+Total raw bytes (all included files): 2178791
 Truncated/skipped files: 1
-Export time: 7ms
+Export time: 20ms
 
 ## Notes
 
@@ -13713,16 +13713,18 @@ export default defineConfig([
 
 ```ts
 // apps/web/src/api.ts
-// Biblia.to — typed API client
+// Biblia.to — hardened typed API client
 //
-// Hardened goals:
-// - same-origin by default, optional VITE_API_BASE
+// Goals:
+// - same-origin by default, optional VITE_API_BASE override
 // - stable translation selection + reconciliation
-// - GET envelope decoding with proper 204/304 handling
-// - in-memory ETag cache that cannot "freeze on 304"
+// - GET envelope decoding with safe 204 / 304 handling
+// - in-memory ETag cache that cannot freeze on 304
 // - merged abort signals + timeout classification
 // - safer parsing / narrower envelope assumptions
 // - explicit diagnostics with request id + body snippet
+// - stricter query encoding / path hygiene
+// - deterministic cache-keying + cache invalidation hooks
 
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: { code: string; message: string } };
@@ -13730,7 +13732,7 @@ export type ApiRes<T> = ApiOk<T> | ApiErr;
 
 export type ApiCacheMode = "default" | "no-store" | "reload";
 
-export type ApiRequestOptions = {
+export type ApiRequestOptions = Readonly<{
     timeoutMs?: number;
     headers?: Record<string, string>;
     signal?: AbortSignal;
@@ -13738,17 +13740,17 @@ export type ApiRequestOptions = {
     credentials?: RequestCredentials;
     cacheMode?: ApiCacheMode;
     cacheTtlMs?: number;
-};
+}>;
 
 export type ApiErrorCode =
-     | "TIMEOUT"
-     | "NETWORK"
-     | "HTTP_ERROR"
-     | "BAD_RESPONSE"
-     | "NOT_JSON"
-     | "API_ERROR"
-     | "ABORTED"
-     | "CACHE_MISS";
+    | "TIMEOUT"
+    | "NETWORK"
+    | "HTTP_ERROR"
+    | "BAD_RESPONSE"
+    | "NOT_JSON"
+    | "API_ERROR"
+    | "ABORTED"
+    | "CACHE_MISS";
 
 export class ApiError extends Error {
     readonly code: ApiErrorCode;
@@ -13759,15 +13761,15 @@ export class ApiError extends Error {
     readonly requestId?: string;
 
     constructor(
-         code: ApiErrorCode,
-         message: string,
-         init?: {
-             status?: number;
-             url?: string;
-             method?: string;
-             bodyText?: string;
-             requestId?: string;
-         },
+        code: ApiErrorCode,
+        message: string,
+        init?: Readonly<{
+            status?: number;
+            url?: string;
+            method?: string;
+            bodyText?: string;
+            requestId?: string;
+        }>,
     ) {
         super(`${code}: ${message}`);
         this.name = "ApiError";
@@ -13860,15 +13862,15 @@ export type LinkRow = {
     targetKind: "ENTITY" | "EVENT" | "ROUTE" | "PLACE_GEO" | string;
     targetId: string;
     linkKind:
-         | "MENTIONS"
-         | "PRIMARY_SUBJECT"
-         | "LOCATION"
-         | "SETTING"
-         | "JOURNEY_STEP"
-         | "PARALLEL_ACCOUNT"
-         | "QUOTE_SOURCE"
-         | "QUOTE_TARGET"
-         | string;
+        | "MENTIONS"
+        | "PRIMARY_SUBJECT"
+        | "LOCATION"
+        | "SETTING"
+        | "JOURNEY_STEP"
+        | "PARALLEL_ACCOUNT"
+        | "QUOTE_SOURCE"
+        | "QUOTE_TARGET"
+        | string;
     weight: number;
     source: string;
     confidence: number | null;
@@ -13915,8 +13917,8 @@ export type SearchPayload = {
 };
 
 export type PersonPayload =
-     | null
-     | {
+    | null
+    | {
     entity: {
         entityId: string;
         kind: "PERSON" | string;
@@ -13959,8 +13961,8 @@ export type PersonPayload =
 };
 
 export type PlacePayload =
-     | null
-     | {
+    | null
+    | {
     entity: {
         entityId: string;
         kind: "PLACE" | string;
@@ -13992,8 +13994,8 @@ export type PlacePayload =
 };
 
 export type EventPayload =
-     | null
-     | {
+    | null
+    | {
     event: {
         eventId: string;
         canonicalTitle: string;
@@ -14033,8 +14035,8 @@ export type SlicePayload = {
 };
 
 export type LocPayload =
-     | null
-     | {
+    | null
+    | {
     verseKey: string;
     verseOrd: number;
     bookId: string;
@@ -14054,25 +14056,35 @@ function stripTrailingSlashes(value: string): string {
     return value.replace(/\/+$/g, "");
 }
 
+function stripLeadingSlashes(value: string): string {
+    return value.replace(/^\/+/g, "");
+}
+
 function isAbsoluteUrl(value: string): boolean {
     return /^https?:\/\//i.test(value);
 }
 
-function joinUrl(base: string, path: string): string {
-    const pathname = path.startsWith("/") ? path : `/${path}`;
-    const normalizedBase = stripTrailingSlashes(base.trim());
+function normalizeApiBase(raw: string): string {
+    const trimmed = raw.trim();
+    if (!trimmed) return "";
 
-    if (!normalizedBase) return pathname;
-
-    if (isAbsoluteUrl(normalizedBase)) {
-        return `${normalizedBase}${pathname}`;
+    if (isAbsoluteUrl(trimmed)) {
+        return stripTrailingSlashes(trimmed);
     }
 
-    const pathBase = normalizedBase.startsWith("/") ? normalizedBase : `/${normalizedBase}`;
-    return `${stripTrailingSlashes(pathBase)}${pathname}`;
+    const withLeading = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+    return stripTrailingSlashes(withLeading);
 }
 
-const API_BASE = joinUrl("", RAW_API_BASE);
+function joinUrl(base: string, path: string): string {
+    const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+    const normalizedBase = normalizeApiBase(base);
+
+    if (!normalizedBase) return normalizedPath;
+    return `${normalizedBase}${normalizedPath}`;
+}
+
+const API_BASE = normalizeApiBase(RAW_API_BASE);
 
 /* ------------------------ Translation selection -------------------------- */
 
@@ -14149,7 +14161,7 @@ export function setTranslationId(id: string | null): void {
 }
 
 export function reconcileTranslationId(
-     translations: TranslationMeta[] | undefined | null,
+    translations: TranslationMeta[] | undefined | null,
 ): string | null {
     const list = translations ?? [];
     if (list.length === 0) return getTranslationId();
@@ -14160,9 +14172,9 @@ export function reconcileTranslationId(
     }
 
     const defaultId =
-         list.find((t) => t.isDefault)?.translationId ??
-         list[0]?.translationId ??
-         null;
+        list.find((t) => t.isDefault)?.translationId ??
+        list[0]?.translationId ??
+        null;
 
     setTranslationId(defaultId);
     return defaultId;
@@ -14198,15 +14210,13 @@ function isObj(value: unknown): value is Record<string, unknown> {
 }
 
 function hasOwn<K extends string>(
-     value: Record<string, unknown>,
-     key: K,
+    value: Record<string, unknown>,
+    key: K,
 ): value is Record<K, unknown> {
     return Object.prototype.hasOwnProperty.call(value, key);
 }
 
-function tryParseJson(
-     text: string,
-): { ok: true; value: unknown } | { ok: false } {
+function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false } {
     if (!text) return { ok: true, value: null };
     try {
         return { ok: true, value: JSON.parse(text) as unknown };
@@ -14256,16 +14266,18 @@ type MergedSignal = {
     signal?: AbortSignal;
     cleanup: () => void;
     didTimeout: () => boolean;
+    wasExternallyAborted: () => boolean;
 };
 
 function mergeSignalsWithTimeout(
-     externalSignal: AbortSignal | undefined,
-     timeoutMs: number,
+    externalSignal: AbortSignal | undefined,
+    timeoutMs: number,
 ): MergedSignal {
     const timeoutCtrl = new AbortController();
     const mergedCtrl = new AbortController();
 
     let timedOut = false;
+    let externallyAborted = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const abortMerged = () => {
@@ -14273,6 +14285,7 @@ function mergeSignalsWithTimeout(
     };
 
     const onExternalAbort = () => {
+        externallyAborted = true;
         abortMerged();
     };
 
@@ -14282,6 +14295,7 @@ function mergeSignalsWithTimeout(
     };
 
     if (externalSignal?.aborted) {
+        externallyAborted = true;
         abortMerged();
     } else if (externalSignal) {
         externalSignal.addEventListener("abort", onExternalAbort, { once: true });
@@ -14309,23 +14323,28 @@ function mergeSignalsWithTimeout(
             timeoutCtrl.signal.removeEventListener("abort", onTimeoutAbort);
         },
         didTimeout: () => timedOut,
+        wasExternallyAborted: () => externallyAborted,
     };
 }
 
 function classifyFetchError(
-     error: unknown,
-     method: string,
-     url: string,
-     didTimeout: boolean,
+    error: unknown,
+    method: string,
+    url: string,
+    merged: Pick<MergedSignal, "didTimeout" | "wasExternallyAborted">,
 ): ApiError {
     if (error instanceof ApiError) return error;
 
     if (error && typeof error === "object" && "name" in error) {
         const name = String((error as { name?: unknown }).name ?? "");
         if (name === "AbortError") {
-            return didTimeout
-                 ? new ApiError("TIMEOUT", "Request took too long.", { method, url })
-                 : new ApiError("ABORTED", "Request aborted.", { method, url });
+            if (merged.didTimeout()) {
+                return new ApiError("TIMEOUT", "Request took too long.", { method, url });
+            }
+            if (merged.wasExternallyAborted()) {
+                return new ApiError("ABORTED", "Request aborted.", { method, url });
+            }
+            return new ApiError("ABORTED", "Request aborted.", { method, url });
         }
     }
 
@@ -14365,13 +14384,17 @@ function cachePut(key: string, etag: string, data: unknown): void {
     if (!cleanEtag) return;
 
     responseCache.set(
-         key,
-         Object.freeze({
-             at: Date.now(),
-             etag: cleanEtag,
-             data,
-         }),
+        key,
+        Object.freeze({
+            at: Date.now(),
+            etag: cleanEtag,
+            data,
+        }),
     );
+}
+
+function cacheDelete(key: string): void {
+    responseCache.delete(key);
 }
 
 function shouldCacheResponse(method: string, res: Response): boolean {
@@ -14382,26 +14405,57 @@ function shouldCacheResponse(method: string, res: Response): boolean {
 
 /* ----------------------------- Request core ------------------------------ */
 
+type HttpMethod = "GET" | "POST";
+
+function normalizeTimeoutMs(value: number | undefined): number {
+    if (!Number.isFinite(value ?? NaN)) return 12_000;
+    return Math.max(1, Math.trunc(value as number));
+}
+
+function normalizeCacheTtlMs(value: number | undefined): number {
+    if (!Number.isFinite(value ?? NaN)) return DEFAULT_CACHE_TTL_MS;
+    return Math.max(0, Math.trunc(value as number));
+}
+
+function buildHeaders(source: Record<string, string> | undefined): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (!source) return out;
+
+    for (const [key, value] of Object.entries(source)) {
+        out[key] = value;
+    }
+
+    return out;
+}
+
+async function readResponseBodyText(res: Response): Promise<string> {
+    try {
+        return await res.text();
+    } catch {
+        return "";
+    }
+}
+
 async function requestJson<T>(
-     method: "GET" | "POST",
-     path: string,
-     body: unknown | undefined,
-     opts: ApiRequestOptions = {},
+    method: HttpMethod,
+    path: string,
+    body: unknown | undefined,
+    opts: ApiRequestOptions = {},
 ): Promise<T> {
     const pathWithTranslation = withTranslation(path, opts);
     const url = joinUrl(API_BASE, pathWithTranslation);
 
-    const timeoutMs = opts.timeoutMs ?? 12_000;
+    const timeoutMs = normalizeTimeoutMs(opts.timeoutMs);
     const cacheMode = opts.cacheMode ?? "default";
-    const cacheTtlMs = opts.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+    const cacheTtlMs = normalizeCacheTtlMs(opts.cacheTtlMs);
     const credentials = opts.credentials ?? "same-origin";
 
     const merged = mergeSignalsWithTimeout(opts.signal, timeoutMs);
 
-    const headers: Record<string, string> = {
-        Accept: "application/json",
-        ...(opts.headers ?? {}),
-    };
+    const headers = buildHeaders(opts.headers);
+    if (headers.Accept == null) {
+        headers.Accept = "application/json";
+    }
 
     if (cacheMode === "no-store" && headers["Cache-Control"] == null) {
         headers["Cache-Control"] = "no-store";
@@ -14417,11 +14471,12 @@ async function requestJson<T>(
     }
 
     try {
-        const payload =
-             method === "POST" && body !== undefined ? JSON.stringify(body) : undefined;
-
-        if (method === "POST" && headers["Content-Type"] == null) {
-            headers["Content-Type"] = "application/json";
+        let payload: string | undefined;
+        if (method === "POST" && body !== undefined) {
+            payload = JSON.stringify(body);
+            if (headers["Content-Type"] == null) {
+                headers["Content-Type"] = "application/json";
+            }
         }
 
         const res = await fetch(url, {
@@ -14436,15 +14491,16 @@ async function requestJson<T>(
 
         if (res.status === 304) {
             if (!prior) {
+                cacheDelete(key);
                 throw new ApiError(
-                     "CACHE_MISS",
-                     "Server returned 304 but client has no cached response body.",
-                     {
-                         status: 304,
-                         method,
-                         url,
-                         requestId,
-                     },
+                    "CACHE_MISS",
+                    "Server returned 304 but client has no cached response body.",
+                    {
+                        status: 304,
+                        method,
+                        url,
+                        requestId,
+                    },
                 );
             }
             return prior.data as T;
@@ -14454,7 +14510,7 @@ async function requestJson<T>(
             return null as T;
         }
 
-        const text = await res.text();
+        const text = await readResponseBodyText(res);
         const parsed = tryParseJson(text);
 
         if (!res.ok) {
@@ -14479,15 +14535,15 @@ async function requestJson<T>(
 
         if (!parsed.ok) {
             throw new ApiError(
-                 isLikelyJson(res) ? "NOT_JSON" : "BAD_RESPONSE",
-                 "Expected JSON response but received non-JSON content.",
-                 {
-                     status: res.status,
-                     method,
-                     url,
-                     requestId,
-                     bodyText: bodySnippet(text),
-                 },
+                isLikelyJson(res) ? "NOT_JSON" : "BAD_RESPONSE",
+                "Expected JSON response but received non-JSON content.",
+                {
+                    status: res.status,
+                    method,
+                    url,
+                    requestId,
+                    bodyText: bodySnippet(text),
+                },
             );
         }
 
@@ -14515,11 +14571,13 @@ async function requestJson<T>(
 
         if (shouldCacheResponse(method, res)) {
             cachePut(key, res.headers.get("etag") ?? "", data);
+        } else if (method === "GET" && cacheMode !== "default") {
+            cacheDelete(key);
         }
 
         return data;
     } catch (error: unknown) {
-        throw classifyFetchError(error, method, url, merged.didTimeout());
+        throw classifyFetchError(error, method, url, merged);
     } finally {
         merged.cleanup();
     }
@@ -14530,9 +14588,9 @@ async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T
 }
 
 async function postJson<T>(
-     path: string,
-     body?: unknown,
-     opts: ApiRequestOptions = {},
+    path: string,
+    body?: unknown,
+    opts: ApiRequestOptions = {},
 ): Promise<T> {
     return requestJson<T>("POST", path, body, opts);
 }
@@ -14552,29 +14610,35 @@ export function apiGetBooks(opts?: ApiRequestOptions): Promise<{ books: BookRow[
 }
 
 export function apiGetChapters(
-     bookId: string,
-     opts?: ApiRequestOptions,
+    bookId: string,
+    opts?: ApiRequestOptions,
 ): Promise<ChaptersPayload> {
     return getJson(`/chapters/${encodeURIComponent(bookId)}`, opts);
 }
 
 export function apiGetChapter(
-     bookId: string,
-     chapter: number,
-     opts?: ApiRequestOptions,
+    bookId: string,
+    chapter: number,
+    opts?: ApiRequestOptions,
 ): Promise<ChapterPayload> {
     return getJson(
-         `/chapter/${encodeURIComponent(bookId)}/${encodeURIComponent(String(chapter))}`,
-         opts,
+        `/chapter/${encodeURIComponent(bookId)}/${encodeURIComponent(String(Math.trunc(chapter)))}`,
+        opts,
     );
 }
 
 export function apiSearch(
-     q: string,
-     limit = 30,
-     opts?: ApiRequestOptions,
+    q: string,
+    limit = 30,
+    opts?: ApiRequestOptions,
 ): Promise<SearchPayload> {
-    return getJson(addQuery("/search", { q, limit }), opts);
+    return getJson(
+        addQuery("/search", {
+            q,
+            limit: Math.max(1, Math.trunc(limit)),
+        }),
+        opts,
+    );
 }
 
 export function apiGetPerson(id: string, opts?: ApiRequestOptions): Promise<PersonPayload> {
@@ -14594,26 +14658,33 @@ export function apiGetSpine(opts?: ApiRequestOptions): Promise<SpineStats> {
 }
 
 export function apiGetSlice(
-     fromOrd: number,
-     limit = 240,
-     opts?: ApiRequestOptions,
+    fromOrd: number,
+    limit = 240,
+    opts?: ApiRequestOptions,
 ): Promise<SlicePayload> {
-    return getJson(addQuery("/slice", { fromOrd, limit }), opts);
+    return getJson(
+        addQuery("/slice", {
+            fromOrd: Math.trunc(fromOrd),
+            limit: Math.max(1, Math.trunc(limit)),
+        }),
+        opts,
+    );
 }
 
 export function apiResolveLoc(
-     bookId: string,
-     chapter: number,
-     verse: number | null,
-     opts?: ApiRequestOptions,
+    bookId: string,
+    chapter: number,
+    verse: number | null,
+    opts?: ApiRequestOptions,
 ): Promise<LocPayload> {
+    const cleanBookId = normalizeBookId(bookId);
     return getJson(
-         addQuery("/loc", {
-             bookId,
-             chapter,
-             ...(verse != null ? { verse } : {}),
-         }),
-         opts,
+        addQuery("/loc", {
+            bookId: cleanBookId,
+            chapter: Math.trunc(chapter),
+            ...(verse != null ? { verse: Math.trunc(verse) } : {}),
+        }),
+        opts,
     );
 }
 
@@ -14626,6 +14697,10 @@ export function apiAuthLogout(opts?: ApiRequestOptions): Promise<{ redirect: str
 }
 
 /* -------------------------- Convenience / debug -------------------------- */
+
+function normalizeBookId(bookId: string): string {
+    return bookId.trim().toUpperCase();
+}
 
 export function formatApiError(error: unknown): string {
     if (!(error instanceof ApiError)) {
@@ -14646,6 +14721,15 @@ export function formatApiError(error: unknown): string {
 
 export function clearApiResponseCache(): void {
     responseCache.clear();
+}
+
+export function getApiBase(): string {
+    return API_BASE;
+}
+
+export function makeApiUrl(path: string): string {
+    const normalizedPath = `/${stripLeadingSlashes(path)}`;
+    return joinUrl(API_BASE, normalizedPath);
 }
 ```
 
@@ -15321,20 +15405,32 @@ type PopPos = {
 };
 
 type MenuActionState =
-     | "idle"
-     | "refreshing"
-     | "signing_out"
-     | "signing_in"
-     | "opening_account";
+    | "idle"
+    | "refreshing"
+    | "signing_out"
+    | "signing_in"
+    | "opening_account";
 
-const MENU_WIDTH = 272;
-const MENU_GAP = 8;
+type UserLike = {
+    displayName: string | null;
+    email: string | null;
+} | null;
+
+type UiDims = Readonly<{
+    btn: number;
+    avatar: number;
+    labelMax: number;
+    chevron: number;
+}>;
+
+const MENU_WIDTH = 276;
+const MENU_GAP = 10;
 const VIEWPORT_MARGIN = 12;
 const MENU_Z_INDEX = 300;
 const POINTER_DOWN_FOCUS_RESTORE_DELAY_MS = 0;
 
 const useIsomorphicLayoutEffect =
-     typeof window !== "undefined" ? useLayoutEffect : useEffect;
+    typeof window !== "undefined" ? useLayoutEffect : useEffect;
 
 function clamp(n: number, lo: number, hi: number): number {
     if (!Number.isFinite(n)) return lo;
@@ -15372,16 +15468,16 @@ function usePrefersReducedMotion(): boolean {
     return reduced;
 }
 
-function formatUserLabel(user: { displayName: string | null; email: string | null } | null): string {
+function formatUserLabel(user: UserLike): string {
     return user?.displayName?.trim() || user?.email?.trim() || "User";
 }
 
-function formatTriggerTitle(user: { displayName: string | null; email: string | null } | null): string {
+function formatTriggerTitle(user: UserLike): string {
     if (!user) return "Sign in";
     return user.displayName?.trim() || user.email?.trim() || "Account";
 }
 
-function initialsFromUser(user: { displayName: string | null; email: string | null } | null): string {
+function initialsFromUser(user: UserLike): string {
     const base = formatUserLabel(user).trim();
     if (!base) return "U";
 
@@ -15410,13 +15506,228 @@ function pathIncludesNode(path: EventTarget[] | null, node: Node | null): boolea
 }
 
 function isWithin(
-     target: Node | null,
-     path: EventTarget[] | null,
-     container: HTMLElement | null | undefined,
+    target: Node | null,
+    path: EventTarget[] | null,
+    container: HTMLElement | null | undefined,
 ): boolean {
     if (!container) return false;
     if (target && container.contains(target)) return true;
     return pathIncludesNode(path, container);
+}
+
+function getDims(size: Size): UiDims {
+    if (size === "md") {
+        return {
+            btn: 40,
+            avatar: 28,
+            labelMax: 220,
+            chevron: 16,
+        };
+    }
+
+    return {
+        btn: 34,
+        avatar: 24,
+        labelMax: 164,
+        chevron: 14,
+    };
+}
+
+function uiToken(state: {
+    open: boolean;
+    hovered: boolean;
+    pressed: boolean;
+    reducedMotion: boolean;
+}) {
+    const { open, hovered, pressed, reducedMotion } = state;
+    const active = open || hovered;
+
+    const ringIdle = "0 0 0 1px color-mix(in srgb, var(--border) 60%, transparent)";
+    const ringHover = "0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent)";
+    const ringOpen = "0 0 0 1px color-mix(in srgb, var(--border) 80%, transparent)";
+
+    const shadowIdle = "0 8px 20px color-mix(in srgb, black 10%, transparent)";
+    const shadowHover = "0 10px 26px color-mix(in srgb, black 13%, transparent)";
+    const shadowOpen = "0 14px 36px color-mix(in srgb, black 16%, transparent)";
+
+    return {
+        triggerRing: open ? ringOpen : active ? ringHover : ringIdle,
+        triggerShadow: open ? shadowOpen : active ? shadowHover : shadowIdle,
+        triggerBg: open
+            ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 66%, transparent), transparent)"
+            : active
+                ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 42%, transparent), transparent)"
+                : "transparent",
+        triggerScale: pressed ? "scale(0.972)" : "scale(1)",
+        motionFast: reducedMotion ? undefined : "140ms cubic-bezier(0.16, 1, 0.3, 1)",
+        motionMed: reducedMotion ? undefined : "180ms cubic-bezier(0.16, 1, 0.3, 1)",
+        menuBorder: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
+        menuBg:
+            "linear-gradient(180deg, color-mix(in srgb, var(--card) 96%, white), color-mix(in srgb, var(--card) 99%, transparent))",
+        menuShadow: "0 18px 56px color-mix(in srgb, black 20%, transparent)",
+        menuDivider: "color-mix(in srgb, var(--border) 72%, transparent)",
+        menuAlertBorder: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
+        menuAlertBg: "color-mix(in srgb, var(--activeBg) 44%, transparent)",
+        rowHoverBg: "color-mix(in srgb, var(--activeBg) 60%, transparent)",
+        rowHoverBorder: "color-mix(in srgb, var(--border) 62%, transparent)",
+        rowFocusRing: "0 0 0 3px color-mix(in srgb, var(--focusRing) 78%, transparent)",
+        avatarRing: "0 0 0 1px color-mix(in srgb, var(--border) 70%, transparent)",
+        avatarBg:
+            "linear-gradient(180deg, color-mix(in srgb, var(--card) 96%, white), color-mix(in srgb, var(--card) 99%, transparent))",
+    } as const;
+}
+
+function styles(args: {
+    dims: UiDims;
+    showLabel: boolean;
+    loading: boolean;
+    open: boolean;
+    hovered: boolean;
+    pressed: boolean;
+    reducedMotion: boolean;
+    pos: PopPos | null;
+    style?: React.CSSProperties;
+}) {
+    const { dims, showLabel, loading, open, hovered, pressed, reducedMotion, pos, style } = args;
+    const t = uiToken({ open, hovered, pressed, reducedMotion });
+
+    return {
+        trigger: {
+            height: dims.btn,
+            minWidth: dims.btn,
+            maxWidth: showLabel ? dims.labelMax + dims.avatar + 34 : dims.btn,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: showLabel ? 8 : 0,
+            padding: showLabel ? "0 9px 0 4px" : 0,
+            borderRadius: 999,
+            border: "1px solid transparent",
+            background: t.triggerBg,
+            color: "var(--fg)",
+            boxShadow: `${t.triggerRing}, ${t.triggerShadow}`,
+            cursor: "pointer",
+            userSelect: "none",
+            WebkitTapHighlightColor: "transparent",
+            transition: reducedMotion
+                ? undefined
+                : [
+                    `box-shadow ${t.motionMed}`,
+                    "transform 100ms ease-out",
+                    "background 140ms ease-out",
+                    "opacity 140ms ease-out",
+                ].join(", "),
+            touchAction: "manipulation",
+            transform: t.triggerScale,
+            outline: "none",
+            ...style,
+        } satisfies React.CSSProperties,
+
+        triggerLabel: {
+            fontSize: 13,
+            fontWeight: 760,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            maxWidth: dims.labelMax,
+            opacity: loading ? 0.68 : 1,
+        } satisfies React.CSSProperties,
+
+        triggerChevron: {
+            display: "grid",
+            placeItems: "center",
+            opacity: 0.62,
+            marginLeft: -1,
+            flex: "0 0 auto",
+            transform: open ? "rotate(180deg)" : "rotate(0deg)",
+            transition: reducedMotion
+                ? undefined
+                : "transform 160ms ease, opacity 140ms ease",
+        } satisfies React.CSSProperties,
+
+        menuPanel: pos
+            ? ({
+                position: "fixed",
+                top: pos.top,
+                left: pos.left,
+                width: pos.width,
+                zIndex: MENU_Z_INDEX,
+                borderRadius: 16,
+                border: t.menuBorder,
+                background: t.menuBg,
+                boxShadow: t.menuShadow,
+                backdropFilter: "blur(12px)",
+                WebkitBackdropFilter: "blur(12px)",
+                padding: 10,
+                transformOrigin: pos.transformOrigin,
+                opacity: 1,
+                transform: "translateY(0) scale(1)",
+                transition: reducedMotion
+                    ? undefined
+                    : "opacity 140ms cubic-bezier(0.16, 1, 0.3, 1), transform 140ms cubic-bezier(0.16, 1, 0.3, 1)",
+            } satisfies React.CSSProperties)
+            : null,
+
+        menuHeader: {
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            padding: "6px 6px 8px 6px",
+        } satisfies React.CSSProperties,
+
+        menuHeaderTextWrap: {
+            minWidth: 0,
+            flex: 1,
+        } satisfies React.CSSProperties,
+
+        menuHeaderTitle: {
+            fontWeight: 800,
+            fontSize: 13,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            opacity: loading ? 0.74 : 1,
+        } satisfies React.CSSProperties,
+
+        menuHeaderSubline: {
+            fontSize: 12,
+            opacity: 0.72,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            marginTop: 2,
+        } satisfies React.CSSProperties,
+
+        menuAlert: {
+            margin: "0 6px 8px",
+            padding: "8px 10px",
+            borderRadius: 12,
+            border: t.menuAlertBorder,
+            background: t.menuAlertBg,
+            fontSize: 12,
+            lineHeight: 1.35,
+            opacity: 0.92,
+        } satisfies React.CSSProperties,
+
+        divider: {
+            height: 1,
+            background: t.menuDivider,
+            margin: "8px 0",
+        } satisfies React.CSSProperties,
+
+        avatar: (signedIn: boolean, sizePx: number): React.CSSProperties => ({
+            width: sizePx,
+            height: sizePx,
+            borderRadius: 999,
+            display: "grid",
+            placeItems: "center",
+            background: t.avatarBg,
+            boxShadow: t.avatarRing,
+            color: signedIn ? "var(--fg)" : "var(--muted)",
+            userSelect: signedIn ? "none" : undefined,
+            flex: "0 0 auto",
+        }),
+    } as const;
 }
 
 function usePopoverPosition(args: {
@@ -15440,9 +15751,9 @@ function usePopoverPosition(args: {
         const mh = menuRef.current?.getBoundingClientRect().height ?? 0;
 
         const left =
-             align === "right"
-                  ? clamp(r.right - mw, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN)
-                  : clamp(r.left, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN);
+            align === "right"
+                ? clamp(r.right - mw, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN)
+                : clamp(r.left, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN);
 
         const belowTop = r.bottom + MENU_GAP;
         const aboveTop = r.top - MENU_GAP - mh;
@@ -15450,12 +15761,14 @@ function usePopoverPosition(args: {
         const canFitBelow = belowTop + mh <= window.innerHeight - VIEWPORT_MARGIN;
         const canFitAbove = aboveTop >= VIEWPORT_MARGIN;
 
-        const placement: PopPos["placement"] = !canFitBelow && canFitAbove ? "top" : "bottom";
+        const placement: PopPos["placement"] =
+            !canFitBelow && canFitAbove ? "top" : "bottom";
+
         const unclampedTop = placement === "top" ? aboveTop : belowTop;
         const top = clamp(
-             unclampedTop,
-             VIEWPORT_MARGIN,
-             Math.max(VIEWPORT_MARGIN, window.innerHeight - mh - VIEWPORT_MARGIN),
+            unclampedTop,
+            VIEWPORT_MARGIN,
+            Math.max(VIEWPORT_MARGIN, window.innerHeight - mh - VIEWPORT_MARGIN),
         );
 
         const originX = align === "right" ? "right" : "left";
@@ -15523,58 +15836,38 @@ function usePopoverPosition(args: {
 }
 
 function AvatarCircle(props: {
-    user: { displayName: string | null; email: string | null } | null;
+    user: UserLike;
     sizePx: number;
     signedIn: boolean;
+    ui: ReturnType<typeof styles>;
 }) {
-    const { user, sizePx, signedIn } = props;
-
-    const ring = "0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent)";
-    const bg =
-         "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))";
+    const { user, sizePx, signedIn, ui } = props;
 
     if (!signedIn) {
         return (
-             <div
-                  aria-hidden="true"
-                  style={{
-                      width: sizePx,
-                      height: sizePx,
-                      borderRadius: 999,
-                      display: "grid",
-                      placeItems: "center",
-                      background: bg,
-                      boxShadow: ring,
-                      flex: "0 0 auto",
-                  }}
-             >
-                 <UserRound size={Math.max(16, Math.floor(sizePx * 0.62))} />
-             </div>
+            <div aria-hidden="true" style={ui.avatar(false, sizePx)}>
+                <UserRound size={Math.max(16, Math.floor(sizePx * 0.58))} />
+            </div>
         );
     }
 
     return (
-         <div
-              aria-hidden="true"
-              style={{
-                  width: sizePx,
-                  height: sizePx,
-                  borderRadius: 999,
-                  display: "grid",
-                  placeItems: "center",
-                  fontSize: Math.max(11, Math.floor(sizePx * 0.46)),
-                  fontWeight: 800,
-                  letterSpacing: "0.04em",
-                  color: "var(--fg)",
-                  background: bg,
-                  boxShadow: ring,
-                  userSelect: "none",
-                  flex: "0 0 auto",
-              }}
-         >
-             {initialsFromUser(user)}
-         </div>
+        <div
+            aria-hidden="true"
+            style={{
+                ...ui.avatar(true, sizePx),
+                fontSize: Math.max(11, Math.floor(sizePx * 0.42)),
+                fontWeight: 800,
+                letterSpacing: "0.04em",
+            }}
+        >
+            {initialsFromUser(user)}
+        </div>
     );
+}
+
+function MenuDivider(props: { ui: ReturnType<typeof styles> }) {
+    return <div aria-hidden="true" style={props.ui.divider} />;
 }
 
 function RowButton(props: {
@@ -15589,6 +15882,7 @@ function RowButton(props: {
 }) {
     const { label, hint, icon, onClick, disabled, autoFocus, danger, busy } = props;
     const [hover, setHover] = useState(false);
+    const [focusVisible, setFocusVisible] = useState(false);
 
     const isDisabled = !!disabled || !!busy;
 
@@ -15597,66 +15891,111 @@ function RowButton(props: {
         display: "flex",
         alignItems: "center",
         gap: 10,
-        padding: "9px 10px",
+        padding: "10px 10px",
         borderRadius: 12,
         border: "1px solid transparent",
-        background: "transparent",
-        color: danger ? "color-mix(in srgb, var(--fg) 82%, #b00020)" : "var(--fg)",
+        background: hover && !isDisabled
+            ? "color-mix(in srgb, var(--activeBg) 60%, transparent)"
+            : "transparent",
+        color: danger
+            ? "color-mix(in srgb, var(--fg) 82%, #b00020)"
+            : "var(--fg)",
         cursor: isDisabled ? "default" : "pointer",
         textAlign: "left",
         fontSize: 13,
         lineHeight: 1.2,
-        opacity: isDisabled ? 0.58 : 1,
+        opacity: isDisabled ? 0.56 : 1,
         userSelect: "none",
         WebkitTapHighlightColor: "transparent",
         outline: "none",
-        transition: "all 0.15s cubic-bezier(0.16, 1, 0.3, 1)",
+        borderColor: hover && !isDisabled
+            ? "color-mix(in srgb, var(--border) 62%, transparent)"
+            : "transparent",
+        boxShadow: focusVisible
+            ? "0 0 0 3px color-mix(in srgb, var(--focusRing) 78%, transparent)"
+            : "none",
+        transition:
+            "background 140ms ease, border-color 140ms ease, box-shadow 140ms ease, opacity 140ms ease, transform 140ms ease",
     };
 
-    const hoverStyle: React.CSSProperties = isDisabled
-         ? {}
-         : {
-             background: "color-mix(in srgb, var(--activeBg) 70%, transparent)",
-             borderColor: "color-mix(in srgb, var(--border) 60%, transparent)",
-         };
-
     return (
-         <button
-              type="button"
-              role="menuitem"
-              disabled={isDisabled}
-              autoFocus={autoFocus}
-              aria-busy={busy || undefined}
-              onClick={() => {
-                  if (isDisabled) return;
-                  void onClick();
-              }}
-              onPointerEnter={() => setHover(true)}
-              onPointerLeave={() => setHover(false)}
-              onFocus={() => setHover(true)}
-              onBlur={() => setHover(false)}
-              style={{ ...base, ...(hover ? hoverStyle : null) }}
-         >
-             {icon ? (
-                  <span
-                       aria-hidden="true"
-                       style={{
-                           width: 18,
-                           display: "grid",
-                           placeItems: "center",
-                           opacity: 0.95,
-                           flex: "0 0 auto",
-                       }}
-                  >
+        <button
+            type="button"
+            role="menuitem"
+            disabled={isDisabled}
+            autoFocus={autoFocus}
+            aria-busy={busy || undefined}
+            onClick={() => {
+                if (isDisabled) return;
+                void onClick();
+            }}
+            onPointerEnter={() => setHover(true)}
+            onPointerLeave={() => setHover(false)}
+            onFocus={() => {
+                setHover(true);
+                setFocusVisible(true);
+            }}
+            onBlur={() => {
+                setHover(false);
+                setFocusVisible(false);
+            }}
+            style={base}
+        >
+            {icon ? (
+                <span
+                    aria-hidden="true"
+                    style={{
+                        width: 18,
+                        display: "grid",
+                        placeItems: "center",
+                        opacity: busy ? 0.7 : 0.92,
+                        flex: "0 0 auto",
+                    }}
+                >
                     {icon}
                 </span>
-             ) : null}
+            ) : null}
 
-             <div style={{ minWidth: 0, flex: 1 }}>
-                 <div style={{ fontWeight: 780 }}>{label}</div>
-                 {hint ? <div style={{ fontSize: 12, opacity: 0.78, marginTop: 2 }}>{hint}</div> : null}
-             </div>
-         </button>
+            <div style={{ minWidth: 0, flex: 1 }}>
+                <div
+                    style={{
+                        fontWeight: 760,
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                    }}
+                >
+                    <span>{label}</span>
+                    {busy ? (
+                        <span
+                            aria-hidden="true"
+                            style={{
+                                fontSize: 11,
+                                opacity: 0.6,
+                                fontWeight: 650,
+                            }}
+                        >
+                            …
+                        </span>
+                    ) : null}
+                </div>
+
+                {hint ? (
+                    <div
+                        style={{
+                            fontSize: 12,
+                            opacity: 0.72,
+                            marginTop: 2,
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                        }}
+                    >
+                        {hint}
+                    </div>
+                ) : null}
+            </div>
+        </button>
     );
 }
 
@@ -15684,6 +16023,7 @@ export function AccountMenu({
 
     const [open, setOpen] = useState(false);
     const [pressed, setPressed] = useState(false);
+    const [hovered, setHovered] = useState(false);
     const [actionState, setActionState] = useState<MenuActionState>("idle");
 
     const reactId = useId();
@@ -15691,26 +16031,7 @@ export function AccountMenu({
     const menuId = `acct-menu-${reactId}`;
 
     const reducedMotion = usePrefersReducedMotion();
-
-    useEffect(() => {
-        mountedRef.current = true;
-        return () => {
-            mountedRef.current = false;
-        };
-    }, []);
-
-    useEffect(() => {
-        if (!signedIn && open) {
-            setOpen(false);
-        }
-    }, [signedIn, open]);
-
-    const dims = useMemo(() => {
-        if (size === "md") {
-            return { btn: 38, avatar: 28, labelMax: 220, chevron: 16 };
-        }
-        return { btn: 32, avatar: 24, labelMax: 160, chevron: 14 };
-    }, [size]);
+    const dims = useMemo(() => getDims(size), [size]);
 
     const triggerTitle = formatTriggerTitle(user);
     const showLabel = signedIn && showLabelWhenSignedIn;
@@ -15729,40 +16050,6 @@ export function AccountMenu({
         setOpen((v) => !v);
     }, []);
 
-    const anchorStyle = useMemo<React.CSSProperties>(() => {
-        const ringIdle = "0 0 0 1px color-mix(in srgb, var(--border) 62%, transparent)";
-        const ringOpen = "0 0 0 1px color-mix(in srgb, var(--border) 78%, transparent)";
-        const shadowIdle = "0 8px 18px color-mix(in srgb, black 12%, transparent)";
-        const shadowOpen = "0 14px 34px color-mix(in srgb, black 18%, transparent)";
-
-        return {
-            height: dims.btn,
-            minWidth: dims.btn,
-            maxWidth: showLabel ? dims.labelMax + dims.avatar + 30 : dims.btn,
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: showLabel ? 8 : 0,
-            padding: showLabel ? "0 8px 0 4px" : 0,
-            borderRadius: 999,
-            border: "1px solid transparent",
-            background: "transparent",
-            color: "var(--fg)",
-            boxShadow: open ? `${ringOpen}, ${shadowOpen}` : `${ringIdle}, ${shadowIdle}`,
-            cursor: "pointer",
-            userSelect: "none",
-            WebkitTapHighlightColor: "transparent",
-            transition:
-                 "box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.08s ease-out, background 0.15s ease-out",
-            touchAction: "manipulation",
-            transform: pressed ? "scale(0.965)" : "scale(1)",
-            backgroundImage: open
-                 ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 62%, transparent), transparent)"
-                 : "none",
-            ...style,
-        };
-    }, [dims, open, pressed, showLabel, style]);
-
     const pos = usePopoverPosition({
         open,
         align,
@@ -15771,9 +16058,40 @@ export function AccountMenu({
         menuRef,
     });
 
+    const ui = useMemo(
+        () =>
+            styles({
+                dims,
+                showLabel,
+                loading,
+                open,
+                hovered,
+                pressed,
+                reducedMotion,
+                pos,
+                style,
+            }),
+        [dims, showLabel, loading, open, hovered, pressed, reducedMotion, pos, style],
+    );
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!signedIn && open) {
+            setOpen(false);
+        }
+    }, [signedIn, open]);
+
     const focusableItems = useCallback((): HTMLElement[] => {
         return Array.from(
-             menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])') ?? [],
+            menuRef.current?.querySelectorAll<HTMLElement>(
+                '[role="menuitem"]:not([disabled])',
+            ) ?? [],
         );
     }, []);
 
@@ -15841,7 +16159,7 @@ export function AccountMenu({
     }, [open, focusFirstItem]);
 
     useEffect(() => {
-        if (!open && restoreFocusOnCloseRef.current) {
+        if (!open && restoreFocusOnCloseRef.current && typeof window !== "undefined") {
             const t = window.setTimeout(() => {
                 safeFocus(btnRef.current);
             }, POINTER_DOWN_FOCUS_RESTORE_DELAY_MS);
@@ -15851,92 +16169,92 @@ export function AccountMenu({
     }, [open]);
 
     const handleMenuKeyDown = useCallback(
-         (e: React.KeyboardEvent) => {
-             const items = focusableItems();
+        (e: React.KeyboardEvent) => {
+            const items = focusableItems();
 
-             if (e.key === "Tab") {
-                 if (!items.length) return;
+            if (e.key === "Tab") {
+                if (!items.length) return;
 
-                 const first = items[0]!;
-                 const last = items[items.length - 1]!;
-                 const active = document.activeElement as HTMLElement | null;
+                const first = items[0]!;
+                const last = items[items.length - 1]!;
+                const active = document.activeElement as HTMLElement | null;
 
-                 if (e.shiftKey) {
-                     if (active === first || !menuRef.current?.contains(active)) {
-                         e.preventDefault();
-                         safeFocus(last);
-                     }
-                 } else if (active === last) {
-                     e.preventDefault();
-                     safeFocus(first);
-                 }
-                 return;
-             }
+                if (e.shiftKey) {
+                    if (active === first || !menuRef.current?.contains(active)) {
+                        e.preventDefault();
+                        safeFocus(last);
+                    }
+                } else if (active === last) {
+                    e.preventDefault();
+                    safeFocus(first);
+                }
+                return;
+            }
 
-             if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-                 e.preventDefault();
-                 if (!items.length) return;
+            if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                e.preventDefault();
+                if (!items.length) return;
 
-                 const active = document.activeElement as HTMLElement | null;
-                 const currentIndex = active ? items.indexOf(active) : -1;
-                 const startIndex = currentIndex >= 0 ? currentIndex : 0;
-                 let nextIndex = e.key === "ArrowDown" ? startIndex + 1 : startIndex - 1;
+                const active = document.activeElement as HTMLElement | null;
+                const currentIndex = active ? items.indexOf(active) : -1;
+                const startIndex = currentIndex >= 0 ? currentIndex : 0;
+                let nextIndex = e.key === "ArrowDown" ? startIndex + 1 : startIndex - 1;
 
-                 if (nextIndex >= items.length) nextIndex = 0;
-                 if (nextIndex < 0) nextIndex = items.length - 1;
+                if (nextIndex >= items.length) nextIndex = 0;
+                if (nextIndex < 0) nextIndex = items.length - 1;
 
-                 safeFocus(items[nextIndex] ?? null);
-                 return;
-             }
+                safeFocus(items[nextIndex] ?? null);
+                return;
+            }
 
-             if (e.key === "Home") {
-                 e.preventDefault();
-                 focusFirstItem();
-                 return;
-             }
+            if (e.key === "Home") {
+                e.preventDefault();
+                focusFirstItem();
+                return;
+            }
 
-             if (e.key === "End") {
-                 e.preventDefault();
-                 focusLastItem();
-             }
-         },
-         [focusableItems, focusFirstItem, focusLastItem],
+            if (e.key === "End") {
+                e.preventDefault();
+                focusLastItem();
+            }
+        },
+        [focusableItems, focusFirstItem, focusLastItem],
     );
 
     const onTriggerKeyDown = useCallback(
-         (e: React.KeyboardEvent) => {
-             if (e.key === "ArrowDown") {
-                 e.preventDefault();
-                 if (!open) {
-                     openMenu();
-                 } else {
-                     focusFirstItem();
-                 }
-                 return;
-             }
+        (e: React.KeyboardEvent) => {
+            if (e.key === "ArrowDown") {
+                e.preventDefault();
+                if (!open) {
+                    openMenu();
+                } else {
+                    focusFirstItem();
+                }
+                return;
+            }
 
-             if (e.key === "ArrowUp") {
-                 e.preventDefault();
-                 if (!open) {
-                     openMenu();
-                 } else {
-                     focusLastItem();
-                 }
-                 return;
-             }
+            if (e.key === "ArrowUp") {
+                e.preventDefault();
+                if (!open) {
+                    openMenu();
+                } else {
+                    focusLastItem();
+                }
+                return;
+            }
 
-             if (e.key === "Enter" || e.key === " ") {
-                 e.preventDefault();
-                 toggle();
-                 return;
-             }
+            if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                toggle();
+                return;
+            }
 
-             if (e.key === "Escape" && open) {
-                 e.preventDefault();
-                 close();
-             }
-         },
-         [open, openMenu, toggle, close, focusFirstItem, focusLastItem],
+            if (e.key === "Escape" && open) {
+                e.preventDefault();
+                close();
+            }
+        },
+        [open, openMenu, toggle, close, focusFirstItem, focusLastItem],
     );
 
     const handleRefresh = useCallback(async () => {
@@ -15980,7 +16298,8 @@ export function AccountMenu({
         close({ restoreFocus: false });
 
         try {
-            const returnTo = typeof window !== "undefined" ? window.location.href : undefined;
+            const returnTo =
+                typeof window !== "undefined" ? window.location.href : undefined;
             signInWithGoogle({ returnTo });
         } catch {
             if (mountedRef.current) {
@@ -15990,226 +16309,150 @@ export function AccountMenu({
     }, [signInWithGoogle, close]);
 
     const menuStatusTitle = loading
-         ? "Checking…"
-         : signedIn
-              ? user?.displayName?.trim() || "Signed in"
-              : "Not signed in";
+        ? "Checking…"
+        : signedIn
+            ? user?.displayName?.trim() || "Signed in"
+            : "Not signed in";
 
     const menuStatusSubline = loading
-         ? "—"
-         : signedIn
-              ? user?.email?.trim() || "—"
-              : "Sign in to sync";
+        ? "—"
+        : signedIn
+            ? user?.email?.trim() || "—"
+            : "Sign in to sync";
 
     const triggerText = loading ? "…" : triggerTitle;
 
     const menu =
-         open && pos && typeof document !== "undefined"
-              ? createPortal(
-                   <>
-                       <style>{`
-              @keyframes acctScaleFadeIn {
-                from { opacity: 0; transform: translateY(-2px) scale(0.985); }
-                to { opacity: 1; transform: translateY(0) scale(1); }
-              }
-            `}</style>
+        open &&
+        pos &&
+        typeof document !== "undefined" &&
+        ui.menuPanel
+            ? createPortal(
+                <div
+                    ref={menuRef}
+                    id={menuId}
+                    role="menu"
+                    aria-labelledby={triggerId}
+                    aria-label="Account menu"
+                    onKeyDown={handleMenuKeyDown}
+                    style={ui.menuPanel}
+                >
+                    <div style={ui.menuHeader}>
+                        <AvatarCircle
+                            user={user}
+                            sizePx={dims.avatar}
+                            signedIn={signedIn}
+                            ui={ui}
+                        />
 
-                       <div
-                            ref={menuRef}
-                            id={menuId}
-                            role="menu"
-                            aria-labelledby={triggerId}
-                            aria-label="Account menu"
-                            onKeyDown={handleMenuKeyDown}
-                            style={{
-                                position: "fixed",
-                                top: pos.top,
-                                left: pos.left,
-                                width: pos.width,
-                                zIndex: MENU_Z_INDEX,
-                                borderRadius: 14,
-                                border: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
-                                background:
-                                     "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))",
-                                boxShadow: "0 18px 60px color-mix(in srgb, black 22%, transparent)",
-                                backdropFilter: "blur(10px)",
-                                WebkitBackdropFilter: "blur(10px)",
-                                padding: 10,
-                                transformOrigin: pos.transformOrigin,
-                                animation: reducedMotion
-                                     ? undefined
-                                     : "acctScaleFadeIn 0.14s cubic-bezier(0.16, 1, 0.3, 1) forwards",
-                            }}
-                       >
-                           <div
-                                style={{
-                                    display: "flex",
-                                    alignItems: "center",
-                                    gap: 10,
-                                    padding: "6px 6px 8px 6px",
-                                }}
-                           >
-                               <AvatarCircle user={user} sizePx={dims.avatar} signedIn={signedIn} />
+                        <div style={ui.menuHeaderTextWrap}>
+                            <div style={ui.menuHeaderTitle}>{menuStatusTitle}</div>
+                            <div style={ui.menuHeaderSubline}>{menuStatusSubline}</div>
+                        </div>
+                    </div>
 
-                               <div style={{ minWidth: 0, flex: 1 }}>
-                                   <div
-                                        style={{
-                                            fontWeight: 820,
-                                            fontSize: 13,
-                                            whiteSpace: "nowrap",
-                                            overflow: "hidden",
-                                            textOverflow: "ellipsis",
-                                            opacity: loading ? 0.75 : 1,
-                                        }}
-                                   >
-                                       {menuStatusTitle}
-                                   </div>
+                    {error ? (
+                        <div role="alert" style={ui.menuAlert}>
+                            {error}
+                        </div>
+                    ) : null}
 
-                                   <div
-                                        style={{
-                                            fontSize: 12,
-                                            opacity: 0.78,
-                                            whiteSpace: "nowrap",
-                                            overflow: "hidden",
-                                            textOverflow: "ellipsis",
-                                        }}
-                                   >
-                                       {menuStatusSubline}
-                                   </div>
-                               </div>
-                           </div>
+                    <MenuDivider ui={ui} />
 
-                           {error ? (
-                                <div
-                                     role="alert"
-                                     style={{
-                                         margin: "0 6px 8px",
-                                         padding: "7px 9px",
-                                         borderRadius: 12,
-                                         border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
-                                         background:
-                                              "color-mix(in srgb, var(--activeBg) 50%, transparent)",
-                                         fontSize: 12,
-                                         opacity: 0.9,
-                                     }}
-                                >
-                                    {error}
-                                </div>
-                           ) : null}
+                    {!signedIn ? (
+                        <RowButton
+                            autoFocus
+                            label="Continue with Google"
+                            hint="Secure sign-in"
+                            disabled={loading}
+                            busy={actionState === "signing_in"}
+                            icon={<LogIn size={16} />}
+                            onClick={handleSignIn}
+                        />
+                    ) : (
+                        <>
+                            <RowButton
+                                autoFocus
+                                label="Account"
+                                hint="Manage your session"
+                                disabled={loading}
+                                busy={actionState === "opening_account"}
+                                icon={<Settings2 size={16} />}
+                                onClick={handleOpenAccount}
+                            />
 
-                           <div
-                                style={{
-                                    height: 1,
-                                    background: "color-mix(in srgb, var(--border) 70%, transparent)",
-                                    margin: "6px 0 8px",
-                                }}
-                           />
+                            <RowButton
+                                label="Refresh session"
+                                hint="Re-check login state"
+                                disabled={loading}
+                                busy={actionState === "refreshing"}
+                                icon={<RefreshCcw size={16} />}
+                                onClick={handleRefresh}
+                            />
 
-                           {!signedIn ? (
-                                <RowButton
-                                     autoFocus
-                                     label="Continue with Google"
-                                     hint="Secure sign-in"
-                                     disabled={loading}
-                                     busy={actionState === "signing_in"}
-                                     icon={<LogIn size={16} />}
-                                     onClick={handleSignIn}
-                                />
-                           ) : (
-                                <>
-                                    <RowButton
-                                         autoFocus
-                                         label="Account"
-                                         hint="Manage your session"
-                                         disabled={loading}
-                                         busy={actionState === "opening_account"}
-                                         icon={<Settings2 size={16} />}
-                                         onClick={handleOpenAccount}
-                                    />
-
-                                    <RowButton
-                                         label="Refresh session"
-                                         hint="Re-check login state"
-                                         disabled={loading}
-                                         busy={actionState === "refreshing"}
-                                         icon={<RefreshCcw size={16} />}
-                                         onClick={handleRefresh}
-                                    />
-
-                                    <RowButton
-                                         label="Sign out"
-                                         hint="End this session"
-                                         disabled={loading}
-                                         busy={actionState === "signing_out"}
-                                         danger
-                                         icon={<LogOut size={16} />}
-                                         onClick={handleSignOut}
-                                    />
-                                </>
-                           )}
-                       </div>
-                   </>,
-                   document.body,
-              )
-              : null;
+                            <RowButton
+                                label="Sign out"
+                                hint="End this session"
+                                disabled={loading}
+                                busy={actionState === "signing_out"}
+                                danger
+                                icon={<LogOut size={16} />}
+                                onClick={handleSignOut}
+                            />
+                        </>
+                    )}
+                </div>,
+                document.body,
+            )
+            : null;
 
     return (
-         <>
-             <button
-                  ref={btnRef}
-                  id={triggerId}
-                  type="button"
-                  aria-haspopup="menu"
-                  aria-controls={open ? menuId : undefined}
-                  aria-expanded={open}
-                  title={triggerTitle}
-                  onKeyDown={onTriggerKeyDown}
-                  onClick={toggle}
-                  onPointerDown={() => setPressed(true)}
-                  onPointerUp={() => setPressed(false)}
-                  onPointerCancel={() => setPressed(false)}
-                  onPointerLeave={() => setPressed(false)}
-                  style={anchorStyle}
-             >
-                 <AvatarCircle user={user} sizePx={dims.avatar} signedIn={signedIn} />
+        <>
+            <button
+                ref={btnRef}
+                id={triggerId}
+                type="button"
+                aria-haspopup="menu"
+                aria-controls={open ? menuId : undefined}
+                aria-expanded={open}
+                title={triggerTitle}
+                onKeyDown={onTriggerKeyDown}
+                onClick={toggle}
+                onPointerEnter={() => setHovered(true)}
+                onPointerLeave={() => {
+                    setHovered(false);
+                    setPressed(false);
+                }}
+                onPointerDown={() => setPressed(true)}
+                onPointerUp={() => setPressed(false)}
+                onPointerCancel={() => setPressed(false)}
+                onFocus={() => setHovered(true)}
+                onBlur={() => {
+                    setHovered(false);
+                    setPressed(false);
+                }}
+                style={ui.trigger}
+            >
+                <AvatarCircle
+                    user={user}
+                    sizePx={dims.avatar}
+                    signedIn={signedIn}
+                    ui={ui}
+                />
 
-                 {showLabel ? (
-                      <>
-                        <span
-                             style={{
-                                 fontSize: 13,
-                                 fontWeight: 780,
-                                 whiteSpace: "nowrap",
-                                 overflow: "hidden",
-                                 textOverflow: "ellipsis",
-                                 maxWidth: dims.labelMax,
-                                 opacity: loading ? 0.7 : 1,
-                                 paddingRight: 0,
-                             }}
-                        >
-                            {triggerText}
-                        </span>
+                {showLabel ? (
+                    <>
+                        <span style={ui.triggerLabel}>{triggerText}</span>
 
-                          <span
-                               aria-hidden="true"
-                               style={{
-                                   display: "grid",
-                                   placeItems: "center",
-                                   opacity: 0.7,
-                                   marginLeft: -2,
-                                   flex: "0 0 auto",
-                                   transform: open ? "rotate(180deg)" : "rotate(0deg)",
-                                   transition: reducedMotion ? undefined : "transform 0.16s ease",
-                               }}
-                          >
+                        <span aria-hidden="true" style={ui.triggerChevron}>
                             <ChevronDown size={dims.chevron} />
                         </span>
-                      </>
-                 ) : null}
-             </button>
+                    </>
+                ) : null}
+            </button>
 
-             {menu}
-         </>
+            {menu}
+        </>
     );
 }
 ```
@@ -20754,6 +20997,7 @@ type ScrollMode = "auto" | "smooth";
 
 const LS_LAST_ORD = "bp_last_pos_ord_v1";
 const LS_LAST_LOC = "bp_last_pos_loc_v1";
+const POSITION_SAVE_DEBOUNCE_MS = 220;
 
 type PendingJump = Readonly<{
     ord: number;
@@ -20772,9 +21016,13 @@ const INITIAL_POSITION: ReaderPosition = {
     book: null,
 };
 
+function isBrowser(): boolean {
+    return typeof window !== "undefined" && typeof localStorage !== "undefined";
+}
+
 function safeGetLS(key: string): string | null {
     try {
-        if (typeof localStorage === "undefined") return null;
+        if (!isBrowser()) return null;
         return localStorage.getItem(key);
     } catch {
         return null;
@@ -20783,10 +21031,18 @@ function safeGetLS(key: string): string | null {
 
 function safeSetLS(key: string, value: string): void {
     try {
-        if (typeof localStorage === "undefined") return;
+        if (!isBrowser()) return;
         localStorage.setItem(key, value);
     } catch {
         // ignore
+    }
+}
+
+function safeJsonStringify(value: unknown): string | null {
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return null;
     }
 }
 
@@ -20802,18 +21058,43 @@ function parseFiniteInt(value: string | null): number | null {
     return Math.trunc(n);
 }
 
+function normalizeBookId(value: string): string {
+    return value.trim().toUpperCase();
+}
+
+function normalizeLocationInput(loc: ReaderLocation): StoredLocation | null {
+    const bookId = normalizeBookId(loc.bookId);
+    const chapter = Math.trunc(loc.chapter);
+    const verse = loc.verse == null ? null : Math.trunc(loc.verse);
+
+    if (!bookId) return null;
+    if (!Number.isFinite(chapter) || chapter < 1) return null;
+    if (verse != null && (!Number.isFinite(verse) || verse < 1)) return null;
+
+    return { bookId, chapter, verse };
+}
+
 function makeLocKey(loc?: ReaderLocation): string {
     if (!loc) return "";
+    const normalized = normalizeLocationInput(loc);
+    if (!normalized) return "";
+    return `${normalized.bookId}:${normalized.chapter}:${normalized.verse ?? ""}`;
+}
+
+function makeStoredLocationKey(loc: StoredLocation): string {
     return `${loc.bookId}:${loc.chapter}:${loc.verse ?? ""}`;
 }
 
 function isStoredLocation(value: unknown): value is StoredLocation {
     if (!value || typeof value !== "object") return false;
+
     const v = value as Record<string, unknown>;
 
     if (typeof v.bookId !== "string" || v.bookId.trim() === "") return false;
     if (typeof v.chapter !== "number" || !Number.isFinite(v.chapter) || v.chapter < 1) return false;
-    if (v.verse !== null && (typeof v.verse !== "number" || !Number.isFinite(v.verse) || v.verse < 1)) return false;
+    if (v.verse !== null && (typeof v.verse !== "number" || !Number.isFinite(v.verse) || v.verse < 1)) {
+        return false;
+    }
 
     return true;
 }
@@ -20823,21 +21104,21 @@ function parseStoredLocation(raw: string | null): StoredLocation | null {
 
     try {
         const parsed = JSON.parse(raw) as unknown;
-        return isStoredLocation(parsed)
-             ? {
-                 bookId: parsed.bookId.trim().toUpperCase(),
-                 chapter: Math.trunc(parsed.chapter),
-                 verse: parsed.verse == null ? null : Math.trunc(parsed.verse),
-             }
-             : null;
+        if (!isStoredLocation(parsed)) return null;
+
+        return {
+            bookId: normalizeBookId(parsed.bookId),
+            chapter: Math.trunc(parsed.chapter),
+            verse: parsed.verse == null ? null : Math.trunc(parsed.verse),
+        };
     } catch {
         return null;
     }
 }
 
 function sameVerse(
-     a: ReaderPosition["verse"] | null | undefined,
-     b: ReaderPosition["verse"] | null | undefined,
+    a: ReaderPosition["verse"] | null | undefined,
+    b: ReaderPosition["verse"] | null | undefined,
 ): boolean {
     if (a === b) return true;
     if (!a || !b) return false;
@@ -20845,12 +21126,32 @@ function sameVerse(
 }
 
 function sameBook(
-     a: ReaderPosition["book"] | null | undefined,
-     b: ReaderPosition["book"] | null | undefined,
+    a: ReaderPosition["book"] | null | undefined,
+    b: ReaderPosition["book"] | null | undefined,
 ): boolean {
     if (a === b) return true;
     if (!a || !b) return false;
     return a.bookId === b.bookId;
+}
+
+function makeStoredLocation(
+    bookId: string,
+    chapter: number,
+    verse: number | null,
+): StoredLocation | null {
+    const cleanBookId = normalizeBookId(bookId);
+    const cleanChapter = Math.trunc(chapter);
+    const cleanVerse = verse == null ? null : Math.trunc(verse);
+
+    if (!cleanBookId) return null;
+    if (!Number.isFinite(cleanChapter) || cleanChapter < 1) return null;
+    if (cleanVerse != null && (!Number.isFinite(cleanVerse) || cleanVerse < 1)) return null;
+
+    return {
+        bookId: cleanBookId,
+        chapter: cleanChapter,
+        verse: cleanVerse,
+    };
 }
 
 export function Reader(props: Props) {
@@ -20860,18 +21161,21 @@ export function Reader(props: Props) {
     const [spine, setSpine] = useState<SpineStats | null>(null);
     const [err, setErr] = useState<string | null>(null);
     const [pos, setPos] = useState<ReaderPosition>(INITIAL_POSITION);
+    const [viewportReady, setViewportReady] = useState(false);
 
     const viewportHandleRef = useRef<ReaderViewportHandle | null>(null);
-    const [viewportHandle, setViewportHandle] = useState<ReaderViewportHandle | null>(null);
-    const [viewportReady, setViewportReady] = useState(false);
+    const selectionRootRef = useRef<HTMLDivElement | null>(null);
 
     const pendingJumpRef = useRef<PendingJump | null>(null);
     const didRestoreRef = useRef(false);
     const appliedInitialKeyRef = useRef("");
     const loadSeqRef = useRef(0);
     const resolveSeqRef = useRef(0);
+    const lastResolvedLocKeyRef = useRef("");
+    const lastSavedLocJsonRef = useRef<string | null>(safeGetLS(LS_LAST_LOC));
+    const lastSavedOrdRef = useRef<string | null>(safeGetLS(LS_LAST_ORD));
+    const savePositionTimerRef = useRef<number | null>(null);
 
-    const selectionRootRef = useRef<HTMLDivElement | null>(null);
     const annotations = useReaderAnnotations(selectionRootRef);
 
     useEffect(() => {
@@ -20879,30 +21183,41 @@ export function Reader(props: Props) {
     }, []);
 
     useEffect(() => {
+        return () => {
+            if (savePositionTimerRef.current != null && typeof window !== "undefined") {
+                window.clearTimeout(savePositionTimerRef.current);
+                savePositionTimerRef.current = null;
+            }
+        };
+    }, []);
+
+    useEffect(() => {
         setViewportReady(false);
+        pendingJumpRef.current = null;
     }, [spine?.verseOrdMin, spine?.verseOrdMax, spine?.verseCount]);
 
     useEffect(() => {
         const seq = ++loadSeqRef.current;
-        let alive = true;
+        let cancelled = false;
 
         (async () => {
             try {
                 setErr(null);
+
                 const [bookRes, spineRes] = await Promise.all([apiGetBooks(), apiGetSpine()]);
-                if (!alive || seq !== loadSeqRef.current) return;
+                if (cancelled || seq !== loadSeqRef.current) return;
 
                 setBooks(bookRes.books);
                 setSpine(spineRes);
             } catch (e: unknown) {
-                if (!alive || seq !== loadSeqRef.current) return;
+                if (cancelled || seq !== loadSeqRef.current) return;
                 const msg = e instanceof Error ? e.message : String(e);
                 setErr(msg);
             }
         })();
 
         return () => {
-            alive = false;
+            cancelled = true;
         };
     }, []);
 
@@ -20922,62 +21237,80 @@ export function Reader(props: Props) {
         return `${bookName} ${pos.verse.chapter}:${pos.verse.verse}`;
     }, [spine, pos]);
 
-    const canJumpNow = !!(spine && viewportReady && viewportHandle);
-
     const setViewportRef = useCallback((handle: ReaderViewportHandle | null) => {
         viewportHandleRef.current = handle;
-        setViewportHandle(handle);
     }, []);
 
     const jumpToOrd = useCallback(
-         (ord: number, behavior: ScrollMode) => {
-             if (!spine) return;
+        (ord: number, behavior: ScrollMode) => {
+            if (!spine) return;
 
-             const clamped = clampOrd(ord, spine);
-             const handle = viewportHandleRef.current;
+            const clamped = clampOrd(ord, spine);
+            const handle = viewportHandleRef.current;
 
-             if (handle && viewportReady) {
-                 handle.jumpToOrd(clamped, behavior);
-                 return;
-             }
+            if (handle && viewportReady) {
+                handle.jumpToOrd(clamped, behavior);
+                return;
+            }
 
-             pendingJumpRef.current = { ord: clamped, behavior };
-         },
-         [spine, viewportReady],
+            pendingJumpRef.current = { ord: clamped, behavior };
+        },
+        [spine, viewportReady],
     );
 
+    const persistLocation = useCallback((stored: StoredLocation) => {
+        const json = safeJsonStringify(stored);
+        if (!json) return;
+        if (lastSavedLocJsonRef.current === json) return;
+
+        lastSavedLocJsonRef.current = json;
+        safeSetLS(LS_LAST_LOC, json);
+    }, []);
+
+    const persistOrd = useCallback((ord: number, spineValue: SpineStats) => {
+        const next = String(clampOrd(ord, spineValue));
+        if (lastSavedOrdRef.current === next) return;
+
+        lastSavedOrdRef.current = next;
+        safeSetLS(LS_LAST_ORD, next);
+    }, []);
+
     const resolveAndJump = useCallback(
-         async (bookId: string, chapter: number, verse: number | null, behavior: ScrollMode) => {
-             const cleanBookId = bookId.trim().toUpperCase();
-             if (!cleanBookId || chapter < 1) return;
+        async (bookId: string, chapter: number, verse: number | null, behavior: ScrollMode) => {
+            const stored = makeStoredLocation(bookId, chapter, verse);
+            if (!stored) return;
 
-             annotations.clearSelection();
-             setErr(null);
+            const locKey = makeStoredLocationKey(stored);
+            lastResolvedLocKeyRef.current = locKey;
 
-             const seq = ++resolveSeqRef.current;
+            annotations.clearSelection();
+            setErr(null);
 
-             try {
-                 const loc = await apiResolveLoc(cleanBookId, chapter, verse);
-                 if (seq !== resolveSeqRef.current) return;
-                 if (!loc?.verseOrd || !Number.isFinite(loc.verseOrd)) return;
+            const seq = ++resolveSeqRef.current;
 
-                 jumpToOrd(loc.verseOrd, behavior);
+            try {
+                const loc = await apiResolveLoc(stored.bookId, stored.chapter, stored.verse);
+                if (seq !== resolveSeqRef.current) return;
 
-                 safeSetLS(
-                      LS_LAST_LOC,
-                      JSON.stringify({
-                          bookId: cleanBookId,
-                          chapter,
-                          verse: verse ?? null,
-                      } satisfies StoredLocation),
-                 );
-             } catch (e: unknown) {
-                 if (seq !== resolveSeqRef.current) return;
-                 const msg = e instanceof Error ? e.message : String(e);
-                 setErr(msg);
-             }
-         },
-         [annotations, jumpToOrd],
+                const verseOrd =
+                    loc && typeof loc.verseOrd === "number" && Number.isFinite(loc.verseOrd)
+                        ? Math.trunc(loc.verseOrd)
+                        : null;
+
+                if (verseOrd == null) {
+                    setErr("Could not resolve that passage.");
+                    return;
+                }
+
+                jumpToOrd(verseOrd, behavior);
+                persistLocation(stored);
+            } catch (e: unknown) {
+                if (seq !== resolveSeqRef.current) return;
+                const msg = e instanceof Error ? e.message : String(e);
+                setErr(msg);
+            }
+        },
+        [annotations, jumpToOrd, persistLocation],
     );
 
     useEffect(() => {
@@ -20988,12 +21321,13 @@ export function Reader(props: Props) {
         if (appliedInitialKeyRef.current === key) return;
 
         appliedInitialKeyRef.current = key;
+        didRestoreRef.current = true;
 
         void resolveAndJump(
-             initialLocation.bookId,
-             initialLocation.chapter,
-             initialLocation.verse ?? null,
-             "auto",
+            initialLocation.bookId,
+            initialLocation.chapter,
+            initialLocation.verse ?? null,
+            "auto",
         );
     }, [spine, initialLocation, resolveAndJump]);
 
@@ -21017,26 +21351,52 @@ export function Reader(props: Props) {
     }, [spine, initialLocation, jumpToOrd, resolveAndJump]);
 
     useEffect(() => {
-        if (!canJumpNow) return;
+        if (!viewportReady) return;
 
+        const handle = viewportHandleRef.current;
         const pending = pendingJumpRef.current;
-        if (!pending) return;
+        if (!handle || !pending) return;
 
         pendingJumpRef.current = null;
-        viewportHandle?.jumpToOrd(pending.ord, pending.behavior);
-    }, [canJumpNow, viewportHandle]);
+        handle.jumpToOrd(pending.ord, pending.behavior);
+    }, [viewportReady]);
 
     useEffect(() => {
         if (!spine) return;
         if (!Number.isFinite(pos.ord)) return;
         if (typeof window === "undefined") return;
 
-        const id = window.setTimeout(() => {
-            safeSetLS(LS_LAST_ORD, String(clampOrd(pos.ord, spine)));
-        }, 220);
+        const nextOrd = clampOrd(pos.ord, spine);
 
-        return () => window.clearTimeout(id);
-    }, [pos.ord, spine]);
+        if (savePositionTimerRef.current != null) {
+            window.clearTimeout(savePositionTimerRef.current);
+            savePositionTimerRef.current = null;
+        }
+
+        savePositionTimerRef.current = window.setTimeout(() => {
+            persistOrd(nextOrd, spine);
+            savePositionTimerRef.current = null;
+        }, POSITION_SAVE_DEBOUNCE_MS);
+
+        return () => {
+            if (savePositionTimerRef.current != null) {
+                window.clearTimeout(savePositionTimerRef.current);
+                savePositionTimerRef.current = null;
+            }
+        };
+    }, [persistOrd, pos.ord, spine]);
+
+    useEffect(() => {
+        if (!pos.verse) return;
+
+        const stored = makeStoredLocation(pos.verse.bookId, pos.verse.chapter, pos.verse.verse);
+        if (!stored) return;
+
+        const key = makeStoredLocationKey(stored);
+        if (lastResolvedLocKeyRef.current === key) return;
+
+        persistLocation(stored);
+    }, [persistLocation, pos.verse]);
 
     const handleReady = useCallback(() => {
         setViewportReady(true);
@@ -21048,7 +21408,11 @@ export function Reader(props: Props) {
 
     const handlePosition = useCallback((next: ReaderPosition) => {
         setPos((prev) => {
-            if (prev.ord === next.ord && sameVerse(prev.verse, next.verse) && sameBook(prev.book, next.book)) {
+            if (
+                prev.ord === next.ord &&
+                sameVerse(prev.verse, next.verse) &&
+                sameBook(prev.book, next.book)
+            ) {
                 return prev;
             }
             return next;
@@ -21056,17 +21420,17 @@ export function Reader(props: Props) {
     }, []);
 
     const handleJumpRef = useCallback(
-         (bookId: string, chapter: number, verse: number | null) => {
-             void resolveAndJump(bookId, chapter, verse, "smooth");
-         },
-         [resolveAndJump],
+        (bookId: string, chapter: number, verse: number | null) => {
+            void resolveAndJump(bookId, chapter, verse, "smooth");
+        },
+        [resolveAndJump],
     );
 
     const handleNavigate = useCallback(
-         (loc: ReaderLocation) => {
-             void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "smooth");
-         },
-         [resolveAndJump],
+        (loc: ReaderLocation) => {
+            void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "smooth");
+        },
+        [resolveAndJump],
     );
 
     const handleBackHome = useCallback(() => {
@@ -21075,47 +21439,47 @@ export function Reader(props: Props) {
     }, [annotations, onBackHome]);
 
     const topContent = useMemo(
-         () => (
-              <ReaderSelectionToolbar
-                   selection={annotations.selection}
-                   onHighlight={annotations.createHighlight}
-                   onBookmark={annotations.createBookmark}
-                   onNote={() => {
-                       annotations.createNote(null, "New note");
-                   }}
-                   onClear={annotations.clearSelection}
-              />
-         ),
-         [annotations],
+        () => (
+            <ReaderSelectionToolbar
+                selection={annotations.selection}
+                onHighlight={annotations.createHighlight}
+                onBookmark={annotations.createBookmark}
+                onNote={() => {
+                    annotations.createNote(null, "New note");
+                }}
+                onClear={annotations.clearSelection}
+            />
+        ),
+        [annotations],
     );
 
     return (
-         <ReaderShell
-              styles={styles}
-              books={books}
-              onBackHome={handleBackHome}
-              current={{
-                  label: posLabel,
-                  ord: pos.ord,
-                  bookId: pos.verse?.bookId ?? null,
-                  chapter: pos.verse?.chapter ?? null,
-                  verse: pos.verse?.verse ?? null,
-              }}
-              onJumpRef={handleJumpRef}
-              onNavigate={handleNavigate}
-              mode={mode}
-              onToggleTheme={onToggleTheme}
-              spine={spine}
-              bookById={bookById}
-              viewportRef={setViewportRef}
-              selectionRootRef={selectionRootRef}
-              annotationSnapshot={annotations.snapshot}
-              topContent={topContent}
-              onPosition={handlePosition}
-              onError={handleError}
-              onReady={handleReady}
-              err={err}
-         />
+        <ReaderShell
+            styles={styles}
+            books={books}
+            onBackHome={handleBackHome}
+            current={{
+                label: posLabel,
+                ord: pos.ord,
+                bookId: pos.verse?.bookId ?? null,
+                chapter: pos.verse?.chapter ?? null,
+                verse: pos.verse?.verse ?? null,
+            }}
+            onJumpRef={handleJumpRef}
+            onNavigate={handleNavigate}
+            mode={mode}
+            onToggleTheme={onToggleTheme}
+            spine={spine}
+            bookById={bookById}
+            viewportRef={setViewportRef}
+            selectionRootRef={selectionRootRef}
+            annotationSnapshot={annotations.snapshot}
+            topContent={topContent}
+            onPosition={handlePosition}
+            onError={handleError}
+            onReady={handleReady}
+            err={err}
+        />
     );
 }
 ```
@@ -21848,7 +22212,7 @@ type ReaderPrefsState = Readonly<{
 
     typography: ReaderTypography;
     setTypography: (
-         patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>),
+        patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>),
     ) => void;
     replaceTypography: (next: ReaderTypography) => void;
     resetTypography: () => void;
@@ -21876,7 +22240,7 @@ function safeSet(key: string, val: string): void {
         if (!isBrowser()) return;
         window.localStorage.setItem(key, val);
     } catch {
-        // ignore
+        // ignore storage failures
     }
 }
 
@@ -21885,7 +22249,7 @@ function safeDel(key: string): void {
         if (!isBrowser()) return;
         window.localStorage.removeItem(key);
     } catch {
-        // ignore
+        // ignore storage failures
     }
 }
 
@@ -21903,8 +22267,16 @@ function cloneTypography(input: ReaderTypography): ReaderTypography {
 }
 
 function safeLoadTypography(): ReaderTypography | null {
-    const loaded = loadReaderTypography();
-    return loaded ? cloneTypography(loaded) : null;
+    try {
+        const loaded = loadReaderTypography();
+        return loaded ? cloneTypography(loaded) : null;
+    } catch {
+        return null;
+    }
+}
+
+function serializeTypography(value: ReaderTypography): string {
+    return JSON.stringify(value);
 }
 
 export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
@@ -21916,23 +22288,17 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
     }
 
     const initialTypography = initTypographyRef.current;
-    const [typographyEnabled, setTypographyEnabledState] = useState<boolean>(!!initialTypography);
-    const [typography, setTypographyState] = useState<ReaderTypography>(
-         initialTypography ?? cloneTypography(DEFAULT_TYPOGRAPHY),
-    );
-    const [translationId, setTranslationIdState] = useState<string | null>(() => readTranslation());
+    const initialTranslation = readTranslation();
 
-    const mountedRef = useRef(true);
+    const [typographyEnabled, setTypographyEnabledState] = useState<boolean>(() => !!initialTypography);
+    const [typography, setTypographyState] = useState<ReaderTypography>(
+        () => initialTypography ?? cloneTypography(DEFAULT_TYPOGRAPHY),
+    );
+    const [translationId, setTranslationIdState] = useState<string | null>(() => initialTranslation);
+
     const appliedTypographyRef = useRef<string | null>(null);
     const appliedTypographyEnabledRef = useRef<boolean | null>(null);
-    const lastWrittenTranslationRef = useRef<string | null>(translationId);
-
-    useEffect(() => {
-        mountedRef.current = true;
-        return () => {
-            mountedRef.current = false;
-        };
-    }, []);
+    const lastWrittenTranslationRef = useRef<string | null>(initialTranslation);
 
     const setTypographyEnabled = useCallback((on: boolean) => {
         setTypographyEnabledState(Boolean(on));
@@ -21943,33 +22309,37 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
     }, []);
 
     const setTypography = useCallback(
-         (patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>)) => {
-             setTypographyEnabledState(true);
+        (patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>)) => {
+            setTypographyEnabledState(true);
 
-             setTypographyState((prev) => {
-                 const delta = typeof patch === "function" ? patch(prev) : patch;
-                 return updateTypography(prev, delta ?? {});
-             });
-         },
-         [],
+            setTypographyState((prev) => {
+                const delta = typeof patch === "function" ? patch(prev) : patch;
+                const next = updateTypography(prev, delta ?? {});
+                return serializeTypography(prev) === serializeTypography(next) ? prev : next;
+            });
+        },
+        [],
     );
 
     const replaceTypography = useCallback((next: ReaderTypography) => {
         setTypographyEnabledState(true);
-        setTypographyState(updateTypography(DEFAULT_TYPOGRAPHY, next));
+        setTypographyState((prev) => {
+            const resolved = updateTypography(DEFAULT_TYPOGRAPHY, next);
+            return serializeTypography(prev) === serializeTypography(resolved) ? prev : resolved;
+        });
     }, []);
 
     const resetTypography = useCallback(() => {
         setTypographyEnabledState(false);
-        setTypographyState(cloneTypography(DEFAULT_TYPOGRAPHY));
+        setTypographyState((prev) => {
+            const next = cloneTypography(DEFAULT_TYPOGRAPHY);
+            return serializeTypography(prev) === serializeTypography(next) ? prev : next;
+        });
     }, []);
 
     const setTranslationId = useCallback((id: string | null) => {
         const next = cleanTranslationId(id);
-        setTranslationIdState((prev) => {
-            if (prev === next) return prev;
-            return next;
-        });
+        setTranslationIdState((prev) => (prev === next ? prev : next));
     }, []);
 
     useEffect(() => {
@@ -21983,11 +22353,11 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
     }, [translationId]);
 
     useEffect(() => {
-        const serialized = JSON.stringify(typography);
+        const serialized = serializeTypography(typography);
 
         if (
-             appliedTypographyEnabledRef.current === typographyEnabled &&
-             appliedTypographyRef.current === serialized
+            appliedTypographyEnabledRef.current === typographyEnabled &&
+            appliedTypographyRef.current === serialized
         ) {
             return;
         }
@@ -21996,7 +22366,6 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
         appliedTypographyRef.current = serialized;
 
         if (!typographyEnabled) {
-            applyReaderTypography(null);
             clearReaderTypography();
             return;
         }
@@ -22009,7 +22378,6 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
         if (!isBrowser()) return;
 
         const onStorage = (e: StorageEvent) => {
-            if (!mountedRef.current) return;
             if (!e.key) return;
 
             if (e.key === LS_TRANSLATION) {
@@ -22019,20 +22387,17 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
                 return;
             }
 
-            // Typography storage keys live inside the typography module.
-            // We keep this deliberately broad enough to pick up its writes,
-            // but narrow enough to avoid random unrelated storage churn.
             const key = e.key.toLowerCase();
             if (!key.includes("typography")) return;
 
             const nextTypography = safeLoadTypography();
-            const nextEnabled = !!nextTypography;
+            const nextEnabled = nextTypography !== null;
             const nextValue = nextTypography ?? cloneTypography(DEFAULT_TYPOGRAPHY);
+            const nextSerialized = serializeTypography(nextValue);
 
             setTypographyEnabledState((prev) => (prev === nextEnabled ? prev : nextEnabled));
             setTypographyState((prev) => {
-                const prevSerialized = JSON.stringify(prev);
-                const nextSerialized = JSON.stringify(nextValue);
+                const prevSerialized = serializeTypography(prev);
                 return prevSerialized === nextSerialized ? prev : nextValue;
             });
         };
@@ -22044,30 +22409,30 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
     }, []);
 
     const value = useMemo<ReaderPrefsState>(
-         () => ({
-             typographyEnabled,
-             setTypographyEnabled,
-             toggleTypographyEnabled,
+        () => ({
+            typographyEnabled,
+            setTypographyEnabled,
+            toggleTypographyEnabled,
 
-             typography,
-             setTypography,
-             replaceTypography,
-             resetTypography,
+            typography,
+            setTypography,
+            replaceTypography,
+            resetTypography,
 
-             translationId,
-             setTranslationId,
-         }),
-         [
-             typographyEnabled,
-             setTypographyEnabled,
-             toggleTypographyEnabled,
-             typography,
-             setTypography,
-             replaceTypography,
-             resetTypography,
-             translationId,
-             setTranslationId,
-         ],
+            translationId,
+            setTranslationId,
+        }),
+        [
+            typographyEnabled,
+            setTypographyEnabled,
+            toggleTypographyEnabled,
+            typography,
+            setTypography,
+            replaceTypography,
+            resetTypography,
+            translationId,
+            setTranslationId,
+        ],
     );
 
     return <ReaderPrefsContext.Provider value={value}>{children}</ReaderPrefsContext.Provider>;
@@ -22094,6 +22459,8 @@ type Props = {
      annotations: readonly Annotation[];
 };
 
+type AnnotationKind = Annotation["kind"];
+
 type Tone = Readonly<{
      wash: string;
      rail: string;
@@ -22101,15 +22468,35 @@ type Tone = Readonly<{
      ring: string;
 }>;
 
+type OverlayMeta = Readonly<{
+     tone: Tone;
+     hasWash: boolean;
+     showRail: boolean;
+     markerKinds: readonly AnnotationKind[];
+     extraCount: number;
+}>;
+
 const MAX_MARKERS = 3;
+
 const CORNER_TOP = 8;
 const CORNER_RIGHT = 10;
+
 const RAIL_INSET_Y = 8;
 const RAIL_WIDTH = 2;
-const DOT_SIZE = 6;
-const STACK_BADGE_H = 18;
 
-function toneForKind(kind: Annotation["kind"]): Tone {
+const DOT_SIZE = 6;
+const DOT_GAP = 4;
+const STACK_BADGE_H = 18;
+const ROOT_RADIUS = 16;
+
+const BADGE_BG =
+    "color-mix(in oklab, var(--card, white) 94%, transparent)";
+const BADGE_FG =
+    "color-mix(in oklab, var(--fg, #111) 62%, transparent)";
+const BADGE_BORDER =
+    "1px solid color-mix(in oklab, var(--border, rgba(127,127,127,0.2)) 78%, transparent)";
+
+function toneForKind(kind: AnnotationKind): Tone {
      switch (kind) {
           case "BOOKMARK":
                return {
@@ -22118,6 +22505,7 @@ function toneForKind(kind: Annotation["kind"]): Tone {
                     dot: "color-mix(in oklab, #5f92ff 74%, transparent)",
                     ring: "color-mix(in oklab, white 60%, transparent)",
                };
+
           case "NOTE":
                return {
                     wash: "color-mix(in oklab, #b191ff 8%, transparent)",
@@ -22125,6 +22513,7 @@ function toneForKind(kind: Annotation["kind"]): Tone {
                     dot: "color-mix(in oklab, #9c75ff 74%, transparent)",
                     ring: "color-mix(in oklab, white 60%, transparent)",
                };
+
           case "DRAWING":
                return {
                     wash: "color-mix(in oklab, #7de0d0 8%, transparent)",
@@ -22132,6 +22521,7 @@ function toneForKind(kind: Annotation["kind"]): Tone {
                     dot: "color-mix(in oklab, #42cdb7 74%, transparent)",
                     ring: "color-mix(in oklab, white 60%, transparent)",
                };
+
           case "HIGHLIGHT":
           default:
                return {
@@ -22144,55 +22534,136 @@ function toneForKind(kind: Annotation["kind"]): Tone {
 }
 
 function isLiveAnnotation(annotation: Annotation): boolean {
-     return annotation.deletedAt === null;
+     return annotation.deletedAt == null;
 }
 
-function hasKind(list: readonly Annotation[], kind: Annotation["kind"]): boolean {
-     return list.some((annotation) => annotation.kind === kind);
+function timestampValueOf(annotation: Annotation): number {
+     const raw = annotation.updatedAt ?? annotation.createdAt ?? null;
+     if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+     if (typeof raw === "string") {
+          const ms = Date.parse(raw);
+          return Number.isFinite(ms) ? ms : 0;
+     }
+     return 0;
 }
 
-const sx: Record<string, CSSProperties> = {
-     root: {
+function priorityForKind(kind: AnnotationKind): number {
+     switch (kind) {
+          case "BOOKMARK":
+               return 0;
+          case "NOTE":
+               return 1;
+          case "DRAWING":
+               return 2;
+          case "HIGHLIGHT":
+          default:
+               return 3;
+     }
+}
+
+function compareAnnotations(
+    a: { annotation: Annotation; index: number },
+    b: { annotation: Annotation; index: number },
+): number {
+     const aKind = priorityForKind(a.annotation.kind);
+     const bKind = priorityForKind(b.annotation.kind);
+     if (aKind !== bKind) return aKind - bKind;
+
+     const aTime = timestampValueOf(a.annotation);
+     const bTime = timestampValueOf(b.annotation);
+     if (aTime !== bTime) return bTime - aTime;
+
+     return a.index - b.index;
+}
+
+function hasKind(
+    annotations: readonly Annotation[],
+    kind: AnnotationKind,
+): boolean {
+     return annotations.some((annotation) => annotation.kind === kind);
+}
+
+function buildMeta(live: readonly Annotation[]): OverlayMeta | null {
+     if (live.length === 0) return null;
+
+     const ordered = live
+         .map((annotation, index) => ({ annotation, index }))
+         .sort(compareAnnotations)
+         .map((entry) => entry.annotation);
+
+     const primary = ordered[0];
+     if (!primary) return null;
+
+     const showRail =
+         hasKind(ordered, "BOOKMARK") ||
+         hasKind(ordered, "NOTE") ||
+         hasKind(ordered, "DRAWING");
+
+     const railSource =
+         ordered.find(
+             (annotation) =>
+                 annotation.kind === "BOOKMARK" ||
+                 annotation.kind === "NOTE" ||
+                 annotation.kind === "DRAWING",
+         ) ?? primary;
+
+     return {
+          tone: toneForKind(railSource.kind),
+          hasWash: hasKind(ordered, "HIGHLIGHT"),
+          showRail,
+          markerKinds: ordered
+              .slice(0, MAX_MARKERS)
+              .map((annotation) => annotation.kind),
+          extraCount: Math.max(0, ordered.length - MAX_MARKERS),
+     };
+}
+
+const sx = {
+     root: Object.freeze<CSSProperties>({
           position: "absolute",
           inset: 0,
           pointerEvents: "none",
-          borderRadius: 16,
+          borderRadius: ROOT_RADIUS,
           overflow: "hidden",
           zIndex: 0,
-     },
+     }),
 
-     wash: {
+     wash: Object.freeze<CSSProperties>({
           position: "absolute",
           inset: 0,
-          borderRadius: 16,
-     },
+          borderRadius: ROOT_RADIUS,
+     }),
 
-     rail: {
+     rail: Object.freeze<CSSProperties>({
           position: "absolute",
           left: 0,
           top: RAIL_INSET_Y,
           bottom: RAIL_INSET_Y,
           width: RAIL_WIDTH,
           borderRadius: 999,
-     },
+     }),
 
-     markerRow: {
+     markerRow: Object.freeze<CSSProperties>({
           position: "absolute",
           top: CORNER_TOP,
           right: CORNER_RIGHT,
           display: "inline-flex",
           alignItems: "center",
-          gap: 4,
-     },
+          gap: DOT_GAP,
+          maxWidth: "calc(100% - 20px)",
+          minWidth: 0,
+     }),
 
-     dot: {
+     dot: Object.freeze<CSSProperties>({
           width: DOT_SIZE,
           height: DOT_SIZE,
+          minWidth: DOT_SIZE,
+          minHeight: DOT_SIZE,
           borderRadius: 999,
           flex: "0 0 auto",
-     },
+     }),
 
-     countBadge: {
+     countBadge: Object.freeze<CSSProperties>({
           minWidth: 18,
           height: STACK_BADGE_H,
           paddingInline: 5,
@@ -22205,101 +22676,72 @@ const sx: Record<string, CSSProperties> = {
           lineHeight: 1,
           letterSpacing: "-0.01em",
           userSelect: "none",
-     },
-};
+          whiteSpace: "nowrap",
+          flex: "0 0 auto",
+          background: BADGE_BG,
+          color: BADGE_FG,
+          border: BADGE_BORDER,
+          boxSizing: "border-box",
+     }),
+} as const;
 
-export const ReaderAnnotationOverlay = memo(function ReaderAnnotationOverlay(props: Props) {
-     const { annotations } = props;
-
-     const live = useMemo(
-          () => annotations.filter(isLiveAnnotation),
-          [annotations],
-     );
-
-     const primary = live[0] ?? null;
-
-     const markerKinds = useMemo(
-          () => live.slice(0, MAX_MARKERS).map((annotation) => annotation.kind),
-          [live],
-     );
-
-     const meta = useMemo(() => {
-          if (!primary) {
-               return {
-                    tone: null as Tone | null,
-                    hasHighlight: false,
-                    showRail: false,
-                    extraCount: 0,
-               };
-          }
-
-          const tone = toneForKind(primary.kind);
-          const hasHighlight = hasKind(live, "HIGHLIGHT");
-          const showRail =
-               hasKind(live, "BOOKMARK") ||
-               hasKind(live, "NOTE") ||
-               hasKind(live, "DRAWING");
-
-          return {
-               tone,
-               hasHighlight,
-               showRail,
-               extraCount: Math.max(0, live.length - MAX_MARKERS),
-          };
-     }, [live, primary]);
-
-     if (!primary || !meta.tone) return null;
+const MarkerDot = memo(function MarkerDot(props: { kind: AnnotationKind }) {
+     const tone = toneForKind(props.kind);
 
      return (
-          <div aria-hidden="true" style={sx.root}>
-               {meta.hasHighlight ? (
-                    <div
-                         style={{
-                              ...sx.wash,
-                              background: meta.tone.wash,
-                         }}
-                    />
-               ) : null}
+         <span
+             aria-hidden="true"
+             style={{
+                  ...sx.dot,
+                  background: tone.dot,
+                  boxShadow: `0 0 0 1px ${tone.ring}`,
+             }}
+         />
+     );
+});
 
-               {meta.showRail ? (
-                    <div
-                         style={{
-                              ...sx.rail,
-                              background: meta.tone.rail,
-                         }}
-                    />
-               ) : null}
+export const ReaderAnnotationOverlay = memo(function ReaderAnnotationOverlay(
+    props: Props,
+) {
+     const { annotations } = props;
 
-               <div style={sx.markerRow}>
-                    {markerKinds.map((kind, index) => {
-                         const markerTone = toneForKind(kind);
+     const meta = useMemo(() => {
+          const live = annotations.filter(isLiveAnnotation);
+          return buildMeta(live);
+     }, [annotations]);
 
-                         return (
-                              <span
-                                   key={`${kind}-${index}`}
-                                   style={{
-                                        ...sx.dot,
-                                        background: markerTone.dot,
-                                        boxShadow: `0 0 0 1px ${markerTone.ring}`,
-                                   }}
-                              />
-                         );
-                    })}
+     if (!meta) return null;
 
-                    {meta.extraCount > 0 ? (
-                         <span
-                              style={{
-                                   ...sx.countBadge,
-                                   background: "color-mix(in oklab, var(--card, white) 94%, transparent)",
-                                   color: "color-mix(in oklab, var(--text, #111) 62%, transparent)",
-                                   border: "1px solid color-mix(in oklab, var(--border, rgba(127,127,127,0.2)) 78%, transparent)",
-                              }}
-                         >
-                        +{meta.extraCount}
-                    </span>
-                    ) : null}
-               </div>
-          </div>
+     return (
+         <div aria-hidden="true" style={sx.root}>
+              {meta.hasWash ? (
+                  <div
+                      style={{
+                           ...sx.wash,
+                           background: meta.tone.wash,
+                      }}
+                  />
+              ) : null}
+
+              {meta.showRail ? (
+                  <div
+                      style={{
+                           ...sx.rail,
+                           background: meta.tone.rail,
+                      }}
+                  />
+              ) : null}
+
+              <div style={sx.markerRow}>
+                   {meta.markerKinds.map((kind, index) => (
+                       <MarkerDot key={`${kind}-${index}`} kind={kind} />
+                   ))}
+
+                   {meta.extraCount > 0 ? (
+                       <span style={sx.countBadge}>+{meta.extraCount}</span>
+                   ) : null}
+              </div>
+         </div>
      );
 });
 ```
@@ -22319,8 +22761,6 @@ const ATTR_TOKEN_INDEX = "data-token-index";
 const ATTR_TOKEN_CHAR_START = "data-token-char-start";
 const ATTR_TOKEN_CHAR_END = "data-token-char-end";
 const ATTR_TRANSLATION_ID = "data-translation-id";
-
-type HTMLElementWithParent = HTMLElement & { parentElement: HTMLElement | null };
 
 function isElement(value: unknown): value is Element {
     return typeof Element !== "undefined" && value instanceof Element;
@@ -22376,11 +22816,6 @@ function getClosestHTMLElement(node: Node | null): HTMLElement | null {
     return isHTMLElement(el) ? el : null;
 }
 
-function getParentHTMLElement(el: HTMLElement | null): HTMLElement | null {
-    if (!el) return null;
-    return (el as HTMLElementWithParent).parentElement;
-}
-
 function findClosestAttrElement(node: Node | null, attr: string): HTMLElement | null {
     let current = getClosestHTMLElement(node);
 
@@ -22388,7 +22823,7 @@ function findClosestAttrElement(node: Node | null, attr: string): HTMLElement | 
         if (current.hasAttribute(attr)) {
             return current;
         }
-        current = getParentHTMLElement(current);
+        current = current.parentElement;
     }
 
     return null;
@@ -22401,7 +22836,33 @@ function findVerseElement(node: Node | null): HTMLElement | null {
         if (current.hasAttribute(ATTR_VERSE_KEY) && current.hasAttribute(ATTR_VERSE_ORD)) {
             return current;
         }
-        current = getParentHTMLElement(current);
+        current = current.parentElement;
+    }
+
+    return null;
+}
+
+function isTokenElement(el: HTMLElement): boolean {
+    return (
+        el.hasAttribute(ATTR_TOKEN_INDEX) ||
+        el.hasAttribute(ATTR_TOKEN_CHAR_START) ||
+        el.hasAttribute(ATTR_TOKEN_CHAR_END)
+    );
+}
+
+function findTokenElement(node: Node | null, verseEl: HTMLElement | null): HTMLElement | null {
+    let current = getClosestHTMLElement(node);
+
+    while (current) {
+        if (verseEl && current === verseEl.parentElement) break;
+
+        if (isTokenElement(current)) {
+            if (!verseEl || verseEl.contains(current)) return current;
+            return null;
+        }
+
+        if (verseEl && current === verseEl) break;
+        current = current.parentElement;
     }
 
     return null;
@@ -22438,34 +22899,74 @@ function getTokenCharEnd(tokenEl: HTMLElement | null): number | null {
     return end;
 }
 
-function resolveOffsetWithinNode(node: Node, offset: number): number {
-    if (isTextNode(node)) {
-        return clampInt(offset, 0, getNodeTextLength(node));
+function sumTextLengthOfChildrenBefore(node: Node, childOffset: number): number {
+    const count = clampInt(childOffset, 0, node.childNodes.length);
+    let total = 0;
+
+    for (let i = 0; i < count; i += 1) {
+        total += getNodeTextLength(node.childNodes[i] ?? null);
     }
 
-    return clampInt(offset, 0, node.childNodes.length);
+    return total;
 }
 
 /**
- * Best-effort local offset inside a token.
+ * Computes a character offset relative to `ancestor` from DOM boundary `(node, offset)`.
  *
- * Important:
- * - We keep this conservative and deterministic.
- * - We do NOT try to fully reconstruct nested DOM text layout here.
- * - For text nodes inside token elements, raw text offset is already the calmest signal.
+ * Rules:
+ * - text node => offset is character offset within that text node
+ * - element node => offset is child-node boundary index
+ * - while walking upward, sum text lengths of preceding siblings
+ *
+ * Returns null if `node` is not contained inside `ancestor`.
  */
+function resolveOffsetRelativeToAncestor(
+    node: Node,
+    offset: number,
+    ancestor: HTMLElement,
+): number | null {
+    if (!ancestor.contains(node) && node !== ancestor) {
+        return null;
+    }
+
+    if (node === ancestor) {
+        if (isTextNode(node)) {
+            return clampInt(offset, 0, getNodeTextLength(node));
+        }
+        return sumTextLengthOfChildrenBefore(node, offset);
+    }
+
+    let total = 0;
+    let current: Node | null = node;
+
+    if (isTextNode(current)) {
+        total += clampInt(offset, 0, getNodeTextLength(current));
+    } else {
+        total += sumTextLengthOfChildrenBefore(current, offset);
+    }
+
+    while (current && current !== ancestor) {
+        const parent: Node | null = current.parentNode;
+        if (!parent) return null;
+
+        let sibling: Node | null = parent.firstChild;
+        while (sibling && sibling !== current) {
+            total += getNodeTextLength(sibling);
+            sibling = sibling.nextSibling;
+        }
+
+        current = parent;
+    }
+
+    if (current !== ancestor) return null;
+    return clampInt(total, 0, getNodeTextLength(ancestor));
+}
+
 function resolveTokenRelativeOffset(node: Node, offset: number, tokenEl: HTMLElement): number {
     const tokenTextLen = getNodeTextLength(tokenEl);
-
-    if (isTextNode(node)) {
-        return clampInt(offset, 0, getNodeTextLength(node));
-    }
-
-    if (node === tokenEl) {
-        return clampInt(resolveOffsetWithinNode(node, offset), 0, tokenTextLen);
-    }
-
-    return clampInt(offset, 0, tokenTextLen);
+    const relative = resolveOffsetRelativeToAncestor(node, offset, tokenEl);
+    if (relative == null) return 0;
+    return clampInt(relative, 0, tokenTextLen);
 }
 
 function resolveCharOffset(node: Node, offset: number, tokenEl: HTMLElement | null): number | null {
@@ -22478,35 +22979,59 @@ function resolveCharOffset(node: Node, offset: number, tokenEl: HTMLElement | nu
 
     const tokenStart = getTokenCharStart(tokenEl);
     const tokenEnd = getTokenCharEnd(tokenEl);
+    const local = resolveTokenRelativeOffset(node, offset, tokenEl);
 
     if (tokenStart == null && tokenEnd == null) {
-        if (isTextNode(node)) {
-            return clampInt(offset, 0, getNodeTextLength(node));
-        }
-        return null;
+        return local;
     }
 
     if (tokenStart != null && tokenEnd != null) {
         const lo = Math.min(tokenStart, tokenEnd);
         const hi = Math.max(tokenStart, tokenEnd);
         const width = Math.max(0, hi - lo);
-        const local = resolveTokenRelativeOffset(node, offset, tokenEl);
         return lo + clampInt(local, 0, width);
     }
 
     if (tokenStart != null) {
-        const local = resolveTokenRelativeOffset(node, offset, tokenEl);
         return tokenStart + Math.max(0, local);
     }
 
-    return tokenEnd;
+    if (tokenEnd != null) {
+        const tokenTextLen = getNodeTextLength(tokenEl);
+        const inferredStart = Math.max(0, tokenEnd - tokenTextLen);
+        const width = Math.max(0, tokenEnd - inferredStart);
+        return inferredStart + clampInt(local, 0, width);
+    }
+
+    return null;
+}
+
+function readTranslationIdFromVerseOrAncestors(
+    node: Node,
+    verseEl: HTMLElement | null,
+): string | null {
+    const verseScoped =
+        verseEl && verseEl.hasAttribute(ATTR_TRANSLATION_ID)
+            ? normalizeString(verseEl.getAttribute(ATTR_TRANSLATION_ID))
+            : null;
+
+    if (verseScoped) return verseScoped;
+
+    const nearest = findClosestAttrElement(node, ATTR_TRANSLATION_ID);
+    if (!nearest) return null;
+
+    if (verseEl && !nearest.contains(verseEl) && !verseEl.contains(nearest)) {
+        return null;
+    }
+
+    return normalizeString(nearest.getAttribute(ATTR_TRANSLATION_ID));
 }
 
 function buildLocator(
-     verseEl: HTMLElement,
-     tokenEl: HTMLElement | null,
-     node: Node,
-     offset: number,
+    verseEl: HTMLElement,
+    tokenEl: HTMLElement | null,
+    node: Node,
+    offset: number,
 ): DomSelectionTokenLocator | null {
     const verseKey = getVerseKey(verseEl);
     const verseOrd = getVerseOrd(verseEl);
@@ -22531,14 +23056,13 @@ export class ReaderDomSelectionResolver implements DomSelectionResolver {
         const verseEl = findVerseElement(node);
         if (!verseEl) return null;
 
-        const tokenEl = findClosestAttrElement(node, ATTR_TOKEN_INDEX);
+        const tokenEl = findTokenElement(node, verseEl);
         return buildLocator(verseEl, tokenEl, node, offset);
     }
 
-    resolveTranslationId(root: Node): string | null {
-        const el = findClosestAttrElement(root, ATTR_TRANSLATION_ID);
-        if (!el) return null;
-        return normalizeString(el.getAttribute(ATTR_TRANSLATION_ID));
+    resolveTranslationId(node: Node): string | null {
+        const verseEl = findVerseElement(node);
+        return readTranslationIdFromVerseOrAncestors(node, verseEl);
     }
 }
 ```
@@ -22558,317 +23082,380 @@ import { ReaderTypographyControl } from "./ReaderTypographyControl";
 import { Home } from "lucide-react";
 
 type CurrentPos = {
-     label: string;
-     ord: number;
-     bookId: string | null;
-     chapter: number | null;
-     verse: number | null;
+    label: string;
+    ord: number;
+    bookId: string | null;
+    chapter: number | null;
+    verse: number | null;
 };
 
 type Props = {
-     styles: Record<string, React.CSSProperties>;
-     books: BookRow[] | null;
+    styles: Record<string, React.CSSProperties>;
+    books: BookRow[] | null;
 
-     onBackHome: () => void;
+    onBackHome: () => void;
 
-     current: CurrentPos;
-     onJumpRef: (bookId: string, chapter: number, verse: number | null) => void;
+    current: CurrentPos;
+    onJumpRef: (bookId: string, chapter: number, verse: number | null) => void;
 
-     // retained for API compatibility, not used by header anymore
-     onNavigate: (loc: { bookId: string; chapter: number; verse?: number }) => void;
+    // retained for API compatibility, not used by header anymore
+    onNavigate: (loc: { bookId: string; chapter: number; verse?: number }) => void;
 
-     // legacy: keep props but header uses global theme now
-     mode?: "light" | "dark";
-     onToggleTheme?: () => void;
+    // legacy: keep props but header uses global theme now
+    mode?: "light" | "dark";
+    onToggleTheme?: () => void;
 };
 
 type DockProps = {
-     children: ReactNode;
-     title?: string;
-     ariaLabel?: string;
-     pad?: number;
+    children: ReactNode;
+    title?: string;
+    ariaLabel?: string;
+    pad?: number;
+    minHeight?: number;
 };
 
+const TOKENS = Object.freeze({
+    dockRadius: 999,
+    dockMinHeight: 38,
+    dockPad: 3,
+    dockBorder: "1px solid color-mix(in srgb, var(--border) 62%, transparent)",
+    dockBg: "color-mix(in srgb, var(--bg) 86%, var(--panel))",
+    dockShadow: "0 8px 18px rgba(0,0,0,0.045)",
+    dockBlur: "blur(10px)",
+
+    iconBtnSize: 32,
+    iconBtnRadius: 999,
+    iconBtnHoverBg: "color-mix(in srgb, var(--activeBg) 58%, transparent)",
+    iconBtnDownBg: "color-mix(in srgb, var(--activeBg) 76%, transparent)",
+    iconBtnRing: "inset 0 0 0 1px color-mix(in srgb, var(--border) 58%, transparent)",
+    iconBtnTransition:
+        "transform 120ms ease, background 140ms ease, border-color 140ms ease, opacity 140ms ease, box-shadow 140ms ease",
+
+    groupGap: 8,
+    subtleGap: 6,
+    dividerColor: "color-mix(in srgb, var(--border) 68%, transparent)",
+    dividerHeight: 20,
+    dividerWidth: 1,
+});
+
+function releasePointerCaptureSafe(target: EventTarget | null, pointerId: number): void {
+    if (!(target instanceof Element)) return;
+
+    const el = target as Element & {
+        releasePointerCapture?: (id: number) => void;
+        hasPointerCapture?: (id: number) => boolean;
+    };
+
+    try {
+        if (typeof el.hasPointerCapture === "function") {
+            if (el.hasPointerCapture(pointerId) && typeof el.releasePointerCapture === "function") {
+                el.releasePointerCapture(pointerId);
+            }
+            return;
+        }
+
+        if (typeof el.releasePointerCapture === "function") {
+            el.releasePointerCapture(pointerId);
+        }
+    } catch {
+        // ignore
+    }
+}
+
+const ui = {
+    shell: Object.freeze<CSSProperties>({
+        display: "flex",
+        alignItems: "center",
+        gap: TOKENS.groupGap,
+        minWidth: 0,
+    }),
+
+    centerWrap: Object.freeze<CSSProperties>({
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        minWidth: 0,
+        width: "100%",
+    }),
+
+    rightCluster: Object.freeze<CSSProperties>({
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "flex-end",
+        gap: TOKENS.groupGap,
+        minWidth: 0,
+        flexWrap: "nowrap",
+    }),
+
+    divider: Object.freeze<CSSProperties>({
+        width: TOKENS.dividerWidth,
+        height: TOKENS.dividerHeight,
+        background: TOKENS.dividerColor,
+        opacity: 0.78,
+        marginInline: 1,
+        flex: "0 0 auto",
+    }),
+} as const;
+
 const Dock = memo(function Dock(props: DockProps) {
-     const { children, title, ariaLabel, pad = 3 } = props;
+    const {
+        children,
+        title,
+        ariaLabel,
+        pad = TOKENS.dockPad,
+        minHeight = TOKENS.dockMinHeight,
+    } = props;
 
-     const dock = useMemo<CSSProperties>(
-          () => ({
-               display: "inline-flex",
-               alignItems: "center",
-               justifyContent: "center",
-               padding: pad,
-               minHeight: 38,
-               borderRadius: 999,
-               background: "color-mix(in srgb, var(--bg) 86%, var(--panel))",
-               border: "1px solid color-mix(in srgb, var(--border) 62%, transparent)",
-               boxShadow: "0 8px 18px rgba(0,0,0,0.045)",
-               backdropFilter: "blur(10px)",
-               WebkitBackdropFilter: "blur(10px)",
-          }),
-          [pad],
-     );
+    const style = useMemo<CSSProperties>(
+        () => ({
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            minWidth: 0,
+            minHeight,
+            padding: pad,
+            borderRadius: TOKENS.dockRadius,
+            background: TOKENS.dockBg,
+            border: TOKENS.dockBorder,
+            boxShadow: TOKENS.dockShadow,
+            backdropFilter: TOKENS.dockBlur,
+            WebkitBackdropFilter: TOKENS.dockBlur,
+            boxSizing: "border-box",
+        }),
+        [minHeight, pad],
+    );
 
-     return (
-          <div style={dock} title={title} aria-label={ariaLabel}>
-               {children}
-          </div>
-     );
+    return (
+        <div style={style} title={title} aria-label={ariaLabel}>
+            {children}
+        </div>
+    );
 });
 
 const HeaderGroup = memo(function HeaderGroup(props: {
-     children: ReactNode;
-     ariaLabel?: string;
-     gap?: number;
+    children: ReactNode;
+    ariaLabel?: string;
+    gap?: number;
 }) {
-     const style = useMemo<CSSProperties>(
-          () => ({
-               display: "flex",
-               alignItems: "center",
-               gap: props.gap ?? 8,
-               minWidth: 0,
-          }),
-          [props.gap],
-     );
+    const { children, ariaLabel, gap = TOKENS.groupGap } = props;
 
-     return (
-          <div style={style} aria-label={props.ariaLabel}>
-               {props.children}
-          </div>
-     );
+    const style = useMemo<CSSProperties>(
+        () => ({
+            display: "flex",
+            alignItems: "center",
+            gap,
+            minWidth: 0,
+            flexWrap: "nowrap",
+        }),
+        [gap],
+    );
+
+    return (
+        <div style={style} aria-label={ariaLabel}>
+            {children}
+        </div>
+    );
 });
 
 const Divider = memo(function Divider() {
-     return (
-          <div
-               aria-hidden
-               style={{
-                    width: 1,
-                    height: 20,
-                    background: "color-mix(in srgb, var(--border) 68%, transparent)",
-                    opacity: 0.78,
-                    marginInline: 1,
-                    flex: "0 0 auto",
-               }}
-          />
-     );
+    return <div aria-hidden style={ui.divider} />;
 });
 
 type IconDockButtonProps = {
-     ariaLabel: string;
-     title: string;
-     onClick: () => void;
-     icon: ReactNode;
-     pressed?: boolean;
+    ariaLabel: string;
+    title: string;
+    onClick: () => void;
+    icon: ReactNode;
+    pressed?: boolean;
 };
 
 const IconDockButton = memo(function IconDockButton(props: IconDockButtonProps) {
-     const { ariaLabel, title, onClick, icon, pressed = false } = props;
-     const [hover, setHover] = useState(false);
-     const [down, setDown] = useState(false);
+    const { ariaLabel, title, onClick, icon, pressed = false } = props;
 
-     const style = useMemo<CSSProperties>(
-          () => ({
-               appearance: "none",
-               WebkitAppearance: "none",
-               width: 32,
-               height: 32,
-               border: "1px solid transparent",
-               borderRadius: 999,
-               background:
-                    down || pressed
-                         ? "color-mix(in srgb, var(--activeBg) 76%, transparent)"
-                         : hover
-                              ? "color-mix(in srgb, var(--activeBg) 58%, transparent)"
-                              : "transparent",
-               color: "var(--fg)",
-               display: "inline-flex",
-               alignItems: "center",
-               justifyContent: "center",
-               cursor: "pointer",
-               transform: down ? "scale(0.97)" : "scale(1)",
-               transition:
-                    "transform 120ms ease, background 140ms ease, border-color 140ms ease, opacity 140ms ease",
-               WebkitTapHighlightColor: "transparent",
-               outline: "none",
-               boxShadow:
-                    hover || down || pressed
-                         ? "inset 0 0 0 1px color-mix(in srgb, var(--border) 58%, transparent)"
-                         : "none",
-          }),
-          [down, hover, pressed],
-     );
+    const [hover, setHover] = useState(false);
+    const [down, setDown] = useState(false);
+    const active = pressed || down;
 
-     const onPointerEnter = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
-          if (e.pointerType === "touch") return;
-          setHover(true);
-     }, []);
+    const style = useMemo<CSSProperties>(
+        () => ({
+            appearance: "none",
+            WebkitAppearance: "none",
+            width: TOKENS.iconBtnSize,
+            height: TOKENS.iconBtnSize,
+            minWidth: TOKENS.iconBtnSize,
+            minHeight: TOKENS.iconBtnSize,
+            border: "1px solid transparent",
+            borderRadius: TOKENS.iconBtnRadius,
+            background: active
+                ? TOKENS.iconBtnDownBg
+                : hover
+                    ? TOKENS.iconBtnHoverBg
+                    : "transparent",
+            color: "var(--fg)",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            transform: down ? "scale(0.97)" : "scale(1)",
+            transition: TOKENS.iconBtnTransition,
+            WebkitTapHighlightColor: "transparent",
+            outline: "none",
+            boxShadow: hover || active ? TOKENS.iconBtnRing : "none",
+            flex: "0 0 auto",
+        }),
+        [active, down, hover],
+    );
 
-     const onPointerLeave = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
-          if (e.pointerType === "touch") return;
-          setHover(false);
-          setDown(false);
-     }, []);
+    const onPointerEnter = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+        if (e.pointerType === "touch") return;
+        setHover(true);
+    }, []);
 
-     const onPointerDown = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
-          try {
-               e.currentTarget.setPointerCapture(e.pointerId);
-          } catch {
-               // ignore
-          }
-          setDown(true);
-     }, []);
+    const onPointerLeave = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+        if (e.pointerType === "touch") return;
+        setHover(false);
+        setDown(false);
+        releasePointerCaptureSafe(e.currentTarget, e.pointerId);
+    }, []);
 
-     const onPointerClear = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
-          try {
-               e.currentTarget.releasePointerCapture(e.pointerId);
-          } catch {
-               // ignore
-          }
-          setDown(false);
-     }, []);
+    const onPointerDown = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+        try {
+            e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+            // ignore
+        }
+        setDown(true);
+    }, []);
 
-     return (
-          <button
-               type="button"
-               aria-label={ariaLabel}
-               title={title}
-               onClick={onClick}
-               onPointerEnter={onPointerEnter}
-               onPointerLeave={onPointerLeave}
-               onPointerDown={onPointerDown}
-               onPointerUp={onPointerClear}
-               onPointerCancel={onPointerClear}
-               onPointerOutCapture={onPointerClear}
-               style={style}
-          >
-               {icon}
-          </button>
-     );
+    const onPointerUp = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+        releasePointerCaptureSafe(e.currentTarget, e.pointerId);
+        setDown(false);
+    }, []);
+
+    const onPointerCancel = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+        releasePointerCaptureSafe(e.currentTarget, e.pointerId);
+        setDown(false);
+    }, []);
+
+    return (
+        <button
+            type="button"
+            aria-label={ariaLabel}
+            title={title}
+            onClick={onClick}
+            onPointerEnter={onPointerEnter}
+            onPointerLeave={onPointerLeave}
+            onPointerDown={onPointerDown}
+            onPointerUp={onPointerUp}
+            onPointerCancel={onPointerCancel}
+            style={style}
+        >
+            {icon}
+        </button>
+    );
+});
+
+const HomeDock = memo(function HomeDock(props: { onBackHome: () => void }) {
+    const { onBackHome } = props;
+
+    return (
+        <Dock title="Home" ariaLabel="Home">
+            <IconDockButton
+                ariaLabel="Home"
+                title="Home"
+                onClick={onBackHome}
+                icon={<Home size={17} aria-hidden />}
+            />
+        </Dock>
+    );
+});
+
+const AccountDock = memo(function AccountDock() {
+    return (
+        <Dock title="Account" ariaLabel="Account">
+            <AccountMenu size="sm" />
+        </Dock>
+    );
+});
+
+const TypographyDock = memo(function TypographyDock() {
+    return (
+        <Dock title="Typography" ariaLabel="Typography">
+            <ReaderTypographyControl />
+        </Dock>
+    );
+});
+
+const ThemeDock = memo(function ThemeDock() {
+    return (
+        <Dock title="Theme" ariaLabel="Theme">
+            <ThemeToggleSwitch size="sm" />
+        </Dock>
+    );
+});
+
+const PositionDock = memo(function PositionDock(props: {
+    styles: Record<string, React.CSSProperties>;
+    books: BookRow[] | null;
+    current: CurrentPos;
+    onJump: (bookId: string, chapter: number, verse: number | null) => void;
+}) {
+    const { styles, books, current, onJump } = props;
+
+    return (
+        <div style={ui.centerWrap}>
+            <PositionPill
+                styles={styles}
+                books={books}
+                current={current}
+                onJump={onJump}
+            />
+        </div>
+    );
 });
 
 export const ReaderHeader = memo(function ReaderHeader(props: Props) {
-     const { styles, books, onBackHome, current, onJumpRef } = props;
+    const { styles, books, onBackHome, current, onJumpRef } = props;
 
-     const topLeftStyle = sx.topLeft;
-     const topCenterStyle = sx.topCenter;
-     const topRightStyle = sx.topRight;
-     const topBarStyle = sx.topBar;
+    const onJump = useCallback(
+        (bookId: string, chapter: number, verse: number | null) => {
+            onJumpRef(bookId, chapter, verse);
+        },
+        [onJumpRef],
+    );
 
-     const shellStyle = useMemo<CSSProperties>(
-          () => ({
-               display: "flex",
-               alignItems: "center",
-               gap: 8,
-               minWidth: 0,
-          }),
-          [],
-     );
+    return (
+        <div style={sx.topBar}>
+            <div style={sx.topLeft}>
+                <HeaderGroup ariaLabel="Navigation and account">
+                    <HomeDock onBackHome={onBackHome} />
+                    <AccountDock />
+                </HeaderGroup>
+            </div>
 
-     const centerWrapStyle = useMemo<CSSProperties>(
-          () => ({
-               display: "flex",
-               alignItems: "center",
-               justifyContent: "center",
-               minWidth: 0,
-               width: "100%",
-          }),
-          [],
-     );
+            <div style={sx.topCenter}>
+                <PositionDock
+                    styles={styles}
+                    books={books}
+                    current={current}
+                    onJump={onJump}
+                />
+            </div>
 
-     const rightClusterStyle = useMemo<CSSProperties>(
-          () => ({
-               display: "flex",
-               alignItems: "center",
-               justifyContent: "flex-end",
-               gap: 8,
-               minWidth: 0,
-          }),
-          [],
-     );
-
-     const onJump = useCallback(
-          (bookId: string, chapter: number, verse: number | null) => {
-               onJumpRef(bookId, chapter, verse);
-          },
-          [onJumpRef],
-     );
-
-     const homeDock = useMemo(
-          () => (
-               <Dock title="Home" ariaLabel="Home">
-                    <IconDockButton
-                         ariaLabel="Home"
-                         title="Home"
-                         onClick={onBackHome}
-                         icon={<Home size={17} aria-hidden />}
-                    />
-               </Dock>
-          ),
-          [onBackHome],
-     );
-
-     const accountDock = useMemo(
-          () => (
-               <Dock title="Account" ariaLabel="Account">
-                    <AccountMenu size="sm" />
-               </Dock>
-          ),
-          [],
-     );
-
-     const typeDock = useMemo(
-          () => (
-               <Dock title="Typography" ariaLabel="Typography">
-                    <ReaderTypographyControl />
-               </Dock>
-          ),
-          [],
-     );
-
-     const themeDock = useMemo(
-          () => (
-               <Dock title="Theme" ariaLabel="Theme">
-                    <ThemeToggleSwitch size="sm" />
-               </Dock>
-          ),
-          [],
-     );
-
-     return (
-          <div style={topBarStyle}>
-               <div style={topLeftStyle}>
-                    <HeaderGroup ariaLabel="Navigation and account">
-                         {homeDock}
-                         {accountDock}
+            <div style={sx.topRight}>
+                <div style={ui.rightCluster}>
+                    <HeaderGroup ariaLabel="Reader controls">
+                        <TypographyDock />
                     </HeaderGroup>
-               </div>
 
-               <div style={topCenterStyle}>
-                    <div style={centerWrapStyle}>
-                         <PositionPill
-                              styles={styles}
-                              books={books}
-                              current={current}
-                              onJump={onJump}
-                         />
-                    </div>
-               </div>
-
-               <div style={topRightStyle}>
-                    <div style={rightClusterStyle}>
-                         <HeaderGroup ariaLabel="Reader controls">
-                              {typeDock}
-                         </HeaderGroup>
-
-                         <HeaderGroup ariaLabel="Appearance" gap={6}>
-                              <Divider />
-                              {themeDock}
-                         </HeaderGroup>
-                    </div>
-               </div>
-          </div>
-     );
+                    <HeaderGroup ariaLabel="Appearance" gap={TOKENS.subtleGap}>
+                        <Divider />
+                        <ThemeDock />
+                    </HeaderGroup>
+                </div>
+            </div>
+        </div>
+    );
 });
 ```
 
@@ -23305,8 +23892,8 @@ type CurrentPos = Readonly<{
 }>;
 
 type SpineValidation =
-     | { ok: true }
-     | { ok: false; msg: string };
+    | { ok: true }
+    | { ok: false; msg: string };
 
 type Props = Readonly<{
     styles: Record<string, CSSProperties>;
@@ -23336,34 +23923,34 @@ type Props = Readonly<{
     err?: string | null;
 }>;
 
-const MEASURE_WRAP_STYLE: CSSProperties = {
+const MEASURE_WRAP_STYLE: CSSProperties = Object.freeze({
     maxWidth: "var(--bpReaderMeasure, 840px)",
     marginInline: "auto",
     paddingInline: 18,
     boxSizing: "border-box",
     width: "100%",
     minWidth: 0,
-};
+});
 
-const ERR_BANNER_OUTER_STYLE: CSSProperties = {
+const ERR_BANNER_OUTER_STYLE: CSSProperties = Object.freeze({
     borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
     background: "color-mix(in oklab, var(--bg) 94%, var(--panel))",
-};
+});
 
-const ERR_BANNER_INNER_STYLE: CSSProperties = {
+const ERR_BANNER_INNER_STYLE: CSSProperties = Object.freeze({
     paddingBlock: 9,
-};
+});
 
-const ERR_TEXT_STYLE: CSSProperties = {
+const ERR_TEXT_STYLE: CSSProperties = Object.freeze({
     fontSize: 12,
     color: "var(--muted)",
     whiteSpace: "pre-wrap",
-};
+});
 
-const LOADING_TEXT_STYLE: CSSProperties = {
+const LOADING_TEXT_STYLE: CSSProperties = Object.freeze({
     ...sx.msg,
     paddingTop: 22,
-};
+});
 
 function isFiniteIntegerLike(value: unknown): value is number {
     return typeof value === "number" && Number.isFinite(value);
@@ -23377,14 +23964,18 @@ function validateSpine(spine: SpineStats | null): SpineValidation {
     const { verseOrdMin, verseOrdMax, verseCount } = spine;
 
     if (
-         !isFiniteIntegerLike(verseOrdMin) ||
-         !isFiniteIntegerLike(verseOrdMax) ||
-         !isFiniteIntegerLike(verseCount)
+        !isFiniteIntegerLike(verseOrdMin) ||
+        !isFiniteIntegerLike(verseOrdMax) ||
+        !isFiniteIntegerLike(verseCount)
     ) {
         return { ok: false, msg: "Spine has non-numeric fields." };
     }
 
-    if (!Number.isInteger(verseOrdMin) || !Number.isInteger(verseOrdMax) || !Number.isInteger(verseCount)) {
+    if (
+        !Number.isInteger(verseOrdMin) ||
+        !Number.isInteger(verseOrdMax) ||
+        !Number.isInteger(verseCount)
+    ) {
         return { ok: false, msg: "Spine fields must be integers." };
     }
 
@@ -23422,25 +24013,25 @@ const MeasureWrap = memo(function MeasureWrap(props: Readonly<{ children: ReactN
 
 const ErrBanner = memo(function ErrBanner(props: Readonly<{ msg: string }>) {
     return (
-         <div role="status" aria-live="polite" style={ERR_BANNER_OUTER_STYLE}>
-             <MeasureWrap>
-                 <div style={ERR_BANNER_INNER_STYLE}>
-                     <div style={ERR_TEXT_STYLE}>{props.msg}</div>
-                 </div>
-             </MeasureWrap>
-         </div>
+        <div role="status" aria-live="polite" style={ERR_BANNER_OUTER_STYLE}>
+            <MeasureWrap>
+                <div style={ERR_BANNER_INNER_STYLE}>
+                    <div style={ERR_TEXT_STYLE}>{props.msg}</div>
+                </div>
+            </MeasureWrap>
+        </div>
     );
 });
 
 const LoadingBody = memo(function LoadingBody(props: Readonly<{ msg?: string | null }>) {
     return (
-         <div style={sx.body}>
-             <MeasureWrap>
-                 <div style={LOADING_TEXT_STYLE} role="status" aria-live="polite">
-                     {props.msg ?? "Loading…"}
-                 </div>
-             </MeasureWrap>
-         </div>
+        <div style={sx.body}>
+            <MeasureWrap>
+                <div style={LOADING_TEXT_STYLE} role="status" aria-live="polite">
+                    {props.msg ?? "Loading…"}
+                </div>
+            </MeasureWrap>
+        </div>
     );
 });
 
@@ -23478,64 +24069,60 @@ export function ReaderShell(props: Props) {
     }, [err, spine, spineCheck]);
 
     const reportedErrorRef = useRef<string | null>(null);
-    const readyCalledRef = useRef(false);
 
     useEffect(() => {
-        if (!bannerMsg || !onError) return;
+        if (!bannerMsg) {
+            reportedErrorRef.current = null;
+            return;
+        }
+
+        if (!onError) return;
         if (reportedErrorRef.current === bannerMsg) return;
 
         reportedErrorRef.current = bannerMsg;
         onError(bannerMsg);
     }, [bannerMsg, onError]);
 
-    useEffect(() => {
-        if (!hasValidSpine) {
-            readyCalledRef.current = false;
-            return;
-        }
-        if (!spine) {
-            readyCalledRef.current = false;
-            return;
-        }
-        if (!onReady) return;
-        if (readyCalledRef.current) return;
-
-        readyCalledRef.current = true;
-        onReady();
-    }, [hasValidSpine, onReady, spine]);
+    const isLoading = !spine && !err;
+    const hasFatalError = !!bannerMsg && (!spine || !hasValidSpine || !!err);
 
     return (
-         <main style={sx.page} aria-busy={!hasValidSpine} aria-live="polite">
-             <ReaderHeader
-                  styles={styles}
-                  books={books}
-                  onBackHome={onBackHome}
-                  current={current}
-                  onJumpRef={onJumpRef}
-                  onNavigate={onNavigate}
-                  mode={mode}
-                  onToggleTheme={onToggleTheme}
-             />
+        <main
+            style={sx.page}
+            aria-busy={isLoading}
+            aria-live="polite"
+            data-reader-shell="1"
+        >
+            <ReaderHeader
+                styles={styles}
+                books={books}
+                onBackHome={onBackHome}
+                current={current}
+                onJumpRef={onJumpRef}
+                onNavigate={onNavigate}
+                mode={mode}
+                onToggleTheme={onToggleTheme}
+            />
 
-             {bannerMsg ? <ErrBanner msg={bannerMsg} /> : null}
+            {bannerMsg ? <ErrBanner msg={bannerMsg} /> : null}
 
-             {hasValidSpine && spine ? (
-                  <ReaderViewport
-                       key={viewportKey}
-                       ref={viewportRef ?? null}
-                       spine={spine}
-                       bookById={bookById}
-                       selectionRootRef={selectionRootRef ?? null}
-                       annotationSnapshot={annotationSnapshot ?? null}
-                       topContent={topContent ?? null}
-                       onPosition={onPosition}
-                       onError={onError}
-                       onReady={onReady}
-                  />
-             ) : (
-                  <LoadingBody msg={!spine && !err ? "Loading…" : undefined} />
-             )}
-         </main>
+            {hasValidSpine && spine ? (
+                <ReaderViewport
+                    key={viewportKey}
+                    ref={viewportRef ?? null}
+                    spine={spine}
+                    bookById={bookById}
+                    selectionRootRef={selectionRootRef ?? null}
+                    annotationSnapshot={annotationSnapshot ?? null}
+                    topContent={topContent ?? null}
+                    onPosition={onPosition}
+                    onError={onError}
+                    onReady={onReady}
+                />
+            ) : (
+                <LoadingBody msg={hasFatalError ? undefined : "Loading…"} />
+            )}
+        </main>
     );
 }
 ```
@@ -23554,6 +24141,7 @@ import React, {
     useRef,
     useState,
 } from "react";
+import { createPortal } from "react-dom";
 import {
     applyReaderTypography,
     clearReaderTypography,
@@ -23570,17 +24158,12 @@ import {
 /**
  * Biblia.to — Reader Typography Control
  *
- * Locked contract:
- * - measurePx always fixed to DEFAULT_TYPOGRAPHY.measurePx
- * - leading always fixed to DEFAULT_TYPOGRAPHY.leading
- * - user controls: enabled + font + size + weight
- *
- * Notes:
- * - stable storage/apply contract
- * - viewport-aware panel positioning
- * - touch + mouse friendly controls
- * - hard guard against stale/legacy measure/leading drift
- * - no deprecated MediaQueryList listener APIs
+ * Upgraded:
+ * - narrower / denser panel
+ * - more premium controls
+ * - press-and-hold acceleration for weight / size / font arrows
+ * - stable floating portal
+ * - locked typography contract (measure + leading fixed)
  */
 
 type FontOpt = ReturnType<typeof fontOptions>[number] & {
@@ -23590,20 +24173,35 @@ type FontOpt = ReturnType<typeof fontOptions>[number] & {
     previewText?: string;
 };
 
-type PanelSide = "bottom-right" | "bottom-left";
+type PanelPlacementX = "left" | "right";
+type PanelPlacementY = "top" | "bottom";
 
-const PANEL_W = 332;
-const PANEL_GAP = 10;
-const SAMPLE_TEXT = "In the beginning God created the heaven and the earth.";
+type PanelLayout = Readonly<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    placeX: PanelPlacementX;
+    placeY: PanelPlacementY;
+}>;
+
+const PANEL_W = 268;
+const PANEL_H = 236;
+const PANEL_MIN_W = 248;
+const PANEL_GAP = 8;
+const VIEWPORT_PAD = 10;
+
+const STYLE_ATTR = "data-bp-reader-typo-style";
+const PORTAL_PANEL_ID = "bp-reader-typo-panel";
+
+const HOLD_INITIAL_DELAY_MS = 260;
+const HOLD_REPEAT_START_MS = 120;
+const HOLD_REPEAT_FAST_MS = 52;
+const HOLD_ACCEL_AFTER_MS = 560;
 
 function clampNum(n: number, lo: number, hi: number): number {
     if (!Number.isFinite(n)) return lo;
     return Math.max(lo, Math.min(hi, n));
-}
-
-function roundToStep(n: number, step: number): number {
-    if (!Number.isFinite(n) || !Number.isFinite(step) || step <= 0) return n;
-    return Math.round(n / step) * step;
 }
 
 function normalizeLockedTypography(input: ReaderTypography): ReaderTypography {
@@ -23620,25 +24218,6 @@ function nextOf<T>(arr: readonly T[], current: T, dir: 1 | -1): T {
     return arr[n]!;
 }
 
-function fontFamilyForOpt(f: FontOpt | null): string {
-    if (!f) return "var(--font-serif)";
-    const fam = (f.previewFamily ?? f.cssFamily ?? f.family ?? String(f.id)).trim();
-    if (!fam) return "var(--font-serif)";
-    if (
-         fam.startsWith("var(") ||
-         fam.includes(",") ||
-         fam.startsWith("ui-") ||
-         fam.includes("system-ui")
-    ) {
-        return fam;
-    }
-    return `"${fam}", var(--font-serif), Georgia, Cambria, "Times New Roman", serif`;
-}
-
-function isRangeInput(el: Element | null): el is HTMLInputElement {
-    return !!el && el.tagName === "INPUT" && (el as HTMLInputElement).type === "range";
-}
-
 function eventComposedPath(e: Event): EventTarget[] | null {
     const maybe = e as Event & { composedPath?: () => EventTarget[] };
     return typeof maybe.composedPath === "function" ? maybe.composedPath() : null;
@@ -23652,6 +24231,63 @@ function pathContainsNode(path: EventTarget[] | null, node: Node | null): boolea
     return false;
 }
 
+function getViewportSize(): { width: number; height: number } {
+    if (typeof window === "undefined") return { width: 0, height: 0 };
+    const vv = window.visualViewport;
+    if (vv) {
+        return {
+            width: Math.round(vv.width),
+            height: Math.round(vv.height),
+        };
+    }
+    return {
+        width: window.innerWidth,
+        height: window.innerHeight,
+    };
+}
+
+function computePanelLayout(trigger: DOMRect, preferredWidth: number): PanelLayout {
+    const { width: viewportW, height: viewportH } = getViewportSize();
+
+    const width = Math.round(
+        clampNum(preferredWidth, PANEL_MIN_W, Math.max(PANEL_MIN_W, viewportW - VIEWPORT_PAD * 2)),
+    );
+    const height = Math.min(PANEL_H, Math.max(210, viewportH - VIEWPORT_PAD * 2));
+
+    const roomRight = viewportW - trigger.right - VIEWPORT_PAD;
+    const roomLeft = trigger.left - VIEWPORT_PAD;
+    const roomBelow = viewportH - trigger.bottom - PANEL_GAP - VIEWPORT_PAD;
+    const roomAbove = trigger.top - PANEL_GAP - VIEWPORT_PAD;
+
+    const placeX: PanelPlacementX =
+        roomRight >= width || roomRight >= roomLeft ? "right" : "left";
+    const placeY: PanelPlacementY =
+        roomBelow >= height || roomBelow >= roomAbove ? "bottom" : "top";
+
+    let left = placeX === "right" ? trigger.right - width : trigger.left;
+    left = clampNum(
+        Math.round(left),
+        VIEWPORT_PAD,
+        Math.max(VIEWPORT_PAD, viewportW - width - VIEWPORT_PAD),
+    );
+
+    let top = placeY === "bottom" ? trigger.bottom + PANEL_GAP : trigger.top - PANEL_GAP - height;
+    top = clampNum(
+        Math.round(top),
+        VIEWPORT_PAD,
+        Math.max(VIEWPORT_PAD, viewportH - height - VIEWPORT_PAD),
+    );
+
+    return {
+        left,
+        top,
+        width,
+        height,
+        placeX,
+        placeY,
+    };
+}
+
 function usePrefersReducedMotion(): boolean {
     const [reduced, setReduced] = useState(false);
 
@@ -23663,10 +24299,7 @@ function usePrefersReducedMotion(): boolean {
 
         setReduced(mq.matches);
         mq.addEventListener("change", onChange);
-
-        return () => {
-            mq.removeEventListener("change", onChange);
-        };
+        return () => mq.removeEventListener("change", onChange);
     }, []);
 
     return reduced;
@@ -23684,78 +24317,157 @@ function useInjectOnceStyle(cssText: string, attr: string): void {
     }, [cssText, attr]);
 }
 
-function useViewportPanelSide(
-     open: boolean,
-     triggerRef: React.RefObject<HTMLButtonElement | null>,
-): PanelSide {
-    const [side, setSide] = useState<PanelSide>("bottom-right");
+function useHoldToRepeat(action: () => void, enabled: boolean) {
+    const actionRef = useRef(action);
+    const enabledRef = useRef(enabled);
+    const timeoutRef = useRef<number | null>(null);
+    const intervalRef = useRef<number | null>(null);
+    const holdStartedAtRef = useRef<number>(0);
 
-    useLayoutEffect(() => {
-        if (!open || typeof window === "undefined") return;
+    useEffect(() => {
+        actionRef.current = action;
+    }, [action]);
 
-        const compute = () => {
-            const trigger = triggerRef.current;
-            if (!trigger) return;
+    useEffect(() => {
+        enabledRef.current = enabled;
+    }, [enabled]);
 
-            const rect = trigger.getBoundingClientRect();
-            const roomRight = window.innerWidth - rect.right;
-            const roomLeft = rect.left;
+    const clearTimers = useCallback(() => {
+        if (timeoutRef.current != null && typeof window !== "undefined") {
+            window.clearTimeout(timeoutRef.current);
+            timeoutRef.current = null;
+        }
+        if (intervalRef.current != null && typeof window !== "undefined") {
+            window.clearInterval(intervalRef.current);
+            intervalRef.current = null;
+        }
+    }, []);
 
-            if (roomRight >= PANEL_W || roomRight >= roomLeft) {
-                setSide("bottom-right");
-            } else {
-                setSide("bottom-left");
-            }
-        };
+    useEffect(() => clearTimers, [clearTimers]);
 
-        compute();
-        window.addEventListener("resize", compute);
+    const start = useCallback(() => {
+        if (!enabledRef.current || typeof window === "undefined") return;
 
-        return () => window.removeEventListener("resize", compute);
-    }, [open, triggerRef]);
+        clearTimers();
+        actionRef.current();
+        holdStartedAtRef.current = Date.now();
 
-    return side;
+        timeoutRef.current = window.setTimeout(() => {
+            let fast = false;
+
+            const tick = () => {
+                if (!enabledRef.current) {
+                    clearTimers();
+                    return;
+                }
+
+                actionRef.current();
+
+                const elapsed = Date.now() - holdStartedAtRef.current;
+                if (!fast && elapsed >= HOLD_ACCEL_AFTER_MS) {
+                    fast = true;
+                    if (intervalRef.current != null) {
+                        window.clearInterval(intervalRef.current);
+                    }
+                    intervalRef.current = window.setInterval(tick, HOLD_REPEAT_FAST_MS);
+                }
+            };
+
+            intervalRef.current = window.setInterval(tick, HOLD_REPEAT_START_MS);
+        }, HOLD_INITIAL_DELAY_MS);
+    }, [clearTimers]);
+
+    const stop = useCallback(() => {
+        clearTimers();
+    }, [clearTimers]);
+
+    return { start, stop };
 }
 
 function IconAa() {
     return <span style={{ fontWeight: 860, letterSpacing: "-0.06em" }}>Aa</span>;
 }
 
-function IconX() {
-    return <span style={{ fontSize: 14, lineHeight: 1 }}>✕</span>;
+function IconClose() {
+    return <span style={{ fontSize: 11, lineHeight: 1 }}>✕</span>;
 }
 
-function IconCheck(props: { on: boolean }) {
+function IconChevron(props: { dir: "left" | "right" }) {
+    return <span aria-hidden>{props.dir === "left" ? "‹" : "›"}</span>;
+}
+
+function ArrowButton(props: {
+    title: string;
+    dir: "left" | "right";
+    disabled?: boolean;
+    onTrigger: () => void;
+}) {
+    const { title, dir, disabled = false, onTrigger } = props;
+    const hold = useHoldToRepeat(onTrigger, !disabled);
+
     return (
-         <span
-              aria-hidden
-              style={{
-                  width: 14,
-                  height: 14,
-                  borderRadius: 999,
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  fontSize: 10,
-                  lineHeight: 1,
-                  border: "1px solid color-mix(in oklab, var(--hairline) 88%, transparent)",
-                  background: props.on
-                       ? "color-mix(in oklab, var(--focus) 92%, transparent)"
-                       : "transparent",
-                  color: props.on ? "#fff" : "transparent",
-                  flexShrink: 0,
-              }}
-         >
-            ✓
-        </span>
+        <button
+            type="button"
+            style={{ ...sx.arrowBtn, ...(disabled ? sx.arrowBtnDisabled : null) }}
+            onClick={(e) => {
+                e.preventDefault();
+            }}
+            onPointerDown={(e) => {
+                if (disabled) return;
+                if (e.button !== 0) return;
+                e.preventDefault();
+                hold.start();
+            }}
+            onPointerUp={hold.stop}
+            onPointerCancel={hold.stop}
+            onPointerLeave={hold.stop}
+            onBlur={hold.stop}
+            onContextMenu={(e) => e.preventDefault()}
+            disabled={disabled}
+            aria-label={title}
+            title={title}
+        >
+            <IconChevron dir={dir} />
+        </button>
     );
 }
 
-const FONT_PREVIEW_TEXTS = [
-    "Blessed are the pure in heart.",
-    "The earth was without form, and void.",
-    "The Lord is my shepherd; I shall not want.",
-] as const;
+function ControlCard(props: {
+    title: string;
+    value: string;
+    disabled?: boolean;
+    onPrev: () => void;
+    onNext: () => void;
+}) {
+    const { title, value, disabled, onPrev, onNext } = props;
+
+    return (
+        <div style={{ ...sx.controlCard, ...(disabled ? sx.controlCardDisabled : null) }}>
+            <div style={sx.controlMain}>
+                <ArrowButton
+                    title={`Previous ${title.toLowerCase()}`}
+                    dir="left"
+                    disabled={disabled}
+                    onTrigger={onPrev}
+                />
+
+                <div style={sx.controlCenter}>
+                    <div style={sx.controlKicker}>{title}</div>
+                    <div style={sx.controlValue} title={value}>
+                        {value}
+                    </div>
+                </div>
+
+                <ArrowButton
+                    title={`Next ${title.toLowerCase()}`}
+                    dir="right"
+                    disabled={disabled}
+                    onTrigger={onNext}
+                />
+            </div>
+        </div>
+    );
+}
 
 export function ReaderTypographyControl() {
     const storageLoadedRef = useRef<ReaderTypography | null>(null);
@@ -23766,65 +24478,87 @@ export function ReaderTypographyControl() {
     const stored = storageLoadedRef.current;
     const [enabled, setEnabled] = useState<boolean>(!!stored);
     const [t, setT] = useState<ReaderTypography>(
-         normalizeLockedTypography(stored ?? DEFAULT_TYPOGRAPHY),
+        normalizeLockedTypography(stored ?? DEFAULT_TYPOGRAPHY),
     );
     const [open, setOpen] = useState(false);
+    const [panelLayout, setPanelLayout] = useState<PanelLayout | null>(null);
 
     const rootRef = useRef<HTMLDivElement | null>(null);
     const triggerRef = useRef<HTMLButtonElement | null>(null);
     const panelRef = useRef<HTMLDivElement | null>(null);
-    const firstFontButtonRef = useRef<HTMLButtonElement | null>(null);
 
     const reducedMotion = usePrefersReducedMotion();
     const limits = useMemo(() => typographyLimits(), []);
     const fonts = useMemo(() => fontOptions() as FontOpt[], []);
-    const ids = useMemo(() => fonts.map((f) => f.id) as TypographyFont[], [fonts]);
-
-    const panelSide = useViewportPanelSide(open, triggerRef);
 
     const panelId = useId();
     const labelId = `${panelId}-label`;
     const descId = `${panelId}-desc`;
 
     useInjectOnceStyle(
-         `
-@keyframes bpTypoPop {
-  from { opacity: 0; transform: translateY(6px) scale(0.985); }
-  to   { opacity: 1; transform: translateY(0px) scale(1); }
+        `
+@keyframes bpTypoPopoverIn {
+  from { opacity: 0; transform: translateY(4px) scale(0.992); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+#${PORTAL_PANEL_ID}::-webkit-scrollbar { width: 8px; height: 8px; }
+#${PORTAL_PANEL_ID}::-webkit-scrollbar-track { background: transparent; }
+#${PORTAL_PANEL_ID}::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--hairline) 90%, transparent);
+  border-radius: 999px;
 }
 `,
-         "data-bp-typo-pop",
+        STYLE_ATTR,
     );
 
     const current = useMemo(() => normalizeLockedTypography(t), [t]);
 
     const currentFontIndex = useMemo(() => {
-        if (!fonts.length) return 0;
         const idx = fonts.findIndex((f) => f.id === current.font);
         return idx >= 0 ? idx : 0;
     }, [fonts, current.font]);
 
-    const currentFont = useMemo(() => {
-        if (!fonts.length) return null;
-        return fonts[currentFontIndex] ?? null;
-    }, [fonts, currentFontIndex]);
+    const currentFont = useMemo(() => fonts[currentFontIndex] ?? null, [fonts, currentFontIndex]);
+    const fontIds = useMemo(() => fonts.map((f) => f.id) as TypographyFont[], [fonts]);
 
-    const currentFontCss = useMemo(() => fontFamilyForOpt(currentFont), [currentFont]);
+    const sizeValues = useMemo(() => {
+        const out: number[] = [];
+        for (let n = limits.sizePx.lo; n <= limits.sizePx.hi; n += limits.sizePx.step) {
+            out.push(n);
+        }
+        return out;
+    }, [limits.sizePx.hi, limits.sizePx.lo, limits.sizePx.step]);
+
+    const weightValues = useMemo(() => {
+        const out: number[] = [];
+        for (let n = limits.weight.lo; n <= limits.weight.hi; n += limits.weight.step) {
+            out.push(n);
+        }
+        return out;
+    }, [limits.weight.hi, limits.weight.lo, limits.weight.step]);
 
     const summary = useMemo(() => {
         const font = currentFont?.label ?? String(current.font);
-        const size = `${Math.round(current.sizePx)}px`;
-        const weight = `${Math.round(current.weight)}`;
-        return `${font} · ${size} · ${weight}`;
+        return `${font} · ${Math.round(current.sizePx)}px · ${Math.round(current.weight)}`;
     }, [current, currentFont]);
+
+    const triggerLabel = enabled ? summary : "Typography off";
 
     const setPatch = useCallback((patch: Partial<ReaderTypography>) => {
         setEnabled(true);
         setT((prev) => normalizeLockedTypography(updateTypography(prev, patch)));
     }, []);
 
+    const recomputeLayout = useCallback(() => {
+        if (!open) return;
+        const trigger = triggerRef.current;
+        if (!trigger) return;
+        setPanelLayout(computePanelLayout(trigger.getBoundingClientRect(), PANEL_W));
+    }, [open]);
+
     const closePanel = useCallback(() => {
         setOpen(false);
+        setPanelLayout(null);
         queueMicrotask(() => {
             triggerRef.current?.focus();
         });
@@ -23834,50 +24568,42 @@ export function ReaderTypographyControl() {
         setEnabled(false);
         setT(normalizeLockedTypography(DEFAULT_TYPOGRAPHY));
         setOpen(false);
+        setPanelLayout(null);
         queueMicrotask(() => {
             triggerRef.current?.focus();
         });
     }, []);
 
     const cycleFont = useCallback(
-         (dir: -1 | 1) => {
-             if (!ids.length) return;
-             setPatch({ font: nextOf(ids, current.font, dir) });
-         },
-         [ids, current.font, setPatch],
+        (dir: -1 | 1) => {
+            if (!fontIds.length) return;
+            setPatch({ font: nextOf(fontIds, current.font, dir) });
+        },
+        [current.font, fontIds, setPatch],
     );
 
-    const applySizeDelta = useCallback(
-         (delta: number) => {
-             const step = limits.sizePx.step;
-             const next = clampNum(
-                  roundToStep(current.sizePx + delta * step, step),
-                  limits.sizePx.lo,
-                  limits.sizePx.hi,
-             );
-             setPatch({ sizePx: Math.round(next) });
-         },
-         [current.sizePx, limits.sizePx.hi, limits.sizePx.lo, limits.sizePx.step, setPatch],
+    const cycleSize = useCallback(
+        (dir: -1 | 1) => {
+            if (!sizeValues.length) return;
+            const cur = Math.round(current.sizePx);
+            setPatch({ sizePx: nextOf(sizeValues, cur, dir) });
+        },
+        [current.sizePx, setPatch, sizeValues],
     );
 
-    const applyWeightDelta = useCallback(
-         (delta: number) => {
-             const step = limits.weight.step;
-             const next = clampNum(
-                  roundToStep(current.weight + delta * step, step),
-                  limits.weight.lo,
-                  limits.weight.hi,
-             );
-             setPatch({ weight: Math.round(next) });
-         },
-         [current.weight, limits.weight.hi, limits.weight.lo, limits.weight.step, setPatch],
+    const cycleWeight = useCallback(
+        (dir: -1 | 1) => {
+            if (!weightValues.length) return;
+            const cur = Math.round(current.weight);
+            setPatch({ weight: nextOf(weightValues, cur, dir) });
+        },
+        [current.weight, setPatch, weightValues],
     );
 
     useEffect(() => {
         const locked = normalizeLockedTypography(current);
 
         if (!enabled) {
-            applyReaderTypography(null);
             clearReaderTypography();
             return;
         }
@@ -23886,47 +24612,71 @@ export function ReaderTypographyControl() {
         saveReaderTypography(locked);
 
         if (
-             locked.measurePx !== current.measurePx ||
-             locked.leading !== current.leading ||
-             locked.sizePx !== current.sizePx ||
-             locked.weight !== current.weight ||
-             locked.font !== current.font
+            locked.measurePx !== current.measurePx ||
+            locked.leading !== current.leading ||
+            locked.sizePx !== current.sizePx ||
+            locked.weight !== current.weight ||
+            locked.font !== current.font
         ) {
             setT(locked);
         }
     }, [enabled, current]);
 
+    useLayoutEffect(() => {
+        if (!open) return;
+        recomputeLayout();
+    }, [open, recomputeLayout]);
+
     useEffect(() => {
         if (!open) return;
-        queueMicrotask(() => {
-            if (firstFontButtonRef.current) {
-                firstFontButtonRef.current.focus();
-                return;
-            }
+
+        const id = requestAnimationFrame(() => {
+            recomputeLayout();
             panelRef.current?.focus();
         });
-    }, [open]);
+
+        return () => cancelAnimationFrame(id);
+    }, [open, recomputeLayout]);
+
+    useEffect(() => {
+        if (!open) return;
+
+        const update = () => recomputeLayout();
+        const vv = typeof window !== "undefined" ? window.visualViewport : null;
+
+        window.addEventListener("resize", update, { passive: true });
+        window.addEventListener("scroll", update, true);
+        vv?.addEventListener("resize", update, { passive: true });
+        vv?.addEventListener("scroll", update, { passive: true });
+
+        return () => {
+            window.removeEventListener("resize", update);
+            window.removeEventListener("scroll", update, true);
+            vv?.removeEventListener("resize", update);
+            vv?.removeEventListener("scroll", update);
+        };
+    }, [open, recomputeLayout]);
 
     useEffect(() => {
         if (!open) return;
 
         const onPointerDownCapture = (e: PointerEvent) => {
             const root = rootRef.current;
-            if (!root) return;
-
+            const panel = panelRef.current;
             const target = e.target as Node | null;
             const path = eventComposedPath(e);
-            const inside =
-                 !!(target && root.contains(target)) || pathContainsNode(path, root);
 
-            if (!inside) closePanel();
+            const insideRoot =
+                !!(target && root && root.contains(target)) || pathContainsNode(path, root);
+            const insidePanel =
+                !!(target && panel && panel.contains(target)) || pathContainsNode(path, panel);
+
+            if (!insideRoot && !insidePanel) closePanel();
         };
 
         document.addEventListener("pointerdown", onPointerDownCapture, { capture: true });
         return () => {
-            document.removeEventListener("pointerdown", onPointerDownCapture, {
-                capture: true,
-            });
+            document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
         };
     }, [open, closePanel]);
 
@@ -23942,20 +24692,6 @@ export function ReaderTypographyControl() {
 
             if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-            const activeEl = document.activeElement as Element | null;
-
-            if (isRangeInput(activeEl)) {
-                if (e.key === "Home" || e.key === "End") {
-                    const min = Number(activeEl.min);
-                    const max = Number(activeEl.max);
-                    activeEl.value = String(e.key === "Home" ? min : max);
-                    activeEl.dispatchEvent(new Event("input", { bubbles: true }));
-                    activeEl.dispatchEvent(new Event("change", { bubbles: true }));
-                    e.preventDefault();
-                }
-                return;
-            }
-
             switch (e.key) {
                 case "ArrowLeft":
                     cycleFont(-1);
@@ -23966,20 +24702,20 @@ export function ReaderTypographyControl() {
                     e.preventDefault();
                     return;
                 case "[":
-                    applySizeDelta(-1);
+                    cycleSize(-1);
                     e.preventDefault();
                     return;
                 case "]":
-                    applySizeDelta(1);
+                    cycleSize(1);
                     e.preventDefault();
                     return;
                 case "-":
-                    applyWeightDelta(-1);
+                    cycleWeight(-1);
                     e.preventDefault();
                     return;
                 case "=":
                 case "+":
-                    applyWeightDelta(1);
+                    cycleWeight(1);
                     e.preventDefault();
                     return;
                 default:
@@ -23989,372 +24725,157 @@ export function ReaderTypographyControl() {
 
         window.addEventListener("keydown", onKeyCapture, { capture: true });
         return () => window.removeEventListener("keydown", onKeyCapture, { capture: true });
-    }, [open, closePanel, cycleFont, applySizeDelta, applyWeightDelta]);
+    }, [open, closePanel, cycleFont, cycleSize, cycleWeight]);
 
     const panelStyle = useMemo<React.CSSProperties>(() => {
-        const base: React.CSSProperties = {
-            ...sx.panel,
-            ...(reducedMotion ? sx.panelNoMotion : null),
-        };
-
-        if (panelSide === "bottom-left") {
+        if (!panelLayout) {
             return {
-                ...base,
-                left: 0,
-                right: "auto",
-                transformOrigin: "top left",
+                ...sx.panel,
+                opacity: 0,
+                pointerEvents: "none",
             };
         }
 
-        return {
-            ...base,
-            right: 0,
-            left: "auto",
-            transformOrigin: "top right",
-        };
-    }, [panelSide, reducedMotion]);
+        const originX = panelLayout.placeX === "right" ? "right" : "left";
+        const originY = panelLayout.placeY === "bottom" ? "top" : "bottom";
 
-    const sliderStyle = enabled ? sx.range : { ...sx.range, ...sx.rangeDisabled };
+        return {
+            ...sx.panel,
+            ...(reducedMotion ? sx.panelNoMotion : null),
+            left: panelLayout.left,
+            top: panelLayout.top,
+            width: panelLayout.width,
+            height: panelLayout.height,
+            maxHeight: panelLayout.height,
+            transformOrigin: `${originY} ${originX}`,
+        };
+    }, [panelLayout, reducedMotion]);
+
+    const panelNode =
+        open && typeof document !== "undefined"
+            ? createPortal(
+                <div
+                    id={PORTAL_PANEL_ID}
+                    ref={panelRef}
+                    role="dialog"
+                    aria-modal="false"
+                    aria-labelledby={labelId}
+                    aria-describedby={descId}
+                    tabIndex={-1}
+                    style={panelStyle}
+                >
+                    <div style={sx.header}>
+                        <div style={sx.headerText}>
+                            <div id={labelId} style={sx.title}>
+                                Typography
+                            </div>
+                            <div id={descId} style={sx.subtitle}>
+                                Font, size, weight.
+                            </div>
+                        </div>
+
+                        <div style={sx.headerActions}>
+                            <button
+                                type="button"
+                                style={{
+                                    ...sx.toggleBtn,
+                                    ...(enabled ? sx.toggleBtnOn : sx.toggleBtnOff),
+                                }}
+                                onClick={() => setEnabled((v) => !v)}
+                                aria-pressed={enabled}
+                                title={enabled ? "Typography overrides on" : "Typography overrides off"}
+                            >
+                                {enabled ? "On" : "Off"}
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={closePanel}
+                                style={sx.iconBtn}
+                                aria-label="Close typography settings"
+                                title="Close"
+                            >
+                                <IconClose />
+                            </button>
+                        </div>
+                    </div>
+
+                    <div style={sx.body}>
+                        <div style={sx.stack}>
+                            <ControlCard
+                                title="Font"
+                                value={currentFont?.label ?? String(current.font)}
+                                disabled={!enabled}
+                                onPrev={() => cycleFont(-1)}
+                                onNext={() => cycleFont(1)}
+                            />
+
+                            <ControlCard
+                                title="Size"
+                                value={`${Math.round(current.sizePx)}px`}
+                                disabled={!enabled}
+                                onPrev={() => cycleSize(-1)}
+                                onNext={() => cycleSize(1)}
+                            />
+
+                            <ControlCard
+                                title="Weight"
+                                value={`${Math.round(current.weight)}`}
+                                disabled={!enabled}
+                                onPrev={() => cycleWeight(-1)}
+                                onNext={() => cycleWeight(1)}
+                            />
+                        </div>
+                    </div>
+
+                    <div style={sx.footer}>
+                        <button type="button" style={sx.resetBtn} onClick={resetToDefaults}>
+                            Reset
+                        </button>
+                        <button type="button" style={sx.doneBtn} onClick={closePanel}>
+                            Done
+                        </button>
+                    </div>
+                </div>,
+                document.body,
+            )
+            : null;
 
     return (
-         <div ref={rootRef} style={sx.root}>
-             <button
-                  ref={triggerRef}
-                  type="button"
-                  style={{
-                      ...sx.trigger,
-                      ...(open ? sx.triggerOpen : null),
-                      ...(enabled ? null : sx.triggerDisabled),
-                  }}
-                  onClick={() => setOpen((v) => !v)}
-                  aria-haspopup="dialog"
-                  aria-expanded={open}
-                  aria-controls={panelId}
-                  aria-label="Typography settings"
-                  title={`Typography (${summary})`}
-             >
+        <div ref={rootRef} style={sx.root}>
+            <button
+                ref={triggerRef}
+                type="button"
+                style={{
+                    ...sx.trigger,
+                    ...(open ? sx.triggerOpen : null),
+                    ...(enabled ? sx.triggerEnabled : sx.triggerDisabled),
+                }}
+                onClick={() => {
+                    setOpen((prev) => {
+                        const next = !prev;
+                        if (!next) setPanelLayout(null);
+                        return next;
+                    });
+                }}
+                aria-haspopup="dialog"
+                aria-expanded={open}
+                aria-controls={panelId}
+                aria-label="Typography settings"
+                title={triggerLabel}
+            >
                 <span style={sx.triggerGlyph}>
                     <IconAa />
                 </span>
-                 <span style={{ ...sx.dot, ...(enabled ? sx.dotOn : sx.dotOff) }} aria-hidden />
-             </button>
+                <span style={sx.triggerMeta}>
+                    <span style={sx.triggerMetaTop}>Type</span>
+                    <span style={sx.triggerMetaBottom}>{enabled ? "On" : "Off"}</span>
+                </span>
+                <span style={{ ...sx.dot, ...(enabled ? sx.dotOn : sx.dotOff) }} aria-hidden />
+            </button>
 
-             {open ? (
-                  <div
-                       id={panelId}
-                       ref={panelRef}
-                       role="dialog"
-                       aria-modal="false"
-                       aria-labelledby={labelId}
-                       aria-describedby={descId}
-                       tabIndex={-1}
-                       style={panelStyle}
-                  >
-                      <div style={sx.header}>
-                          <div style={sx.hTitleWrap}>
-                              <div id={labelId} style={sx.hTitle}>
-                                  Typography
-                              </div>
-                              <div id={descId} style={sx.hSub}>
-                                  Reader overrides for font, size, and weight.
-                              </div>
-                          </div>
-
-                          <div style={sx.hRight}>
-                              <label style={sx.switchLabel} title={enabled ? "Overrides on" : "Overrides off"}>
-                                  <input
-                                       type="checkbox"
-                                       checked={enabled}
-                                       onChange={() => setEnabled((v) => !v)}
-                                       style={sx.switchInput}
-                                       aria-label={
-                                           enabled
-                                                ? "Turn typography overrides off"
-                                                : "Turn typography overrides on"
-                                       }
-                                  />
-                                  <span
-                                       style={{
-                                           ...sx.switchTrack,
-                                           background: enabled
-                                                ? "color-mix(in oklab, var(--focus) 86%, transparent)"
-                                                : "color-mix(in oklab, var(--panel) 92%, transparent)",
-                                       }}
-                                       aria-hidden
-                                  />
-                                  <span
-                                       style={{
-                                           ...sx.switchThumb,
-                                           transform: enabled ? "translateX(12px)" : "translateX(0px)",
-                                       }}
-                                       aria-hidden
-                                  />
-                              </label>
-
-                              <button
-                                   type="button"
-                                   onClick={closePanel}
-                                   style={sx.iconBtn}
-                                   aria-label="Close"
-                              >
-                                  <IconX />
-                              </button>
-                          </div>
-                      </div>
-
-                      <div style={sx.summaryRow}>
-                          <div style={sx.summaryText} title={summary}>
-                              {summary}
-                          </div>
-                          <div style={sx.lockPill} title="Width and leading are locked">
-                              Locked layout
-                          </div>
-                      </div>
-
-                      <div
-                           style={{
-                               ...sx.sampleCard,
-                               ...(enabled ? null : sx.sampleCardDisabled),
-                           }}
-                           aria-hidden={!enabled}
-                      >
-                          <div style={sx.sampleMetaRow}>
-                              <span style={sx.sampleMetaLabel}>Live preview</span>
-                              <span style={sx.sampleMetaValue}>
-                                {Math.round(current.sizePx)}px · {Math.round(current.weight)}
-                            </span>
-                          </div>
-
-                          <div
-                               style={{
-                                   ...sx.sampleVerse,
-                                   fontFamily: currentFontCss,
-                                   fontSize: current.sizePx,
-                                   fontWeight: current.weight,
-                                   lineHeight: DEFAULT_TYPOGRAPHY.leading,
-                                   maxWidth: DEFAULT_TYPOGRAPHY.measurePx,
-                               }}
-                          >
-                              {SAMPLE_TEXT}
-                          </div>
-                      </div>
-
-                      {!enabled ? (
-                           <div style={sx.offRow}>
-                               <span style={sx.offPill}>Off</span>
-                               <span style={sx.offText}>Enable to apply reader typography overrides.</span>
-                           </div>
-                      ) : null}
-
-                      <div style={sx.body}>
-                          <div style={sx.sectionHead}>
-                              <div style={sx.sectionTitle}>Fonts</div>
-                              <div style={sx.sectionHint}>← → to cycle</div>
-                          </div>
-
-                          <div style={sx.fontNavRow}>
-                              <button
-                                   type="button"
-                                   style={{ ...sx.chevBtn, ...(enabled ? null : sx.chevBtnDisabled) }}
-                                   onClick={() => cycleFont(-1)}
-                                   disabled={!enabled || fonts.length === 0}
-                                   aria-label="Previous font"
-                                   title="Previous font"
-                              >
-                                  ‹
-                              </button>
-
-                              <div style={sx.fontIndexPill}>
-                                  {fonts.length ? `${currentFontIndex + 1}/${fonts.length}` : "0/0"}
-                              </div>
-
-                              <button
-                                   type="button"
-                                   style={{ ...sx.chevBtn, ...(enabled ? null : sx.chevBtnDisabled) }}
-                                   onClick={() => cycleFont(1)}
-                                   disabled={!enabled || fonts.length === 0}
-                                   aria-label="Next font"
-                                   title="Next font"
-                              >
-                                  ›
-                              </button>
-                          </div>
-
-                          <div style={sx.fontGrid} role="list" aria-label="Font choices">
-                              {fonts.map((font, index) => {
-                                  const selected = font.id === current.font;
-                                  const previewFamily = fontFamilyForOpt(font);
-                                  const previewText =
-                                       font.previewText?.trim() ||
-                                       FONT_PREVIEW_TEXTS[index % FONT_PREVIEW_TEXTS.length];
-
-                                  return (
-                                       <button
-                                            key={font.id}
-                                            ref={index === 0 ? firstFontButtonRef : undefined}
-                                            type="button"
-                                            role="listitem"
-                                            disabled={!enabled}
-                                            aria-pressed={selected}
-                                            onClick={() => setPatch({ font: font.id })}
-                                            title={font.label}
-                                            style={{
-                                                ...sx.fontCard,
-                                                ...(selected ? sx.fontCardSelected : null),
-                                                ...(enabled ? null : sx.fontCardDisabled),
-                                            }}
-                                       >
-                                           <div style={sx.fontCardTop}>
-                                               <IconCheck on={selected} />
-                                               <span style={sx.fontCardName}>{font.label}</span>
-                                           </div>
-
-                                           <div
-                                                style={{
-                                                    ...sx.fontCardSample,
-                                                    fontFamily: previewFamily,
-                                                    fontWeight: current.weight,
-                                                }}
-                                           >
-                                               {previewText}
-                                           </div>
-                                       </button>
-                                  );
-                              })}
-                          </div>
-
-                          <div style={sx.block}>
-                              <div style={sx.blockTop}>
-                                  <span style={sx.blockLabel}>Size</span>
-                                  <div style={sx.blockTopRight}>
-                                      <button
-                                           type="button"
-                                           style={{
-                                               ...sx.miniStepBtn,
-                                               ...(enabled ? null : sx.miniStepBtnDisabled),
-                                           }}
-                                           onClick={() => applySizeDelta(-1)}
-                                           disabled={!enabled}
-                                           aria-label="Decrease size"
-                                      >
-                                          −
-                                      </button>
-                                      <span style={sx.blockValue}>{Math.round(current.sizePx)}px</span>
-                                      <button
-                                           type="button"
-                                           style={{
-                                               ...sx.miniStepBtn,
-                                               ...(enabled ? null : sx.miniStepBtnDisabled),
-                                           }}
-                                           onClick={() => applySizeDelta(1)}
-                                           disabled={!enabled}
-                                           aria-label="Increase size"
-                                      >
-                                          +
-                                      </button>
-                                  </div>
-                              </div>
-
-                              <input
-                                   type="range"
-                                   min={limits.sizePx.lo}
-                                   max={limits.sizePx.hi}
-                                   step={limits.sizePx.step}
-                                   value={current.sizePx}
-                                   onChange={(e) =>
-                                        setPatch({
-                                            sizePx: Math.round(
-                                                 clampNum(
-                                                      Number(e.target.value),
-                                                      limits.sizePx.lo,
-                                                      limits.sizePx.hi,
-                                                 ),
-                                            ),
-                                        })
-                                   }
-                                   style={sliderStyle}
-                                   disabled={!enabled}
-                                   aria-label="Scripture font size"
-                              />
-
-                              <div style={sx.keyHint}>Keys: [ and ]</div>
-                          </div>
-
-                          <div style={sx.block}>
-                              <div style={sx.blockTop}>
-                                  <span style={sx.blockLabel}>Weight</span>
-                                  <div style={sx.blockTopRight}>
-                                      <button
-                                           type="button"
-                                           style={{
-                                               ...sx.miniStepBtn,
-                                               ...(enabled ? null : sx.miniStepBtnDisabled),
-                                           }}
-                                           onClick={() => applyWeightDelta(-1)}
-                                           disabled={!enabled}
-                                           aria-label="Decrease weight"
-                                      >
-                                          −
-                                      </button>
-                                      <span style={sx.blockValue}>{Math.round(current.weight)}</span>
-                                      <button
-                                           type="button"
-                                           style={{
-                                               ...sx.miniStepBtn,
-                                               ...(enabled ? null : sx.miniStepBtnDisabled),
-                                           }}
-                                           onClick={() => applyWeightDelta(1)}
-                                           disabled={!enabled}
-                                           aria-label="Increase weight"
-                                      >
-                                          +
-                                      </button>
-                                  </div>
-                              </div>
-
-                              <input
-                                   type="range"
-                                   min={limits.weight.lo}
-                                   max={limits.weight.hi}
-                                   step={limits.weight.step}
-                                   value={current.weight}
-                                   onChange={(e) =>
-                                        setPatch({
-                                            weight: Math.round(
-                                                 clampNum(
-                                                      Number(e.target.value),
-                                                      limits.weight.lo,
-                                                      limits.weight.hi,
-                                                 ),
-                                            ),
-                                        })
-                                   }
-                                   style={sliderStyle}
-                                   disabled={!enabled}
-                                   aria-label="Scripture font weight"
-                              />
-
-                              <div style={sx.keyHint}>Keys: - and +</div>
-                          </div>
-                      </div>
-
-                      <div style={sx.footer}>
-                          <button type="button" style={sx.doneBtn} onClick={closePanel}>
-                              Done
-                          </button>
-
-                          <button
-                               type="button"
-                               style={sx.resetBtn}
-                               onClick={resetToDefaults}
-                               title="Reset and turn off overrides"
-                          >
-                              Reset
-                          </button>
-                      </div>
-                  </div>
-             ) : null}
-         </div>
+            {panelNode}
+        </div>
     );
 }
 
@@ -24366,73 +24887,104 @@ const sx: Record<string, React.CSSProperties> = {
     },
 
     trigger: {
-        width: 32,
-        height: 32,
-        borderRadius: 12,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
+        height: 30,
+        minWidth: 76,
+        borderRadius: 11,
+        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 97%, transparent), color-mix(in oklab, var(--panel) 90%, var(--bg)))",
         display: "inline-flex",
         alignItems: "center",
-        justifyContent: "center",
+        gap: 8,
+        padding: "0 10px",
         cursor: "pointer",
         userSelect: "none",
-        boxShadow: "0 10px 26px rgba(0,0,0,0.075)",
+        boxShadow:
+            "0 1px 0 rgba(255,255,255,0.28) inset, 0 10px 24px rgba(0,0,0,0.075)",
         transition:
-             "transform 200ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 200ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
+            "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 140ms ease, background 140ms ease, opacity 140ms ease",
         position: "relative",
         outline: "none",
         WebkitTapHighlightColor: "transparent",
     },
     triggerOpen: {
-        transform: "translateY(-2px) scale(1.03)",
-        borderColor: "color-mix(in oklab, var(--focus) 70%, var(--hairline))",
-        boxShadow: "0 22px 62px rgba(0,0,0,0.18)",
-        background: "color-mix(in oklab, var(--panel) 86%, transparent)",
+        transform: "translateY(-1px)",
+        borderColor: "color-mix(in oklab, var(--focus) 58%, var(--hairline))",
+        boxShadow:
+            "0 1px 0 rgba(255,255,255,0.32) inset, 0 18px 34px rgba(0,0,0,0.14)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 99%, transparent), color-mix(in oklab, var(--panel) 92%, var(--bg)))",
+    },
+    triggerEnabled: {
+        opacity: 1,
     },
     triggerDisabled: {
-        opacity: 0.92,
+        opacity: 0.95,
     },
     triggerGlyph: {
-        fontSize: 13.5,
+        width: 16,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontSize: 13,
         fontWeight: 860,
         letterSpacing: "-0.05em",
+        flexShrink: 0,
+    },
+    triggerMeta: {
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "flex-start",
+        minWidth: 0,
+        lineHeight: 1.02,
+        gap: 1,
+    },
+    triggerMetaTop: {
+        fontSize: 9.4,
+        fontWeight: 760,
+        color: "var(--muted)",
+        letterSpacing: "-0.01em",
+    },
+    triggerMetaBottom: {
+        fontSize: 10.8,
+        fontWeight: 860,
+        letterSpacing: "-0.01em",
+        color: "var(--fg)",
     },
 
     dot: {
-        position: "absolute",
-        right: 6,
-        bottom: 6,
+        marginLeft: "auto",
         width: 7,
         height: 7,
         borderRadius: 999,
-        border: "1px solid color-mix(in oklab, var(--hairline) 75%, transparent)",
+        border: "1px solid color-mix(in oklab, var(--hairline) 70%, transparent)",
+        flexShrink: 0,
     },
     dotOn: {
-        background: "var(--focus)",
-        boxShadow: "0 0 0 4px color-mix(in oklab, var(--focus) 14%, transparent)",
+        background: "#22c55e",
+        boxShadow: "0 0 0 4px rgba(34,197,94,0.14)",
     },
     dotOff: {
         background: "color-mix(in oklab, var(--muted) 40%, transparent)",
     },
 
     panel: {
-        position: "absolute",
-        top: 32 + PANEL_GAP,
-        width: PANEL_W,
-        maxWidth: "min(360px, calc(100vw - 18px))",
-        borderRadius: 18,
+        position: "fixed",
+        zIndex: 99999,
+        borderRadius: 16,
         border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-        background: "color-mix(in oklab, var(--bg) 96%, var(--panel))",
-        boxShadow: "0 28px 80px rgba(0,0,0,0.22)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--bg) 99%, var(--panel)), color-mix(in oklab, var(--bg) 96%, var(--panel)))",
+        boxShadow:
+            "0 1px 0 rgba(255,255,255,0.26) inset, 0 28px 68px rgba(0,0,0,0.22)",
         overflow: "hidden",
-        zIndex: 9999,
-        padding: 10,
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
-        animation: "bpTypoPop 170ms cubic-bezier(0.23, 1, 0.32, 1) both",
-        backdropFilter: "blur(18px)",
-        WebkitBackdropFilter: "blur(18px)",
+        padding: 9,
+        display: "grid",
+        gridTemplateRows: "auto minmax(0, 1fr) auto",
+        gap: 7,
+        animation: "bpTypoPopoverIn 120ms cubic-bezier(0.23, 1, 0.32, 1) both",
+        backdropFilter: "blur(16px)",
+        WebkitBackdropFilter: "blur(16px)",
     },
     panelNoMotion: {
         animation: "none",
@@ -24442,399 +24994,208 @@ const sx: Record<string, React.CSSProperties> = {
         display: "flex",
         alignItems: "flex-start",
         justifyContent: "space-between",
-        gap: 10,
-        padding: "1px 1px 0",
+        gap: 8,
+        minHeight: 0,
     },
-    hTitleWrap: {
+    headerText: {
         display: "flex",
         flexDirection: "column",
-        gap: 2,
+        gap: 1,
         minWidth: 0,
     },
-    hTitle: {
-        fontSize: 13,
+    title: {
+        fontSize: 12.6,
         fontWeight: 860,
         letterSpacing: "-0.02em",
+        color: "var(--fg)",
     },
-    hSub: {
-        fontSize: 10.8,
+    subtitle: {
+        fontSize: 9.8,
         color: "var(--muted)",
-        lineHeight: 1.3,
+        lineHeight: 1.22,
+        maxWidth: 152,
     },
-    hRight: {
+    headerActions: {
         display: "flex",
         alignItems: "center",
-        gap: 6,
+        gap: 5,
         flexShrink: 0,
     },
 
-    summaryRow: {
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-        justifyContent: "space-between",
-        minWidth: 0,
-    },
-    summaryText: {
-        minWidth: 0,
-        fontSize: 10.8,
-        color: "var(--muted)",
-        letterSpacing: "-0.01em",
-        overflow: "hidden",
-        textOverflow: "ellipsis",
-        whiteSpace: "nowrap",
-    },
-    lockPill: {
-        flexShrink: 0,
-        fontSize: 10.1,
-        fontWeight: 780,
-        color: "var(--muted)",
-        padding: "4px 8px",
+    toggleBtn: {
+        height: 26,
+        minWidth: 44,
         borderRadius: 999,
-        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
+        border: "1px solid color-mix(in oklab, var(--hairline) 94%, transparent)",
+        padding: "0 9px",
+        fontSize: 10.4,
+        fontWeight: 860,
+        cursor: "pointer",
+        WebkitTapHighlightColor: "transparent",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.18) inset",
+        transition:
+            "background 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease, transform 140ms ease",
+    },
+    toggleBtnOn: {
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--fg) 100%, white 0%), color-mix(in oklab, var(--fg) 90%, black 10%))",
+        borderColor: "color-mix(in oklab, var(--fg) 88%, black 12%)",
+        color: "var(--bg)",
+        boxShadow: "0 10px 18px rgba(0,0,0,0.16)",
+    },
+    toggleBtnOff: {
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 98%, transparent), color-mix(in oklab, var(--panel) 92%, var(--bg)))",
+        borderColor: "color-mix(in oklab, var(--hairline) 94%, transparent)",
+        color: "var(--muted)",
     },
 
     iconBtn: {
-        width: 28,
-        height: 28,
+        width: 26,
+        height: 26,
         borderRadius: 999,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 86%, transparent)",
-        color: "var(--muted)",
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        cursor: "pointer",
-        transition:
-             "transform 140ms cubic-bezier(0.23, 1, 0.32, 1), background 140ms ease, border-color 140ms ease",
-        WebkitTapHighlightColor: "transparent",
-        userSelect: "none",
-    },
-
-    switchLabel: {
-        position: "relative",
-        width: 38,
-        height: 24,
-        borderRadius: 999,
-        border: "1px solid var(--hairline)",
-        background: "transparent",
-        cursor: "pointer",
-        padding: 0,
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        overflow: "hidden",
-        userSelect: "none",
-        WebkitTapHighlightColor: "transparent",
-    },
-    switchInput: {
-        position: "absolute",
-        inset: 0,
-        opacity: 0,
-        cursor: "pointer",
-    },
-    switchTrack: {
-        position: "absolute",
-        inset: 0,
-        borderRadius: 999,
-        transition: "background 180ms ease",
-    },
-    switchThumb: {
-        position: "absolute",
-        top: 3,
-        left: 3,
-        width: 18,
-        height: 18,
-        borderRadius: 999,
-        background: "var(--bg)",
-        border: "1px solid color-mix(in oklab, var(--hairline) 70%, transparent)",
-        boxShadow: "0 6px 14px rgba(0,0,0,0.16)",
-        transition: "transform 180ms cubic-bezier(0.23, 1, 0.32, 1)",
-    },
-
-    sampleCard: {
-        borderRadius: 14,
-        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+        border: "1px solid color-mix(in oklab, var(--hairline) 96%, transparent)",
         background:
-             "linear-gradient(180deg, color-mix(in oklab, var(--panel) 96%, transparent), color-mix(in oklab, var(--bg) 94%, var(--panel)))",
-        padding: 10,
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
-    },
-    sampleCardDisabled: {
-        opacity: 0.66,
-    },
-    sampleMetaRow: {
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: 8,
-    },
-    sampleMetaLabel: {
-        fontSize: 10.8,
-        color: "var(--muted)",
-        fontWeight: 740,
-    },
-    sampleMetaValue: {
-        fontSize: 10.8,
-        color: "var(--muted)",
-        fontVariantNumeric: "tabular-nums",
-    },
-    sampleVerse: {
+            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 99%, transparent), color-mix(in oklab, var(--panel) 92%, var(--bg)))",
         color: "var(--fg)",
-        letterSpacing: "-0.01em",
-        wordBreak: "break-word",
-        textWrap: "pretty",
-    },
-
-    offRow: {
-        display: "flex",
+        display: "inline-flex",
         alignItems: "center",
-        gap: 8,
-        padding: "7px 9px",
-        borderRadius: 11,
-        border: "1px dashed color-mix(in oklab, var(--hairline) 92%, transparent)",
-        background: "color-mix(in oklab, var(--bg) 65%, transparent)",
-    },
-    offPill: {
-        fontSize: 10.2,
-        fontWeight: 820,
-        letterSpacing: "0.06em",
-        textTransform: "uppercase",
-        color: "var(--muted)",
-        padding: "4px 8px",
-        borderRadius: 999,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 90%, transparent)",
-    },
-    offText: {
-        fontSize: 11.2,
-        color: "var(--muted)",
+        justifyContent: "center",
+        cursor: "pointer",
+        WebkitTapHighlightColor: "transparent",
+        userSelect: "none",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.2) inset",
     },
 
     body: {
-        background: "color-mix(in oklab, var(--bg) 86%, var(--panel))",
-        borderRadius: 14,
-        border: "1px solid var(--hairline)",
-        padding: 9,
-        display: "flex",
-        flexDirection: "column",
-        gap: 10,
+        minHeight: 0,
+        overflow: "hidden",
     },
-
-    sectionHead: {
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: 8,
-    },
-    sectionTitle: {
-        fontSize: 11.7,
-        fontWeight: 840,
-        letterSpacing: "-0.01em",
-    },
-    sectionHint: {
-        fontSize: 10.5,
-        color: "var(--muted)",
-    },
-
-    fontNavRow: {
-        display: "flex",
-        alignItems: "center",
-        gap: 6,
-    },
-    fontIndexPill: {
-        flex: 1,
-        height: 30,
-        borderRadius: 10,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 92%, transparent)",
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        fontSize: 11,
-        fontWeight: 760,
-        color: "var(--muted)",
-        fontVariantNumeric: "tabular-nums",
-    },
-
-    chevBtn: {
-        width: 30,
-        height: 30,
-        borderRadius: 10,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--bg) 72%, var(--panel))",
-        cursor: "pointer",
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        userSelect: "none",
-        WebkitTapHighlightColor: "transparent",
-        color: "var(--muted)",
-        fontSize: 18,
-        fontWeight: 760,
-        flexShrink: 0,
-    },
-    chevBtnDisabled: {
-        cursor: "not-allowed",
-        opacity: 0.55,
-    },
-
-    fontGrid: {
+    stack: {
+        height: "100%",
         display: "grid",
         gridTemplateColumns: "1fr",
+        gridAutoRows: "1fr",
         gap: 7,
-        maxHeight: 204,
-        overflowY: "auto",
-        paddingRight: 2,
-    },
-    fontCard: {
-        width: "100%",
-        borderRadius: 12,
-        border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-        background: "color-mix(in oklab, var(--panel) 90%, transparent)",
-        padding: "9px 10px",
-        display: "flex",
-        flexDirection: "column",
-        gap: 7,
-        textAlign: "left",
-        cursor: "pointer",
-        WebkitTapHighlightColor: "transparent",
-    },
-    fontCardSelected: {
-        borderColor: "color-mix(in oklab, var(--focus) 68%, var(--hairline))",
-        boxShadow: "0 0 0 1px color-mix(in oklab, var(--focus) 18%, transparent) inset",
-        background: "color-mix(in oklab, var(--focus) 9%, var(--panel))",
-    },
-    fontCardDisabled: {
-        cursor: "not-allowed",
-        opacity: 0.62,
-    },
-    fontCardTop: {
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-    },
-    fontCardName: {
-        minWidth: 0,
-        fontSize: 11.5,
-        fontWeight: 820,
-        letterSpacing: "-0.01em",
-        overflow: "hidden",
-        textOverflow: "ellipsis",
-        whiteSpace: "nowrap",
-    },
-    fontCardSample: {
-        fontSize: 14.2,
-        lineHeight: 1.25,
-        color: "color-mix(in oklab, var(--fg) 94%, var(--muted) 6%)",
-        letterSpacing: "-0.01em",
-        textWrap: "pretty",
-        overflowWrap: "anywhere",
+        alignItems: "stretch",
     },
 
-    block: {
+    controlCard: {
         display: "flex",
         flexDirection: "column",
-        gap: 6,
+        justifyContent: "center",
+        borderRadius: 12,
+        border: "1px solid color-mix(in oklab, var(--hairline) 96%, transparent)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--bg) 90%, var(--panel)), color-mix(in oklab, var(--bg) 84%, var(--panel)))",
+        padding: 7,
+        minWidth: 0,
+        minHeight: 0,
+        boxShadow: "0 1px 0 rgba(255,255,255,0.12) inset",
     },
-    blockTop: {
-        display: "flex",
+    controlCardDisabled: {
+        opacity: 0.62,
+    },
+    controlMain: {
+        display: "grid",
+        gridTemplateColumns: "24px minmax(0,1fr) 24px",
         alignItems: "center",
-        justifyContent: "space-between",
-        gap: 10,
-    },
-    blockTopRight: {
-        display: "flex",
-        alignItems: "center",
         gap: 6,
+        minWidth: 0,
     },
-    blockLabel: {
-        fontSize: 11.6,
-        fontWeight: 820,
+    controlCenter: {
+        minWidth: 0,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: 1,
+    },
+    controlKicker: {
+        fontSize: 9.5,
+        fontWeight: 760,
+        color: "var(--muted)",
         letterSpacing: "-0.01em",
+        whiteSpace: "nowrap",
     },
-    blockValue: {
-        minWidth: 52,
+    controlValue: {
+        fontSize: 10.9,
+        fontWeight: 840,
+        color: "var(--fg)",
+        letterSpacing: "-0.01em",
+        whiteSpace: "nowrap",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
         textAlign: "center",
-        fontSize: 11.6,
-        color: "var(--focus)",
-        fontVariantNumeric: "tabular-nums",
-        fontWeight: 860,
+        width: "100%",
+        maxWidth: "100%",
     },
-    miniStepBtn: {
+
+    arrowBtn: {
         width: 24,
         height: 24,
         borderRadius: 8,
-        border: "1px solid var(--hairline)",
-        background: "color-mix(in oklab, var(--panel) 90%, transparent)",
+        border: "1px solid color-mix(in oklab, var(--hairline) 84%, transparent)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--fg) 100%, white 0%), color-mix(in oklab, var(--fg) 88%, black 12%))",
+        color: "var(--bg)",
+        cursor: "pointer",
         display: "inline-flex",
         alignItems: "center",
         justifyContent: "center",
-        cursor: "pointer",
-        color: "var(--muted)",
         fontSize: 15,
-        fontWeight: 860,
-        padding: 0,
+        fontWeight: 900,
         flexShrink: 0,
+        WebkitTapHighlightColor: "transparent",
+        padding: 0,
+        boxShadow:
+            "0 1px 0 rgba(255,255,255,0.1) inset, 0 8px 16px rgba(0,0,0,0.16)",
+        userSelect: "none",
+        transition:
+            "transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease, filter 120ms ease",
     },
-    miniStepBtnDisabled: {
+    arrowBtnDisabled: {
         cursor: "not-allowed",
-        opacity: 0.55,
-    },
-
-    range: {
-        width: "100%",
-        accentColor: "var(--focus)",
-        cursor: "pointer",
-        height: 4,
-        borderRadius: 999,
-        background: "color-mix(in oklab, var(--hairline) 44%, transparent)",
-    },
-    rangeDisabled: {
-        cursor: "not-allowed",
-        opacity: 0.55,
-    },
-
-    keyHint: {
-        fontSize: 10.5,
-        color: "var(--muted)",
-        fontVariantNumeric: "tabular-nums",
+        opacity: 0.38,
+        boxShadow: "none",
     },
 
     footer: {
         display: "flex",
         alignItems: "center",
-        gap: 6,
-        paddingTop: 1,
+        justifyContent: "flex-end",
+        gap: 7,
+        minHeight: 0,
     },
     doneBtn: {
-        flex: 1,
-        height: 35,
-        borderRadius: 11,
-        border: "1px solid color-mix(in oklab, var(--focus) 70%, var(--hairline))",
-        background: "var(--focus)",
-        color: "#fff",
-        fontSize: 12.1,
+        height: 30,
+        minWidth: 66,
+        borderRadius: 10,
+        border: "1px solid color-mix(in oklab, var(--fg) 84%, black 16%)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--fg) 100%, white 0%), color-mix(in oklab, var(--fg) 88%, black 12%))",
+        color: "var(--bg)",
+        fontSize: 10.9,
         fontWeight: 860,
-        padding: "0 12px",
+        padding: "0 11px",
         cursor: "pointer",
-        boxShadow: "0 10px 22px color-mix(in oklab, var(--focus) 22%, transparent)",
+        boxShadow:
+            "0 1px 0 rgba(255,255,255,0.1) inset, 0 10px 18px rgba(0,0,0,0.16)",
         WebkitTapHighlightColor: "transparent",
     },
     resetBtn: {
-        height: 35,
-        borderRadius: 11,
-        border: "1px solid var(--hairline)",
-        background: "transparent",
+        height: 30,
+        minWidth: 62,
+        borderRadius: 10,
+        border: "1px solid color-mix(in oklab, var(--hairline) 94%, transparent)",
+        background:
+            "linear-gradient(180deg, color-mix(in oklab, var(--panel) 99%, transparent), color-mix(in oklab, var(--panel) 92%, var(--bg)))",
         color: "var(--muted)",
-        fontSize: 12,
-        fontWeight: 740,
-        padding: "0 12px",
+        fontSize: 10.7,
+        fontWeight: 780,
+        padding: "0 11px",
         cursor: "pointer",
         WebkitTapHighlightColor: "transparent",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.16) inset",
     },
 };
 ```
@@ -24866,6 +25227,7 @@ const PREFETCH_CHUNKS_BEHIND = 1;
 const MAX_CHUNKS_IN_MEMORY = 10;
 const EST_ROW_PX = 56;
 const GATE_COOLDOWN_TICKS = 8;
+const SCROLL_SETTLE_MS = 140;
 
 const EMPTY_ANNOTATIONS: readonly Annotation[] = [];
 const GATE_BLOCK_KEYS = new Set([
@@ -24879,6 +25241,8 @@ const GATE_BLOCK_KEYS = new Set([
 ]);
 
 type ScrollMode = "auto" | "smooth";
+type ScrollDirection = "up" | "down" | "none";
+type WritableElementRef<T> = { current: T | null };
 
 function clamp(n: number, lo: number, hi: number): number {
      return Math.max(lo, Math.min(hi, n));
@@ -24900,10 +25264,10 @@ function getRowTranslationId(row: SliceVerse): string | null {
 }
 
 function normalizeSpanBounds(
-     startOrd: number,
-     endOrd: number,
-     minOrd: number,
-     maxOrd: number,
+    startOrd: number,
+    endOrd: number,
+    minOrd: number,
+    maxOrd: number,
 ): { startOrd: number; endOrd: number } | null {
      const a = clamp(startOrd, minOrd, maxOrd);
      const b = clamp(endOrd, minOrd, maxOrd);
@@ -24915,12 +25279,83 @@ function normalizeSpanBounds(
 }
 
 function focusSoon(getEl: () => HTMLElement | null): void {
-     const run = () => getEl()?.focus();
+     const run = () => {
+          const el = getEl();
+          if (!el) return;
+
+          try {
+               el.focus({ preventScroll: true });
+          } catch {
+               el.focus();
+          }
+     };
+
      if (typeof queueMicrotask === "function") {
           queueMicrotask(run);
           return;
      }
+
      setTimeout(run, 0);
+}
+
+function useElementHeight(el: HTMLElement | null): number {
+     const [height, setHeight] = useState(0);
+
+     useLayoutEffect(() => {
+          if (!el) {
+               setHeight(0);
+               return;
+          }
+
+          let raf = 0;
+
+          const measure = () => {
+               cancelAnimationFrame(raf);
+               raf = requestAnimationFrame(() => {
+                    const next = Math.max(0, Math.round(el.getBoundingClientRect().height));
+                    setHeight((prev) => (prev === next ? prev : next));
+               });
+          };
+
+          measure();
+
+          if (typeof ResizeObserver !== "undefined") {
+               const ro = new ResizeObserver(() => measure());
+               ro.observe(el);
+               return () => {
+                    cancelAnimationFrame(raf);
+                    ro.disconnect();
+               };
+          }
+
+          window.addEventListener("resize", measure, { passive: true });
+          return () => {
+               cancelAnimationFrame(raf);
+               window.removeEventListener("resize", measure);
+          };
+     }, [el]);
+
+     return height;
+}
+
+function hasNonCollapsedSelection(selection: Selection | null): boolean {
+     if (!selection) return false;
+     if (selection.rangeCount <= 0) return false;
+     return !selection.isCollapsed;
+}
+
+function nodeWithinRoot(node: Node | null, root: HTMLElement | null): boolean {
+     if (!node || !root) return false;
+     return root.contains(node);
+}
+
+function selectionTouchesRoot(selection: Selection | null, root: HTMLElement | null): boolean {
+     if (!selection || !hasNonCollapsedSelection(selection) || !root) return false;
+
+     const anchorNode = selection.anchorNode;
+     const focusNode = selection.focusNode;
+
+     return nodeWithinRoot(anchorNode, root) || nodeWithinRoot(focusNode, root);
 }
 
 export type ReaderViewportHandle = {
@@ -24932,7 +25367,7 @@ type Props = {
      spine: SpineStats;
      bookById: Map<string, BookRow>;
      topContent?: React.ReactNode;
-     selectionRootRef?: React.MutableRefObject<HTMLDivElement | null> | null;
+     selectionRootRef?: WritableElementRef<HTMLDivElement> | null;
      annotationSnapshot?: AnnotationSnapshot | null;
      onPosition: (pos: ReaderPosition) => void;
      onError?: (msg: string) => void;
@@ -24966,9 +25401,9 @@ function createChunkState(): ChunkState {
 }
 
 function buildAnnotationVerseIndex(
-     snapshot: AnnotationSnapshot | null | undefined,
-     minOrd: number,
-     maxOrd: number,
+    snapshot: AnnotationSnapshot | null | undefined,
+    minOrd: number,
+    maxOrd: number,
 ): Map<number, readonly Annotation[]> {
      const buckets = new Map<number, Map<string, Annotation>>();
      if (!snapshot) return new Map();
@@ -24980,10 +25415,10 @@ function buildAnnotationVerseIndex(
                if (span.deletedAt !== null) continue;
 
                const bounds = normalizeSpanBounds(
-                    span.start.verseOrd,
-                    span.end.verseOrd,
-                    minOrd,
-                    maxOrd,
+                   span.start.verseOrd,
+                   span.end.verseOrd,
+                   minOrd,
+                   maxOrd,
                );
                if (!bounds) continue;
 
@@ -25001,11 +25436,11 @@ function buildAnnotationVerseIndex(
      const out = new Map<number, readonly Annotation[]>();
      for (const [ord, bucket] of buckets) {
           out.set(
-               ord,
-               [...bucket.values()].sort((a, b) => {
-                    if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
-                    return a.annotationId.localeCompare(b.annotationId);
-               }),
+              ord,
+              [...bucket.values()].sort((a, b) => {
+                   if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
+                   return a.annotationId.localeCompare(b.annotationId);
+              }),
           );
      }
 
@@ -25025,88 +25460,88 @@ function BookGate(props: {
      }, []);
 
      return (
-          <div
-               role="dialog"
-               aria-modal="true"
-               aria-label={`Book: ${book?.name ?? bookId}`}
-               tabIndex={-1}
-               style={{
-                    position: "absolute",
-                    inset: 0,
-                    zIndex: 30,
-                    display: "grid",
-                    placeItems: "center",
-                    padding: 18,
-                    background: "color-mix(in oklab, var(--bg) 72%, rgba(0,0,0,0.55))",
-                    backdropFilter: "blur(10px)",
-                    WebkitBackdropFilter: "blur(10px)",
-               }}
-               onKeyDown={(event) => {
-                    if (GATE_BLOCK_KEYS.has(event.key)) {
-                         event.preventDefault();
-                         event.stopPropagation();
-                         return;
-                    }
+         <div
+             role="dialog"
+             aria-modal="true"
+             aria-label={`Book: ${book?.name ?? bookId}`}
+             tabIndex={-1}
+             style={{
+                  position: "absolute",
+                  inset: 0,
+                  zIndex: 30,
+                  display: "grid",
+                  placeItems: "center",
+                  padding: 18,
+                  background: "color-mix(in oklab, var(--bg) 72%, rgba(0,0,0,0.55))",
+                  backdropFilter: "blur(10px)",
+                  WebkitBackdropFilter: "blur(10px)",
+             }}
+             onKeyDown={(event) => {
+                  if (GATE_BLOCK_KEYS.has(event.key)) {
+                       event.preventDefault();
+                       event.stopPropagation();
+                       return;
+                  }
 
-                    if (event.key === "Escape" || event.key === "Enter") {
-                         event.preventDefault();
-                         event.stopPropagation();
-                         onContinue();
-                    }
-               }}
-          >
-               <div
-                    style={{
-                         width: "min(860px, 100%)",
-                         borderRadius: 18,
-                         border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-                         background: "color-mix(in oklab, var(--bg) 82%, var(--panel))",
-                         boxShadow: "0 34px 110px rgba(0,0,0,0.34)",
-                         overflow: "hidden",
-                    }}
-               >
-                    <BookTitlePage book={book} bookId={bookId} />
+                  if (event.key === "Escape" || event.key === "Enter") {
+                       event.preventDefault();
+                       event.stopPropagation();
+                       onContinue();
+                  }
+             }}
+         >
+              <div
+                  style={{
+                       width: "min(860px, 100%)",
+                       borderRadius: 18,
+                       border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+                       background: "color-mix(in oklab, var(--bg) 82%, var(--panel))",
+                       boxShadow: "0 34px 110px rgba(0,0,0,0.34)",
+                       overflow: "hidden",
+                  }}
+              >
+                   <BookTitlePage book={book} bookId={bookId} />
 
-                    <div
-                         style={{
-                              display: "flex",
-                              justifyContent: "center",
-                              padding: "14px 14px 18px",
-                              background:
-                                   "linear-gradient(to bottom, transparent, color-mix(in oklab, var(--bg) 88%, var(--panel)))",
-                         }}
-                    >
-                         <button
-                              ref={btnRef}
-                              type="button"
-                              onClick={onContinue}
-                              style={{
-                                   appearance: "none",
-                                   WebkitAppearance: "none",
-                                   height: 40,
-                                   padding: "0 16px",
-                                   borderRadius: 12,
-                                   border: "1px solid color-mix(in oklab, var(--focus) 70%, var(--hairline))",
-                                   background: "var(--focus)",
-                                   color: "var(--fg)",
-                                   fontSize: 12.6,
-                                   fontWeight: 820,
-                                   letterSpacing: "-0.01em",
-                                   cursor: "pointer",
-                                   boxShadow: "0 14px 34px color-mix(in oklab, var(--focus) 20%, transparent)",
-                              }}
-                         >
-                              Continue
-                         </button>
-                    </div>
-               </div>
-          </div>
+                   <div
+                       style={{
+                            display: "flex",
+                            justifyContent: "center",
+                            padding: "14px 14px 18px",
+                            background:
+                                "linear-gradient(to bottom, transparent, color-mix(in oklab, var(--bg) 88%, var(--panel)))",
+                       }}
+                   >
+                        <button
+                            ref={btnRef}
+                            type="button"
+                            onClick={onContinue}
+                            style={{
+                                 appearance: "none",
+                                 WebkitAppearance: "none",
+                                 height: 40,
+                                 padding: "0 16px",
+                                 borderRadius: 12,
+                                 border: "1px solid color-mix(in oklab, var(--focus) 70%, var(--hairline))",
+                                 background: "var(--focus)",
+                                 color: "var(--fg)",
+                                 fontSize: 12.6,
+                                 fontWeight: 820,
+                                 letterSpacing: "-0.01em",
+                                 cursor: "pointer",
+                                 boxShadow: "0 14px 34px color-mix(in oklab, var(--focus) 20%, transparent)",
+                            }}
+                        >
+                             Continue
+                        </button>
+                   </div>
+              </div>
+         </div>
      );
 }
 
 export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function ReaderViewport(
-     props,
-     ref,
+    props,
+    ref,
 ) {
      const {
           spine,
@@ -25120,11 +25555,16 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      } = props;
 
      const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+     const [leadEl, setLeadEl] = useState<HTMLDivElement | null>(null);
      const [dataTick, setDataTick] = useState(0);
      const [gate, setGate] = useState<BookGateState | null>(null);
 
+     const leadHeight = useElementHeight(leadEl);
+
      const chunkRef = useRef<ChunkState>(createChunkState());
      const measuredAtRef = useRef<WeakMap<Element, number>>(new WeakMap());
+     const selectionRootInnerRef = useRef<HTMLDivElement | null>(null);
+     const selectionActiveRef = useRef(false);
 
      const initialOrd = useMemo(() => {
           return clamp(spine.verseOrdMin, spine.verseOrdMin, spine.verseOrdMax);
@@ -25142,12 +25582,18 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      const gateRef = useRef<BookGateState | null>(null);
      const lastGatedBookIdRef = useRef<string | null>(null);
      const gateCooldownRef = useRef(0);
+     const suppressGateUntilScrollSettlesRef = useRef(false);
+     const suppressGateTimerRef = useRef<number | null>(null);
 
      const rafScrollRef = useRef(0);
      const lastSentRef = useRef<{ ord: number; hasVerse: boolean }>({
           ord: -1,
           hasVerse: false,
      });
+
+     const lastScrollTopRef = useRef(0);
+     const scrollDirectionRef = useRef<ScrollDirection>("none");
+     const lastObservedOrdRef = useRef<number>(initialOrd);
 
      const bumpTick = useCallback(() => {
           setDataTick((t) => t + 1);
@@ -25179,13 +25625,30 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      }, [dataTick]);
 
      const setSelectionRootEl = useCallback(
-          (el: HTMLDivElement | null) => {
-               if (selectionRootRef) {
-                    selectionRootRef.current = el;
-               }
-          },
-          [selectionRootRef],
+         (el: HTMLDivElement | null) => {
+              selectionRootInnerRef.current = el;
+              if (selectionRootRef) {
+                   selectionRootRef.current = el;
+              }
+         },
+         [selectionRootRef],
      );
+
+     const clearSuppressGateTimer = useCallback(() => {
+          if (suppressGateTimerRef.current != null) {
+               window.clearTimeout(suppressGateTimerRef.current);
+               suppressGateTimerRef.current = null;
+          }
+     }, []);
+
+     const suppressGateForProgrammaticScroll = useCallback(() => {
+          suppressGateUntilScrollSettlesRef.current = true;
+          clearSuppressGateTimer();
+          suppressGateTimerRef.current = window.setTimeout(() => {
+               suppressGateUntilScrollSettlesRef.current = false;
+               suppressGateTimerRef.current = null;
+          }, SCROLL_SETTLE_MS);
+     }, [clearSuppressGateTimer]);
 
      const abortAllInFlight = useCallback(() => {
           for (const controller of inFlightRef.current.values()) {
@@ -25204,83 +25667,83 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      }, [gate]);
 
      const evictFarChunks = useCallback(
-          (keepOrd: number): void => {
-               const state = chunkRef.current;
-               const keepChunk = chunkStart(clamp(keepOrd, spine.verseOrdMin, spine.verseOrdMax));
+         (keepOrd: number): void => {
+              const state = chunkRef.current;
+              const keepChunk = chunkStart(clamp(keepOrd, spine.verseOrdMin, spine.verseOrdMax));
 
-               while (state.loadedOrder.length > MAX_CHUNKS_IN_MEMORY) {
-                    let farIdx = 0;
-                    let farDist = -1;
+              while (state.loadedOrder.length > MAX_CHUNKS_IN_MEMORY) {
+                   let farIdx = 0;
+                   let farDist = -1;
 
-                    for (let i = 0; i < state.loadedOrder.length; i += 1) {
-                         const loadedChunk = state.loadedOrder[i]!;
-                         const dist = Math.abs(loadedChunk - keepChunk);
-                         if (dist > farDist) {
-                              farDist = dist;
-                              farIdx = i;
-                         }
-                    }
+                   for (let i = 0; i < state.loadedOrder.length; i += 1) {
+                        const loadedChunk = state.loadedOrder[i]!;
+                        const dist = Math.abs(loadedChunk - keepChunk);
+                        if (dist > farDist) {
+                             farDist = dist;
+                             farIdx = i;
+                        }
+                   }
 
-                    const victim = state.loadedOrder.splice(farIdx, 1)[0]!;
-                    state.loadedChunks.delete(victim);
+                   const victim = state.loadedOrder.splice(farIdx, 1)[0]!;
+                   state.loadedChunks.delete(victim);
 
-                    const startOrd = victim;
-                    const endOrd = Math.min(victim + CHUNK - 1, spine.verseOrdMax);
+                   const startOrd = victim;
+                   const endOrd = Math.min(victim + CHUNK - 1, spine.verseOrdMax);
 
-                    for (let ord = startOrd; ord <= endOrd; ord += 1) {
-                         state.verseMap.delete(ord);
-                    }
-               }
-          },
-          [spine.verseOrdMin, spine.verseOrdMax],
+                   for (let ord = startOrd; ord <= endOrd; ord += 1) {
+                        state.verseMap.delete(ord);
+                   }
+              }
+         },
+         [spine.verseOrdMin, spine.verseOrdMax],
      );
 
      const ensureChunk = useCallback(
-          async (startOrd: number, keepOrd?: number): Promise<void> => {
-               const safeOrd = clamp(startOrd, spine.verseOrdMin, spine.verseOrdMax);
-               const chunk = chunkStart(safeOrd);
-               const state = chunkRef.current;
+         async (startOrd: number, keepOrd?: number): Promise<void> => {
+              const safeOrd = clamp(startOrd, spine.verseOrdMin, spine.verseOrdMax);
+              const chunk = chunkStart(safeOrd);
+              const state = chunkRef.current;
 
-               if (state.loadedChunks.has(chunk)) return;
-               if (state.loadingChunks.has(chunk)) return;
+              if (state.loadedChunks.has(chunk)) return;
+              if (state.loadingChunks.has(chunk)) return;
 
-               const myRunId = runIdRef.current;
-               const controller = new AbortController();
+              const myRunId = runIdRef.current;
+              const controller = new AbortController();
 
-               state.loadingChunks.add(chunk);
-               inFlightRef.current.set(chunk, controller);
+              state.loadingChunks.add(chunk);
+              inFlightRef.current.set(chunk, controller);
 
-               try {
-                    const res = await apiGetSlice(chunk, CHUNK, {
-                         signal: controller.signal,
-                    });
+              try {
+                   const res = await apiGetSlice(chunk, CHUNK, {
+                        signal: controller.signal,
+                   });
 
-                    if (runIdRef.current !== myRunId) return;
-                    if (controller.signal.aborted) return;
+                   if (runIdRef.current !== myRunId) return;
+                   if (controller.signal.aborted) return;
 
-                    for (const verse of res.verses) {
-                         state.verseMap.set(verse.verseOrd, verse);
-                    }
+                   for (const verse of res.verses) {
+                        state.verseMap.set(verse.verseOrd, verse);
+                   }
 
-                    state.loadedChunks.add(chunk);
-                    if (!state.loadedOrder.includes(chunk)) {
-                         state.loadedOrder.push(chunk);
-                    }
+                   state.loadedChunks.add(chunk);
+                   if (!state.loadedOrder.includes(chunk)) {
+                        state.loadedOrder.push(chunk);
+                   }
 
-                    evictFarChunks(keepOrd ?? posOrdRef.current);
-                    bumpTick();
-               } catch (error: unknown) {
-                    if (runIdRef.current !== myRunId) return;
-                    if (controller.signal.aborted) return;
+                   evictFarChunks(keepOrd ?? posOrdRef.current);
+                   bumpTick();
+              } catch (error: unknown) {
+                   if (runIdRef.current !== myRunId) return;
+                   if (controller.signal.aborted) return;
 
-                    const message = error instanceof Error ? error.message : String(error);
-                    onError?.(message);
-               } finally {
-                    state.loadingChunks.delete(chunk);
-                    inFlightRef.current.delete(chunk);
-               }
-          },
-          [bumpTick, evictFarChunks, onError, spine.verseOrdMin, spine.verseOrdMax],
+                   const message = error instanceof Error ? error.message : String(error);
+                   onError?.(message);
+              } finally {
+                   state.loadingChunks.delete(chunk);
+                   inFlightRef.current.delete(chunk);
+              }
+         },
+         [bumpTick, evictFarChunks, onError, spine.verseOrdMin, spine.verseOrdMax],
      );
 
      useEffect(() => {
@@ -25292,40 +25755,66 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
           setPosOrd(initialOrd);
           posOrdRef.current = initialOrd;
+          lastObservedOrdRef.current = initialOrd;
 
           setGate(null);
           gateRef.current = null;
           lastGatedBookIdRef.current = null;
           gateCooldownRef.current = 0;
 
+          clearSuppressGateTimer();
+          suppressGateUntilScrollSettlesRef.current = false;
+          selectionActiveRef.current = false;
+
           pendingJumpRef.current = null;
           readyOnceRef.current = false;
           lastSentRef.current = { ord: -1, hasVerse: false };
+          lastScrollTopRef.current = 0;
+          scrollDirectionRef.current = "none";
 
           void ensureChunk(chunkStart(initialOrd), initialOrd);
           bumpTick();
-     }, [abortAllInFlight, bumpTick, ensureChunk, initialOrd]);
+     }, [abortAllInFlight, bumpTick, clearSuppressGateTimer, ensureChunk, initialOrd]);
 
      useEffect(() => {
           return () => {
                abortAllInFlight();
+               clearSuppressGateTimer();
                if (rafScrollRef.current) {
                     cancelAnimationFrame(rafScrollRef.current);
                     rafScrollRef.current = 0;
                }
           };
-     }, [abortAllInFlight]);
+     }, [abortAllInFlight, clearSuppressGateTimer]);
 
      useEffect(() => {
           if (!scrollEl) return;
           void ensureChunk(chunkStart(initialOrd), initialOrd);
      }, [scrollEl, ensureChunk, initialOrd]);
 
+     useEffect(() => {
+          if (typeof document === "undefined") return;
+
+          const onSelectionChange = () => {
+               const selection = document.getSelection();
+               selectionActiveRef.current = selectionTouchesRoot(
+                   selection,
+                   selectionRootInnerRef.current,
+               );
+          };
+
+          document.addEventListener("selectionchange", onSelectionChange);
+          return () => {
+               document.removeEventListener("selectionchange", onSelectionChange);
+          };
+     }, []);
+
      const rowVirtualizer = useVirtualizer({
           count,
           getScrollElement: () => scrollEl,
           estimateSize: () => EST_ROW_PX,
           overscan: 18,
+          paddingStart: leadHeight,
           getItemKey: (index) => String(spine.verseOrdMin + index),
      });
 
@@ -25334,34 +25823,43 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      const lastIndex = virtualItems.length ? virtualItems[virtualItems.length - 1]!.index : 0;
 
      const jumpToOrd = useCallback(
-          (ord: number, behavior: ScrollMode = "auto") => {
-               const targetOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
-               const targetIndex = targetOrd - spine.verseOrdMin;
+         (ord: number, behavior: ScrollMode = "auto") => {
+              const targetOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
+              const targetIndex = targetOrd - spine.verseOrdMin;
 
-               void ensureChunk(chunkStart(targetOrd), targetOrd);
+              void ensureChunk(chunkStart(targetOrd), targetOrd);
 
-               if (!scrollEl) {
-                    pendingJumpRef.current = { ord: targetOrd, behavior };
-                    return;
-               }
+              if (!scrollEl) {
+                   pendingJumpRef.current = { ord: targetOrd, behavior };
+                   return;
+              }
 
-               requestAnimationFrame(() => {
-                    rowVirtualizer.scrollToIndex(targetIndex, {
-                         align: "start",
-                         behavior,
-                    });
-               });
-          },
-          [ensureChunk, rowVirtualizer, scrollEl, spine.verseOrdMin, spine.verseOrdMax],
+              suppressGateForProgrammaticScroll();
+
+              requestAnimationFrame(() => {
+                   rowVirtualizer.scrollToIndex(targetIndex, {
+                        align: "start",
+                        behavior,
+                   });
+              });
+         },
+         [
+              ensureChunk,
+              rowVirtualizer,
+              scrollEl,
+              spine.verseOrdMin,
+              spine.verseOrdMax,
+              suppressGateForProgrammaticScroll,
+         ],
      );
 
      useImperativeHandle(
-          ref,
-          () => ({
-               jumpToOrd,
-               getCurrentOrd: () => posOrdRef.current,
-          }),
-          [jumpToOrd],
+         ref,
+         () => ({
+              jumpToOrd,
+              getCurrentOrd: () => posOrdRef.current,
+         }),
+         [jumpToOrd],
      );
 
      useEffect(() => {
@@ -25443,8 +25941,9 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           rafScrollRef.current = 0;
 
           if (!scrollEl || !virtualItems.length || gateRef.current) return;
+          if (selectionActiveRef.current) return;
 
-          const scrollTop = scrollEl.scrollTop;
+          const scrollTop = Math.max(0, scrollEl.scrollTop);
           let topItem = virtualItems[0]!;
 
           for (let i = 0; i < virtualItems.length; i += 1) {
@@ -25461,11 +25960,13 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                setPosOrd(ord);
           }
 
+          lastObservedOrdRef.current = ord;
           void ensureChunk(chunkStart(ord), ord);
      }, [ensureChunk, scrollEl, spine.verseOrdMin, virtualItems]);
 
      useLayoutEffect(() => {
           if (!scrollEl || !virtualItems.length || gateRef.current) return;
+          if (selectionActiveRef.current) return;
           computeAndSetTopOrd();
      }, [computeAndSetTopOrd, firstIndex, lastIndex, scrollEl, virtualItems.length]);
 
@@ -25473,6 +25974,20 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           if (!scrollEl) return;
 
           const onScroll = () => {
+               const nextTop = Math.max(0, scrollEl.scrollTop);
+               const prevTop = lastScrollTopRef.current;
+
+               if (nextTop > prevTop + 1) {
+                    scrollDirectionRef.current = "down";
+               } else if (nextTop < prevTop - 1) {
+                    scrollDirectionRef.current = "up";
+               } else {
+                    scrollDirectionRef.current = "none";
+               }
+
+               lastScrollTopRef.current = nextTop;
+
+               if (selectionActiveRef.current) return;
                if (rafScrollRef.current) return;
                rafScrollRef.current = window.requestAnimationFrame(computeAndSetTopOrd);
           };
@@ -25503,16 +26018,21 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
      useEffect(() => {
           if (!scrollEl || gateRef.current) return;
+          if (selectionActiveRef.current) return;
+          if (suppressGateUntilScrollSettlesRef.current) return;
 
           if (gateCooldownRef.current > 0) {
                gateCooldownRef.current -= 1;
                return;
           }
 
+          if (scrollDirectionRef.current !== "down") return;
+
           const ord = posOrdRef.current;
           const current = chunkRef.current.verseMap.get(ord) ?? null;
           if (!current) return;
-          if (ord === spine.verseOrdMin) return;
+
+          if (ord <= spine.verseOrdMin) return;
 
           const previous = chunkRef.current.verseMap.get(ord - 1) ?? null;
           if (!previous) return;
@@ -25524,6 +26044,8 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           lastGatedBookIdRef.current = bookId;
           const index = ord - spine.verseOrdMin;
 
+          suppressGateForProgrammaticScroll();
+
           requestAnimationFrame(() => {
                rowVirtualizer.scrollToIndex(index, {
                     align: "start",
@@ -25531,118 +26053,128 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                });
 
                requestAnimationFrame(() => {
+                    if (selectionActiveRef.current) return;
+                    if (scrollDirectionRef.current !== "down") return;
                     setGate({ ord, bookId });
                });
           });
-     }, [dataTick, posOrd, rowVirtualizer, scrollEl, spine.verseOrdMin]);
+     }, [
+          dataTick,
+          posOrd,
+          rowVirtualizer,
+          scrollEl,
+          spine.verseOrdMin,
+          suppressGateForProgrammaticScroll,
+     ]);
 
      const totalSize = rowVirtualizer.getTotalSize();
 
      const renderRow = useCallback(
-          (verseOrd: number) => {
-               const row = chunkRef.current.verseMap.get(verseOrd) ?? null;
+         (verseOrd: number) => {
+              const row = chunkRef.current.verseMap.get(verseOrd) ?? null;
 
-               if (!row) {
-                    return (
-                         <div style={sx.skelRow}>
-                              <div style={sx.verseNum}>…</div>
-                              <div style={sx.skelText} />
-                         </div>
-                    );
-               }
+              if (!row) {
+                   return (
+                       <div style={sx.skelRow}>
+                            <div style={sx.verseNum}>…</div>
+                            <div style={sx.skelText} />
+                       </div>
+                   );
+              }
 
-               const annotations = annotationIndex.get(verseOrd) ?? EMPTY_ANNOTATIONS;
+              const annotations = annotationIndex.get(verseOrd) ?? EMPTY_ANNOTATIONS;
 
-               return (
-                    <VerseRow
-                         row={row}
-                         book={bookById.get(row.bookId) ?? null}
-                         annotations={annotations}
-                    />
-               );
-          },
-          [annotationIndex, bookById],
+              return (
+                  <VerseRow
+                      row={row}
+                      book={bookById.get(row.bookId) ?? null}
+                      annotations={annotations}
+                  />
+              );
+         },
+         [annotationIndex, bookById],
      );
 
      const measureRowEl = useCallback(
-          (el: HTMLDivElement | null) => {
-               if (!el) return;
+         (el: HTMLDivElement | null) => {
+              if (!el) return;
+              if (selectionActiveRef.current) return;
 
-               const mark = measuredAtRef.current;
-               const lastMeasuredAt = mark.get(el);
-               if (lastMeasuredAt === dataTick) return;
+              const mark = measuredAtRef.current;
+              const lastMeasuredAt = mark.get(el);
+              if (lastMeasuredAt === dataTick) return;
 
-               mark.set(el, dataTick);
-               rowVirtualizer.measureElement(el);
-          },
-          [dataTick, rowVirtualizer],
+              mark.set(el, dataTick);
+              rowVirtualizer.measureElement(el);
+         },
+         [dataTick, rowVirtualizer],
      );
 
      return (
-          <div style={sx.body}>
-               <div ref={setScrollEl} style={sx.scroll}>
-                    <div
-                         ref={setSelectionRootEl}
-                         className="container"
-                         style={sx.container}
-                         data-translation-id={loadedTranslationId ?? undefined}
-                    >
-                         {topContent}
+         <div style={sx.body}>
+              <div ref={setScrollEl} style={sx.scroll}>
+                   <div
+                       ref={setSelectionRootEl}
+                       className="container"
+                       style={sx.container}
+                       data-reader-selection-root="1"
+                       data-translation-id={loadedTranslationId ?? undefined}
+                   >
+                        {topContent ? <div ref={setLeadEl}>{topContent}</div> : null}
 
-                         <div
-                              style={{
-                                   position: "relative",
-                                   height: totalSize,
-                                   contain: "layout paint",
-                              }}
-                         >
-                              {virtualItems.map((item) => {
-                                   const verseOrd = spine.verseOrdMin + item.index;
+                        <div
+                            style={{
+                                 position: "relative",
+                                 height: totalSize,
+                            }}
+                        >
+                             {virtualItems.map((item) => {
+                                  const verseOrd = spine.verseOrdMin + item.index;
 
-                                   return (
-                                        <div
-                                             key={item.key}
-                                             ref={measureRowEl}
-                                             data-index={item.index}
-                                             style={{
-                                                  position: "absolute",
-                                                  top: 0,
-                                                  left: 0,
-                                                  width: "100%",
-                                                  transform: `translate3d(0, ${item.start}px, 0)`,
-                                                  willChange: "transform",
-                                             }}
-                                        >
-                                             {renderRow(verseOrd)}
-                                        </div>
-                                   );
-                              })}
-                         </div>
-                    </div>
+                                  return (
+                                      <div
+                                          key={item.key}
+                                          ref={measureRowEl}
+                                          data-index={item.index}
+                                          style={{
+                                               position: "absolute",
+                                               top: 0,
+                                               left: 0,
+                                               width: "100%",
+                                               transform: `translateY(${item.start}px)`,
+                                          }}
+                                      >
+                                           {renderRow(verseOrd)}
+                                      </div>
+                                  );
+                             })}
+                        </div>
+                   </div>
 
-                    {gate ? (
-                         <BookGate
-                              book={bookById.get(gate.bookId) ?? null}
-                              bookId={gate.bookId}
-                              onContinue={() => {
-                                   const ord = gate.ord;
+                   {gate ? (
+                       <BookGate
+                           book={bookById.get(gate.bookId) ?? null}
+                           bookId={gate.bookId}
+                           onContinue={() => {
+                                const ord = gate.ord;
 
-                                   setGate(null);
-                                   gateRef.current = null;
-                                   gateCooldownRef.current = GATE_COOLDOWN_TICKS;
+                                setGate(null);
+                                gateRef.current = null;
+                                gateCooldownRef.current = GATE_COOLDOWN_TICKS;
+                                suppressGateForProgrammaticScroll();
 
-                                   requestAnimationFrame(() => {
-                                        const index = ord - spine.verseOrdMin;
-                                        rowVirtualizer.scrollToIndex(index, {
-                                             align: "start",
-                                             behavior: "auto",
-                                        });
-                                   });
-                              }}
-                         />
-                    ) : null}
-               </div>
-          </div>
+                                requestAnimationFrame(() => {
+                                     const index = ord - spine.verseOrdMin;
+                                     rowVirtualizer.scrollToIndex(index, {
+                                          align: "start",
+                                          behavior: "auto",
+                                     });
+                                });
+                           }}
+                       />
+                   ) : null}
+              </div>
+         </div>
      );
 });
 
@@ -25667,6 +26199,7 @@ import type { CSSProperties } from "react";
  * - no invalid / non-portable inline style tokens
  * - explicit row wrapper surface for verse containers
  * - safer cross-browser fallbacks for inline React CSSProperties
+ * - stricter reusable constants to reduce drift
  *
  * Notes:
  * - keep layout-critical surfaces simple and deterministic
@@ -25706,7 +26239,28 @@ const HEADER_BOTTOM_PAD = 10;
 const SCROLL_TOP_PAD = 18;
 const SCROLL_BOTTOM_PAD = 96;
 
-const ROW_SCROLL_MARGIN_TOP = `calc(72px + ${SAFE_TOP})`;
+const HEADER_MIN_HEIGHT = 60;
+const HEADER_BLUR = 12;
+const HEADER_SHADOW = "0 10px 22px rgba(0, 0, 0, 0.032)";
+const BUTTON_SHADOW = "0 8px 18px rgba(0,0,0,0.055)";
+const BUTTON_SHADOW_HOVER = "0 10px 20px rgba(0,0,0,0.07)";
+const BUTTON_SHADOW_ACTIVE = "0 6px 14px rgba(0,0,0,0.06)";
+
+const VERSE_NUM_COL = 34;
+const VERSE_ROW_GAP = 12;
+const VERSE_ROW_PAD_Y = 9;
+const VERSE_ROW_PAD_X = 6;
+
+const BOOK_TITLE_SIZE = 24;
+const CHAPTER_TITLE_SIZE = 16;
+
+const ROW_SCROLL_MARGIN_TOP = `calc(${HEADER_MIN_HEIGHT}px + ${SCROLL_TOP_PAD}px + ${SAFE_TOP})`;
+
+const BUTTON_TRANSITION =
+    "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease";
+
+const ROW_TRANSITION =
+    "background 140ms ease, transform 140ms ease, box-shadow 140ms ease";
 
 export const sx = {
     /* ---------- Shell ---------- */
@@ -25719,6 +26273,7 @@ export const sx = {
         background: "var(--bg)",
         isolation: "isolate",
         overflow: "hidden",
+        minWidth: 0,
     },
 
     /* ---------- Header ---------- */
@@ -25730,16 +26285,18 @@ export const sx = {
         gridTemplateColumns: "auto minmax(0, 1fr) auto",
         alignItems: "center",
         columnGap: 12,
+        minHeight: HEADER_MIN_HEIGHT,
         paddingTop: `calc(${HEADER_TOP_PAD}px + ${SAFE_TOP})`,
         paddingBottom: HEADER_BOTTOM_PAD,
         paddingLeft: `calc(${HEADER_HORIZONTAL_PAD}px + ${SAFE_LEFT})`,
         paddingRight: `calc(${HEADER_HORIZONTAL_PAD}px + ${SAFE_RIGHT})`,
         background: HEADER_BG,
-        backdropFilter: "blur(12px)",
-        WebkitBackdropFilter: "blur(12px)",
+        backdropFilter: `blur(${HEADER_BLUR}px)`,
+        WebkitBackdropFilter: `blur(${HEADER_BLUR}px)`,
         borderBottom: `1px solid ${HAIRLINE}`,
-        boxShadow: "0 10px 22px rgba(0, 0, 0, 0.032)",
+        boxShadow: HEADER_SHADOW,
         transform: "translateZ(0)",
+        boxSizing: "border-box",
     },
 
     topLeft: {
@@ -25773,6 +26330,7 @@ export const sx = {
         justifyContent: "flex-end",
         gap: 10,
         minWidth: 0,
+        flexWrap: "nowrap",
     },
 
     searchWrap: {
@@ -25794,6 +26352,9 @@ export const sx = {
     backBtn: {
         appearance: "none",
         WebkitAppearance: "none",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
         fontSize: 12,
         lineHeight: 1,
         whiteSpace: "nowrap",
@@ -25804,24 +26365,26 @@ export const sx = {
         border: `1px solid ${HAIRLINE}`,
         borderRadius: 999,
         padding: "7px 12px",
+        minHeight: 32,
         boxSizing: "border-box",
-        boxShadow: "0 8px 18px rgba(0,0,0,0.055)",
+        boxShadow: BUTTON_SHADOW,
         outline: "none",
         WebkitTapHighlightColor: "transparent",
-        transition:
-             "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease",
+        transition: BUTTON_TRANSITION,
+        textDecoration: "none",
+        flexShrink: 0,
     },
 
     backBtnHover: {
         background: PANEL_BG_SOFT_HOVER,
         borderColor: HAIRLINE_STRONG,
-        boxShadow: "0 10px 20px rgba(0,0,0,0.07)",
+        boxShadow: BUTTON_SHADOW_HOVER,
         transform: "translateY(-0.5px)",
     },
 
     backBtnActive: {
         transform: "translateY(0)",
-        boxShadow: "0 6px 14px rgba(0,0,0,0.06)",
+        boxShadow: BUTTON_SHADOW_ACTIVE,
         opacity: 0.96,
     },
 
@@ -25830,6 +26393,7 @@ export const sx = {
         position: "relative",
         flex: 1,
         minHeight: 0,
+        minWidth: 0,
         overflow: "hidden",
         contain: "layout paint",
     },
@@ -25848,6 +26412,8 @@ export const sx = {
         WebkitOverflowScrolling: "touch",
         touchAction: "pan-y",
         transform: "translateZ(0)",
+        minWidth: 0,
+        boxSizing: "border-box",
     },
 
     container: {
@@ -25873,6 +26439,7 @@ export const sx = {
         marginTop: 6,
         borderBottom: `1px solid ${HAIRLINE}`,
         scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
+        minWidth: 0,
     },
 
     bookKicker: {
@@ -25885,11 +26452,12 @@ export const sx = {
 
     bookTitle: {
         marginTop: 9,
-        fontSize: 24,
+        fontSize: BOOK_TITLE_SIZE,
         fontWeight: 650,
         lineHeight: 1.15,
         letterSpacing: "-0.03em",
-        textWrap: "balance",
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
     },
 
     chapterHeader: {
@@ -25897,6 +26465,7 @@ export const sx = {
         marginTop: 14,
         borderBottom: `1px solid ${HAIRLINE}`,
         scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
+        minWidth: 0,
     },
 
     chapterKicker: {
@@ -25908,11 +26477,12 @@ export const sx = {
 
     chapterTitle: {
         marginTop: 8,
-        fontSize: 16,
+        fontSize: CHAPTER_TITLE_SIZE,
         fontWeight: 650,
         lineHeight: 1.2,
         letterSpacing: "-0.02em",
-        textWrap: "balance",
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
     },
 
     /* ---------- Verse rows ---------- */
@@ -25926,19 +26496,20 @@ export const sx = {
 
     verseRow: {
         display: "grid",
-        gridTemplateColumns: "34px minmax(0, 1fr)",
-        gap: 12,
+        gridTemplateColumns: `${VERSE_NUM_COL}px minmax(0, 1fr)`,
+        gap: VERSE_ROW_GAP,
         alignItems: "start",
         borderRadius: RADIUS_PX,
-        padding: "9px 6px",
+        padding: `${VERSE_ROW_PAD_Y}px ${VERSE_ROW_PAD_X}px`,
         boxSizing: "border-box",
         background: "transparent",
-        transition: "background 140ms ease, transform 140ms ease, box-shadow 140ms ease",
+        transition: ROW_TRANSITION,
         WebkitTapHighlightColor: "transparent",
         scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
         width: "100%",
         minWidth: 0,
         outline: "none",
+        position: "relative",
     },
 
     verseRowHover: {
@@ -25965,6 +26536,8 @@ export const sx = {
         userSelect: "none",
         opacity: 0.9,
         minWidth: 0,
+        whiteSpace: "nowrap",
+        lineHeight: 1.25,
     },
 
     verseText: {
@@ -25976,11 +26549,11 @@ export const sx = {
     /* ---------- Skeleton ---------- */
     skelRow: {
         display: "grid",
-        gridTemplateColumns: "34px minmax(0, 1fr)",
-        gap: 12,
+        gridTemplateColumns: `${VERSE_NUM_COL}px minmax(0, 1fr)`,
+        gap: VERSE_ROW_GAP,
         alignItems: "start",
         borderRadius: RADIUS_PX,
-        padding: "9px 6px",
+        padding: `${VERSE_ROW_PAD_Y}px ${VERSE_ROW_PAD_X}px`,
         boxSizing: "border-box",
         opacity: 0.55,
         width: "100%",
@@ -25992,6 +26565,8 @@ export const sx = {
         marginTop: 6,
         borderRadius: 9,
         background: SKELETON_BG,
+        width: "100%",
+        minWidth: 0,
     },
 } satisfies SxMap;
 ```
@@ -26032,6 +26607,11 @@ export type TranslationId = string;
 export type TokenizerId = string;
 export type DeviceId = string;
 export type Revision = number;
+export type CssPx = number;
+export type UnitInterval = number; // expected 0..1 when used as normalized UI geometry
+
+export type Nullable<T> = T | null;
+export type Maybe<T> = T | null | undefined;
 
 /* =============================================================================
    Core Reader Data
@@ -26054,28 +26634,28 @@ export type TranslationRef = Readonly<{
     label?: string | null;
 }>;
 
-export type SliceTokenKind =
-     | "WORD"
-     | "PUNCT"
-     | "SPACE"
-     | "LINEBREAK"
-     | "MARKER"
-     | "NUMBER"
-     | "SYMBOL";
-
 export type TokenizerRef = Readonly<{
     tokenizerId: TokenizerId;
     version?: string | null;
 }>;
 
+export type SliceTokenKind =
+    | "WORD"
+    | "PUNCT"
+    | "SPACE"
+    | "LINEBREAK"
+    | "MARKER"
+    | "NUMBER"
+    | "SYMBOL";
+
 /**
- * Canonical token shape for the reader slice payload.
+ * Canonical token shape for reader payloads.
  *
  * Notes:
- * - Keep this flat and transport-safe.
- * - Supports both semantic anchoring and DOM projection.
- * - `token` is the rendered token text exactly as emitted by the tokenizer.
- * - char offsets are local to the verse text payload.
+ * - Flat and transport-safe
+ * - Supports semantic anchoring + DOM projection
+ * - `token` is the rendered token text exactly as emitted by the tokenizer
+ * - char offsets are local to the verse text payload
  */
 export type SliceToken = Readonly<{
     tokenIndex: number;
@@ -26110,6 +26690,11 @@ export type SliceVerse = Readonly<{
     updatedAt: IsoDateTimeString | null;
 }>;
 
+export type SlicePayload = Readonly<{
+    verses: ReadonlyArray<SliceVerse>;
+    spine: SpineStats;
+}>;
+
 export type ReaderPosition = Readonly<{
     ord: number;
     verse: SliceVerse | null;
@@ -26124,6 +26709,7 @@ export type ReaderCurrentPos = Readonly<{
     verse: number | null;
 }>;
 
+/** Minimal “jump” intent used by controls. */
 export type ReaderJump = VerseRef;
 
 /* =============================================================================
@@ -26142,12 +26728,12 @@ export type ReaderAnchor = Readonly<{
 }>;
 
 export type ReaderSelectionOrigin =
-     | "MOUSE_DRAG"
-     | "KEYBOARD"
-     | "TOUCH"
-     | "PROGRAM"
-     | "SEARCH"
-     | "SHARE_LINK";
+    | "MOUSE_DRAG"
+    | "KEYBOARD"
+    | "TOUCH"
+    | "PROGRAM"
+    | "SEARCH"
+    | "SHARE_LINK";
 
 export type ReaderRange = Readonly<{
     start: ReaderAnchor;
@@ -26169,35 +26755,50 @@ export type ReaderVerseSpan = Readonly<{
     endVerseKey: VerseKey;
 }>;
 
+/**
+ * Export / lookup-friendly flattened selection snapshot.
+ * Useful for copy/share/export without forcing consumers to traverse anchors.
+ */
+export type ReaderSelectionSnapshot = Readonly<{
+    range: ReaderRange;
+    verseSpan: ReaderVerseSpan;
+    translationId?: TranslationId | null;
+    text?: string | null;
+}>;
+
 /* =============================================================================
    Annotation System
 ============================================================================= */
 
 export type ReaderAnnotationKind =
-     | "HIGHLIGHT"
-     | "UNDERLINE"
-     | "NOTE"
-     | "BOOKMARK"
-     | "LINK"
-     | "DRAWING";
+    | "HIGHLIGHT"
+    | "UNDERLINE"
+    | "NOTE"
+    | "BOOKMARK"
+    | "LINK"
+    | "DRAWING";
 
 export type ReaderAnnotationScope = "RANGE" | "WHOLE_VERSE";
 export type ReaderVisibility = "PRIVATE" | "SHARED" | "PUBLIC";
 
 export type ReaderInk =
-     | "INK_0"
-     | "INK_1"
-     | "INK_2"
-     | "INK_3"
-     | "INK_4"
-     | "INK_5";
+    | "INK_0"
+    | "INK_1"
+    | "INK_2"
+    | "INK_3"
+    | "INK_4"
+    | "INK_5";
 
 export type ReaderHighlightStyle = "SOLID" | "SOFT" | "UNDERLINE" | "OUTLINE";
 export type ReaderUnderlineStyle = "SINGLE" | "DOUBLE";
 
+export type ReaderTag = Readonly<{
+    value: string;
+}>;
+
 export type ReaderNoteBody =
-     | Readonly<{ format: "PLAINTEXT"; text: string }>
-     | Readonly<{ format: "MARKDOWN"; md: string }>;
+    | Readonly<{ format: "PLAINTEXT"; text: string }>
+    | Readonly<{ format: "MARKDOWN"; md: string }>;
 
 export type ReaderAnnotationBase = Readonly<{
     id: ReaderId;
@@ -26215,52 +26816,52 @@ export type ReaderAnnotationBase = Readonly<{
 }>;
 
 export type ReaderHighlight = ReaderAnnotationBase &
-     Readonly<{
-         kind: "HIGHLIGHT";
-         style?: ReaderHighlightStyle | null;
-         strength?: number | null;
-     }>;
+    Readonly<{
+        kind: "HIGHLIGHT";
+        style?: ReaderHighlightStyle | null;
+        strength?: number | null;
+    }>;
 
 export type ReaderUnderline = ReaderAnnotationBase &
-     Readonly<{
-         kind: "UNDERLINE";
-         style?: ReaderUnderlineStyle | null;
-     }>;
+    Readonly<{
+        kind: "UNDERLINE";
+        style?: ReaderUnderlineStyle | null;
+    }>;
 
 export type ReaderNote = ReaderAnnotationBase &
-     Readonly<{
-         kind: "NOTE";
-         title?: string | null;
-         body: ReaderNoteBody;
-         uiState?: Readonly<{ collapsed?: boolean | null }> | null;
-     }>;
+    Readonly<{
+        kind: "NOTE";
+        title?: string | null;
+        body: ReaderNoteBody;
+        uiState?: Readonly<{ collapsed?: boolean | null }> | null;
+    }>;
 
 export type ReaderBookmark = ReaderAnnotationBase &
-     Readonly<{
-         kind: "BOOKMARK";
-         label?: string | null;
-     }>;
+    Readonly<{
+        kind: "BOOKMARK";
+        label?: string | null;
+    }>;
 
 export type ReaderLinkTarget =
-     | Readonly<{ type: "VERSE_REF"; ref: VerseRef }>
-     | Readonly<{ type: "RANGE"; range: ReaderRange }>
-     | Readonly<{ type: "URL"; url: string }>
-     | Readonly<{ type: "SEARCH"; query: string }>;
+    | Readonly<{ type: "VERSE_REF"; ref: VerseRef }>
+    | Readonly<{ type: "RANGE"; range: ReaderRange }>
+    | Readonly<{ type: "URL"; url: string }>
+    | Readonly<{ type: "SEARCH"; query: string }>;
 
 export type ReaderLink = ReaderAnnotationBase &
-     Readonly<{
-         kind: "LINK";
-         target: ReaderLinkTarget;
-         label?: string | null;
-     }>;
+    Readonly<{
+        kind: "LINK";
+        target: ReaderLinkTarget;
+        label?: string | null;
+    }>;
 
 export type ReaderDrawingProjection = "VERSE_BLOCK" | "RANGE_BLOCK" | "PAGE_VIEW";
 
 export type ReaderPoint = Readonly<{
     x: number;
     y: number;
-    p?: number | null;
-    t?: number | null;
+    p?: number | null; // pressure
+    t?: number | null; // time or sequence-adjacent scalar
 }>;
 
 export type ReaderStroke = Readonly<{
@@ -26279,19 +26880,19 @@ export type ReaderDrawingPayload = Readonly<{
 }>;
 
 export type ReaderDrawing = ReaderAnnotationBase &
-     Readonly<{
-         kind: "DRAWING";
-         drawing: ReaderDrawingPayload;
-         projection?: ReaderDrawingProjection | null;
-     }>;
+    Readonly<{
+        kind: "DRAWING";
+        drawing: ReaderDrawingPayload;
+        projection?: ReaderDrawingProjection | null;
+    }>;
 
 export type ReaderAnnotation =
-     | ReaderHighlight
-     | ReaderUnderline
-     | ReaderNote
-     | ReaderBookmark
-     | ReaderLink
-     | ReaderDrawing;
+    | ReaderHighlight
+    | ReaderUnderline
+    | ReaderNote
+    | ReaderBookmark
+    | ReaderLink
+    | ReaderDrawing;
 
 /* =============================================================================
    UI Geometry Projections
@@ -26303,10 +26904,21 @@ export type VerseDomKey = Readonly<{
 }>;
 
 export type ViewportRect = Readonly<{
-    left: number;
-    top: number;
-    width: number;
-    height: number;
+    left: CssPx;
+    top: CssPx;
+    width: CssPx;
+    height: CssPx;
+}>;
+
+/**
+ * Normalized bbox projection, typically relative to a verse block or container.
+ * 0..1 expected for each coordinate.
+ */
+export type NormalizedRect = Readonly<{
+    minX: UnitInterval;
+    minY: UnitInterval;
+    maxX: UnitInterval;
+    maxY: UnitInterval;
 }>;
 
 export type RangeOverlayProjection = Readonly<{
@@ -26385,27 +26997,27 @@ export type ReaderAnnotationSyncResponse = Readonly<{
 }>;
 
 /* =============================================================================
-   Slice Payload
-============================================================================= */
-
-export type SlicePayload = Readonly<{
-    verses: ReadonlyArray<SliceVerse>;
-    spine: SpineStats;
-}>;
-
-/* =============================================================================
    Convenient unions / helpers
 ============================================================================= */
 
 export type ReaderEntity =
-     | SliceVerse
-     | ReaderAnnotation
-     | ReaderRange
-     | ReaderExportBlock;
+    | SliceVerse
+    | ReaderAnnotation
+    | ReaderRange
+    | ReaderExportBlock;
 
 export type ReaderAnnotationMap = ReadonlyMap<ReaderId, ReaderAnnotation>;
 export type VerseIndexMap = ReadonlyMap<number, SliceVerse>;
 export type BookIndexMap = ReadonlyMap<BookId, BookRow>;
+
+export type ReaderLoadState<T> =
+    | Readonly<{ status: "idle" }>
+    | Readonly<{ status: "loading" }>
+    | Readonly<{ status: "ready"; value: T }>
+    | Readonly<{ status: "error"; message: string }>;
+
+export type ReaderMaybeVerse = SliceVerse | null;
+export type ReaderMaybeAnnotation = ReaderAnnotation | null;
 ```
 
 ### apps/web/src/reader/typography.ts
@@ -26417,30 +27029,30 @@ export type BookIndexMap = ReadonlyMap<BookId, BookRow>;
 // Biblia.to — reader typography + layout tuning
 //
 // Goals:
-// - Persist stable font IDs, never raw CSS strings
-// - Normalize + clamp deterministically
-// - Migrate older saves cleanly
-// - One authoritative apply() to <html>
-// - Explicit modern font presets with richer metadata
-// - Stable helpers for virtualizer / measurement calm
-// - Hardened storage / migration / SSR safety
+// - persist stable font IDs, never raw CSS strings
+// - normalize + clamp deterministically
+// - migrate older saves cleanly
+// - one authoritative apply() to <html>
+// - explicit modern font presets with richer metadata
+// - stable helpers for virtualizer / measurement calm
+// - hardened storage / migration / SSR safety
 
 export type TypographyFont =
-     | "inter"
-     | "literata"
-     | "quicksand"
-     | "book"
-     | "human"
-     | "mono"
-     | "custom_1"
-     | "custom_2";
+    | "inter"
+    | "literata"
+    | "quicksand"
+    | "book"
+    | "human"
+    | "mono"
+    | "custom_1"
+    | "custom_2";
 
 export type TypographyCategory =
-     | "sans"
-     | "serif"
-     | "rounded"
-     | "mono"
-     | "custom";
+    | "sans"
+    | "serif"
+    | "rounded"
+    | "mono"
+    | "custom";
 
 export type ReaderTypography = Readonly<{
     font: TypographyFont;
@@ -26488,25 +27100,28 @@ type TypographyEnvelopeV1 = Readonly<{
     t: ReaderTypography;
 }>;
 
-/**
- * Default:
- * - Inter is the default modern reading-first sans
- * - calmer measure for scripture
- */
-export const DEFAULT_TYPOGRAPHY: ReaderTypography = Object.freeze({
-    font: "inter",
-    sizePx: 18,
-    weight: 400,
-    leading: 1.72,
-    measurePx: 820,
-});
+type StoredTypographyEnvelope = TypographyEnvelopeV1;
+
+type FontFaceSetLike = {
+    ready: Promise<unknown>;
+};
+
+type DocumentWithFonts = Document & {
+    fonts?: FontFaceSetLike;
+};
 
 const STORAGE_KEY_V2 = "bp_reader_typography_v2";
 const STORAGE_KEY_V1 = "bp_reader_typography_v1";
 const LEGACY_KEYS = Object.freeze([
     "bp_reader_typography",
     "bp_typography",
-]);
+] as const);
+
+const CSS_VAR_FONT = "--bpScriptureFont";
+const CSS_VAR_SIZE = "--bpScriptureSize";
+const CSS_VAR_LEADING = "--bpScriptureLeading";
+const CSS_VAR_WEIGHT = "--bpScriptureWeight";
+const CSS_VAR_MEASURE = "--bpReaderMeasure";
 
 const LIMITS: TypographyLimits = Object.freeze({
     sizePx: Object.freeze({ lo: 12, hi: 30, step: 1 }),
@@ -26526,6 +27141,18 @@ const FONT_ORDER = Object.freeze([
     "custom_2",
 ] satisfies readonly TypographyFont[]);
 
+export const DEFAULT_TYPOGRAPHY: ReaderTypography = Object.freeze({
+    font: "inter",
+    sizePx: 18,
+    weight: 400,
+    leading: 1.72,
+    measurePx: 820,
+});
+
+/**
+ * Keep IDs stable forever.
+ * CSS family strings may evolve, IDs must not.
+ */
 export const FONT_PRESETS: Readonly<Record<TypographyFont, FontPreset>> = Object.freeze({
     inter: Object.freeze({
         label: "Inter",
@@ -26536,6 +27163,7 @@ export const FONT_PRESETS: Readonly<Record<TypographyFont, FontPreset>> = Object
         aliases: Object.freeze([
             "sans",
             "ui sans",
+            "ui-sans",
             "modern sans",
             "inter variable",
             "--font-sans",
@@ -26582,6 +27210,7 @@ export const FONT_PRESETS: Readonly<Record<TypographyFont, FontPreset>> = Object
             "georgia",
             "times",
             "traditional serif",
+            "book serif",
         ]),
     }),
 
@@ -26593,8 +27222,12 @@ export const FONT_PRESETS: Readonly<Record<TypographyFont, FontPreset>> = Object
         uiFamily: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif',
         aliases: Object.freeze([
             "system",
+            "system ui",
             "system-ui",
+            "ui sans serif",
+            "ui-sans-serif",
             "ui-sans",
+            "human sans",
             "humanist sans",
             "roboto",
             "segoe",
@@ -26611,10 +27244,12 @@ export const FONT_PRESETS: Readonly<Record<TypographyFont, FontPreset>> = Object
         aliases: Object.freeze([
             "mono",
             "monospace",
+            "reader mono",
             "menlo",
             "monaco",
             "consolas",
             "sfmono",
+            "sfmono-regular",
         ]),
     }),
 
@@ -26645,11 +27280,24 @@ export const FONT_PRESETS: Readonly<Record<TypographyFont, FontPreset>> = Object
     }),
 });
 
+const FONT_OPTIONS: ReadonlyArray<FontOption> = Object.freeze(
+    FONT_ORDER.map((id) =>
+        Object.freeze({
+            id,
+            label: FONT_PRESETS[id].label,
+            cssFamily: FONT_PRESETS[id].css,
+            previewFamily: FONT_PRESETS[id].uiFamily ?? FONT_PRESETS[id].css,
+            category: FONT_PRESETS[id].category,
+            previewText: FONT_PRESETS[id].previewText,
+        }),
+    ),
+);
+
 let lastAppliedSignature: string | null = null;
 let lastAppliedEnabled = false;
 
 function isBrowser(): boolean {
-    return typeof window !== "undefined";
+    return typeof window !== "undefined" && typeof document !== "undefined";
 }
 
 function isDocumentAvailable(): boolean {
@@ -26666,8 +27314,11 @@ function clamp(n: number, lo: number, hi: number): number {
     return Math.max(lo, Math.min(hi, n));
 }
 
-function clampInt(n: number, lo: number, hi: number): number {
-    return Math.round(clamp(n, lo, hi));
+function snapInt(n: number, lo: number, hi: number, step: number): number {
+    const safeStep = Number.isFinite(step) && step > 0 ? step : 1;
+    const v = clamp(n, lo, hi);
+    const snapped = lo + Math.round((v - lo) / safeStep) * safeStep;
+    return Math.round(clamp(snapped, lo, hi));
 }
 
 function clampFloat(n: number, lo: number, hi: number, digits: number): number {
@@ -26678,17 +27329,23 @@ function clampFloat(n: number, lo: number, hi: number, digits: number): number {
 
 function toNumber(x: unknown): number | null {
     if (typeof x === "number" && Number.isFinite(x)) return x;
+
     if (typeof x === "string") {
         const trimmed = x.trim();
         if (!trimmed) return null;
         const n = Number(trimmed);
         return Number.isFinite(n) ? n : null;
     }
+
     return null;
 }
 
 function toString(x: unknown): string | null {
     return typeof x === "string" ? x : null;
+}
+
+function normalizeLooseString(x: unknown): string {
+    return (toString(x) ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function isRecord(x: unknown): x is Record<string, unknown> {
@@ -26697,6 +27354,7 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 
 function safeJsonParse(text: string | null): unknown | null {
     if (!text) return null;
+
     try {
         return JSON.parse(text) as unknown;
     } catch {
@@ -26706,6 +27364,7 @@ function safeJsonParse(text: string | null): unknown | null {
 
 function safeLocalStorageGet(key: string): string | null {
     if (!isBrowser()) return null;
+
     try {
         return window.localStorage.getItem(key);
     } catch {
@@ -26715,19 +27374,21 @@ function safeLocalStorageGet(key: string): string | null {
 
 function safeLocalStorageSet(key: string, value: string): void {
     if (!isBrowser()) return;
+
     try {
         window.localStorage.setItem(key, value);
     } catch {
-        // ignore
+        // ignore storage failures
     }
 }
 
 function safeLocalStorageRemove(key: string): void {
     if (!isBrowser()) return;
+
     try {
         window.localStorage.removeItem(key);
     } catch {
-        // ignore
+        // ignore storage failures
     }
 }
 
@@ -26747,79 +27408,128 @@ function isTypographyFont(x: string): x is TypographyFont {
     }
 }
 
-function stringIncludesAny(haystack: string, needles: readonly string[]): boolean {
-    for (const needle of needles) {
-        if (needle && haystack.includes(needle)) return true;
+function includesAlias(haystack: string, aliases: readonly string[] | undefined): boolean {
+    if (!aliases || aliases.length === 0) return false;
+
+    for (const alias of aliases) {
+        const a = normalizeLooseString(alias);
+        if (a && haystack.includes(a)) return true;
     }
+
     return false;
 }
 
 function normalizeFont(raw: unknown): TypographyFont {
-    const s = (toString(raw) ?? "").trim().toLowerCase();
+    const s = normalizeLooseString(raw);
     if (!s) return DEFAULT_TYPOGRAPHY.font;
     if (isTypographyFont(s)) return s;
 
     for (const id of FONT_ORDER) {
         const preset = FONT_PRESETS[id];
-        if (s === id) return id;
-        if (s === preset.label.trim().toLowerCase()) return id;
-        if (s === preset.css.trim().toLowerCase()) return id;
-        if (preset.aliases && stringIncludesAny(s, preset.aliases)) return id;
-        if (s.includes(id.replace("_", " "))) return id;
+        const normalizedLabel = normalizeLooseString(preset.label);
+        const normalizedCss = normalizeLooseString(preset.css);
+
+        if (s === normalizedLabel) return id;
+        if (s === normalizedCss) return id;
+        if (s === id.replace(/_/g, " ")) return id;
+        if (includesAlias(s, preset.aliases)) return id;
     }
 
     if (s === "sans") return "inter";
     if (s === "serif") return "literata";
     if (s === "rounded") return "quicksand";
+    if (s === "mono" || s === "monospace") return "mono";
+    if (s === "system") return "human";
 
     return DEFAULT_TYPOGRAPHY.font;
 }
 
 function normalizeTypography(
-     t: Partial<ReaderTypography> | null | undefined,
+    t: Partial<ReaderTypography> | null | undefined,
 ): ReaderTypography {
     return Object.freeze({
         font: normalizeFont(t?.font),
-        sizePx: clampInt(
-             toNumber(t?.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx,
-             LIMITS.sizePx.lo,
-             LIMITS.sizePx.hi,
+        sizePx: snapInt(
+            toNumber(t?.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx,
+            LIMITS.sizePx.lo,
+            LIMITS.sizePx.hi,
+            LIMITS.sizePx.step,
         ),
-        weight: clampInt(
-             toNumber(t?.weight) ?? DEFAULT_TYPOGRAPHY.weight,
-             LIMITS.weight.lo,
-             LIMITS.weight.hi,
+        weight: snapInt(
+            toNumber(t?.weight) ?? DEFAULT_TYPOGRAPHY.weight,
+            LIMITS.weight.lo,
+            LIMITS.weight.hi,
+            LIMITS.weight.step,
         ),
         leading: clampFloat(
-             toNumber(t?.leading) ?? DEFAULT_TYPOGRAPHY.leading,
-             LIMITS.leading.lo,
-             LIMITS.leading.hi,
-             LIMITS.leading.digits,
+            toNumber(t?.leading) ?? DEFAULT_TYPOGRAPHY.leading,
+            LIMITS.leading.lo,
+            LIMITS.leading.hi,
+            LIMITS.leading.digits,
         ),
-        measurePx: clampInt(
-             toNumber(t?.measurePx) ?? DEFAULT_TYPOGRAPHY.measurePx,
-             LIMITS.measurePx.lo,
-             LIMITS.measurePx.hi,
+        measurePx: snapInt(
+            toNumber(t?.measurePx) ?? DEFAULT_TYPOGRAPHY.measurePx,
+            LIMITS.measurePx.lo,
+            LIMITS.measurePx.hi,
+            LIMITS.measurePx.step,
         ),
     });
 }
 
-function unwrapTypographyPayload(parsed: unknown): ReaderTypography | null {
-    if (!isRecord(parsed)) return null;
+function isEnvelopeV1(parsed: unknown): parsed is TypographyEnvelopeV1 {
+    return (
+        isRecord(parsed) &&
+        parsed.v === 1 &&
+        isRecord(parsed.t)
+    );
+}
 
-    if (parsed.v === 1 && isRecord(parsed.t)) {
-        return normalizeTypography(parsed.t as Partial<ReaderTypography>);
+function unwrapTypographyPayload(parsed: unknown): ReaderTypography | null {
+    if (!parsed) return null;
+
+    if (isEnvelopeV1(parsed)) {
+        return normalizeTypography(parsed.t);
     }
 
-    return normalizeTypography(parsed as Partial<ReaderTypography>);
+    if (isRecord(parsed)) {
+        return normalizeTypography(parsed as Partial<ReaderTypography>);
+    }
+
+    return null;
+}
+
+function buildTypographyEnvelope(t: ReaderTypography): StoredTypographyEnvelope {
+    return Object.freeze({
+        v: 1,
+        t: normalizeTypography(t),
+    });
 }
 
 function removeTypographyVars(root: HTMLElement): void {
-    root.style.removeProperty("--bpScriptureFont");
-    root.style.removeProperty("--bpScriptureSize");
-    root.style.removeProperty("--bpScriptureLeading");
-    root.style.removeProperty("--bpScriptureWeight");
-    root.style.removeProperty("--bpReaderMeasure");
+    root.style.removeProperty(CSS_VAR_FONT);
+    root.style.removeProperty(CSS_VAR_SIZE);
+    root.style.removeProperty(CSS_VAR_LEADING);
+    root.style.removeProperty(CSS_VAR_WEIGHT);
+    root.style.removeProperty(CSS_VAR_MEASURE);
+}
+
+function resetAppliedState(): void {
+    lastAppliedEnabled = false;
+    lastAppliedSignature = null;
+}
+
+function purgeLegacyKeys(): void {
+    safeLocalStorageRemove(STORAGE_KEY_V1);
+
+    for (const key of LEGACY_KEYS) {
+        safeLocalStorageRemove(key);
+    }
+}
+
+function tryLoadFromKey(key: string): ReaderTypography | null {
+    const raw = safeLocalStorageGet(key);
+    if (!raw) return null;
+    return unwrapTypographyPayload(safeJsonParse(raw));
 }
 
 export function typographyLimits(): TypographyLimits {
@@ -26828,21 +27538,36 @@ export function typographyLimits(): TypographyLimits {
 
 export function typographySignature(t: ReaderTypography): string {
     const normalized = normalizeTypography(t);
-    return `f=${normalized.font}|s=${normalized.sizePx}|w=${normalized.weight}|l=${normalized.leading}|m=${normalized.measurePx}`;
+
+    return [
+        `f=${normalized.font}`,
+        `s=${normalized.sizePx}`,
+        `w=${normalized.weight}`,
+        `l=${normalized.leading.toFixed(LIMITS.leading.digits)}`,
+        `m=${normalized.measurePx}`,
+    ].join("|");
 }
 
 export function getFontCssFamily(font: TypographyFont): string {
-    return FONT_PRESETS[font]?.css ?? "var(--font-sans)";
+    return FONT_PRESETS[font]?.css ?? FONT_PRESETS.inter.css;
+}
+
+export function getFontPreset(font: TypographyFont): FontPreset {
+    return FONT_PRESETS[font] ?? FONT_PRESETS.inter;
+}
+
+export function getFontLabel(font: TypographyFont): string {
+    return getFontPreset(font).label;
 }
 
 export function normalizeReaderTypography(
-     t: Partial<ReaderTypography> | ReaderTypography | null | undefined,
+    t: Partial<ReaderTypography> | ReaderTypography | null | undefined,
 ): ReaderTypography {
     return normalizeTypography(t ?? undefined);
 }
 
 export function coerceTypographyPatch(
-     patch: Partial<ReaderTypography> | null | undefined,
+    patch: Partial<ReaderTypography> | null | undefined,
 ): Partial<ReaderTypography> {
     if (!patch) return {};
 
@@ -26853,35 +27578,38 @@ export function coerceTypographyPatch(
     }
 
     if (patch.sizePx != null) {
-        out.sizePx = clampInt(
-             toNumber(patch.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx,
-             LIMITS.sizePx.lo,
-             LIMITS.sizePx.hi,
+        out.sizePx = snapInt(
+            toNumber(patch.sizePx) ?? DEFAULT_TYPOGRAPHY.sizePx,
+            LIMITS.sizePx.lo,
+            LIMITS.sizePx.hi,
+            LIMITS.sizePx.step,
         );
     }
 
     if (patch.weight != null) {
-        out.weight = clampInt(
-             toNumber(patch.weight) ?? DEFAULT_TYPOGRAPHY.weight,
-             LIMITS.weight.lo,
-             LIMITS.weight.hi,
+        out.weight = snapInt(
+            toNumber(patch.weight) ?? DEFAULT_TYPOGRAPHY.weight,
+            LIMITS.weight.lo,
+            LIMITS.weight.hi,
+            LIMITS.weight.step,
         );
     }
 
     if (patch.leading != null) {
         out.leading = clampFloat(
-             toNumber(patch.leading) ?? DEFAULT_TYPOGRAPHY.leading,
-             LIMITS.leading.lo,
-             LIMITS.leading.hi,
-             LIMITS.leading.digits,
+            toNumber(patch.leading) ?? DEFAULT_TYPOGRAPHY.leading,
+            LIMITS.leading.lo,
+            LIMITS.leading.hi,
+            LIMITS.leading.digits,
         );
     }
 
     if (patch.measurePx != null) {
-        out.measurePx = clampInt(
-             toNumber(patch.measurePx) ?? DEFAULT_TYPOGRAPHY.measurePx,
-             LIMITS.measurePx.lo,
-             LIMITS.measurePx.hi,
+        out.measurePx = snapInt(
+            toNumber(patch.measurePx) ?? DEFAULT_TYPOGRAPHY.measurePx,
+            LIMITS.measurePx.lo,
+            LIMITS.measurePx.hi,
+            LIMITS.measurePx.step,
         );
     }
 
@@ -26889,8 +27617,8 @@ export function coerceTypographyPatch(
 }
 
 export function updateTypography(
-     base: ReaderTypography,
-     patch: Partial<ReaderTypography>,
+    base: ReaderTypography,
+    patch: Partial<ReaderTypography>,
 ): ReaderTypography {
     return normalizeTypography({
         ...normalizeTypography(base),
@@ -26899,41 +27627,29 @@ export function updateTypography(
 }
 
 export function fontOptions(): FontOption[] {
-    return FONT_ORDER.map((id) => ({
-        id,
-        label: FONT_PRESETS[id].label,
-        cssFamily: FONT_PRESETS[id].css,
-        previewFamily: FONT_PRESETS[id].uiFamily ?? FONT_PRESETS[id].css,
-        category: FONT_PRESETS[id].category,
-        previewText: FONT_PRESETS[id].previewText,
-    }));
+    return [...FONT_OPTIONS];
 }
 
 /**
- * Try v2 → v1 → legacy keys, normalize, migrate to v2 envelope.
+ * Try v2 -> v1 -> legacy keys.
+ * Any successful non-v2 read is migrated forward immediately.
  */
 export function loadReaderTypography(): ReaderTypography | null {
-    const tryKey = (key: string): ReaderTypography | null => {
-        const raw = safeLocalStorageGet(key);
-        if (!raw) return null;
-        return unwrapTypographyPayload(safeJsonParse(raw));
-    };
-
-    const v2 = tryKey(STORAGE_KEY_V2);
+    const v2 = tryLoadFromKey(STORAGE_KEY_V2);
     if (v2) return v2;
 
-    const v1 = tryKey(STORAGE_KEY_V1);
+    const v1 = tryLoadFromKey(STORAGE_KEY_V1);
     if (v1) {
         saveReaderTypographyEnvelope(v1);
-        safeLocalStorageRemove(STORAGE_KEY_V1);
+        purgeLegacyKeys();
         return v1;
     }
 
     for (const key of LEGACY_KEYS) {
-        const migrated = tryKey(key);
+        const migrated = tryLoadFromKey(key);
         if (migrated) {
             saveReaderTypographyEnvelope(migrated);
-            safeLocalStorageRemove(key);
+            purgeLegacyKeys();
             return migrated;
         }
     }
@@ -26946,18 +27662,22 @@ export function saveReaderTypography(t: ReaderTypography): void {
 }
 
 export function saveReaderTypographyEnvelope(t: ReaderTypography): void {
-    const normalized = normalizeTypography(t);
-    const env: TypographyEnvelopeV1 = Object.freeze({ v: 1, t: normalized });
+    const env = buildTypographyEnvelope(t);
     safeLocalStorageSet(STORAGE_KEY_V2, JSON.stringify(env));
 }
 
 export function clearReaderTypography(): void {
     safeLocalStorageRemove(STORAGE_KEY_V2);
-    safeLocalStorageRemove(STORAGE_KEY_V1);
+    purgeLegacyKeys();
+    resetAppliedState();
+}
 
-    for (const key of LEGACY_KEYS) {
-        safeLocalStorageRemove(key);
+export function clearAppliedReaderTypography(): void {
+    const root = currentRoot();
+    if (root) {
+        removeTypographyVars(root);
     }
+    resetAppliedState();
 }
 
 export function applyReaderTypography(t: ReaderTypography | null): void {
@@ -26967,8 +27687,7 @@ export function applyReaderTypography(t: ReaderTypography | null): void {
     if (!t) {
         if (!lastAppliedEnabled) return;
         removeTypographyVars(root);
-        lastAppliedEnabled = false;
-        lastAppliedSignature = null;
+        resetAppliedState();
         return;
     }
 
@@ -26979,11 +27698,11 @@ export function applyReaderTypography(t: ReaderTypography | null): void {
         return;
     }
 
-    root.style.setProperty("--bpScriptureFont", getFontCssFamily(normalized.font));
-    root.style.setProperty("--bpScriptureSize", `${normalized.sizePx}px`);
-    root.style.setProperty("--bpScriptureLeading", String(normalized.leading));
-    root.style.setProperty("--bpScriptureWeight", String(normalized.weight));
-    root.style.setProperty("--bpReaderMeasure", `${normalized.measurePx}px`);
+    root.style.setProperty(CSS_VAR_FONT, getFontCssFamily(normalized.font));
+    root.style.setProperty(CSS_VAR_SIZE, `${normalized.sizePx}px`);
+    root.style.setProperty(CSS_VAR_LEADING, String(normalized.leading));
+    root.style.setProperty(CSS_VAR_WEIGHT, String(normalized.weight));
+    root.style.setProperty(CSS_VAR_MEASURE, `${normalized.measurePx}px`);
 
     lastAppliedEnabled = true;
     lastAppliedSignature = sig;
@@ -26997,25 +27716,28 @@ export function applyReaderTypographyFromStorage(): ReaderTypography | null {
 
 /**
  * Best-effort wait for document fonts readiness.
+ * Safe in SSR / restricted browser contexts.
  */
 export async function waitForFontsIfSupported(timeoutMs = 700): Promise<void> {
-    if (!isDocumentAvailable()) return;
+    if (!isBrowser()) return;
 
-    const doc = document as Document & { fonts?: FontFaceSet };
+    const doc = document as DocumentWithFonts;
     const fonts = doc.fonts;
-    if (!fonts) return;
+    if (!fonts || typeof fonts.ready?.then !== "function") return;
 
     let timeoutId: number | null = null;
 
-    await Promise.race([
-        fonts.ready.then(() => undefined).catch(() => undefined),
-        new Promise<void>((resolve) => {
-            timeoutId = window.setTimeout(resolve, timeoutMs);
-        }),
-    ]);
-
-    if (timeoutId != null) {
-        window.clearTimeout(timeoutId);
+    try {
+        await Promise.race([
+            fonts.ready.then(() => undefined).catch(() => undefined),
+            new Promise<void>((resolve) => {
+                timeoutId = window.setTimeout(resolve, Math.max(0, timeoutMs));
+            }),
+        ]);
+    } finally {
+        if (timeoutId != null) {
+            window.clearTimeout(timeoutId);
+        }
     }
 }
 ```
@@ -27293,13 +28015,69 @@ type Props = Readonly<{
     annotations?: readonly Annotation[];
 }>;
 
+type TokenKind =
+    | "WORD"
+    | "PUNCT"
+    | "SPACE"
+    | "LINEBREAK"
+    | "MARKER"
+    | "NUMBER"
+    | "SYMBOL"
+    | string;
+
 type TokenMeta = Readonly<{
     tokenIndex: number;
-    tokenKind?: string;
+    tokenKind?: TokenKind;
     charStart?: number;
     charEnd?: number;
     text: string;
 }>;
+
+type VerseMeta = Readonly<{
+    verseOrd: number;
+    verseKey: string;
+    translationId: string | null;
+    normalizedTokens: readonly TokenMeta[] | null;
+    plainVerseText: string;
+    hasTokens: boolean;
+    isBookStart: boolean;
+    isChapterStart: boolean;
+    bookLabel: string;
+    ariaLabel: string;
+    rootId: string;
+    verseTextId: string;
+}>;
+
+const EMPTY_ANNOTATIONS: readonly Annotation[] = [];
+
+const TOKEN_SPAN_BASE_STYLE: React.CSSProperties = Object.freeze({
+    whiteSpace: "pre-wrap",
+});
+
+const TOKEN_TEXT_STYLE: React.CSSProperties = Object.freeze({
+    ...TOKEN_SPAN_BASE_STYLE,
+    position: "relative",
+    zIndex: 1,
+    userSelect: "text",
+    WebkitUserSelect: "text",
+});
+
+const TOKEN_PUNCT_STYLE: React.CSSProperties = Object.freeze({
+    ...TOKEN_SPAN_BASE_STYLE,
+    position: "relative",
+    zIndex: 1,
+    userSelect: "text",
+    WebkitUserSelect: "text",
+});
+
+const TOKEN_MARKER_STYLE: React.CSSProperties = Object.freeze({
+    ...TOKEN_SPAN_BASE_STYLE,
+    opacity: 0.8,
+    position: "relative",
+    zIndex: 1,
+    userSelect: "text",
+    WebkitUserSelect: "text",
+});
 
 function readMaybeString(value: unknown): string | null {
     if (typeof value !== "string") return null;
@@ -27329,9 +28107,9 @@ function getRowVerseOrd(row: SliceVerse): number {
 function getRowVerseKey(row: SliceVerse): string {
     const record = getRecord(row);
     return (
-         readMaybeString(record.verseKey) ??
-         readMaybeString(record.verse_key) ??
-         `${row.bookId}.${row.chapter}.${row.verse}`
+        readMaybeString(record.verseKey) ??
+        readMaybeString(record.verse_key) ??
+        `${row.bookId}.${row.chapter}.${row.verse}`
     );
 }
 
@@ -27340,7 +28118,7 @@ function getTokenIndex(token: SliceToken, fallback: number): number {
     return readMaybeNumber(record.tokenIndex) ?? readMaybeNumber(record.token_index) ?? fallback;
 }
 
-function getTokenKind(token: SliceToken): string | undefined {
+function getTokenKind(token: SliceToken): TokenKind | undefined {
     const record = getRecord(token);
     return readMaybeString(record.tokenKind) ?? readMaybeString(record.token_kind) ?? undefined;
 }
@@ -27374,193 +28152,257 @@ function buildVerseTextPlain(row: SliceVerse, tokens: readonly TokenMeta[] | nul
 function normalizeTokens(row: SliceVerse): readonly TokenMeta[] | null {
     if (!Array.isArray(row.tokens) || row.tokens.length === 0) return null;
 
-    return row.tokens.map((token, index) => ({
+    const out = row.tokens.map((token, index) => ({
         tokenIndex: getTokenIndex(token, index),
         tokenKind: getTokenKind(token),
         charStart: getTokenCharStart(token),
         charEnd: getTokenCharEnd(token),
         text: getTokenText(token),
     }));
+
+    out.sort((a, b) => {
+        if (a.tokenIndex !== b.tokenIndex) return a.tokenIndex - b.tokenIndex;
+        return a.text.localeCompare(b.text);
+    });
+
+    return out;
 }
 
-function shouldHideTokenFromAT(tokenKind: string | undefined): boolean {
+function shouldHideTokenFromAT(tokenKind: TokenKind | undefined): boolean {
     return tokenKind === "SPACE" || tokenKind === "LINEBREAK";
 }
 
-export const VerseRow = React.memo(function VerseRow(props: Props) {
-    const { row, book, annotations = [] } = props;
+function isWhitespaceToken(token: TokenMeta): boolean {
+    if (token.tokenKind === "SPACE" || token.tokenKind === "LINEBREAK") return true;
+    return token.text.trim().length === 0;
+}
 
-    const [hovered, setHovered] = useState(false);
-    const [focused, setFocused] = useState(false);
+function getTokenStyle(token: TokenMeta): React.CSSProperties | undefined {
+    if (isWhitespaceToken(token)) return undefined;
 
-    const verseOrd = useMemo(() => getRowVerseOrd(row), [row]);
-    const verseKey = useMemo(() => getRowVerseKey(row), [row]);
-    const translationId = useMemo(() => getRowTranslationId(row), [row]);
+    switch (token.tokenKind) {
+        case "PUNCT":
+        case "SYMBOL":
+            return TOKEN_PUNCT_STYLE;
+        case "MARKER":
+            return TOKEN_MARKER_STYLE;
+        default:
+            return TOKEN_TEXT_STYLE;
+    }
+}
 
-    const normalizedTokens = useMemo(() => normalizeTokens(row), [row]);
+function buildVerseMeta(row: SliceVerse, book: BookRow | null): VerseMeta {
+    const verseOrd = getRowVerseOrd(row);
+    const verseKey = getRowVerseKey(row);
+    const translationId = getRowTranslationId(row);
+    const normalizedTokens = normalizeTokens(row);
     const hasTokens = !!normalizedTokens && normalizedTokens.length > 0;
-    const hasAnnotations = annotations.length > 0;
-
+    const plainVerseText = buildVerseTextPlain(row, normalizedTokens);
     const isBookStart = row.chapter === 1 && row.verse === 1;
     const isChapterStart = row.verse === 1;
-
     const rootId = verseOrd > 0 ? `ord-${verseOrd}` : `verse-${verseKey}`;
     const verseTextId = `${rootId}-text`;
+    const bookLabel = readMaybeString(book?.name) ?? row.bookId;
+    const ariaLabel = buildVerseAriaLabel(bookLabel, row.chapter, row.verse);
 
-    const bookLabel = useMemo(() => readMaybeString(book?.name) ?? row.bookId, [book?.name, row.bookId]);
+    return {
+        verseOrd,
+        verseKey,
+        translationId,
+        normalizedTokens,
+        plainVerseText,
+        hasTokens,
+        isBookStart,
+        isChapterStart,
+        bookLabel,
+        ariaLabel,
+        rootId,
+        verseTextId,
+    };
+}
 
-    const ariaLabel = useMemo(
-         () => buildVerseAriaLabel(bookLabel, row.chapter, row.verse),
-         [bookLabel, row.chapter, row.verse],
-    );
-
-    const plainVerseText = useMemo(
-         () => buildVerseTextPlain(row, normalizedTokens),
-         [normalizedTokens, row],
-    );
-
-    const rowStyle = useMemo<React.CSSProperties>(() => {
-        const isSelected = hasAnnotations;
-        return {
-            ...sx.verseRow,
-            ...(hovered ? sx.verseRowHover : {}),
-            ...(focused ? sx.verseRowFocus : {}),
-            ...(isSelected ? sx.verseRowSelected : {}),
-            position: "relative",
-            isolation: "isolate",
-            cursor: "text",
-        };
-    }, [focused, hasAnnotations, hovered]);
-
-    const onPointerEnter = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
-        if (event.pointerType === "touch") return;
-        setHovered(true);
-    }, []);
-
-    const onPointerLeave = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
-        if (event.pointerType === "touch") return;
-        setHovered(false);
-    }, []);
-
-    const onFocus = useCallback(() => {
-        setFocused(true);
-    }, []);
-
-    const onBlur = useCallback(() => {
-        setFocused(false);
-    }, []);
-
-    const onMouseDown = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
-        if (event.defaultPrevented) return;
-        if (event.button !== 0) return;
-        if (event.detail > 1) return;
-
-        const target = event.target as HTMLElement | null;
-        if (!target) return;
-
-        const interactive = target.closest(
-             "button, a, input, textarea, select, summary, [role='button'], [contenteditable='true']",
-        );
-        if (interactive) return;
-
-        event.currentTarget.focus({ preventScroll: true });
-    }, []);
-
-    const verseBody = useMemo(() => {
-        if (!hasTokens || !normalizedTokens) {
-            return row.text ?? "";
-        }
-
-        return (
-             <>
-                 {normalizedTokens.map((token, index) => {
-                     const isWhitespaceOnly =
-                          token.tokenKind === "SPACE" ||
-                          token.tokenKind === "LINEBREAK" ||
-                          token.text.trim().length === 0;
-
-                     return (
-                          <span
-                               key={`${verseOrd}:${token.tokenIndex}:${index}`}
-                               data-token-index={token.tokenIndex}
-                               data-token-kind={token.tokenKind}
-                               data-token-char-start={token.charStart}
-                               data-token-char-end={token.charEnd}
-                               aria-hidden={shouldHideTokenFromAT(token.tokenKind) ? true : undefined}
-                               style={isWhitespaceOnly ? undefined : tokenSpanStyle}
-                          >
-                            {token.text}
-                        </span>
-                     );
-                 })}
-             </>
-        );
-    }, [hasTokens, normalizedTokens, row.text, verseOrd]);
+function renderVerseBody(
+    verseOrd: number,
+    normalizedTokens: readonly TokenMeta[] | null,
+    fallbackText: string | null | undefined,
+): React.ReactNode {
+    if (!normalizedTokens || normalizedTokens.length === 0) {
+        return fallbackText ?? "";
+    }
 
     return (
-         <div
-              id={rootId}
-              data-ord={verseOrd || undefined}
-              data-verse-ord={verseOrd || undefined}
-              data-verse-key={verseKey}
-              data-book={row.bookId}
-              data-chapter={row.chapter}
-              data-verse={row.verse}
-              data-translation-id={translationId ?? undefined}
-              data-has-tokens={hasTokens ? "1" : "0"}
-              style={sx.verseRowWrap}
-         >
-             {isBookStart ? <BookTitlePage book={book} bookId={row.bookId} /> : null}
-
-             {isChapterStart ? (
-                  <div style={sx.chapterHeader}>
-                      <div style={sx.chapterKicker}>CHAPTER</div>
-                      <div style={sx.chapterTitle}>
-                          {bookLabel} {row.chapter}
-                      </div>
-                  </div>
-             ) : null}
-
-             <div
-                  role="article"
-                  aria-roledescription="verse"
-                  aria-label={ariaLabel}
-                  aria-describedby={verseTextId}
-                  tabIndex={0}
-                  style={rowStyle}
-                  onPointerEnter={onPointerEnter}
-                  onPointerLeave={onPointerLeave}
-                  onFocus={onFocus}
-                  onBlur={onBlur}
-                  onMouseDown={onMouseDown}
-                  data-has-annotations={hasAnnotations ? "1" : "0"}
-                  data-selected={hasAnnotations ? "1" : "0"}
-             >
-                 <ReaderAnnotationOverlay annotations={annotations} />
-
-                 <div style={sx.verseNum} aria-hidden="true">
-                     {row.verse}
-                 </div>
-
-                 <div
-                      id={verseTextId}
-                      className="scripture"
-                      style={sx.verseText}
-                      data-verse-ord={verseOrd || undefined}
-                      data-verse-key={verseKey}
-                      data-translation-id={translationId ?? undefined}
-                      aria-label={plainVerseText}
-                 >
-                     {verseBody}
-                 </div>
-             </div>
-         </div>
+        <>
+            {normalizedTokens.map((token, index) => (
+                <span
+                    key={`${verseOrd}:${token.tokenIndex}:${index}`}
+                    data-token-index={token.tokenIndex}
+                    data-token-kind={token.tokenKind}
+                    data-token-char-start={token.charStart}
+                    data-token-char-end={token.charEnd}
+                    aria-hidden={shouldHideTokenFromAT(token.tokenKind) ? true : undefined}
+                    style={getTokenStyle(token)}
+                >
+                    {token.text}
+                </span>
+            ))}
+        </>
     );
-});
+}
 
-const tokenSpanStyle: React.CSSProperties = {
-    whiteSpace: "pre-wrap",
-};
+export const VerseRow = React.memo(
+    function VerseRow(props: Props) {
+        const { row, book, annotations = EMPTY_ANNOTATIONS } = props;
+
+        const [hovered, setHovered] = useState(false);
+        const [focused, setFocused] = useState(false);
+
+        const meta = useMemo(() => buildVerseMeta(row, book), [row, book]);
+        const hasAnnotations = annotations.length > 0;
+
+        const rowStyle = useMemo<React.CSSProperties>(() => {
+            const isSelected = hasAnnotations;
+
+            return {
+                ...sx.verseRow,
+                ...(hovered ? sx.verseRowHover : null),
+                ...(focused ? sx.verseRowFocus : null),
+                ...(isSelected ? sx.verseRowSelected : null),
+                position: "relative",
+                isolation: "isolate",
+                cursor: "text",
+                transition:
+                    "background 160ms ease, box-shadow 160ms ease, border-color 160ms ease, transform 160ms ease",
+            };
+        }, [focused, hasAnnotations, hovered]);
+
+        const verseTextStyle = useMemo<React.CSSProperties>(
+            () => ({
+                ...sx.verseText,
+                position: "relative",
+                zIndex: 1,
+                cursor: "text",
+                userSelect: "text",
+                WebkitUserSelect: "text",
+            }),
+            [],
+        );
+
+        const verseNumStyle = useMemo<React.CSSProperties>(
+            () => ({
+                ...sx.verseNum,
+                userSelect: "none",
+                WebkitUserSelect: "none",
+            }),
+            [],
+        );
+
+        const onPointerEnter = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+            if (event.pointerType === "touch") return;
+            setHovered(true);
+        }, []);
+
+        const onPointerLeave = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+            if (event.pointerType === "touch") return;
+            setHovered(false);
+        }, []);
+
+        const onFocus = useCallback(() => {
+            setFocused(true);
+        }, []);
+
+        const onBlur = useCallback(() => {
+            setFocused(false);
+        }, []);
+
+        const verseBody = useMemo(() => {
+            return renderVerseBody(meta.verseOrd, meta.normalizedTokens, row.text);
+        }, [meta.normalizedTokens, meta.verseOrd, row.text]);
+
+        const chapterHeader = useMemo(() => {
+            if (!meta.isChapterStart) return null;
+
+            return (
+                <div
+                    style={sx.chapterHeader}
+                    data-chapter-start="1"
+                    data-book={row.bookId}
+                    data-chapter={row.chapter}
+                >
+                    <div style={sx.chapterKicker}>CHAPTER</div>
+                    <div style={sx.chapterTitle}>
+                        {meta.bookLabel} {row.chapter}
+                    </div>
+                </div>
+            );
+        }, [meta.bookLabel, meta.isChapterStart, row.bookId, row.chapter]);
+
+        return (
+            <div
+                id={meta.rootId}
+                data-ord={meta.verseOrd || undefined}
+                data-verse-ord={meta.verseOrd || undefined}
+                data-verse-key={meta.verseKey}
+                data-book={row.bookId}
+                data-chapter={row.chapter}
+                data-verse={row.verse}
+                data-translation-id={meta.translationId ?? undefined}
+                data-has-tokens={meta.hasTokens ? "1" : "0"}
+                data-book-start={meta.isBookStart ? "1" : undefined}
+                data-chapter-start={meta.isChapterStart ? "1" : undefined}
+                style={sx.verseRowWrap}
+            >
+                {meta.isBookStart ? <BookTitlePage book={book} bookId={row.bookId} /> : null}
+
+                {chapterHeader}
+
+                <div
+                    aria-label={meta.ariaLabel}
+                    aria-describedby={meta.verseTextId}
+                    style={rowStyle}
+                    onPointerEnter={onPointerEnter}
+                    onPointerLeave={onPointerLeave}
+                    onFocus={onFocus}
+                    onBlur={onBlur}
+                    data-has-annotations={hasAnnotations ? "1" : "0"}
+                    data-selected={hasAnnotations ? "1" : "0"}
+                >
+                    <ReaderAnnotationOverlay annotations={annotations} />
+
+                    <div style={verseNumStyle} aria-hidden="true">
+                        {row.verse}
+                    </div>
+
+                    <div
+                        id={meta.verseTextId}
+                        className="scripture"
+                        style={verseTextStyle}
+                        data-verse-ord={meta.verseOrd || undefined}
+                        data-verse-key={meta.verseKey}
+                        data-translation-id={meta.translationId ?? undefined}
+                    >
+                        {verseBody}
+                    </div>
+                </div>
+            </div>
+        );
+    },
+    (prev, next) => {
+        if (prev.row !== next.row) return false;
+        if (prev.book !== next.book) return false;
+
+        const prevAnnotations = prev.annotations ?? EMPTY_ANNOTATIONS;
+        const nextAnnotations = next.annotations ?? EMPTY_ANNOTATIONS;
+
+        if (prevAnnotations === nextAnnotations) return true;
+        if (prevAnnotations.length !== nextAnnotations.length) return false;
+
+        for (let i = 0; i < prevAnnotations.length; i += 1) {
+            if (prevAnnotations[i] !== nextAnnotations[i]) return false;
+        }
+
+        return true;
+    },
+);
 ```
 
 ### apps/web/src/Search.tsx
@@ -28138,15 +28980,10 @@ export function Search(props: Props) {
         ...(focused ? (styles.searchRowFocused ?? {}) : null),
     };
 
-    const maxW =
-         styles.searchWrap?.maxWidth ??
-         styles.searchRow?.maxWidth ??
-         440;
-
     const wrapStyle: React.CSSProperties = {
         position: "relative",
         width: "100%",
-        maxWidth: typeof maxW === "number" || typeof maxW === "string" ? maxW : 440,
+        minWidth: 0,
         ...(styles.searchWrap ?? null),
     };
 
@@ -28155,7 +28992,8 @@ export function Search(props: Props) {
         ...(styles.searchPanel ?? null),
     };
 
-    const hintText = props.hint ?? "";
+    const hintText = props.hint ?? "Type a word or a reference";
+    const placeholder = props.hint ?? "Search… (or John 3:16)";
     const activeDescendant =
          showPanel && items[activeIdx] ? `${listboxId}-option-${activeIdx}` : undefined;
 
@@ -28177,8 +29015,8 @@ export function Search(props: Props) {
                       ref={inputRef}
                       value={q}
                       onChange={(e) => setQ(e.target.value)}
-                      placeholder="Search… (or John 3:16)"
-                      style={{ ...styles.searchInput, maxWidth: "100%" }}
+                      placeholder={placeholder}
+                      style={{ ...styles.searchInput, width: "100%", maxWidth: "100%", minWidth: 0 }}
                       aria-label="Search scripture"
                       aria-expanded={showPanel}
                       aria-controls={showPanel ? listboxId : undefined}
@@ -29187,17 +30025,17 @@ export default defineConfig({
 
 ### biblia.to-code-export.md
 
-> TRUNCATED: file was 1075429 bytes; showing first 48000 chars
+> TRUNCATED: file was 1111846 bytes; showing first 48000 chars
 
 ```md
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-08T03:11:00.325Z
-Root: /Users/dan/Desktop/Biblia-Populi
+Generated: 2026-03-10T17:30:44.223Z
+Root: C:\Users\dannydekker\Desktop\Biblia-Populi
 Total files: 70
-Total raw bytes (all included files): 2101829
+Total raw bytes (all included files): 2170288
 Truncated/skipped files: 1
-Export time: 11ms
+Export time: 28ms
 
 ## Notes
 
@@ -30970,13 +31808,7 @@ export default {
           "name": "entity_id",
           "type": "text",
           "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "duration_ms": {
-          "name": "duration_ms",
-          "type": "integer",
-          "primaryKey": fal
+          "notNull": false
 ```
 
 ### export-repo.ts

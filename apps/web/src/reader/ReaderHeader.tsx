@@ -10,315 +10,378 @@ import { ReaderTypographyControl } from "./ReaderTypographyControl";
 import { Home } from "lucide-react";
 
 type CurrentPos = {
-     label: string;
-     ord: number;
-     bookId: string | null;
-     chapter: number | null;
-     verse: number | null;
+    label: string;
+    ord: number;
+    bookId: string | null;
+    chapter: number | null;
+    verse: number | null;
 };
 
 type Props = {
-     styles: Record<string, React.CSSProperties>;
-     books: BookRow[] | null;
+    styles: Record<string, React.CSSProperties>;
+    books: BookRow[] | null;
 
-     onBackHome: () => void;
+    onBackHome: () => void;
 
-     current: CurrentPos;
-     onJumpRef: (bookId: string, chapter: number, verse: number | null) => void;
+    current: CurrentPos;
+    onJumpRef: (bookId: string, chapter: number, verse: number | null) => void;
 
-     // retained for API compatibility, not used by header anymore
-     onNavigate: (loc: { bookId: string; chapter: number; verse?: number }) => void;
+    // retained for API compatibility, not used by header anymore
+    onNavigate: (loc: { bookId: string; chapter: number; verse?: number }) => void;
 
-     // legacy: keep props but header uses global theme now
-     mode?: "light" | "dark";
-     onToggleTheme?: () => void;
+    // legacy: keep props but header uses global theme now
+    mode?: "light" | "dark";
+    onToggleTheme?: () => void;
 };
 
 type DockProps = {
-     children: ReactNode;
-     title?: string;
-     ariaLabel?: string;
-     pad?: number;
+    children: ReactNode;
+    title?: string;
+    ariaLabel?: string;
+    pad?: number;
+    minHeight?: number;
 };
 
+const TOKENS = Object.freeze({
+    dockRadius: 999,
+    dockMinHeight: 38,
+    dockPad: 3,
+    dockBorder: "1px solid color-mix(in srgb, var(--border) 62%, transparent)",
+    dockBg: "color-mix(in srgb, var(--bg) 86%, var(--panel))",
+    dockShadow: "0 8px 18px rgba(0,0,0,0.045)",
+    dockBlur: "blur(10px)",
+
+    iconBtnSize: 32,
+    iconBtnRadius: 999,
+    iconBtnHoverBg: "color-mix(in srgb, var(--activeBg) 58%, transparent)",
+    iconBtnDownBg: "color-mix(in srgb, var(--activeBg) 76%, transparent)",
+    iconBtnRing: "inset 0 0 0 1px color-mix(in srgb, var(--border) 58%, transparent)",
+    iconBtnTransition:
+        "transform 120ms ease, background 140ms ease, border-color 140ms ease, opacity 140ms ease, box-shadow 140ms ease",
+
+    groupGap: 8,
+    subtleGap: 6,
+    dividerColor: "color-mix(in srgb, var(--border) 68%, transparent)",
+    dividerHeight: 20,
+    dividerWidth: 1,
+});
+
+function releasePointerCaptureSafe(target: EventTarget | null, pointerId: number): void {
+    if (!(target instanceof Element)) return;
+
+    const el = target as Element & {
+        releasePointerCapture?: (id: number) => void;
+        hasPointerCapture?: (id: number) => boolean;
+    };
+
+    try {
+        if (typeof el.hasPointerCapture === "function") {
+            if (el.hasPointerCapture(pointerId) && typeof el.releasePointerCapture === "function") {
+                el.releasePointerCapture(pointerId);
+            }
+            return;
+        }
+
+        if (typeof el.releasePointerCapture === "function") {
+            el.releasePointerCapture(pointerId);
+        }
+    } catch {
+        // ignore
+    }
+}
+
+const ui = {
+    shell: Object.freeze<CSSProperties>({
+        display: "flex",
+        alignItems: "center",
+        gap: TOKENS.groupGap,
+        minWidth: 0,
+    }),
+
+    centerWrap: Object.freeze<CSSProperties>({
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        minWidth: 0,
+        width: "100%",
+    }),
+
+    rightCluster: Object.freeze<CSSProperties>({
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "flex-end",
+        gap: TOKENS.groupGap,
+        minWidth: 0,
+        flexWrap: "nowrap",
+    }),
+
+    divider: Object.freeze<CSSProperties>({
+        width: TOKENS.dividerWidth,
+        height: TOKENS.dividerHeight,
+        background: TOKENS.dividerColor,
+        opacity: 0.78,
+        marginInline: 1,
+        flex: "0 0 auto",
+    }),
+} as const;
+
 const Dock = memo(function Dock(props: DockProps) {
-     const { children, title, ariaLabel, pad = 3 } = props;
+    const {
+        children,
+        title,
+        ariaLabel,
+        pad = TOKENS.dockPad,
+        minHeight = TOKENS.dockMinHeight,
+    } = props;
 
-     const dock = useMemo<CSSProperties>(
-          () => ({
-               display: "inline-flex",
-               alignItems: "center",
-               justifyContent: "center",
-               padding: pad,
-               minHeight: 38,
-               borderRadius: 999,
-               background: "color-mix(in srgb, var(--bg) 86%, var(--panel))",
-               border: "1px solid color-mix(in srgb, var(--border) 62%, transparent)",
-               boxShadow: "0 8px 18px rgba(0,0,0,0.045)",
-               backdropFilter: "blur(10px)",
-               WebkitBackdropFilter: "blur(10px)",
-          }),
-          [pad],
-     );
+    const style = useMemo<CSSProperties>(
+        () => ({
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            minWidth: 0,
+            minHeight,
+            padding: pad,
+            borderRadius: TOKENS.dockRadius,
+            background: TOKENS.dockBg,
+            border: TOKENS.dockBorder,
+            boxShadow: TOKENS.dockShadow,
+            backdropFilter: TOKENS.dockBlur,
+            WebkitBackdropFilter: TOKENS.dockBlur,
+            boxSizing: "border-box",
+        }),
+        [minHeight, pad],
+    );
 
-     return (
-          <div style={dock} title={title} aria-label={ariaLabel}>
-               {children}
-          </div>
-     );
+    return (
+        <div style={style} title={title} aria-label={ariaLabel}>
+            {children}
+        </div>
+    );
 });
 
 const HeaderGroup = memo(function HeaderGroup(props: {
-     children: ReactNode;
-     ariaLabel?: string;
-     gap?: number;
+    children: ReactNode;
+    ariaLabel?: string;
+    gap?: number;
 }) {
-     const style = useMemo<CSSProperties>(
-          () => ({
-               display: "flex",
-               alignItems: "center",
-               gap: props.gap ?? 8,
-               minWidth: 0,
-          }),
-          [props.gap],
-     );
+    const { children, ariaLabel, gap = TOKENS.groupGap } = props;
 
-     return (
-          <div style={style} aria-label={props.ariaLabel}>
-               {props.children}
-          </div>
-     );
+    const style = useMemo<CSSProperties>(
+        () => ({
+            display: "flex",
+            alignItems: "center",
+            gap,
+            minWidth: 0,
+            flexWrap: "nowrap",
+        }),
+        [gap],
+    );
+
+    return (
+        <div style={style} aria-label={ariaLabel}>
+            {children}
+        </div>
+    );
 });
 
 const Divider = memo(function Divider() {
-     return (
-          <div
-               aria-hidden
-               style={{
-                    width: 1,
-                    height: 20,
-                    background: "color-mix(in srgb, var(--border) 68%, transparent)",
-                    opacity: 0.78,
-                    marginInline: 1,
-                    flex: "0 0 auto",
-               }}
-          />
-     );
+    return <div aria-hidden style={ui.divider} />;
 });
 
 type IconDockButtonProps = {
-     ariaLabel: string;
-     title: string;
-     onClick: () => void;
-     icon: ReactNode;
-     pressed?: boolean;
+    ariaLabel: string;
+    title: string;
+    onClick: () => void;
+    icon: ReactNode;
+    pressed?: boolean;
 };
 
 const IconDockButton = memo(function IconDockButton(props: IconDockButtonProps) {
-     const { ariaLabel, title, onClick, icon, pressed = false } = props;
-     const [hover, setHover] = useState(false);
-     const [down, setDown] = useState(false);
+    const { ariaLabel, title, onClick, icon, pressed = false } = props;
 
-     const style = useMemo<CSSProperties>(
-          () => ({
-               appearance: "none",
-               WebkitAppearance: "none",
-               width: 32,
-               height: 32,
-               border: "1px solid transparent",
-               borderRadius: 999,
-               background:
-                    down || pressed
-                         ? "color-mix(in srgb, var(--activeBg) 76%, transparent)"
-                         : hover
-                              ? "color-mix(in srgb, var(--activeBg) 58%, transparent)"
-                              : "transparent",
-               color: "var(--fg)",
-               display: "inline-flex",
-               alignItems: "center",
-               justifyContent: "center",
-               cursor: "pointer",
-               transform: down ? "scale(0.97)" : "scale(1)",
-               transition:
-                    "transform 120ms ease, background 140ms ease, border-color 140ms ease, opacity 140ms ease",
-               WebkitTapHighlightColor: "transparent",
-               outline: "none",
-               boxShadow:
-                    hover || down || pressed
-                         ? "inset 0 0 0 1px color-mix(in srgb, var(--border) 58%, transparent)"
-                         : "none",
-          }),
-          [down, hover, pressed],
-     );
+    const [hover, setHover] = useState(false);
+    const [down, setDown] = useState(false);
+    const active = pressed || down;
 
-     const onPointerEnter = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
-          if (e.pointerType === "touch") return;
-          setHover(true);
-     }, []);
+    const style = useMemo<CSSProperties>(
+        () => ({
+            appearance: "none",
+            WebkitAppearance: "none",
+            width: TOKENS.iconBtnSize,
+            height: TOKENS.iconBtnSize,
+            minWidth: TOKENS.iconBtnSize,
+            minHeight: TOKENS.iconBtnSize,
+            border: "1px solid transparent",
+            borderRadius: TOKENS.iconBtnRadius,
+            background: active
+                ? TOKENS.iconBtnDownBg
+                : hover
+                    ? TOKENS.iconBtnHoverBg
+                    : "transparent",
+            color: "var(--fg)",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            transform: down ? "scale(0.97)" : "scale(1)",
+            transition: TOKENS.iconBtnTransition,
+            WebkitTapHighlightColor: "transparent",
+            outline: "none",
+            boxShadow: hover || active ? TOKENS.iconBtnRing : "none",
+            flex: "0 0 auto",
+        }),
+        [active, down, hover],
+    );
 
-     const onPointerLeave = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
-          if (e.pointerType === "touch") return;
-          setHover(false);
-          setDown(false);
-     }, []);
+    const onPointerEnter = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+        if (e.pointerType === "touch") return;
+        setHover(true);
+    }, []);
 
-     const onPointerDown = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
-          try {
-               e.currentTarget.setPointerCapture(e.pointerId);
-          } catch {
-               // ignore
-          }
-          setDown(true);
-     }, []);
+    const onPointerLeave = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+        if (e.pointerType === "touch") return;
+        setHover(false);
+        setDown(false);
+        releasePointerCaptureSafe(e.currentTarget, e.pointerId);
+    }, []);
 
-     const onPointerClear = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
-          try {
-               e.currentTarget.releasePointerCapture(e.pointerId);
-          } catch {
-               // ignore
-          }
-          setDown(false);
-     }, []);
+    const onPointerDown = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+        try {
+            e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+            // ignore
+        }
+        setDown(true);
+    }, []);
 
-     return (
-          <button
-               type="button"
-               aria-label={ariaLabel}
-               title={title}
-               onClick={onClick}
-               onPointerEnter={onPointerEnter}
-               onPointerLeave={onPointerLeave}
-               onPointerDown={onPointerDown}
-               onPointerUp={onPointerClear}
-               onPointerCancel={onPointerClear}
-               onPointerOutCapture={onPointerClear}
-               style={style}
-          >
-               {icon}
-          </button>
-     );
+    const onPointerUp = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+        releasePointerCaptureSafe(e.currentTarget, e.pointerId);
+        setDown(false);
+    }, []);
+
+    const onPointerCancel = useCallback<PointerEventHandler<HTMLButtonElement>>((e) => {
+        releasePointerCaptureSafe(e.currentTarget, e.pointerId);
+        setDown(false);
+    }, []);
+
+    return (
+        <button
+            type="button"
+            aria-label={ariaLabel}
+            title={title}
+            onClick={onClick}
+            onPointerEnter={onPointerEnter}
+            onPointerLeave={onPointerLeave}
+            onPointerDown={onPointerDown}
+            onPointerUp={onPointerUp}
+            onPointerCancel={onPointerCancel}
+            style={style}
+        >
+            {icon}
+        </button>
+    );
+});
+
+const HomeDock = memo(function HomeDock(props: { onBackHome: () => void }) {
+    const { onBackHome } = props;
+
+    return (
+        <Dock title="Home" ariaLabel="Home">
+            <IconDockButton
+                ariaLabel="Home"
+                title="Home"
+                onClick={onBackHome}
+                icon={<Home size={17} aria-hidden />}
+            />
+        </Dock>
+    );
+});
+
+const AccountDock = memo(function AccountDock() {
+    return (
+        <Dock title="Account" ariaLabel="Account">
+            <AccountMenu size="sm" />
+        </Dock>
+    );
+});
+
+const TypographyDock = memo(function TypographyDock() {
+    return (
+        <Dock title="Typography" ariaLabel="Typography">
+            <ReaderTypographyControl />
+        </Dock>
+    );
+});
+
+const ThemeDock = memo(function ThemeDock() {
+    return (
+        <Dock title="Theme" ariaLabel="Theme">
+            <ThemeToggleSwitch size="sm" />
+        </Dock>
+    );
+});
+
+const PositionDock = memo(function PositionDock(props: {
+    styles: Record<string, React.CSSProperties>;
+    books: BookRow[] | null;
+    current: CurrentPos;
+    onJump: (bookId: string, chapter: number, verse: number | null) => void;
+}) {
+    const { styles, books, current, onJump } = props;
+
+    return (
+        <div style={ui.centerWrap}>
+            <PositionPill
+                styles={styles}
+                books={books}
+                current={current}
+                onJump={onJump}
+            />
+        </div>
+    );
 });
 
 export const ReaderHeader = memo(function ReaderHeader(props: Props) {
-     const { styles, books, onBackHome, current, onJumpRef } = props;
+    const { styles, books, onBackHome, current, onJumpRef } = props;
 
-     const topLeftStyle = sx.topLeft;
-     const topCenterStyle = sx.topCenter;
-     const topRightStyle = sx.topRight;
-     const topBarStyle = sx.topBar;
+    const onJump = useCallback(
+        (bookId: string, chapter: number, verse: number | null) => {
+            onJumpRef(bookId, chapter, verse);
+        },
+        [onJumpRef],
+    );
 
-     const shellStyle = useMemo<CSSProperties>(
-          () => ({
-               display: "flex",
-               alignItems: "center",
-               gap: 8,
-               minWidth: 0,
-          }),
-          [],
-     );
+    return (
+        <div style={sx.topBar}>
+            <div style={sx.topLeft}>
+                <HeaderGroup ariaLabel="Navigation and account">
+                    <HomeDock onBackHome={onBackHome} />
+                    <AccountDock />
+                </HeaderGroup>
+            </div>
 
-     const centerWrapStyle = useMemo<CSSProperties>(
-          () => ({
-               display: "flex",
-               alignItems: "center",
-               justifyContent: "center",
-               minWidth: 0,
-               width: "100%",
-          }),
-          [],
-     );
+            <div style={sx.topCenter}>
+                <PositionDock
+                    styles={styles}
+                    books={books}
+                    current={current}
+                    onJump={onJump}
+                />
+            </div>
 
-     const rightClusterStyle = useMemo<CSSProperties>(
-          () => ({
-               display: "flex",
-               alignItems: "center",
-               justifyContent: "flex-end",
-               gap: 8,
-               minWidth: 0,
-          }),
-          [],
-     );
-
-     const onJump = useCallback(
-          (bookId: string, chapter: number, verse: number | null) => {
-               onJumpRef(bookId, chapter, verse);
-          },
-          [onJumpRef],
-     );
-
-     const homeDock = useMemo(
-          () => (
-               <Dock title="Home" ariaLabel="Home">
-                    <IconDockButton
-                         ariaLabel="Home"
-                         title="Home"
-                         onClick={onBackHome}
-                         icon={<Home size={17} aria-hidden />}
-                    />
-               </Dock>
-          ),
-          [onBackHome],
-     );
-
-     const accountDock = useMemo(
-          () => (
-               <Dock title="Account" ariaLabel="Account">
-                    <AccountMenu size="sm" />
-               </Dock>
-          ),
-          [],
-     );
-
-     const typeDock = useMemo(
-          () => (
-               <Dock title="Typography" ariaLabel="Typography">
-                    <ReaderTypographyControl />
-               </Dock>
-          ),
-          [],
-     );
-
-     const themeDock = useMemo(
-          () => (
-               <Dock title="Theme" ariaLabel="Theme">
-                    <ThemeToggleSwitch size="sm" />
-               </Dock>
-          ),
-          [],
-     );
-
-     return (
-          <div style={topBarStyle}>
-               <div style={topLeftStyle}>
-                    <HeaderGroup ariaLabel="Navigation and account">
-                         {homeDock}
-                         {accountDock}
+            <div style={sx.topRight}>
+                <div style={ui.rightCluster}>
+                    <HeaderGroup ariaLabel="Reader controls">
+                        <TypographyDock />
                     </HeaderGroup>
-               </div>
 
-               <div style={topCenterStyle}>
-                    <div style={centerWrapStyle}>
-                         <PositionPill
-                              styles={styles}
-                              books={books}
-                              current={current}
-                              onJump={onJump}
-                         />
-                    </div>
-               </div>
-
-               <div style={topRightStyle}>
-                    <div style={rightClusterStyle}>
-                         <HeaderGroup ariaLabel="Reader controls">
-                              {typeDock}
-                         </HeaderGroup>
-
-                         <HeaderGroup ariaLabel="Appearance" gap={6}>
-                              <Divider />
-                              {themeDock}
-                         </HeaderGroup>
-                    </div>
-               </div>
-          </div>
-     );
+                    <HeaderGroup ariaLabel="Appearance" gap={TOKENS.subtleGap}>
+                        <Divider />
+                        <ThemeDock />
+                    </HeaderGroup>
+                </div>
+            </div>
+        </div>
+    );
 });

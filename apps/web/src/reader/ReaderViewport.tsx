@@ -11,30 +11,101 @@ import React, {
 import type { Annotation, AnnotationSnapshot } from "@biblia/annotation";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { apiGetSlice, type BookRow } from "../api";
-import { BookTitlePage } from "./BookTitlePage";
-import { sx } from "./sx";
 import type { ReaderPosition, SliceVerse, SpineStats } from "./types";
 import { VerseRow } from "./VerseRow";
 
 const CHUNK = 240;
-const PREFETCH_CHUNKS_AHEAD = 2;
-const PREFETCH_CHUNKS_BEHIND = 1;
-const MAX_CHUNKS_IN_MEMORY = 10;
-const EST_ROW_PX = 56;
-const GATE_COOLDOWN_TICKS = 8;
-
-const EMPTY_ANNOTATIONS: readonly Annotation[] = [];
-const GATE_BLOCK_KEYS = new Set([
-     " ",
-     "PageDown",
-     "PageUp",
-     "ArrowDown",
-     "ArrowUp",
-     "Home",
-     "End",
-]);
+const PREFETCH_CHUNKS_AHEAD = 4;
+const PREFETCH_CHUNKS_BEHIND = 2;
+const MAX_CHUNKS_IN_MEMORY = 18;
+const EST_ROW_PX = 64;
+const OVERSCAN = 10;
 
 type ScrollMode = "auto" | "smooth";
+
+export type ReaderViewportHandle = {
+     jumpToOrd: (ord: number, behavior?: ScrollMode) => void;
+     getCurrentOrd: () => number;
+};
+
+type Props = Readonly<{
+     spine: SpineStats;
+     bookById: Map<string, BookRow>;
+     selectionRootRef?: React.MutableRefObject<HTMLDivElement | null> | null;
+     annotationSnapshot?: AnnotationSnapshot | null;
+     topContent?: React.ReactNode;
+     onPosition: (pos: ReaderPosition) => void;
+     onError?: (msg: string) => void;
+     onReady?: () => void;
+}>;
+
+type PendingJump = Readonly<{
+     ord: number;
+     behavior: ScrollMode;
+}>;
+
+type SlicePayload =
+    | readonly SliceVerse[]
+    | Readonly<{ verses?: readonly SliceVerse[]; rows?: readonly SliceVerse[]; items?: readonly SliceVerse[] }>
+    | null
+    | undefined;
+
+const EMPTY_ANNOTATIONS: readonly Annotation[] = Object.freeze([]);
+
+const ROOT_STYLE: React.CSSProperties = Object.freeze({
+     position: "relative",
+     minHeight: 0,
+     flex: "1 1 auto",
+});
+
+const SCROLL_STYLE: React.CSSProperties = Object.freeze({
+     position: "absolute",
+     inset: 0,
+     overflowY: "auto",
+     overflowX: "hidden",
+     WebkitOverflowScrolling: "touch",
+     overscrollBehaviorY: "contain",
+     minHeight: 0,
+});
+
+const CONTAINER_STYLE: React.CSSProperties = Object.freeze({
+     width: "100%",
+     minWidth: 0,
+     maxWidth: "var(--bpReaderMeasure, 840px)",
+     marginInline: "auto",
+     paddingInline: 18,
+     boxSizing: "border-box",
+});
+
+const VIRTUAL_STAGE_STYLE: React.CSSProperties = Object.freeze({
+     position: "relative",
+     width: "100%",
+     contain: "layout paint size",
+});
+
+const SKELETON_ROW_STYLE: React.CSSProperties = Object.freeze({
+     position: "relative",
+     minHeight: 54,
+     padding: "14px 16px 14px 44px",
+     borderRadius: 16,
+     boxSizing: "border-box",
+});
+
+const SKELETON_NUM_STYLE: React.CSSProperties = Object.freeze({
+     position: "absolute",
+     left: 12,
+     top: 14,
+     fontSize: 12,
+     color: "var(--muted)",
+     userSelect: "none",
+});
+
+const SKELETON_TEXT_STYLE: React.CSSProperties = Object.freeze({
+     height: 14,
+     width: "78%",
+     borderRadius: 999,
+     background: "color-mix(in oklab, var(--hairline) 60%, transparent)",
+});
 
 function clamp(n: number, lo: number, hi: number): number {
      return Math.max(lo, Math.min(hi, n));
@@ -44,232 +115,136 @@ function chunkStart(ord: number): number {
      return Math.floor((ord - 1) / CHUNK) * CHUNK + 1;
 }
 
+function chunkIndexFromOrd(ord: number): number {
+     return Math.floor((ord - 1) / CHUNK);
+}
+
+function chunkOrdFromIndex(index: number): number {
+     return index * CHUNK + 1;
+}
+
+function deriveRowCount(spine: SpineStats): number {
+     return Math.max(0, spine.verseOrdMax - spine.verseOrdMin + 1);
+}
+
+function readMaybeNumber(value: unknown): number | null {
+     if (typeof value !== "number" || !Number.isFinite(value)) return null;
+     return Math.trunc(value);
+}
+
 function readMaybeString(value: unknown): string | null {
      if (typeof value !== "string") return null;
      const trimmed = value.trim();
      return trimmed.length > 0 ? trimmed : null;
 }
 
-function getRowTranslationId(row: SliceVerse): string | null {
+function getRowBookId(row: SliceVerse): string {
      const record = row as unknown as Record<string, unknown>;
-     return readMaybeString(record.translationId) ?? readMaybeString(record.translation_id) ?? null;
+     return readMaybeString(record.bookId) ?? readMaybeString(record.book_id) ?? row.bookId;
 }
 
-function normalizeSpanBounds(
-     startOrd: number,
-     endOrd: number,
-     minOrd: number,
-     maxOrd: number,
-): { startOrd: number; endOrd: number } | null {
-     const a = clamp(startOrd, minOrd, maxOrd);
-     const b = clamp(endOrd, minOrd, maxOrd);
-     const lo = Math.min(a, b);
-     const hi = Math.max(a, b);
-
-     if (hi < minOrd || lo > maxOrd) return null;
-     return { startOrd: lo, endOrd: hi };
+function getRowVerseOrd(row: SliceVerse): number {
+     const record = row as unknown as Record<string, unknown>;
+     return (
+         readMaybeNumber(record.verseOrd) ??
+         readMaybeNumber(record.verse_ord) ??
+         0
+     );
 }
 
-function focusSoon(getEl: () => HTMLElement | null): void {
-     const run = () => getEl()?.focus();
-     if (typeof queueMicrotask === "function") {
-          queueMicrotask(run);
-          return;
-     }
-     setTimeout(run, 0);
+function extractSliceRows(payload: SlicePayload): readonly SliceVerse[] {
+     if (!payload) return [];
+     if (Array.isArray(payload)) return payload;
+
+     if ("verses" in payload && Array.isArray(payload.verses)) return payload.verses;
+     if ("rows" in payload && Array.isArray(payload.rows)) return payload.rows;
+     if ("items" in payload && Array.isArray(payload.items)) return payload.items;
+
+     return [];
 }
 
-export type ReaderViewportHandle = {
-     jumpToOrd: (ord: number, behavior?: ScrollMode) => void;
-     getCurrentOrd: () => number;
-};
+function normalizeSpanRange(span: unknown): { startOrd: number; endOrd: number } | null {
+     if (!span || typeof span !== "object") return null;
 
-type Props = {
-     spine: SpineStats;
-     bookById: Map<string, BookRow>;
-     topContent?: React.ReactNode;
-     selectionRootRef?: React.MutableRefObject<HTMLDivElement | null> | null;
-     annotationSnapshot?: AnnotationSnapshot | null;
-     onPosition: (pos: ReaderPosition) => void;
-     onError?: (msg: string) => void;
-     onReady?: () => void;
-};
+     const record = span as Record<string, unknown>;
+     const start =
+         (record.start as Record<string, unknown> | undefined) ??
+         undefined;
+     const end =
+         (record.end as Record<string, unknown> | undefined) ??
+         undefined;
 
-type PendingJump = {
-     ord: number;
-     behavior: ScrollMode;
-};
+     const startOrd =
+         readMaybeNumber(start?.verseOrd) ??
+         readMaybeNumber((start as Record<string, unknown> | undefined)?.verse_ord);
 
-type BookGateState = {
-     ord: number;
-     bookId: string;
-};
+     const endOrd =
+         readMaybeNumber(end?.verseOrd) ??
+         readMaybeNumber((end as Record<string, unknown> | undefined)?.verse_ord);
 
-type ChunkState = {
-     verseMap: Map<number, SliceVerse>;
-     loadedChunks: Set<number>;
-     loadingChunks: Set<number>;
-     loadedOrder: number[];
-};
+     if (startOrd == null || endOrd == null) return null;
 
-function createChunkState(): ChunkState {
      return {
-          verseMap: new Map(),
-          loadedChunks: new Set(),
-          loadingChunks: new Set(),
-          loadedOrder: [],
+          startOrd: Math.min(startOrd, endOrd),
+          endOrd: Math.max(startOrd, endOrd),
      };
 }
 
-function buildAnnotationVerseIndex(
-     snapshot: AnnotationSnapshot | null | undefined,
-     minOrd: number,
-     maxOrd: number,
-): Map<number, readonly Annotation[]> {
-     const buckets = new Map<number, Map<string, Annotation>>();
+function buildAnnotationIndex(
+    snapshot: AnnotationSnapshot | null | undefined,
+    minOrd: number,
+    maxOrd: number,
+): ReadonlyMap<number, readonly Annotation[]> {
      if (!snapshot) return new Map();
 
-     for (const annotation of snapshot.annotations.values()) {
+     const buckets = new Map<number, Annotation[]>();
+     const values = [...snapshot.annotations.values()] as Annotation[];
+
+     values.sort((a, b) => b.updatedAt - a.updatedAt);
+
+     for (const annotation of values) {
           if (annotation.deletedAt !== null) continue;
 
           for (const span of annotation.spans) {
-               if (span.deletedAt !== null) continue;
+               const range = normalizeSpanRange(span);
+               if (!range) continue;
 
-               const bounds = normalizeSpanBounds(
-                    span.start.verseOrd,
-                    span.end.verseOrd,
-                    minOrd,
-                    maxOrd,
-               );
-               if (!bounds) continue;
+               const startOrd = clamp(range.startOrd, minOrd, maxOrd);
+               const endOrd = clamp(range.endOrd, minOrd, maxOrd);
 
-               for (let ord = bounds.startOrd; ord <= bounds.endOrd; ord += 1) {
-                    let bucket = buckets.get(ord);
-                    if (!bucket) {
-                         bucket = new Map<string, Annotation>();
-                         buckets.set(ord, bucket);
+               for (let ord = startOrd; ord <= endOrd; ord += 1) {
+                    const bucket = buckets.get(ord);
+                    if (bucket) {
+                         bucket.push(annotation);
+                    } else {
+                         buckets.set(ord, [annotation]);
                     }
-                    bucket.set(annotation.annotationId, annotation);
                }
           }
      }
 
-     const out = new Map<number, readonly Annotation[]>();
-     for (const [ord, bucket] of buckets) {
-          out.set(
-               ord,
-               [...bucket.values()].sort((a, b) => {
-                    if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
-                    return a.annotationId.localeCompare(b.annotationId);
-               }),
-          );
-     }
-
-     return out;
+     return buckets;
 }
 
-function BookGate(props: {
-     book: BookRow | null;
-     bookId: string;
-     onContinue: () => void;
-}) {
-     const { book, bookId, onContinue } = props;
-     const btnRef = useRef<HTMLButtonElement | null>(null);
-
-     useEffect(() => {
-          focusSoon(() => btnRef.current);
-     }, []);
-
+function skeletonRow(verseOrd: number): React.ReactNode {
      return (
-          <div
-               role="dialog"
-               aria-modal="true"
-               aria-label={`Book: ${book?.name ?? bookId}`}
-               tabIndex={-1}
-               style={{
-                    position: "absolute",
-                    inset: 0,
-                    zIndex: 30,
-                    display: "grid",
-                    placeItems: "center",
-                    padding: 18,
-                    background: "color-mix(in oklab, var(--bg) 72%, rgba(0,0,0,0.55))",
-                    backdropFilter: "blur(10px)",
-                    WebkitBackdropFilter: "blur(10px)",
-               }}
-               onKeyDown={(event) => {
-                    if (GATE_BLOCK_KEYS.has(event.key)) {
-                         event.preventDefault();
-                         event.stopPropagation();
-                         return;
-                    }
-
-                    if (event.key === "Escape" || event.key === "Enter") {
-                         event.preventDefault();
-                         event.stopPropagation();
-                         onContinue();
-                    }
-               }}
-          >
-               <div
-                    style={{
-                         width: "min(860px, 100%)",
-                         borderRadius: 18,
-                         border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-                         background: "color-mix(in oklab, var(--bg) 82%, var(--panel))",
-                         boxShadow: "0 34px 110px rgba(0,0,0,0.34)",
-                         overflow: "hidden",
-                    }}
-               >
-                    <BookTitlePage book={book} bookId={bookId} />
-
-                    <div
-                         style={{
-                              display: "flex",
-                              justifyContent: "center",
-                              padding: "14px 14px 18px",
-                              background:
-                                   "linear-gradient(to bottom, transparent, color-mix(in oklab, var(--bg) 88%, var(--panel)))",
-                         }}
-                    >
-                         <button
-                              ref={btnRef}
-                              type="button"
-                              onClick={onContinue}
-                              style={{
-                                   appearance: "none",
-                                   WebkitAppearance: "none",
-                                   height: 40,
-                                   padding: "0 16px",
-                                   borderRadius: 12,
-                                   border: "1px solid color-mix(in oklab, var(--focus) 70%, var(--hairline))",
-                                   background: "var(--focus)",
-                                   color: "var(--fg)",
-                                   fontSize: 12.6,
-                                   fontWeight: 820,
-                                   letterSpacing: "-0.01em",
-                                   cursor: "pointer",
-                                   boxShadow: "0 14px 34px color-mix(in oklab, var(--focus) 20%, transparent)",
-                              }}
-                         >
-                              Continue
-                         </button>
-                    </div>
-               </div>
-          </div>
+         <div style={SKELETON_ROW_STYLE} aria-hidden="true">
+              <div style={SKELETON_NUM_STYLE}>…</div>
+              <div style={SKELETON_TEXT_STYLE} />
+         </div>
      );
 }
 
 export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function ReaderViewport(
-     props,
-     ref,
+    props,
+    ref,
 ) {
      const {
           spine,
           bookById,
-          topContent,
           selectionRootRef,
           annotationSnapshot,
+          topContent,
           onPosition,
           onError,
           onReady,
@@ -277,528 +252,357 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
      const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
      const [dataTick, setDataTick] = useState(0);
-     const [gate, setGate] = useState<BookGateState | null>(null);
 
-     const chunkRef = useRef<ChunkState>(createChunkState());
-     const measuredAtRef = useRef<WeakMap<Element, number>>(new WeakMap());
-
-     const initialOrd = useMemo(() => {
-          return clamp(spine.verseOrdMin, spine.verseOrdMin, spine.verseOrdMax);
-     }, [spine.verseOrdMin, spine.verseOrdMax]);
-
-     const posOrdRef = useRef<number>(initialOrd);
-     const [posOrd, setPosOrd] = useState<number>(initialOrd);
-
-     const pendingJumpRef = useRef<PendingJump | null>(null);
-     const readyOnceRef = useRef(false);
-     const runIdRef = useRef(0);
-
+     const verseMapRef = useRef<Map<number, SliceVerse>>(new Map());
+     const loadedChunksRef = useRef<Set<number>>(new Set());
+     const loadedOrderRef = useRef<number[]>([]);
      const inFlightRef = useRef<Map<number, AbortController>>(new Map());
 
-     const gateRef = useRef<BookGateState | null>(null);
-     const lastGatedBookIdRef = useRef<string | null>(null);
-     const gateCooldownRef = useRef(0);
+     const pendingJumpRef = useRef<PendingJump | null>(null);
+     const currentOrdRef = useRef<number>(spine.verseOrdMin);
+     const onReadyCalledRef = useRef(false);
+     const rafMeasureRef = useRef<number | null>(null);
 
-     const rafScrollRef = useRef(0);
-     const lastSentRef = useRef<{ ord: number; hasVerse: boolean }>({
-          ord: -1,
-          hasVerse: false,
-     });
+     const rowCount = useMemo(() => deriveRowCount(spine), [spine]);
+     const lastOrd = spine.verseOrdMin + Math.max(0, rowCount - 1);
 
-     const bumpTick = useCallback(() => {
-          setDataTick((t) => t + 1);
-     }, []);
-
-     const derivedCount = useMemo(() => {
-          const min = spine.verseOrdMin;
-          const max = spine.verseOrdMax;
-          return max >= min ? max - min + 1 : 0;
-     }, [spine.verseOrdMin, spine.verseOrdMax]);
-
-     const count = useMemo(() => {
-          const verseCount = Number.isFinite(spine.verseCount) ? spine.verseCount : 0;
-          if (verseCount <= 0) return derivedCount;
-          if (derivedCount > 0 && verseCount !== derivedCount) return derivedCount;
-          return verseCount;
-     }, [spine.verseCount, derivedCount]);
-
-     const annotationIndex = useMemo(() => {
-          return buildAnnotationVerseIndex(annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax);
-     }, [annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax]);
-
-     const loadedTranslationId = useMemo(() => {
-          for (const row of chunkRef.current.verseMap.values()) {
-               const translationId = getRowTranslationId(row);
-               if (translationId) return translationId;
-          }
-          return null;
-     }, [dataTick]);
-
-     const setSelectionRootEl = useCallback(
-          (el: HTMLDivElement | null) => {
-               if (selectionRootRef) {
-                    selectionRootRef.current = el;
-               }
-          },
-          [selectionRootRef],
+     const annotationIndex = useMemo(
+         () => buildAnnotationIndex(annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax),
+         [annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax],
      );
 
-     const abortAllInFlight = useCallback(() => {
+     const rowVirtualizer = useVirtualizer({
+          count: rowCount,
+          getScrollElement: () => scrollEl,
+          estimateSize: () => EST_ROW_PX,
+          overscan: OVERSCAN,
+          measureElement: (el) => el.getBoundingClientRect().height,
+          getItemKey: (index) => spine.verseOrdMin + index,
+     });
+
+     const virtualItems = rowVirtualizer.getVirtualItems();
+     const totalSize = rowVirtualizer.getTotalSize();
+
+     const firstVisibleIndex = virtualItems[0]?.index ?? 0;
+     const lastVisibleIndex = virtualItems[virtualItems.length - 1]?.index ?? 0;
+
+     const setSelectionRootEl = useCallback(
+         (el: HTMLDivElement | null) => {
+              if (selectionRootRef) {
+                   selectionRootRef.current = el;
+              }
+         },
+         [selectionRootRef],
+     );
+
+     const cancelAllInFlight = useCallback(() => {
           for (const controller of inFlightRef.current.values()) {
                controller.abort();
           }
           inFlightRef.current.clear();
-          chunkRef.current.loadingChunks.clear();
      }, []);
 
-     useEffect(() => {
-          posOrdRef.current = posOrd;
-     }, [posOrd]);
-
-     useEffect(() => {
-          gateRef.current = gate;
-     }, [gate]);
-
      const evictFarChunks = useCallback(
-          (keepOrd: number): void => {
-               const state = chunkRef.current;
-               const keepChunk = chunkStart(clamp(keepOrd, spine.verseOrdMin, spine.verseOrdMax));
+         (keepOrd: number) => {
+              const keepIndex = chunkIndexFromOrd(clamp(keepOrd, spine.verseOrdMin, spine.verseOrdMax));
+              const keepMin = Math.max(0, keepIndex - 3);
+              const keepMax = keepIndex + 3;
 
-               while (state.loadedOrder.length > MAX_CHUNKS_IN_MEMORY) {
-                    let farIdx = 0;
-                    let farDist = -1;
+              const order = loadedOrderRef.current;
+              if (order.length <= MAX_CHUNKS_IN_MEMORY) return;
 
-                    for (let i = 0; i < state.loadedOrder.length; i += 1) {
-                         const loadedChunk = state.loadedOrder[i]!;
-                         const dist = Math.abs(loadedChunk - keepChunk);
-                         if (dist > farDist) {
-                              farDist = dist;
-                              farIdx = i;
-                         }
-                    }
+              let scan = 0;
+              while (order.length > MAX_CHUNKS_IN_MEMORY && scan < 64) {
+                   scan += 1;
 
-                    const victim = state.loadedOrder.splice(farIdx, 1)[0]!;
-                    state.loadedChunks.delete(victim);
+                   let evictAt = -1;
+                   let farthestDistance = -1;
 
-                    const startOrd = victim;
-                    const endOrd = Math.min(victim + CHUNK - 1, spine.verseOrdMax);
+                   for (let i = 0; i < order.length; i += 1) {
+                        const chunk = order[i]!;
+                        const idx = chunkIndexFromOrd(chunk);
 
-                    for (let ord = startOrd; ord <= endOrd; ord += 1) {
-                         state.verseMap.delete(ord);
-                    }
-               }
-          },
-          [spine.verseOrdMin, spine.verseOrdMax],
+                        if (idx >= keepMin && idx <= keepMax) {
+                             continue;
+                        }
+
+                        const distance = Math.abs(idx - keepIndex);
+                        if (distance > farthestDistance) {
+                             farthestDistance = distance;
+                             evictAt = i;
+                        }
+                   }
+
+                   if (evictAt < 0) break;
+
+                   const [evictedChunk] = order.splice(evictAt, 1);
+                   if (evictedChunk == null) break;
+
+                   loadedChunksRef.current.delete(evictedChunk);
+
+                   const start = evictedChunk;
+                   const end = Math.min(evictedChunk + CHUNK - 1, spine.verseOrdMax);
+                   for (let ord = start; ord <= end; ord += 1) {
+                        verseMapRef.current.delete(ord);
+                   }
+              }
+         },
+         [spine.verseOrdMax, spine.verseOrdMin],
      );
 
-     const ensureChunk = useCallback(
-          async (startOrd: number, keepOrd?: number): Promise<void> => {
-               const safeOrd = clamp(startOrd, spine.verseOrdMin, spine.verseOrdMax);
-               const chunk = chunkStart(safeOrd);
-               const state = chunkRef.current;
+     const applyChunk = useCallback(
+         (chunkOrd: number, rows: readonly SliceVerse[]) => {
+              let changed = false;
 
-               if (state.loadedChunks.has(chunk)) return;
-               if (state.loadingChunks.has(chunk)) return;
+              for (const row of rows) {
+                   const ord = getRowVerseOrd(row);
+                   if (ord < spine.verseOrdMin || ord > spine.verseOrdMax) continue;
 
-               const myRunId = runIdRef.current;
-               const controller = new AbortController();
+                   verseMapRef.current.set(ord, row);
+                   changed = true;
+              }
 
-               state.loadingChunks.add(chunk);
-               inFlightRef.current.set(chunk, controller);
+              if (!loadedChunksRef.current.has(chunkOrd)) {
+                   loadedChunksRef.current.add(chunkOrd);
+                   loadedOrderRef.current.push(chunkOrd);
+                   changed = true;
+              }
 
-               try {
-                    const res = await apiGetSlice(chunk, CHUNK, {
-                         signal: controller.signal,
-                    });
+              if (changed) {
+                   evictFarChunks(currentOrdRef.current);
+                   setDataTick((tick) => tick + 1);
+              }
+         },
+         [evictFarChunks, spine.verseOrdMax, spine.verseOrdMin],
+     );
 
-                    if (runIdRef.current !== myRunId) return;
-                    if (controller.signal.aborted) return;
+     const loadChunk = useCallback(
+         async (ord: number) => {
+              const startOrd = chunkStart(clamp(ord, spine.verseOrdMin, spine.verseOrdMax));
 
-                    for (const verse of res.verses) {
-                         state.verseMap.set(verse.verseOrd, verse);
-                    }
+              if (loadedChunksRef.current.has(startOrd)) return;
+              if (inFlightRef.current.has(startOrd)) return;
 
-                    state.loadedChunks.add(chunk);
-                    if (!state.loadedOrder.includes(chunk)) {
-                         state.loadedOrder.push(chunk);
-                    }
+              const controller = new AbortController();
+              inFlightRef.current.set(startOrd, controller);
 
-                    evictFarChunks(keepOrd ?? posOrdRef.current);
-                    bumpTick();
-               } catch (error: unknown) {
-                    if (runIdRef.current !== myRunId) return;
-                    if (controller.signal.aborted) return;
+              try {
+                   const payload = (await apiGetSlice(startOrd, CHUNK, {
+                        signal: controller.signal,
+                   } as never)) as SlicePayload;
 
-                    const message = error instanceof Error ? error.message : String(error);
-                    onError?.(message);
-               } finally {
-                    state.loadingChunks.delete(chunk);
-                    inFlightRef.current.delete(chunk);
-               }
-          },
-          [bumpTick, evictFarChunks, onError, spine.verseOrdMin, spine.verseOrdMax],
+                   if (controller.signal.aborted) return;
+
+                   const rows = extractSliceRows(payload);
+                   applyChunk(startOrd, rows);
+              } catch (error) {
+                   if (!controller.signal.aborted) {
+                        const message =
+                            error instanceof Error
+                                ? error.message
+                                : "Failed to load reader slice.";
+                        onError?.(message);
+                   }
+              } finally {
+                   const active = inFlightRef.current.get(startOrd);
+                   if (active === controller) {
+                        inFlightRef.current.delete(startOrd);
+                   }
+              }
+         },
+         [applyChunk, onError, spine.verseOrdMax, spine.verseOrdMin],
+     );
+
+     const ensureWindowLoaded = useCallback(
+         (centerOrd: number) => {
+              const centerChunkIndex = chunkIndexFromOrd(centerOrd);
+              const startChunkIndex = Math.max(0, centerChunkIndex - PREFETCH_CHUNKS_BEHIND);
+              const endChunkIndex = centerChunkIndex + PREFETCH_CHUNKS_AHEAD;
+
+              for (let chunkIdx = startChunkIndex; chunkIdx <= endChunkIndex; chunkIdx += 1) {
+                   const chunkOrd = chunkOrdFromIndex(chunkIdx);
+                   if (chunkOrd > spine.verseOrdMax) break;
+                   void loadChunk(chunkOrd);
+              }
+         },
+         [loadChunk, spine.verseOrdMax],
      );
 
      useEffect(() => {
-          abortAllInFlight();
-          runIdRef.current += 1;
+          verseMapRef.current.clear();
+          loadedChunksRef.current.clear();
+          loadedOrderRef.current = [];
+          cancelAllInFlight();
 
-          chunkRef.current = createChunkState();
-          measuredAtRef.current = new WeakMap();
-
-          setPosOrd(initialOrd);
-          posOrdRef.current = initialOrd;
-
-          setGate(null);
-          gateRef.current = null;
-          lastGatedBookIdRef.current = null;
-          gateCooldownRef.current = 0;
-
-          pendingJumpRef.current = null;
-          readyOnceRef.current = false;
-          lastSentRef.current = { ord: -1, hasVerse: false };
-
-          void ensureChunk(chunkStart(initialOrd), initialOrd);
-          bumpTick();
-     }, [abortAllInFlight, bumpTick, ensureChunk, initialOrd]);
-
-     useEffect(() => {
-          return () => {
-               abortAllInFlight();
-               if (rafScrollRef.current) {
-                    cancelAnimationFrame(rafScrollRef.current);
-                    rafScrollRef.current = 0;
-               }
+          const firstOrd = clamp(spine.verseOrdMin, spine.verseOrdMin, spine.verseOrdMax);
+          currentOrdRef.current = firstOrd;
+          pendingJumpRef.current = {
+               ord: firstOrd,
+               behavior: "auto",
           };
-     }, [abortAllInFlight]);
+          onReadyCalledRef.current = false;
+
+          setDataTick((tick) => tick + 1);
+     }, [cancelAllInFlight, spine.verseOrdMax, spine.verseOrdMin]);
 
      useEffect(() => {
-          if (!scrollEl) return;
-          void ensureChunk(chunkStart(initialOrd), initialOrd);
-     }, [scrollEl, ensureChunk, initialOrd]);
-
-     const rowVirtualizer = useVirtualizer({
-          count,
-          getScrollElement: () => scrollEl,
-          estimateSize: () => EST_ROW_PX,
-          overscan: 18,
-          getItemKey: (index) => String(spine.verseOrdMin + index),
-     });
-
-     const virtualItems = rowVirtualizer.getVirtualItems();
-     const firstIndex = virtualItems[0]?.index ?? 0;
-     const lastIndex = virtualItems.length ? virtualItems[virtualItems.length - 1]!.index : 0;
-
-     const jumpToOrd = useCallback(
-          (ord: number, behavior: ScrollMode = "auto") => {
-               const targetOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
-               const targetIndex = targetOrd - spine.verseOrdMin;
-
-               void ensureChunk(chunkStart(targetOrd), targetOrd);
-
-               if (!scrollEl) {
-                    pendingJumpRef.current = { ord: targetOrd, behavior };
-                    return;
-               }
-
-               requestAnimationFrame(() => {
-                    rowVirtualizer.scrollToIndex(targetIndex, {
-                         align: "start",
-                         behavior,
-                    });
-               });
-          },
-          [ensureChunk, rowVirtualizer, scrollEl, spine.verseOrdMin, spine.verseOrdMax],
-     );
-
-     useImperativeHandle(
-          ref,
-          () => ({
-               jumpToOrd,
-               getCurrentOrd: () => posOrdRef.current,
-          }),
-          [jumpToOrd],
-     );
+          ensureWindowLoaded(currentOrdRef.current);
+     }, [ensureWindowLoaded]);
 
      useEffect(() => {
-          if (!scrollEl) return;
-
-          if (!readyOnceRef.current) {
-               readyOnceRef.current = true;
-               void ensureChunk(chunkStart(initialOrd), initialOrd);
-               onReady?.();
-          }
-
-          const pending = pendingJumpRef.current;
-          if (pending) {
-               pendingJumpRef.current = null;
-               jumpToOrd(pending.ord, pending.behavior);
-          }
-     }, [scrollEl, ensureChunk, initialOrd, jumpToOrd, onReady]);
-
-     useEffect(() => {
-          if (!virtualItems.length) return;
-
-          const firstOrd = spine.verseOrdMin + firstIndex;
-          const lastOrd = spine.verseOrdMin + lastIndex;
-
-          const startChunk = chunkStart(firstOrd);
-          const endChunk = chunkStart(lastOrd);
-
-          for (let chunk = startChunk; chunk <= endChunk; chunk += CHUNK) {
-               void ensureChunk(chunk, firstOrd);
-          }
-
-          for (let i = 1; i <= PREFETCH_CHUNKS_AHEAD; i += 1) {
-               const ahead = endChunk + i * CHUNK;
-               if (ahead <= spine.verseOrdMax) {
-                    void ensureChunk(ahead, lastOrd);
-               }
-          }
-
-          for (let i = 1; i <= PREFETCH_CHUNKS_BEHIND; i += 1) {
-               const behind = startChunk - i * CHUNK;
-               if (behind >= spine.verseOrdMin) {
-                    void ensureChunk(behind, firstOrd);
-               }
-          }
+          const centerIndex = Math.floor((firstVisibleIndex + lastVisibleIndex) / 2);
+          const centerOrd = clamp(spine.verseOrdMin + centerIndex, spine.verseOrdMin, spine.verseOrdMax);
+          ensureWindowLoaded(centerOrd);
+          evictFarChunks(centerOrd);
      }, [
-          ensureChunk,
-          firstIndex,
-          lastIndex,
+          ensureWindowLoaded,
+          evictFarChunks,
+          firstVisibleIndex,
+          lastVisibleIndex,
           spine.verseOrdMax,
           spine.verseOrdMin,
-          virtualItems.length,
      ]);
 
-     useEffect(() => {
-          if (!scrollEl) return;
-
-          const prevOverflowY = scrollEl.style.overflowY;
-          const prevOverscrollBehavior = scrollEl.style.overscrollBehavior;
-          const prevScrollBehavior = scrollEl.style.scrollBehavior;
-
-          if (gate) {
-               scrollEl.style.overflowY = "hidden";
-               scrollEl.style.overscrollBehavior = "contain";
-               scrollEl.style.scrollBehavior = "auto";
-          } else {
-               scrollEl.style.overflowY = prevOverflowY;
-               scrollEl.style.overscrollBehavior = prevOverscrollBehavior;
-               scrollEl.style.scrollBehavior = prevScrollBehavior;
-          }
-
-          return () => {
-               scrollEl.style.overflowY = prevOverflowY;
-               scrollEl.style.overscrollBehavior = prevOverscrollBehavior;
-               scrollEl.style.scrollBehavior = prevScrollBehavior;
-          };
-     }, [gate, scrollEl]);
-
-     const computeAndSetTopOrd = useCallback(() => {
-          rafScrollRef.current = 0;
-
-          if (!scrollEl || !virtualItems.length || gateRef.current) return;
-
-          const scrollTop = scrollEl.scrollTop;
-          let topItem = virtualItems[0]!;
-
-          for (let i = 0; i < virtualItems.length; i += 1) {
-               const item = virtualItems[i]!;
-               if (item.start + item.size > scrollTop + 1) {
-                    topItem = item;
-                    break;
-               }
-          }
-
-          const ord = spine.verseOrdMin + topItem.index;
-          if (posOrdRef.current !== ord) {
-               posOrdRef.current = ord;
-               setPosOrd(ord);
-          }
-
-          void ensureChunk(chunkStart(ord), ord);
-     }, [ensureChunk, scrollEl, spine.verseOrdMin, virtualItems]);
-
      useLayoutEffect(() => {
-          if (!scrollEl || !virtualItems.length || gateRef.current) return;
-          computeAndSetTopOrd();
-     }, [computeAndSetTopOrd, firstIndex, lastIndex, scrollEl, virtualItems.length]);
+          if (virtualItems.length === 0) return;
 
-     useEffect(() => {
-          if (!scrollEl) return;
+          const first = virtualItems[0]!;
+          const ord = clamp(spine.verseOrdMin + first.index, spine.verseOrdMin, spine.verseOrdMax);
+          const row = verseMapRef.current.get(ord) ?? null;
 
-          const onScroll = () => {
-               if (rafScrollRef.current) return;
-               rafScrollRef.current = window.requestAnimationFrame(computeAndSetTopOrd);
-          };
+          currentOrdRef.current = ord;
 
-          scrollEl.addEventListener("scroll", onScroll, { passive: true });
-
-          return () => {
-               scrollEl.removeEventListener("scroll", onScroll);
-               if (rafScrollRef.current) {
-                    cancelAnimationFrame(rafScrollRef.current);
-                    rafScrollRef.current = 0;
-               }
-          };
-     }, [computeAndSetTopOrd, scrollEl]);
-
-     useEffect(() => {
-          const effectiveOrd = posOrdRef.current;
-          const verse = chunkRef.current.verseMap.get(effectiveOrd) ?? null;
-          const book = verse ? bookById.get(verse.bookId) ?? null : null;
-
-          const next = { ord: effectiveOrd, hasVerse: verse !== null };
-          const prev = lastSentRef.current;
-          if (prev.ord === next.ord && prev.hasVerse === next.hasVerse) return;
-
-          lastSentRef.current = next;
-          onPosition({ ord: effectiveOrd, verse, book });
-     }, [bookById, dataTick, onPosition, posOrd]);
-
-     useEffect(() => {
-          if (!scrollEl || gateRef.current) return;
-
-          if (gateCooldownRef.current > 0) {
-               gateCooldownRef.current -= 1;
-               return;
-          }
-
-          const ord = posOrdRef.current;
-          const current = chunkRef.current.verseMap.get(ord) ?? null;
-          if (!current) return;
-          if (ord === spine.verseOrdMin) return;
-
-          const previous = chunkRef.current.verseMap.get(ord - 1) ?? null;
-          if (!previous) return;
-          if (previous.bookId === current.bookId) return;
-
-          const bookId = current.bookId;
-          if (lastGatedBookIdRef.current === bookId) return;
-
-          lastGatedBookIdRef.current = bookId;
-          const index = ord - spine.verseOrdMin;
-
-          requestAnimationFrame(() => {
-               rowVirtualizer.scrollToIndex(index, {
-                    align: "start",
-                    behavior: "auto",
-               });
-
-               requestAnimationFrame(() => {
-                    setGate({ ord, bookId });
-               });
+          onPosition({
+               ord,
+               verse: row,
+               book: row ? (bookById.get(getRowBookId(row)) ?? null) : null,
           });
-     }, [dataTick, posOrd, rowVirtualizer, scrollEl, spine.verseOrdMin]);
+     }, [bookById, onPosition, spine.verseOrdMax, spine.verseOrdMin, virtualItems]);
 
-     const totalSize = rowVirtualizer.getTotalSize();
-
-     const renderRow = useCallback(
-          (verseOrd: number) => {
-               const row = chunkRef.current.verseMap.get(verseOrd) ?? null;
-
-               if (!row) {
-                    return (
-                         <div style={sx.skelRow}>
-                              <div style={sx.verseNum}>…</div>
-                              <div style={sx.skelText} />
-                         </div>
-                    );
-               }
-
-               const annotations = annotationIndex.get(verseOrd) ?? EMPTY_ANNOTATIONS;
-
-               return (
-                    <VerseRow
-                         row={row}
-                         book={bookById.get(row.bookId) ?? null}
-                         annotations={annotations}
-                    />
-               );
-          },
-          [annotationIndex, bookById],
+     useImperativeHandle(
+         ref,
+         () => ({
+              jumpToOrd: (ord, behavior = "auto") => {
+                   const nextOrd = clamp(Math.trunc(ord), spine.verseOrdMin, spine.verseOrdMax);
+                   pendingJumpRef.current = { ord: nextOrd, behavior };
+                   ensureWindowLoaded(nextOrd);
+                   setDataTick((tick) => tick + 1);
+              },
+              getCurrentOrd: () => currentOrdRef.current,
+         }),
+         [ensureWindowLoaded, spine.verseOrdMax, spine.verseOrdMin],
      );
 
-     const measureRowEl = useCallback(
-          (el: HTMLDivElement | null) => {
-               if (!el) return;
+     useEffect(() => {
+          const pending = pendingJumpRef.current;
+          if (!pending) return;
 
-               const mark = measuredAtRef.current;
-               const lastMeasuredAt = mark.get(el);
-               if (lastMeasuredAt === dataTick) return;
+          const index = clamp(pending.ord - spine.verseOrdMin, 0, Math.max(0, rowCount - 1));
+          rowVirtualizer.scrollToIndex(index, {
+               align: "start",
+               behavior: pending.behavior === "smooth" ? "auto" : pending.behavior,
+          });
 
-               mark.set(el, dataTick);
-               rowVirtualizer.measureElement(el);
-          },
-          [dataTick, rowVirtualizer],
+          pendingJumpRef.current = null;
+     }, [dataTick, rowCount, rowVirtualizer, spine.verseOrdMin]);
+
+     useLayoutEffect(() => {
+          if (rafMeasureRef.current != null) {
+               cancelAnimationFrame(rafMeasureRef.current);
+          }
+
+          rafMeasureRef.current = requestAnimationFrame(() => {
+               rowVirtualizer.measure();
+               rafMeasureRef.current = null;
+          });
+
+          return () => {
+               if (rafMeasureRef.current != null) {
+                    cancelAnimationFrame(rafMeasureRef.current);
+                    rafMeasureRef.current = null;
+               }
+          };
+     }, [dataTick, rowVirtualizer]);
+
+     useEffect(() => {
+          if (onReadyCalledRef.current) return;
+          if (loadedChunksRef.current.size === 0) return;
+
+          onReadyCalledRef.current = true;
+          onReady?.();
+     }, [dataTick, onReady]);
+
+     useEffect(() => {
+          return () => {
+               cancelAllInFlight();
+               if (selectionRootRef) {
+                    selectionRootRef.current = null;
+               }
+          };
+     }, [cancelAllInFlight, selectionRootRef]);
+
+     const renderRow = useCallback(
+         (verseOrd: number): React.ReactNode => {
+              const row = verseMapRef.current.get(verseOrd) ?? null;
+              if (!row) return skeletonRow(verseOrd);
+
+              const annotations = annotationIndex.get(verseOrd) ?? EMPTY_ANNOTATIONS;
+
+              return (
+                  <VerseRow
+                      row={row}
+                      book={bookById.get(getRowBookId(row)) ?? null}
+                      annotations={annotations}
+                  />
+              );
+         },
+         [annotationIndex, bookById],
      );
 
      return (
-          <div style={sx.body}>
-               <div ref={setScrollEl} style={sx.scroll}>
-                    <div
-                         ref={setSelectionRootEl}
-                         className="container"
-                         style={sx.container}
-                         data-translation-id={loadedTranslationId ?? undefined}
-                    >
-                         {topContent}
+         <div style={ROOT_STYLE}>
+              <div ref={setScrollEl} style={SCROLL_STYLE}>
+                   <div
+                       ref={setSelectionRootEl}
+                       style={CONTAINER_STYLE}
+                       data-translation-id={undefined}
+                   >
+                        {topContent}
 
-                         <div
-                              style={{
-                                   position: "relative",
-                                   height: totalSize,
-                                   contain: "layout paint",
-                              }}
-                         >
-                              {virtualItems.map((item) => {
-                                   const verseOrd = spine.verseOrdMin + item.index;
+                        <div
+                            style={{
+                                 ...VIRTUAL_STAGE_STYLE,
+                                 height: totalSize,
+                            }}
+                        >
+                             {virtualItems.map((item) => {
+                                  const verseOrd = clamp(
+                                      spine.verseOrdMin + item.index,
+                                      spine.verseOrdMin,
+                                      lastOrd,
+                                  );
 
-                                   return (
-                                        <div
-                                             key={item.key}
-                                             ref={measureRowEl}
-                                             data-index={item.index}
-                                             style={{
-                                                  position: "absolute",
-                                                  top: 0,
-                                                  left: 0,
-                                                  width: "100%",
-                                                  transform: `translate3d(0, ${item.start}px, 0)`,
-                                                  willChange: "transform",
-                                             }}
-                                        >
-                                             {renderRow(verseOrd)}
-                                        </div>
-                                   );
-                              })}
-                         </div>
-                    </div>
-
-                    {gate ? (
-                         <BookGate
-                              book={bookById.get(gate.bookId) ?? null}
-                              bookId={gate.bookId}
-                              onContinue={() => {
-                                   const ord = gate.ord;
-
-                                   setGate(null);
-                                   gateRef.current = null;
-                                   gateCooldownRef.current = GATE_COOLDOWN_TICKS;
-
-                                   requestAnimationFrame(() => {
-                                        const index = ord - spine.verseOrdMin;
-                                        rowVirtualizer.scrollToIndex(index, {
-                                             align: "start",
-                                             behavior: "auto",
-                                        });
-                                   });
-                              }}
-                         />
-                    ) : null}
-               </div>
-          </div>
+                                  return (
+                                      <div
+                                          key={item.key}
+                                          data-index={item.index}
+                                          ref={rowVirtualizer.measureElement}
+                                          style={{
+                                               position: "absolute",
+                                               top: 0,
+                                               left: 0,
+                                               width: "100%",
+                                               transform: `translate3d(0, ${item.start}px, 0)`,
+                                          }}
+                                      >
+                                           {renderRow(verseOrd)}
+                                      </div>
+                                  );
+                             })}
+                        </div>
+                   </div>
+              </div>
+         </div>
      );
 });
 

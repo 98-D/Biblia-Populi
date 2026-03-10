@@ -31,6 +31,11 @@ export type TranslationId = string;
 export type TokenizerId = string;
 export type DeviceId = string;
 export type Revision = number;
+export type CssPx = number;
+export type UnitInterval = number; // expected 0..1 when used as normalized UI geometry
+
+export type Nullable<T> = T | null;
+export type Maybe<T> = T | null | undefined;
 
 /* =============================================================================
    Core Reader Data
@@ -53,28 +58,28 @@ export type TranslationRef = Readonly<{
     label?: string | null;
 }>;
 
-export type SliceTokenKind =
-     | "WORD"
-     | "PUNCT"
-     | "SPACE"
-     | "LINEBREAK"
-     | "MARKER"
-     | "NUMBER"
-     | "SYMBOL";
-
 export type TokenizerRef = Readonly<{
     tokenizerId: TokenizerId;
     version?: string | null;
 }>;
 
+export type SliceTokenKind =
+    | "WORD"
+    | "PUNCT"
+    | "SPACE"
+    | "LINEBREAK"
+    | "MARKER"
+    | "NUMBER"
+    | "SYMBOL";
+
 /**
- * Canonical token shape for the reader slice payload.
+ * Canonical token shape for reader payloads.
  *
  * Notes:
- * - Keep this flat and transport-safe.
- * - Supports both semantic anchoring and DOM projection.
- * - `token` is the rendered token text exactly as emitted by the tokenizer.
- * - char offsets are local to the verse text payload.
+ * - Flat and transport-safe
+ * - Supports semantic anchoring + DOM projection
+ * - `token` is the rendered token text exactly as emitted by the tokenizer
+ * - char offsets are local to the verse text payload
  */
 export type SliceToken = Readonly<{
     tokenIndex: number;
@@ -109,6 +114,11 @@ export type SliceVerse = Readonly<{
     updatedAt: IsoDateTimeString | null;
 }>;
 
+export type SlicePayload = Readonly<{
+    verses: ReadonlyArray<SliceVerse>;
+    spine: SpineStats;
+}>;
+
 export type ReaderPosition = Readonly<{
     ord: number;
     verse: SliceVerse | null;
@@ -123,6 +133,7 @@ export type ReaderCurrentPos = Readonly<{
     verse: number | null;
 }>;
 
+/** Minimal “jump” intent used by controls. */
 export type ReaderJump = VerseRef;
 
 /* =============================================================================
@@ -141,12 +152,12 @@ export type ReaderAnchor = Readonly<{
 }>;
 
 export type ReaderSelectionOrigin =
-     | "MOUSE_DRAG"
-     | "KEYBOARD"
-     | "TOUCH"
-     | "PROGRAM"
-     | "SEARCH"
-     | "SHARE_LINK";
+    | "MOUSE_DRAG"
+    | "KEYBOARD"
+    | "TOUCH"
+    | "PROGRAM"
+    | "SEARCH"
+    | "SHARE_LINK";
 
 export type ReaderRange = Readonly<{
     start: ReaderAnchor;
@@ -168,35 +179,50 @@ export type ReaderVerseSpan = Readonly<{
     endVerseKey: VerseKey;
 }>;
 
+/**
+ * Export / lookup-friendly flattened selection snapshot.
+ * Useful for copy/share/export without forcing consumers to traverse anchors.
+ */
+export type ReaderSelectionSnapshot = Readonly<{
+    range: ReaderRange;
+    verseSpan: ReaderVerseSpan;
+    translationId?: TranslationId | null;
+    text?: string | null;
+}>;
+
 /* =============================================================================
    Annotation System
 ============================================================================= */
 
 export type ReaderAnnotationKind =
-     | "HIGHLIGHT"
-     | "UNDERLINE"
-     | "NOTE"
-     | "BOOKMARK"
-     | "LINK"
-     | "DRAWING";
+    | "HIGHLIGHT"
+    | "UNDERLINE"
+    | "NOTE"
+    | "BOOKMARK"
+    | "LINK"
+    | "DRAWING";
 
 export type ReaderAnnotationScope = "RANGE" | "WHOLE_VERSE";
 export type ReaderVisibility = "PRIVATE" | "SHARED" | "PUBLIC";
 
 export type ReaderInk =
-     | "INK_0"
-     | "INK_1"
-     | "INK_2"
-     | "INK_3"
-     | "INK_4"
-     | "INK_5";
+    | "INK_0"
+    | "INK_1"
+    | "INK_2"
+    | "INK_3"
+    | "INK_4"
+    | "INK_5";
 
 export type ReaderHighlightStyle = "SOLID" | "SOFT" | "UNDERLINE" | "OUTLINE";
 export type ReaderUnderlineStyle = "SINGLE" | "DOUBLE";
 
+export type ReaderTag = Readonly<{
+    value: string;
+}>;
+
 export type ReaderNoteBody =
-     | Readonly<{ format: "PLAINTEXT"; text: string }>
-     | Readonly<{ format: "MARKDOWN"; md: string }>;
+    | Readonly<{ format: "PLAINTEXT"; text: string }>
+    | Readonly<{ format: "MARKDOWN"; md: string }>;
 
 export type ReaderAnnotationBase = Readonly<{
     id: ReaderId;
@@ -214,52 +240,52 @@ export type ReaderAnnotationBase = Readonly<{
 }>;
 
 export type ReaderHighlight = ReaderAnnotationBase &
-     Readonly<{
-         kind: "HIGHLIGHT";
-         style?: ReaderHighlightStyle | null;
-         strength?: number | null;
-     }>;
+    Readonly<{
+        kind: "HIGHLIGHT";
+        style?: ReaderHighlightStyle | null;
+        strength?: number | null;
+    }>;
 
 export type ReaderUnderline = ReaderAnnotationBase &
-     Readonly<{
-         kind: "UNDERLINE";
-         style?: ReaderUnderlineStyle | null;
-     }>;
+    Readonly<{
+        kind: "UNDERLINE";
+        style?: ReaderUnderlineStyle | null;
+    }>;
 
 export type ReaderNote = ReaderAnnotationBase &
-     Readonly<{
-         kind: "NOTE";
-         title?: string | null;
-         body: ReaderNoteBody;
-         uiState?: Readonly<{ collapsed?: boolean | null }> | null;
-     }>;
+    Readonly<{
+        kind: "NOTE";
+        title?: string | null;
+        body: ReaderNoteBody;
+        uiState?: Readonly<{ collapsed?: boolean | null }> | null;
+    }>;
 
 export type ReaderBookmark = ReaderAnnotationBase &
-     Readonly<{
-         kind: "BOOKMARK";
-         label?: string | null;
-     }>;
+    Readonly<{
+        kind: "BOOKMARK";
+        label?: string | null;
+    }>;
 
 export type ReaderLinkTarget =
-     | Readonly<{ type: "VERSE_REF"; ref: VerseRef }>
-     | Readonly<{ type: "RANGE"; range: ReaderRange }>
-     | Readonly<{ type: "URL"; url: string }>
-     | Readonly<{ type: "SEARCH"; query: string }>;
+    | Readonly<{ type: "VERSE_REF"; ref: VerseRef }>
+    | Readonly<{ type: "RANGE"; range: ReaderRange }>
+    | Readonly<{ type: "URL"; url: string }>
+    | Readonly<{ type: "SEARCH"; query: string }>;
 
 export type ReaderLink = ReaderAnnotationBase &
-     Readonly<{
-         kind: "LINK";
-         target: ReaderLinkTarget;
-         label?: string | null;
-     }>;
+    Readonly<{
+        kind: "LINK";
+        target: ReaderLinkTarget;
+        label?: string | null;
+    }>;
 
 export type ReaderDrawingProjection = "VERSE_BLOCK" | "RANGE_BLOCK" | "PAGE_VIEW";
 
 export type ReaderPoint = Readonly<{
     x: number;
     y: number;
-    p?: number | null;
-    t?: number | null;
+    p?: number | null; // pressure
+    t?: number | null; // time or sequence-adjacent scalar
 }>;
 
 export type ReaderStroke = Readonly<{
@@ -278,19 +304,19 @@ export type ReaderDrawingPayload = Readonly<{
 }>;
 
 export type ReaderDrawing = ReaderAnnotationBase &
-     Readonly<{
-         kind: "DRAWING";
-         drawing: ReaderDrawingPayload;
-         projection?: ReaderDrawingProjection | null;
-     }>;
+    Readonly<{
+        kind: "DRAWING";
+        drawing: ReaderDrawingPayload;
+        projection?: ReaderDrawingProjection | null;
+    }>;
 
 export type ReaderAnnotation =
-     | ReaderHighlight
-     | ReaderUnderline
-     | ReaderNote
-     | ReaderBookmark
-     | ReaderLink
-     | ReaderDrawing;
+    | ReaderHighlight
+    | ReaderUnderline
+    | ReaderNote
+    | ReaderBookmark
+    | ReaderLink
+    | ReaderDrawing;
 
 /* =============================================================================
    UI Geometry Projections
@@ -302,10 +328,21 @@ export type VerseDomKey = Readonly<{
 }>;
 
 export type ViewportRect = Readonly<{
-    left: number;
-    top: number;
-    width: number;
-    height: number;
+    left: CssPx;
+    top: CssPx;
+    width: CssPx;
+    height: CssPx;
+}>;
+
+/**
+ * Normalized bbox projection, typically relative to a verse block or container.
+ * 0..1 expected for each coordinate.
+ */
+export type NormalizedRect = Readonly<{
+    minX: UnitInterval;
+    minY: UnitInterval;
+    maxX: UnitInterval;
+    maxY: UnitInterval;
 }>;
 
 export type RangeOverlayProjection = Readonly<{
@@ -384,24 +421,24 @@ export type ReaderAnnotationSyncResponse = Readonly<{
 }>;
 
 /* =============================================================================
-   Slice Payload
-============================================================================= */
-
-export type SlicePayload = Readonly<{
-    verses: ReadonlyArray<SliceVerse>;
-    spine: SpineStats;
-}>;
-
-/* =============================================================================
    Convenient unions / helpers
 ============================================================================= */
 
 export type ReaderEntity =
-     | SliceVerse
-     | ReaderAnnotation
-     | ReaderRange
-     | ReaderExportBlock;
+    | SliceVerse
+    | ReaderAnnotation
+    | ReaderRange
+    | ReaderExportBlock;
 
 export type ReaderAnnotationMap = ReadonlyMap<ReaderId, ReaderAnnotation>;
 export type VerseIndexMap = ReadonlyMap<number, SliceVerse>;
 export type BookIndexMap = ReadonlyMap<BookId, BookRow>;
+
+export type ReaderLoadState<T> =
+    | Readonly<{ status: "idle" }>
+    | Readonly<{ status: "loading" }>
+    | Readonly<{ status: "ready"; value: T }>
+    | Readonly<{ status: "error"; message: string }>;
+
+export type ReaderMaybeVerse = SliceVerse | null;
+export type ReaderMaybeAnnotation = ReaderAnnotation | null;

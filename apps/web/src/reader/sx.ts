@@ -13,6 +13,7 @@ import type { CSSProperties } from "react";
  * - no invalid / non-portable inline style tokens
  * - explicit row wrapper surface for verse containers
  * - safer cross-browser fallbacks for inline React CSSProperties
+ * - stricter reusable constants to reduce drift
  *
  * Notes:
  * - keep layout-critical surfaces simple and deterministic
@@ -52,7 +53,28 @@ const HEADER_BOTTOM_PAD = 10;
 const SCROLL_TOP_PAD = 18;
 const SCROLL_BOTTOM_PAD = 96;
 
-const ROW_SCROLL_MARGIN_TOP = `calc(72px + ${SAFE_TOP})`;
+const HEADER_MIN_HEIGHT = 60;
+const HEADER_BLUR = 12;
+const HEADER_SHADOW = "0 10px 22px rgba(0, 0, 0, 0.032)";
+const BUTTON_SHADOW = "0 8px 18px rgba(0,0,0,0.055)";
+const BUTTON_SHADOW_HOVER = "0 10px 20px rgba(0,0,0,0.07)";
+const BUTTON_SHADOW_ACTIVE = "0 6px 14px rgba(0,0,0,0.06)";
+
+const VERSE_NUM_COL = 34;
+const VERSE_ROW_GAP = 12;
+const VERSE_ROW_PAD_Y = 9;
+const VERSE_ROW_PAD_X = 6;
+
+const BOOK_TITLE_SIZE = 24;
+const CHAPTER_TITLE_SIZE = 16;
+
+const ROW_SCROLL_MARGIN_TOP = `calc(${HEADER_MIN_HEIGHT}px + ${SCROLL_TOP_PAD}px + ${SAFE_TOP})`;
+
+const BUTTON_TRANSITION =
+    "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease";
+
+const ROW_TRANSITION =
+    "background 140ms ease, transform 140ms ease, box-shadow 140ms ease";
 
 export const sx = {
     /* ---------- Shell ---------- */
@@ -65,6 +87,7 @@ export const sx = {
         background: "var(--bg)",
         isolation: "isolate",
         overflow: "hidden",
+        minWidth: 0,
     },
 
     /* ---------- Header ---------- */
@@ -76,16 +99,18 @@ export const sx = {
         gridTemplateColumns: "auto minmax(0, 1fr) auto",
         alignItems: "center",
         columnGap: 12,
+        minHeight: HEADER_MIN_HEIGHT,
         paddingTop: `calc(${HEADER_TOP_PAD}px + ${SAFE_TOP})`,
         paddingBottom: HEADER_BOTTOM_PAD,
         paddingLeft: `calc(${HEADER_HORIZONTAL_PAD}px + ${SAFE_LEFT})`,
         paddingRight: `calc(${HEADER_HORIZONTAL_PAD}px + ${SAFE_RIGHT})`,
         background: HEADER_BG,
-        backdropFilter: "blur(12px)",
-        WebkitBackdropFilter: "blur(12px)",
+        backdropFilter: `blur(${HEADER_BLUR}px)`,
+        WebkitBackdropFilter: `blur(${HEADER_BLUR}px)`,
         borderBottom: `1px solid ${HAIRLINE}`,
-        boxShadow: "0 10px 22px rgba(0, 0, 0, 0.032)",
+        boxShadow: HEADER_SHADOW,
         transform: "translateZ(0)",
+        boxSizing: "border-box",
     },
 
     topLeft: {
@@ -119,6 +144,7 @@ export const sx = {
         justifyContent: "flex-end",
         gap: 10,
         minWidth: 0,
+        flexWrap: "nowrap",
     },
 
     searchWrap: {
@@ -140,6 +166,9 @@ export const sx = {
     backBtn: {
         appearance: "none",
         WebkitAppearance: "none",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
         fontSize: 12,
         lineHeight: 1,
         whiteSpace: "nowrap",
@@ -150,24 +179,26 @@ export const sx = {
         border: `1px solid ${HAIRLINE}`,
         borderRadius: 999,
         padding: "7px 12px",
+        minHeight: 32,
         boxSizing: "border-box",
-        boxShadow: "0 8px 18px rgba(0,0,0,0.055)",
+        boxShadow: BUTTON_SHADOW,
         outline: "none",
         WebkitTapHighlightColor: "transparent",
-        transition:
-             "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease",
+        transition: BUTTON_TRANSITION,
+        textDecoration: "none",
+        flexShrink: 0,
     },
 
     backBtnHover: {
         background: PANEL_BG_SOFT_HOVER,
         borderColor: HAIRLINE_STRONG,
-        boxShadow: "0 10px 20px rgba(0,0,0,0.07)",
+        boxShadow: BUTTON_SHADOW_HOVER,
         transform: "translateY(-0.5px)",
     },
 
     backBtnActive: {
         transform: "translateY(0)",
-        boxShadow: "0 6px 14px rgba(0,0,0,0.06)",
+        boxShadow: BUTTON_SHADOW_ACTIVE,
         opacity: 0.96,
     },
 
@@ -176,6 +207,7 @@ export const sx = {
         position: "relative",
         flex: 1,
         minHeight: 0,
+        minWidth: 0,
         overflow: "hidden",
         contain: "layout paint",
     },
@@ -194,6 +226,8 @@ export const sx = {
         WebkitOverflowScrolling: "touch",
         touchAction: "pan-y",
         transform: "translateZ(0)",
+        minWidth: 0,
+        boxSizing: "border-box",
     },
 
     container: {
@@ -219,6 +253,7 @@ export const sx = {
         marginTop: 6,
         borderBottom: `1px solid ${HAIRLINE}`,
         scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
+        minWidth: 0,
     },
 
     bookKicker: {
@@ -231,11 +266,12 @@ export const sx = {
 
     bookTitle: {
         marginTop: 9,
-        fontSize: 24,
+        fontSize: BOOK_TITLE_SIZE,
         fontWeight: 650,
         lineHeight: 1.15,
         letterSpacing: "-0.03em",
-        textWrap: "balance",
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
     },
 
     chapterHeader: {
@@ -243,6 +279,7 @@ export const sx = {
         marginTop: 14,
         borderBottom: `1px solid ${HAIRLINE}`,
         scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
+        minWidth: 0,
     },
 
     chapterKicker: {
@@ -254,11 +291,12 @@ export const sx = {
 
     chapterTitle: {
         marginTop: 8,
-        fontSize: 16,
+        fontSize: CHAPTER_TITLE_SIZE,
         fontWeight: 650,
         lineHeight: 1.2,
         letterSpacing: "-0.02em",
-        textWrap: "balance",
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
     },
 
     /* ---------- Verse rows ---------- */
@@ -272,19 +310,20 @@ export const sx = {
 
     verseRow: {
         display: "grid",
-        gridTemplateColumns: "34px minmax(0, 1fr)",
-        gap: 12,
+        gridTemplateColumns: `${VERSE_NUM_COL}px minmax(0, 1fr)`,
+        gap: VERSE_ROW_GAP,
         alignItems: "start",
         borderRadius: RADIUS_PX,
-        padding: "9px 6px",
+        padding: `${VERSE_ROW_PAD_Y}px ${VERSE_ROW_PAD_X}px`,
         boxSizing: "border-box",
         background: "transparent",
-        transition: "background 140ms ease, transform 140ms ease, box-shadow 140ms ease",
+        transition: ROW_TRANSITION,
         WebkitTapHighlightColor: "transparent",
         scrollMarginTop: ROW_SCROLL_MARGIN_TOP,
         width: "100%",
         minWidth: 0,
         outline: "none",
+        position: "relative",
     },
 
     verseRowHover: {
@@ -311,6 +350,8 @@ export const sx = {
         userSelect: "none",
         opacity: 0.9,
         minWidth: 0,
+        whiteSpace: "nowrap",
+        lineHeight: 1.25,
     },
 
     verseText: {
@@ -322,11 +363,11 @@ export const sx = {
     /* ---------- Skeleton ---------- */
     skelRow: {
         display: "grid",
-        gridTemplateColumns: "34px minmax(0, 1fr)",
-        gap: 12,
+        gridTemplateColumns: `${VERSE_NUM_COL}px minmax(0, 1fr)`,
+        gap: VERSE_ROW_GAP,
         alignItems: "start",
         borderRadius: RADIUS_PX,
-        padding: "9px 6px",
+        padding: `${VERSE_ROW_PAD_Y}px ${VERSE_ROW_PAD_X}px`,
         boxSizing: "border-box",
         opacity: 0.55,
         width: "100%",
@@ -338,5 +379,7 @@ export const sx = {
         marginTop: 6,
         borderRadius: 9,
         background: SKELETON_BG,
+        width: "100%",
+        minWidth: 0,
     },
 } satisfies SxMap;

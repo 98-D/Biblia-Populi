@@ -19,8 +19,8 @@ type CurrentPos = Readonly<{
 }>;
 
 type SpineValidation =
-     | { ok: true }
-     | { ok: false; msg: string };
+    | { ok: true }
+    | { ok: false; msg: string };
 
 type Props = Readonly<{
     styles: Record<string, CSSProperties>;
@@ -50,34 +50,34 @@ type Props = Readonly<{
     err?: string | null;
 }>;
 
-const MEASURE_WRAP_STYLE: CSSProperties = {
+const MEASURE_WRAP_STYLE: CSSProperties = Object.freeze({
     maxWidth: "var(--bpReaderMeasure, 840px)",
     marginInline: "auto",
     paddingInline: 18,
     boxSizing: "border-box",
     width: "100%",
     minWidth: 0,
-};
+});
 
-const ERR_BANNER_OUTER_STYLE: CSSProperties = {
+const ERR_BANNER_OUTER_STYLE: CSSProperties = Object.freeze({
     borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
     background: "color-mix(in oklab, var(--bg) 94%, var(--panel))",
-};
+});
 
-const ERR_BANNER_INNER_STYLE: CSSProperties = {
+const ERR_BANNER_INNER_STYLE: CSSProperties = Object.freeze({
     paddingBlock: 9,
-};
+});
 
-const ERR_TEXT_STYLE: CSSProperties = {
+const ERR_TEXT_STYLE: CSSProperties = Object.freeze({
     fontSize: 12,
     color: "var(--muted)",
     whiteSpace: "pre-wrap",
-};
+});
 
-const LOADING_TEXT_STYLE: CSSProperties = {
+const LOADING_TEXT_STYLE: CSSProperties = Object.freeze({
     ...sx.msg,
     paddingTop: 22,
-};
+});
 
 function isFiniteIntegerLike(value: unknown): value is number {
     return typeof value === "number" && Number.isFinite(value);
@@ -91,14 +91,18 @@ function validateSpine(spine: SpineStats | null): SpineValidation {
     const { verseOrdMin, verseOrdMax, verseCount } = spine;
 
     if (
-         !isFiniteIntegerLike(verseOrdMin) ||
-         !isFiniteIntegerLike(verseOrdMax) ||
-         !isFiniteIntegerLike(verseCount)
+        !isFiniteIntegerLike(verseOrdMin) ||
+        !isFiniteIntegerLike(verseOrdMax) ||
+        !isFiniteIntegerLike(verseCount)
     ) {
         return { ok: false, msg: "Spine has non-numeric fields." };
     }
 
-    if (!Number.isInteger(verseOrdMin) || !Number.isInteger(verseOrdMax) || !Number.isInteger(verseCount)) {
+    if (
+        !Number.isInteger(verseOrdMin) ||
+        !Number.isInteger(verseOrdMax) ||
+        !Number.isInteger(verseCount)
+    ) {
         return { ok: false, msg: "Spine fields must be integers." };
     }
 
@@ -136,25 +140,25 @@ const MeasureWrap = memo(function MeasureWrap(props: Readonly<{ children: ReactN
 
 const ErrBanner = memo(function ErrBanner(props: Readonly<{ msg: string }>) {
     return (
-         <div role="status" aria-live="polite" style={ERR_BANNER_OUTER_STYLE}>
-             <MeasureWrap>
-                 <div style={ERR_BANNER_INNER_STYLE}>
-                     <div style={ERR_TEXT_STYLE}>{props.msg}</div>
-                 </div>
-             </MeasureWrap>
-         </div>
+        <div role="status" aria-live="polite" style={ERR_BANNER_OUTER_STYLE}>
+            <MeasureWrap>
+                <div style={ERR_BANNER_INNER_STYLE}>
+                    <div style={ERR_TEXT_STYLE}>{props.msg}</div>
+                </div>
+            </MeasureWrap>
+        </div>
     );
 });
 
 const LoadingBody = memo(function LoadingBody(props: Readonly<{ msg?: string | null }>) {
     return (
-         <div style={sx.body}>
-             <MeasureWrap>
-                 <div style={LOADING_TEXT_STYLE} role="status" aria-live="polite">
-                     {props.msg ?? "Loading…"}
-                 </div>
-             </MeasureWrap>
-         </div>
+        <div style={sx.body}>
+            <MeasureWrap>
+                <div style={LOADING_TEXT_STYLE} role="status" aria-live="polite">
+                    {props.msg ?? "Loading…"}
+                </div>
+            </MeasureWrap>
+        </div>
     );
 });
 
@@ -192,63 +196,59 @@ export function ReaderShell(props: Props) {
     }, [err, spine, spineCheck]);
 
     const reportedErrorRef = useRef<string | null>(null);
-    const readyCalledRef = useRef(false);
 
     useEffect(() => {
-        if (!bannerMsg || !onError) return;
+        if (!bannerMsg) {
+            reportedErrorRef.current = null;
+            return;
+        }
+
+        if (!onError) return;
         if (reportedErrorRef.current === bannerMsg) return;
 
         reportedErrorRef.current = bannerMsg;
         onError(bannerMsg);
     }, [bannerMsg, onError]);
 
-    useEffect(() => {
-        if (!hasValidSpine) {
-            readyCalledRef.current = false;
-            return;
-        }
-        if (!spine) {
-            readyCalledRef.current = false;
-            return;
-        }
-        if (!onReady) return;
-        if (readyCalledRef.current) return;
-
-        readyCalledRef.current = true;
-        onReady();
-    }, [hasValidSpine, onReady, spine]);
+    const isLoading = !spine && !err;
+    const hasFatalError = !!bannerMsg && (!spine || !hasValidSpine || !!err);
 
     return (
-         <main style={sx.page} aria-busy={!hasValidSpine} aria-live="polite">
-             <ReaderHeader
-                  styles={styles}
-                  books={books}
-                  onBackHome={onBackHome}
-                  current={current}
-                  onJumpRef={onJumpRef}
-                  onNavigate={onNavigate}
-                  mode={mode}
-                  onToggleTheme={onToggleTheme}
-             />
+        <main
+            style={sx.page}
+            aria-busy={isLoading}
+            aria-live="polite"
+            data-reader-shell="1"
+        >
+            <ReaderHeader
+                styles={styles}
+                books={books}
+                onBackHome={onBackHome}
+                current={current}
+                onJumpRef={onJumpRef}
+                onNavigate={onNavigate}
+                mode={mode}
+                onToggleTheme={onToggleTheme}
+            />
 
-             {bannerMsg ? <ErrBanner msg={bannerMsg} /> : null}
+            {bannerMsg ? <ErrBanner msg={bannerMsg} /> : null}
 
-             {hasValidSpine && spine ? (
-                  <ReaderViewport
-                       key={viewportKey}
-                       ref={viewportRef ?? null}
-                       spine={spine}
-                       bookById={bookById}
-                       selectionRootRef={selectionRootRef ?? null}
-                       annotationSnapshot={annotationSnapshot ?? null}
-                       topContent={topContent ?? null}
-                       onPosition={onPosition}
-                       onError={onError}
-                       onReady={onReady}
-                  />
-             ) : (
-                  <LoadingBody msg={!spine && !err ? "Loading…" : undefined} />
-             )}
-         </main>
+            {hasValidSpine && spine ? (
+                <ReaderViewport
+                    key={viewportKey}
+                    ref={viewportRef ?? null}
+                    spine={spine}
+                    bookById={bookById}
+                    selectionRootRef={selectionRootRef ?? null}
+                    annotationSnapshot={annotationSnapshot ?? null}
+                    topContent={topContent ?? null}
+                    onPosition={onPosition}
+                    onError={onError}
+                    onReady={onReady}
+                />
+            ) : (
+                <LoadingBody msg={hasFatalError ? undefined : "Loading…"} />
+            )}
+        </main>
     );
 }

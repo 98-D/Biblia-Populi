@@ -27,7 +27,7 @@ type ReaderPrefsState = Readonly<{
 
     typography: ReaderTypography;
     setTypography: (
-         patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>),
+        patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>),
     ) => void;
     replaceTypography: (next: ReaderTypography) => void;
     resetTypography: () => void;
@@ -55,7 +55,7 @@ function safeSet(key: string, val: string): void {
         if (!isBrowser()) return;
         window.localStorage.setItem(key, val);
     } catch {
-        // ignore
+        // ignore storage failures
     }
 }
 
@@ -64,7 +64,7 @@ function safeDel(key: string): void {
         if (!isBrowser()) return;
         window.localStorage.removeItem(key);
     } catch {
-        // ignore
+        // ignore storage failures
     }
 }
 
@@ -82,8 +82,16 @@ function cloneTypography(input: ReaderTypography): ReaderTypography {
 }
 
 function safeLoadTypography(): ReaderTypography | null {
-    const loaded = loadReaderTypography();
-    return loaded ? cloneTypography(loaded) : null;
+    try {
+        const loaded = loadReaderTypography();
+        return loaded ? cloneTypography(loaded) : null;
+    } catch {
+        return null;
+    }
+}
+
+function serializeTypography(value: ReaderTypography): string {
+    return JSON.stringify(value);
 }
 
 export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
@@ -95,23 +103,17 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
     }
 
     const initialTypography = initTypographyRef.current;
-    const [typographyEnabled, setTypographyEnabledState] = useState<boolean>(!!initialTypography);
-    const [typography, setTypographyState] = useState<ReaderTypography>(
-         initialTypography ?? cloneTypography(DEFAULT_TYPOGRAPHY),
-    );
-    const [translationId, setTranslationIdState] = useState<string | null>(() => readTranslation());
+    const initialTranslation = readTranslation();
 
-    const mountedRef = useRef(true);
+    const [typographyEnabled, setTypographyEnabledState] = useState<boolean>(() => !!initialTypography);
+    const [typography, setTypographyState] = useState<ReaderTypography>(
+        () => initialTypography ?? cloneTypography(DEFAULT_TYPOGRAPHY),
+    );
+    const [translationId, setTranslationIdState] = useState<string | null>(() => initialTranslation);
+
     const appliedTypographyRef = useRef<string | null>(null);
     const appliedTypographyEnabledRef = useRef<boolean | null>(null);
-    const lastWrittenTranslationRef = useRef<string | null>(translationId);
-
-    useEffect(() => {
-        mountedRef.current = true;
-        return () => {
-            mountedRef.current = false;
-        };
-    }, []);
+    const lastWrittenTranslationRef = useRef<string | null>(initialTranslation);
 
     const setTypographyEnabled = useCallback((on: boolean) => {
         setTypographyEnabledState(Boolean(on));
@@ -122,33 +124,37 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
     }, []);
 
     const setTypography = useCallback(
-         (patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>)) => {
-             setTypographyEnabledState(true);
+        (patch: Partial<ReaderTypography> | ((t: ReaderTypography) => Partial<ReaderTypography>)) => {
+            setTypographyEnabledState(true);
 
-             setTypographyState((prev) => {
-                 const delta = typeof patch === "function" ? patch(prev) : patch;
-                 return updateTypography(prev, delta ?? {});
-             });
-         },
-         [],
+            setTypographyState((prev) => {
+                const delta = typeof patch === "function" ? patch(prev) : patch;
+                const next = updateTypography(prev, delta ?? {});
+                return serializeTypography(prev) === serializeTypography(next) ? prev : next;
+            });
+        },
+        [],
     );
 
     const replaceTypography = useCallback((next: ReaderTypography) => {
         setTypographyEnabledState(true);
-        setTypographyState(updateTypography(DEFAULT_TYPOGRAPHY, next));
+        setTypographyState((prev) => {
+            const resolved = updateTypography(DEFAULT_TYPOGRAPHY, next);
+            return serializeTypography(prev) === serializeTypography(resolved) ? prev : resolved;
+        });
     }, []);
 
     const resetTypography = useCallback(() => {
         setTypographyEnabledState(false);
-        setTypographyState(cloneTypography(DEFAULT_TYPOGRAPHY));
+        setTypographyState((prev) => {
+            const next = cloneTypography(DEFAULT_TYPOGRAPHY);
+            return serializeTypography(prev) === serializeTypography(next) ? prev : next;
+        });
     }, []);
 
     const setTranslationId = useCallback((id: string | null) => {
         const next = cleanTranslationId(id);
-        setTranslationIdState((prev) => {
-            if (prev === next) return prev;
-            return next;
-        });
+        setTranslationIdState((prev) => (prev === next ? prev : next));
     }, []);
 
     useEffect(() => {
@@ -162,11 +168,11 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
     }, [translationId]);
 
     useEffect(() => {
-        const serialized = JSON.stringify(typography);
+        const serialized = serializeTypography(typography);
 
         if (
-             appliedTypographyEnabledRef.current === typographyEnabled &&
-             appliedTypographyRef.current === serialized
+            appliedTypographyEnabledRef.current === typographyEnabled &&
+            appliedTypographyRef.current === serialized
         ) {
             return;
         }
@@ -175,7 +181,6 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
         appliedTypographyRef.current = serialized;
 
         if (!typographyEnabled) {
-            applyReaderTypography(null);
             clearReaderTypography();
             return;
         }
@@ -188,7 +193,6 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
         if (!isBrowser()) return;
 
         const onStorage = (e: StorageEvent) => {
-            if (!mountedRef.current) return;
             if (!e.key) return;
 
             if (e.key === LS_TRANSLATION) {
@@ -198,20 +202,17 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
                 return;
             }
 
-            // Typography storage keys live inside the typography module.
-            // We keep this deliberately broad enough to pick up its writes,
-            // but narrow enough to avoid random unrelated storage churn.
             const key = e.key.toLowerCase();
             if (!key.includes("typography")) return;
 
             const nextTypography = safeLoadTypography();
-            const nextEnabled = !!nextTypography;
+            const nextEnabled = nextTypography !== null;
             const nextValue = nextTypography ?? cloneTypography(DEFAULT_TYPOGRAPHY);
+            const nextSerialized = serializeTypography(nextValue);
 
             setTypographyEnabledState((prev) => (prev === nextEnabled ? prev : nextEnabled));
             setTypographyState((prev) => {
-                const prevSerialized = JSON.stringify(prev);
-                const nextSerialized = JSON.stringify(nextValue);
+                const prevSerialized = serializeTypography(prev);
                 return prevSerialized === nextSerialized ? prev : nextValue;
             });
         };
@@ -223,30 +224,30 @@ export function ReaderPrefsProvider(props: { children: React.ReactNode }) {
     }, []);
 
     const value = useMemo<ReaderPrefsState>(
-         () => ({
-             typographyEnabled,
-             setTypographyEnabled,
-             toggleTypographyEnabled,
+        () => ({
+            typographyEnabled,
+            setTypographyEnabled,
+            toggleTypographyEnabled,
 
-             typography,
-             setTypography,
-             replaceTypography,
-             resetTypography,
+            typography,
+            setTypography,
+            replaceTypography,
+            resetTypography,
 
-             translationId,
-             setTranslationId,
-         }),
-         [
-             typographyEnabled,
-             setTypographyEnabled,
-             toggleTypographyEnabled,
-             typography,
-             setTypography,
-             replaceTypography,
-             resetTypography,
-             translationId,
-             setTranslationId,
-         ],
+            translationId,
+            setTranslationId,
+        }),
+        [
+            typographyEnabled,
+            setTypographyEnabled,
+            toggleTypographyEnabled,
+            typography,
+            setTypography,
+            replaceTypography,
+            resetTypography,
+            translationId,
+            setTranslationId,
+        ],
     );
 
     return <ReaderPrefsContext.Provider value={value}>{children}</ReaderPrefsContext.Provider>;
