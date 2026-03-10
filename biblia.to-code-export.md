@@ -1,11 +1,11 @@
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-10T17:48:29.479Z
+Generated: 2026-03-10T19:05:59.812Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
 Total files: 70
-Total raw bytes (all included files): 2178791
+Total raw bytes (all included files): 2192917
 Truncated/skipped files: 1
-Export time: 20ms
+Export time: 22ms
 
 ## Notes
 
@@ -19616,18 +19616,16 @@ try {
 // apps/web/src/PositionPill.tsx
 // Biblia.to — Position Pill (Book / Chapter / Verse picker)
 //
-// Hardened / micropolished:
-// - no deprecated MediaQueryList listener APIs
-// - no unsafe event-unsubscribe casts
-// - robust outside-click handling via composedPath()
-// - focus restore to pill on close
-// - roving focus + listbox semantics
-// - async chapter loading with per-book cache + AbortController + stale guard
-// - viewport-clamped popover with resize / scroll / visualViewport reflow
-// - monochrome-only visuals
-// - calmer open/close animation + button press states
-// - fixed custom CSS var typing on inline styles
-// - deduplicated focus/scroll movement logic
+// Upgraded / hardened:
+// - fixed popover positioning with visualViewport-aware fixed coords
+// - placement + transform-origin matched to actual side used
+// - stable reflow loop via RAF batching (no jumpy wrong-position paint)
+// - stale chapter payload protection + cache + abort
+// - chapter/verse state resets are deterministic on book changes
+// - tighter keyboard roving + safer focus restore
+// - outside-click via composedPath()
+// - calmer compact UI, paper-like monochrome shell
+// - no unsafe listener removal / no deprecated MediaQueryList APIs
 
 import React, {
   useCallback,
@@ -19659,11 +19657,15 @@ type WheelOption = Readonly<{
   value: number;
 }>;
 
+type PopPlacement = "below" | "above";
+
 type PopPos = Readonly<{
   left: number;
   top: number;
-  height: number;
   width: number;
+  height: number;
+  placement: PopPlacement;
+  origin: string;
 }>;
 
 type Col = "book" | "chapter" | "verse";
@@ -19680,6 +19682,7 @@ const COL_NARROW_W = S(92);
 const POPOVER_MAX_H = S(330);
 const POPOVER_MIN_H = S(200);
 const POPOVER_MARGIN = 14;
+const POPOVER_GAP = 10;
 const LIST_PAD = S(10);
 
 const PILL_W_CLOSED = S(216);
@@ -19713,40 +19716,71 @@ function pressedStyle(styles: Record<string, React.CSSProperties>): React.CSSPro
   return record.btnPressed ?? record.buttonPressed ?? null;
 }
 
+function getVisualViewportBox(): {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+} {
+  if (typeof window === "undefined") {
+    return { left: 0, top: 0, width: 0, height: 0 };
+  }
+
+  const vv = window.visualViewport;
+  if (!vv) {
+    return {
+      left: 0,
+      top: 0,
+      width: window.innerWidth,
+      height: window.innerHeight,
+    };
+  }
+
+  return {
+    left: vv.offsetLeft,
+    top: vv.offsetTop,
+    width: vv.width,
+    height: vv.height,
+  };
+}
+
 function computePopoverPos(anchor: DOMRect, desiredWidth: number): PopPos {
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
+  const vp = getVisualViewportBox();
   const margin = POPOVER_MARGIN;
+  const width = Math.min(desiredWidth, Math.max(220, vp.width - margin * 2));
 
-  const width = Math.min(desiredWidth, vw - margin * 2);
-  const cx = anchor.left + anchor.width / 2;
-  const left = clampInt(Math.round(cx - width / 2), margin, Math.max(margin, vw - width - margin));
+  const anchorCenterX = anchor.left + anchor.width / 2;
+  const leftMin = vp.left + margin;
+  const leftMax = Math.max(leftMin, vp.left + vp.width - width - margin);
+  const left = clampInt(Math.round(anchorCenterX - width / 2), leftMin, leftMax);
 
-  const belowTop = Math.round(anchor.bottom + 12);
-  const belowAvail = vh - belowTop - margin;
-  const cap = Math.min(POPOVER_MAX_H, vh - margin * 2);
+  const maxHeightCap = Math.min(POPOVER_MAX_H, Math.max(POPOVER_MIN_H, vp.height - margin * 2));
+  const belowTop = Math.round(anchor.bottom + POPOVER_GAP);
+  const belowAvail = Math.floor(vp.top + vp.height - margin - belowTop);
 
   if (belowAvail >= POPOVER_MIN_H) {
     return {
       left,
       top: belowTop,
-      height: Math.min(cap, belowAvail),
       width,
+      height: Math.min(maxHeightCap, belowAvail),
+      placement: "below",
+      origin: `${Math.round(anchorCenterX - left)}px top`,
     };
   }
 
-  const top = clampInt(
-       Math.round(anchor.top - 12 - cap),
-       margin,
-       Math.max(margin, vh - cap - margin),
-  );
-  const aboveAvail = Math.round(anchor.top - top - 12);
+  const aboveBottom = Math.round(anchor.top - POPOVER_GAP);
+  const aboveAvail = Math.floor(aboveBottom - (vp.top + margin));
+  const height = Math.min(maxHeightCap, Math.max(POPOVER_MIN_H, aboveAvail));
+  const top = clampInt(aboveBottom - height, vp.top + margin, vp.top + vp.height - height - margin);
 
   return {
     left,
     top,
-    height: Math.min(cap, Math.max(POPOVER_MIN_H, aboveAvail)),
     width,
+    height,
+    placement: "above",
+    origin: `${Math.round(anchorCenterX - left)}px bottom`,
   };
 }
 
@@ -19900,27 +19934,27 @@ const ListItem = React.memo(function ListItem(props: {
   }, [mapRef, itemKey]);
 
   return (
-       <button
-            id={id}
-            type="button"
-            className="bp-row"
-            ref={ref}
-            style={{ ...baseStyle, ...(active ? sx.itemActive : null) }}
-            onPointerDown={(e) => {
-              if (e.pointerType !== "mouse") e.preventDefault();
-            }}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={onClick}
-            onFocus={onFocus}
-            aria-label={ariaLabel}
-            role="option"
-            aria-selected={active}
-            tabIndex={tabIndex}
-       >
-         {active ? <span style={sx.activeBar} aria-hidden /> : null}
-         {children}
-         <span style={{ ...sx.selDot, ...(active ? sx.selDotOn : null) }} aria-hidden />
-       </button>
+      <button
+          id={id}
+          type="button"
+          className="bp-row"
+          ref={ref}
+          style={{ ...baseStyle, ...(active ? sx.itemActive : null) }}
+          onPointerDown={(e) => {
+            if (e.pointerType !== "mouse") e.preventDefault();
+          }}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={onClick}
+          onFocus={onFocus}
+          aria-label={ariaLabel}
+          role="option"
+          aria-selected={active}
+          tabIndex={tabIndex}
+      >
+        {active ? <span style={sx.activeBar} aria-hidden /> : null}
+        {children}
+        <span style={{ ...sx.selDot, ...(active ? sx.selDotOn : null) }} aria-hidden />
+      </button>
   );
 });
 
@@ -19941,6 +19975,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef(0);
   const closeTimerRef = useRef<number | null>(null);
+  const openRafRef = useRef<number | null>(null);
 
   const [open, setOpen] = useState(false);
   const [phase, setPhase] = useState<Phase>("opening");
@@ -19961,6 +19996,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   const [pendingChapter, setPendingChapter] = useState(false);
   const [pendingVerse, setPendingVerse] = useState(false);
   const [chaptersMeta, setChaptersMeta] = useState<ChaptersPayload | null>(null);
+  const [chaptersLoading, setChaptersLoading] = useState(false);
 
   const openRef = useLatestRef(open);
   const phaseRef = useLatestRef(phase);
@@ -19981,18 +20017,18 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   }, [list]);
 
   const currentBookName =
-       (current.bookId ? bookNameById.get(current.bookId) : null) ??
-       currentBookId ??
-       "…";
+      (current.bookId ? bookNameById.get(current.bookId) : null) ??
+      currentBookId ??
+      "…";
 
   const selectedBook = useMemo(
-       () => list.find((b) => b.bookId === bookId) ?? null,
-       [list, bookId],
+      () => list.find((b) => b.bookId === bookId) ?? null,
+      [list, bookId],
   );
 
   const bookName = selectedBook?.name ?? bookId;
   const testamentTag = (selectedBook?.testament ?? "").toUpperCase();
-  const chapterMax = selectedBook?.chapters ?? 999;
+  const chapterMax = Math.max(1, selectedBook?.chapters ?? 1);
 
   useEffect(() => {
     const idx = Math.max(0, list.findIndex((b) => b.bookId === bookId));
@@ -20008,29 +20044,35 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
 
     abortRef.current?.abort();
     abortRef.current = null;
+    setChaptersLoading(true);
 
     const cached = chaptersCacheRef.current.get(bookId) ?? null;
     if (cached) {
       setChaptersMeta(cached);
+      setChaptersLoading(false);
       return;
     }
+
+    setChaptersMeta(null);
 
     const id = ++requestIdRef.current;
     const ac = new AbortController();
     abortRef.current = ac;
 
     apiGetChapters(bookId, { signal: ac.signal })
-         .then((payload) => {
-           if (ac.signal.aborted) return;
-           if (id !== requestIdRef.current) return;
-           chaptersCacheRef.current.set(bookId, payload);
-           setChaptersMeta(payload);
-         })
-         .catch(() => {
-           if (ac.signal.aborted) return;
-           if (id !== requestIdRef.current) return;
-           setChaptersMeta(null);
-         });
+        .then((payload) => {
+          if (ac.signal.aborted) return;
+          if (id !== requestIdRef.current) return;
+          chaptersCacheRef.current.set(bookId, payload);
+          setChaptersMeta(payload);
+          setChaptersLoading(false);
+        })
+        .catch(() => {
+          if (ac.signal.aborted) return;
+          if (id !== requestIdRef.current) return;
+          setChaptersMeta(null);
+          setChaptersLoading(false);
+        });
 
     return () => {
       ac.abort();
@@ -20038,9 +20080,9 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   }, [open, bookId]);
 
   const verseMax = useMemo(() => {
-    if (!chaptersMeta) return 999;
+    if (!chaptersMeta) return 1;
     const row = chaptersMeta.chapters.find((c) => c.chapter === chapter);
-    return row?.verseCount ?? 999;
+    return Math.max(1, row?.verseCount ?? 1);
   }, [chaptersMeta, chapter]);
 
   useEffect(() => {
@@ -20056,7 +20098,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
 
   useEffect(() => {
     setActiveVerseIdx(
-         verse == null ? 0 : Math.max(0, Math.min(verseOptions.length - 1, verse - 1)),
+        verse == null ? 0 : Math.max(0, Math.min(verseOptions.length - 1, verse - 1)),
     );
   }, [verseOptions.length, verse]);
 
@@ -20067,11 +20109,19 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     }
   }, []);
 
+  const cancelOpenRaf = useCallback(() => {
+    if (openRafRef.current != null) {
+      cancelAnimationFrame(openRafRef.current);
+      openRafRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     if (open) return;
 
     abortRef.current?.abort();
     abortRef.current = null;
+    setChaptersLoading(false);
 
     setBookId(currentBookId);
     setChapter(currentChap);
@@ -20080,14 +20130,16 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setPendingVerse(false);
     setChaptersMeta(null);
     setActiveCol("book");
+    setPopPos(null);
 
     clearCloseTimer();
+    cancelOpenRaf();
 
     const id = requestAnimationFrame(() => {
       anchorRef.current?.focus();
     });
     return () => cancelAnimationFrame(id);
-  }, [open, currentBookId, currentChap, currentVerse, clearCloseTimer]);
+  }, [open, currentBookId, currentChap, currentVerse, clearCloseTimer, cancelOpenRaf]);
 
   const titleNumPart = useMemo(() => {
     if (pendingChapter) return "";
@@ -20098,8 +20150,8 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
 
   const pillLabel = useMemo(() => {
     return currentVerse == null
-         ? `${currentBookName} ${currentChap}`
-         : `${currentBookName} ${currentChap}:${currentVerse}`;
+        ? `${currentBookName} ${currentChap}`
+        : `${currentBookName} ${currentChap}:${currentVerse}`;
   }, [currentBookName, currentChap, currentVerse]);
 
   const closePopover = useCallback(() => {
@@ -20131,6 +20183,8 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     setPendingVerse(true);
     setChapter(1);
     setVerse(null);
+    setChaptersMeta(null);
+    setChaptersLoading(true);
     setActiveCol("chapter");
   }, []);
 
@@ -20148,84 +20202,99 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   }, []);
 
   const focusBookByIndex = useCallback(
-       (idx: number) => {
-         const id = list[idx]?.bookId;
-         const el = id ? bookBtnMapRef.current.get(id) : null;
-         el?.focus();
-         scrollIntoViewCentered(el);
-       },
-       [list],
+      (idx: number) => {
+        const id = list[idx]?.bookId;
+        const el = id ? bookBtnMapRef.current.get(id) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      },
+      [list],
   );
 
   const focusChapterByIndex = useCallback(
-       (idx: number) => {
-         const n = chapterOptions[idx]?.value;
-         const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
-         el?.focus();
-         scrollIntoViewCentered(el);
-       },
-       [chapterOptions],
+      (idx: number) => {
+        const n = chapterOptions[idx]?.value;
+        const el = n != null ? chapBtnMapRef.current.get(`c:${n}`) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      },
+      [chapterOptions],
   );
 
   const focusVerseByIndex = useCallback(
-       (idx: number) => {
-         const n = verseOptions[idx]?.value;
-         const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
-         el?.focus();
-         scrollIntoViewCentered(el);
-       },
-       [verseOptions],
+      (idx: number) => {
+        const n = verseOptions[idx]?.value;
+        const el = n != null ? verseBtnMapRef.current.get(`v:${n}`) : null;
+        el?.focus();
+        scrollIntoViewCentered(el);
+      },
+      [verseOptions],
   );
 
   const focusCurrentColumnSelection = useCallback(
-       (col: Col) => {
-         if (col === "book") {
-           focusBookByIndex(activeBookIdx);
-           return;
-         }
-         if (col === "chapter") {
-           focusChapterByIndex(activeChapIdx);
-           return;
-         }
-         focusVerseByIndex(activeVerseIdx);
-       },
-       [activeBookIdx, activeChapIdx, activeVerseIdx, focusBookByIndex, focusChapterByIndex, focusVerseByIndex],
+      (col: Col) => {
+        if (col === "book") {
+          focusBookByIndex(activeBookIdx);
+          return;
+        }
+        if (col === "chapter") {
+          focusChapterByIndex(activeChapIdx);
+          return;
+        }
+        focusVerseByIndex(activeVerseIdx);
+      },
+      [
+        activeBookIdx,
+        activeChapIdx,
+        activeVerseIdx,
+        focusBookByIndex,
+        focusChapterByIndex,
+        focusVerseByIndex,
+      ],
   );
 
   const focusColumnBoundary = useCallback(
-       (col: Col, atEnd: boolean) => {
-         if (col === "book") {
-           const idx = atEnd ? Math.max(0, list.length - 1) : 0;
-           setActiveBookIdx(idx);
-           focusBookByIndex(idx);
-           return;
-         }
+      (col: Col, atEnd: boolean) => {
+        if (col === "book") {
+          const idx = atEnd ? Math.max(0, list.length - 1) : 0;
+          setActiveBookIdx(idx);
+          focusBookByIndex(idx);
+          return;
+        }
 
-         if (col === "chapter") {
-           const idx = atEnd ? Math.max(0, chapterOptions.length - 1) : 0;
-           setActiveChapIdx(idx);
-           focusChapterByIndex(idx);
-           return;
-         }
+        if (col === "chapter") {
+          const idx = atEnd ? Math.max(0, chapterOptions.length - 1) : 0;
+          setActiveChapIdx(idx);
+          focusChapterByIndex(idx);
+          return;
+        }
 
-         const idx = atEnd ? Math.max(0, verseOptions.length - 1) : 0;
-         setActiveVerseIdx(idx);
-         focusVerseByIndex(idx);
-       },
-       [list.length, chapterOptions.length, verseOptions.length, focusBookByIndex, focusChapterByIndex, focusVerseByIndex],
+        const idx = atEnd ? Math.max(0, verseOptions.length - 1) : 0;
+        setActiveVerseIdx(idx);
+        focusVerseByIndex(idx);
+      },
+      [
+        list.length,
+        chapterOptions.length,
+        verseOptions.length,
+        focusBookByIndex,
+        focusChapterByIndex,
+        focusVerseByIndex,
+      ],
   );
 
   useLayoutEffect(() => {
     if (!open) return;
-    const a = anchorRef.current;
-    if (!a) return;
+    const anchor = anchorRef.current;
+    if (!anchor) return;
 
-    let raf = 0;
+    cancelOpenRaf();
 
     const update = () => {
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => {
-        const rect = a.getBoundingClientRect();
+      cancelOpenRaf();
+      openRafRef.current = requestAnimationFrame(() => {
+        openRafRef.current = null;
+        const rect = anchor.getBoundingClientRect();
         setPopPos(computePopoverPos(rect, POPOVER_W));
       });
     };
@@ -20240,13 +20309,13 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     vv?.addEventListener("scroll", update, { passive: true });
 
     return () => {
-      cancelAnimationFrame(raf);
+      cancelOpenRaf();
       window.removeEventListener("resize", update);
       window.removeEventListener("scroll", update, true);
       vv?.removeEventListener("resize", update);
       vv?.removeEventListener("scroll", update);
     };
-  }, [open]);
+  }, [open, cancelOpenRaf]);
 
   useEffect(() => {
     if (!open) return;
@@ -20351,16 +20420,20 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   };
 
   const popAnim: React.CSSProperties = reducedMotion
-       ? { opacity: 1, transform: "none" }
-       : phase === "opening"
-            ? { opacity: 0, transform: "scale(0.975) translateY(6px)" }
-            : phase === "closing"
-                 ? { opacity: 0, transform: "scale(0.988) translateY(4px)" }
-                 : { opacity: 1, transform: "scale(1) translateY(0)" };
+      ? { opacity: 1, transform: "none" }
+      : phase === "opening"
+          ? popPos?.placement === "above"
+              ? { opacity: 0, transform: "scale(0.978) translateY(4px)" }
+              : { opacity: 0, transform: "scale(0.978) translateY(-4px)" }
+          : phase === "closing"
+              ? popPos?.placement === "above"
+                  ? { opacity: 0, transform: "scale(0.988) translateY(2px)" }
+                  : { opacity: 0, transform: "scale(0.988) translateY(-2px)" }
+              : { opacity: 1, transform: "scale(1) translateY(0)" };
 
   const popTransition = reducedMotion
-       ? undefined
-       : "opacity 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0)";
+      ? undefined
+      : "opacity 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0), transform 155ms cubic-bezier(0.23, 1.0, 0.32, 1.0)";
 
   const popoverStyle: CssVarStyle = {
     ...sx.popover,
@@ -20368,6 +20441,7 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
     top: popPos?.top ?? 0,
     width: popPos?.width ?? POPOVER_W,
     height: popPos?.height ?? POPOVER_MIN_H,
+    transformOrigin: popPos?.origin ?? "center top",
     ...popAnim,
     transition: popTransition,
     "--bpAccent": "var(--fg)",
@@ -20376,279 +20450,279 @@ export function PositionPill({ styles, books, current, onJump }: Props) {
   };
 
   const onPopoverKeyDown = useCallback(
-       (e: React.KeyboardEvent<HTMLDivElement>) => {
-         const key = e.key;
-         const col = activeColRef.current;
-         const isBooks = col === "book";
-         const isCh = col === "chapter";
-         const isV = col === "verse";
+      (e: React.KeyboardEvent<HTMLDivElement>) => {
+        const key = e.key;
+        const col = activeColRef.current;
+        const isBooks = col === "book";
+        const isCh = col === "chapter";
+        const isV = col === "verse";
 
-         const moveCol = (next: Col) => {
-           setActiveCol(next);
-           requestAnimationFrame(() => {
-             focusCurrentColumnSelection(next);
-           });
-         };
+        const moveCol = (next: Col) => {
+          setActiveCol(next);
+          requestAnimationFrame(() => {
+            focusCurrentColumnSelection(next);
+          });
+        };
 
-         const handleUpDown = (delta: number) => {
-           if (isBooks) {
-             const idx = nextIndex(activeBookIdx, delta, list.length);
-             setActiveBookIdx(idx);
-             focusBookByIndex(idx);
-             e.preventDefault();
-             return;
-           }
+        const handleUpDown = (delta: number) => {
+          if (isBooks) {
+            const idx = nextIndex(activeBookIdx, delta, list.length);
+            setActiveBookIdx(idx);
+            focusBookByIndex(idx);
+            e.preventDefault();
+            return;
+          }
 
-           if (isCh) {
-             const idx = nextIndex(activeChapIdx, delta, chapterOptions.length);
-             setActiveChapIdx(idx);
-             focusChapterByIndex(idx);
-             e.preventDefault();
-             return;
-           }
+          if (isCh) {
+            const idx = nextIndex(activeChapIdx, delta, chapterOptions.length);
+            setActiveChapIdx(idx);
+            focusChapterByIndex(idx);
+            e.preventDefault();
+            return;
+          }
 
-           const idx = nextIndex(activeVerseIdx, delta, verseOptions.length);
-           setActiveVerseIdx(idx);
-           focusVerseByIndex(idx);
-           e.preventDefault();
-         };
+          const idx = nextIndex(activeVerseIdx, delta, verseOptions.length);
+          setActiveVerseIdx(idx);
+          focusVerseByIndex(idx);
+          e.preventDefault();
+        };
 
-         if (key === "ArrowLeft") {
-           if (isV) moveCol("chapter");
-           else if (isCh) moveCol("book");
-           e.preventDefault();
-           return;
-         }
+        if (key === "ArrowLeft") {
+          if (isV) moveCol("chapter");
+          else if (isCh) moveCol("book");
+          e.preventDefault();
+          return;
+        }
 
-         if (key === "ArrowRight") {
-           if (isBooks) moveCol("chapter");
-           else if (isCh) moveCol("verse");
-           e.preventDefault();
-           return;
-         }
+        if (key === "ArrowRight") {
+          if (isBooks) moveCol("chapter");
+          else if (isCh) moveCol("verse");
+          e.preventDefault();
+          return;
+        }
 
-         if (key === "ArrowUp") {
-           handleUpDown(-1);
-           return;
-         }
+        if (key === "ArrowUp") {
+          handleUpDown(-1);
+          return;
+        }
 
-         if (key === "ArrowDown") {
-           handleUpDown(1);
-           return;
-         }
+        if (key === "ArrowDown") {
+          handleUpDown(1);
+          return;
+        }
 
-         if (key === "Home") {
-           focusColumnBoundary(col, false);
-           e.preventDefault();
-           return;
-         }
+        if (key === "Home") {
+          focusColumnBoundary(col, false);
+          e.preventDefault();
+          return;
+        }
 
-         if (key === "End") {
-           focusColumnBoundary(col, true);
-           e.preventDefault();
-         }
-       },
-       [
-         activeBookIdx,
-         activeChapIdx,
-         activeVerseIdx,
-         activeColRef,
-         chapterOptions.length,
-         verseOptions.length,
-         list.length,
-         focusBookByIndex,
-         focusChapterByIndex,
-         focusVerseByIndex,
-         focusCurrentColumnSelection,
-         focusColumnBoundary,
-       ],
+        if (key === "End") {
+          focusColumnBoundary(col, true);
+          e.preventDefault();
+        }
+      },
+      [
+        activeBookIdx,
+        activeChapIdx,
+        activeVerseIdx,
+        activeColRef,
+        chapterOptions.length,
+        verseOptions.length,
+        list.length,
+        focusBookByIndex,
+        focusChapterByIndex,
+        focusVerseByIndex,
+        focusCurrentColumnSelection,
+        focusColumnBoundary,
+      ],
   );
 
   const popover =
-       open && popPos
-            ? createPortal(
-                 <div
-                      id={POP_ID}
-                      ref={popoverElRef}
-                      style={popoverStyle}
-                      role="dialog"
-                      aria-label="Jump"
-                      aria-modal="false"
-                      onKeyDown={onPopoverKeyDown}
-                 >
-                   <div style={sx.topRow}>
-                     <div
-                          style={sx.titleWrap}
-                          aria-label="Selection summary"
-                          title={`${bookName}${titleNumPart}${testamentTag}`}
-                     >
-                       <span style={sx.titleBook}>{bookName}</span>
-                       {titleNumPart ? <span style={sx.titleNum}>{titleNumPart}</span> : null}
-                       {testamentTag ? <span style={sx.titleTag}>{testamentTag}</span> : null}
-                     </div>
+      open && popPos
+          ? createPortal(
+              <div
+                  id={POP_ID}
+                  ref={popoverElRef}
+                  style={popoverStyle}
+                  role="dialog"
+                  aria-label="Jump"
+                  aria-modal="false"
+                  onKeyDown={onPopoverKeyDown}
+              >
+                <div style={sx.topRow}>
+                  <div
+                      style={sx.titleWrap}
+                      aria-label="Selection summary"
+                      title={`${bookName}${titleNumPart}${testamentTag}`}
+                  >
+                    <span style={sx.titleBook}>{bookName}</span>
+                    {titleNumPart ? <span style={sx.titleNum}>{titleNumPart}</span> : null}
+                    {testamentTag ? <span style={sx.titleTag}>{testamentTag}</span> : null}
+                  </div>
 
-                     <button
-                          type="button"
-                          className="bp-go"
-                          style={goStyle}
-                          onClick={() => {
-                            if (canCommit) commit();
-                          }}
-                          disabled={!canCommit}
-                          onPointerDown={() => setPressGo(true)}
-                          onPointerUp={() => setPressGo(false)}
-                          onPointerCancel={() => setPressGo(false)}
-                          onPointerLeave={() => setPressGo(false)}
-                          aria-label="Confirm jump"
-                          title={canCommit ? "Confirm" : "Pick a chapter first"}
-                     >
-                       →
-                     </button>
-                   </div>
+                  <button
+                      type="button"
+                      className="bp-go"
+                      style={goStyle}
+                      onClick={() => {
+                        if (canCommit) commit();
+                      }}
+                      disabled={!canCommit}
+                      onPointerDown={() => setPressGo(true)}
+                      onPointerUp={() => setPressGo(false)}
+                      onPointerCancel={() => setPressGo(false)}
+                      onPointerLeave={() => setPressGo(false)}
+                      aria-label="Confirm jump"
+                      title={canCommit ? "Confirm" : "Pick a chapter first"}
+                  >
+                    →
+                  </button>
+                </div>
 
-                   <div style={sx.bodyRow}>
-                     <div style={sx.col}>
-                       <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
-                         {list.map((b, idx) => {
-                           const active = b.bookId === bookId;
-                           const tabIndex =
-                                activeCol === "book" && idx === activeBookIdx ? 0 : -1;
+                <div style={sx.bodyRow}>
+                  <div style={sx.col}>
+                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Books">
+                      {list.map((b, idx) => {
+                        const active = b.bookId === bookId;
+                        const tabIndex =
+                            activeCol === "book" && idx === activeBookIdx ? 0 : -1;
 
-                           return (
+                        return (
+                            <ListItem
+                                key={b.bookId}
+                                active={active}
+                                onClick={() => onPickBook(b.bookId)}
+                                mapRef={bookBtnMapRef}
+                                itemKey={b.bookId}
+                                ariaLabel={`Select ${b.name}`}
+                                tabIndex={tabIndex}
+                                onFocus={() => setActiveCol("book")}
+                            >
+                                            <span style={sx.itemLine}>
+                                                <span
+                                                    style={{
+                                                      ...sx.itemTextBook,
+                                                      ...(active ? sx.itemTextActive : null),
+                                                    }}
+                                                >
+                                                    {b.name}
+                                                </span>
+                                            </span>
+                            </ListItem>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div style={sx.colNarrow}>
+                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
+                      {chapterOptions.map((o, idx) => {
+                        const n = o.value;
+                        const active = !pendingChapter && n === chapter;
+                        const tabIndex =
+                            activeCol === "chapter" && idx === activeChapIdx ? 0 : -1;
+
+                        return (
+                            <ListItem
+                                key={o.key}
+                                active={active}
+                                onClick={() => onPickChapter(n)}
+                                tight
+                                mapRef={chapBtnMapRef}
+                                itemKey={`c:${n}`}
+                                ariaLabel={`Chapter ${n}`}
+                                tabIndex={tabIndex}
+                                onFocus={() => setActiveCol("chapter")}
+                            >
+                                            <span
+                                                style={{
+                                                  ...sx.numText,
+                                                  ...(active ? sx.numTextActive : null),
+                                                }}
+                                            >
+                                                <span style={sx.prefixLabel}>CH</span> {n}
+                                            </span>
+                            </ListItem>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div style={sx.colNarrow}>
+                    <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Verses">
+                      {chaptersLoading || !chaptersMeta ? (
+                          <div style={sx.loadingBox}>Loading…</div>
+                      ) : (
+                          verseOptions.map((o, idx) => {
+                            const n = o.value;
+                            const active = !pendingVerse && verse === n;
+                            const tabIndex =
+                                activeCol === "verse" && idx === activeVerseIdx ? 0 : -1;
+
+                            return (
                                 <ListItem
-                                     key={b.bookId}
-                                     active={active}
-                                     onClick={() => onPickBook(b.bookId)}
-                                     mapRef={bookBtnMapRef}
-                                     itemKey={b.bookId}
-                                     ariaLabel={`Select ${b.name}`}
-                                     tabIndex={tabIndex}
-                                     onFocus={() => setActiveCol("book")}
+                                    key={o.key}
+                                    active={active}
+                                    onClick={() => onPickVerse(n)}
+                                    tight
+                                    mapRef={verseBtnMapRef}
+                                    itemKey={`v:${n}`}
+                                    ariaLabel={`Verse ${n}`}
+                                    tabIndex={tabIndex}
+                                    onFocus={() => setActiveCol("verse")}
                                 >
-                                              <span style={sx.itemLine}>
-                                                  <span
-                                                       style={{
-                                                         ...sx.itemTextBook,
-                                                         ...(active ? sx.itemTextActive : null),
-                                                       }}
-                                                  >
-                                                      {b.name}
-                                                  </span>
-                                              </span>
+                                                <span
+                                                    style={{
+                                                      ...sx.numText,
+                                                      ...(active ? sx.numTextActive : null),
+                                                    }}
+                                                >
+                                                    <span style={sx.prefixLabel}>V</span> {n}
+                                                </span>
                                 </ListItem>
-                           );
-                         })}
-                       </div>
-                     </div>
-
-                     <div style={sx.colNarrow}>
-                       <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Chapters">
-                         {chapterOptions.map((o, idx) => {
-                           const n = o.value;
-                           const active = !pendingChapter && n === chapter;
-                           const tabIndex =
-                                activeCol === "chapter" && idx === activeChapIdx ? 0 : -1;
-
-                           return (
-                                <ListItem
-                                     key={o.key}
-                                     active={active}
-                                     onClick={() => onPickChapter(n)}
-                                     tight
-                                     mapRef={chapBtnMapRef}
-                                     itemKey={`c:${n}`}
-                                     ariaLabel={`Chapter ${n}`}
-                                     tabIndex={tabIndex}
-                                     onFocus={() => setActiveCol("chapter")}
-                                >
-                                              <span
-                                                   style={{
-                                                     ...sx.numText,
-                                                     ...(active ? sx.numTextActive : null),
-                                                   }}
-                                              >
-                                                  <span style={sx.prefixLabel}>CH</span> {n}
-                                              </span>
-                                </ListItem>
-                           );
-                         })}
-                       </div>
-                     </div>
-
-                     <div style={sx.colNarrow}>
-                       <div className="bp-scroll" style={sx.list} role="listbox" aria-label="Verses">
-                         {!chaptersMeta ? (
-                              <div style={sx.loadingBox}>Loading…</div>
-                         ) : (
-                              verseOptions.map((o, idx) => {
-                                const n = o.value;
-                                const active = !pendingVerse && verse === n;
-                                const tabIndex =
-                                     activeCol === "verse" && idx === activeVerseIdx ? 0 : -1;
-
-                                return (
-                                     <ListItem
-                                          key={o.key}
-                                          active={active}
-                                          onClick={() => onPickVerse(n)}
-                                          tight
-                                          mapRef={verseBtnMapRef}
-                                          itemKey={`v:${n}`}
-                                          ariaLabel={`Verse ${n}`}
-                                          tabIndex={tabIndex}
-                                          onFocus={() => setActiveCol("verse")}
-                                     >
-                                                  <span
-                                                       style={{
-                                                         ...sx.numText,
-                                                         ...(active ? sx.numTextActive : null),
-                                                       }}
-                                                  >
-                                                      <span style={sx.prefixLabel}>V</span> {n}
-                                                  </span>
-                                     </ListItem>
-                                );
-                              })
-                         )}
-                       </div>
-                     </div>
-                   </div>
-                 </div>,
-                 document.body,
-            )
-            : null;
+                            );
+                          })
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>,
+              document.body,
+          )
+          : null;
 
   return (
-       <div style={sx.root}>
-         <button
-              ref={anchorRef}
-              type="button"
-              className="bp-pill"
-              style={pillStyle}
-              aria-label="Current position"
-              aria-haspopup="dialog"
-              aria-expanded={open}
-              onClick={toggleOpen}
-              onPointerDown={() => {
-                clearCloseTimer();
-                setPressPill(true);
-              }}
-              onPointerUp={() => setPressPill(false)}
-              onPointerCancel={() => setPressPill(false)}
-              onPointerLeave={() => setPressPill(false)}
-              title={pillLabel}
-         >
-           <span style={sx.pillTextStrong}>{currentBookName}</span>
-           <span style={sx.pillTextMuted}>
+      <div style={sx.root}>
+        <button
+            ref={anchorRef}
+            type="button"
+            className="bp-pill"
+            style={pillStyle}
+            aria-label="Current position"
+            aria-haspopup="dialog"
+            aria-expanded={open}
+            onClick={toggleOpen}
+            onPointerDown={() => {
+              clearCloseTimer();
+              setPressPill(true);
+            }}
+            onPointerUp={() => setPressPill(false)}
+            onPointerCancel={() => setPressPill(false)}
+            onPointerLeave={() => setPressPill(false)}
+            title={pillLabel}
+        >
+          <span style={sx.pillTextStrong}>{currentBookName}</span>
+          <span style={sx.pillTextMuted}>
                     {currentVerse == null ? `${currentChap}` : `${currentChap}:${currentVerse}`}
                 </span>
-           <span style={sx.caret} aria-hidden>
+          <span style={{ ...sx.caret, ...(open ? sx.caretOpen : null) }} aria-hidden>
                     ▾
                 </span>
-         </button>
+        </button>
 
-         {popover}
-       </div>
+        {popover}
+      </div>
   );
 }
 
@@ -20675,7 +20749,7 @@ const sx: Record<string, React.CSSProperties> = {
     lineHeight: 1,
     boxShadow: "0 6px 18px rgba(0,0,0,0.06)",
     transition:
-         "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
+        "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 160ms ease, background 160ms ease",
     whiteSpace: "nowrap",
     textAlign: "left",
     WebkitTapHighlightColor: "transparent",
@@ -20723,6 +20797,9 @@ const sx: Record<string, React.CSSProperties> = {
     justifySelf: "center",
     transition: "transform 150ms ease",
   },
+  caretOpen: {
+    transform: "translateY(-0.5px) rotate(180deg)",
+  },
 
   popover: {
     position: "fixed",
@@ -20735,7 +20812,6 @@ const sx: Record<string, React.CSSProperties> = {
     overflow: "hidden",
     display: "flex",
     flexDirection: "column",
-    transformOrigin: "top center",
     backdropFilter: "blur(10px)",
     WebkitBackdropFilter: "blur(10px)",
     outline: "none",
@@ -20973,7 +21049,6 @@ const sx: Record<string, React.CSSProperties> = {
 ### apps/web/src/Reader.tsx
 
 ```tsx
-// apps/web/src/Reader.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiGetBooks, apiGetSpine, apiResolveLoc, type BookRow } from "./api";
 import type { ReaderLocation } from "./Search";
@@ -20998,16 +21073,26 @@ type ScrollMode = "auto" | "smooth";
 const LS_LAST_ORD = "bp_last_pos_ord_v1";
 const LS_LAST_LOC = "bp_last_pos_loc_v1";
 const POSITION_SAVE_DEBOUNCE_MS = 220;
+const PROGRAMMATIC_JUMP_SETTLE_MS = 1200;
+const PROGRAMMATIC_JUMP_ORD_TOLERANCE = 1;
 
 type PendingJump = Readonly<{
     ord: number;
     behavior: ScrollMode;
+    token: number;
 }>;
 
 type StoredLocation = Readonly<{
     bookId: string;
     chapter: number;
     verse: number | null;
+}>;
+
+type JumpSession = Readonly<{
+    token: number;
+    targetOrd: number;
+    targetLocKey: string | null;
+    startedAt: number;
 }>;
 
 const INITIAL_POSITION: ReaderPosition = {
@@ -21018,6 +21103,10 @@ const INITIAL_POSITION: ReaderPosition = {
 
 function isBrowser(): boolean {
     return typeof window !== "undefined" && typeof localStorage !== "undefined";
+}
+
+function nowMs(): number {
+    return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
 
 function safeGetLS(key: string): string | null {
@@ -21154,6 +21243,10 @@ function makeStoredLocation(
     };
 }
 
+function ordNear(a: number, b: number, tolerance = PROGRAMMATIC_JUMP_ORD_TOLERANCE): boolean {
+    return Math.abs(a - b) <= tolerance;
+}
+
 export function Reader(props: Props) {
     const { styles, onBackHome, initialLocation, mode, onToggleTheme } = props;
 
@@ -21171,6 +21264,10 @@ export function Reader(props: Props) {
     const appliedInitialKeyRef = useRef("");
     const loadSeqRef = useRef(0);
     const resolveSeqRef = useRef(0);
+    const jumpTokenRef = useRef(0);
+
+    const activeJumpSessionRef = useRef<JumpSession | null>(null);
+
     const lastResolvedLocKeyRef = useRef("");
     const lastSavedLocJsonRef = useRef<string | null>(safeGetLS(LS_LAST_LOC));
     const lastSavedOrdRef = useRef<string | null>(safeGetLS(LS_LAST_ORD));
@@ -21194,6 +21291,7 @@ export function Reader(props: Props) {
     useEffect(() => {
         setViewportReady(false);
         pendingJumpRef.current = null;
+        activeJumpSessionRef.current = null;
     }, [spine?.verseOrdMin, spine?.verseOrdMax, spine?.verseCount]);
 
     useEffect(() => {
@@ -21241,11 +21339,30 @@ export function Reader(props: Props) {
         viewportHandleRef.current = handle;
     }, []);
 
-    const jumpToOrd = useCallback(
-        (ord: number, behavior: ScrollMode) => {
+    const beginJumpSession = useCallback((ord: number, targetLocKey: string | null): number => {
+        const token = ++jumpTokenRef.current;
+        activeJumpSessionRef.current = {
+            token,
+            targetOrd: ord,
+            targetLocKey,
+            startedAt: nowMs(),
+        };
+        return token;
+    }, []);
+
+    const clearJumpSession = useCallback((token?: number) => {
+        const session = activeJumpSessionRef.current;
+        if (!session) return;
+        if (token != null && session.token !== token) return;
+        activeJumpSessionRef.current = null;
+    }, []);
+
+    const dispatchJumpToOrd = useCallback(
+        (ord: number, behavior: ScrollMode, targetLocKey: string | null) => {
             if (!spine) return;
 
             const clamped = clampOrd(ord, spine);
+            const token = beginJumpSession(clamped, targetLocKey);
             const handle = viewportHandleRef.current;
 
             if (handle && viewportReady) {
@@ -21253,9 +21370,9 @@ export function Reader(props: Props) {
                 return;
             }
 
-            pendingJumpRef.current = { ord: clamped, behavior };
+            pendingJumpRef.current = { ord: clamped, behavior, token };
         },
-        [spine, viewportReady],
+        [beginJumpSession, spine, viewportReady],
     );
 
     const persistLocation = useCallback((stored: StoredLocation) => {
@@ -21302,15 +21419,19 @@ export function Reader(props: Props) {
                     return;
                 }
 
-                jumpToOrd(verseOrd, behavior);
                 persistLocation(stored);
+
+                // Important:
+                // for resolved location jumps, use auto.
+                // smooth fights the viewport correction logic.
+                dispatchJumpToOrd(verseOrd, behavior === "smooth" ? "auto" : behavior, locKey);
             } catch (e: unknown) {
                 if (seq !== resolveSeqRef.current) return;
                 const msg = e instanceof Error ? e.message : String(e);
                 setErr(msg);
             }
         },
-        [annotations, jumpToOrd, persistLocation],
+        [annotations, dispatchJumpToOrd, persistLocation],
     );
 
     useEffect(() => {
@@ -21347,8 +21468,8 @@ export function Reader(props: Props) {
         const ordRaw = parseFiniteInt(safeGetLS(LS_LAST_ORD));
         if (ordRaw == null) return;
 
-        jumpToOrd(ordRaw, "auto");
-    }, [spine, initialLocation, jumpToOrd, resolveAndJump]);
+        dispatchJumpToOrd(ordRaw, "auto", null);
+    }, [spine, initialLocation, dispatchJumpToOrd, resolveAndJump]);
 
     useEffect(() => {
         if (!viewportReady) return;
@@ -21365,6 +21486,18 @@ export function Reader(props: Props) {
         if (!spine) return;
         if (!Number.isFinite(pos.ord)) return;
         if (typeof window === "undefined") return;
+
+        const session = activeJumpSessionRef.current;
+        if (session) {
+            const elapsed = nowMs() - session.startedAt;
+            const landed = ordNear(pos.ord, session.targetOrd);
+
+            if (landed || elapsed > PROGRAMMATIC_JUMP_SETTLE_MS) {
+                clearJumpSession(session.token);
+            } else {
+                return;
+            }
+        }
 
         const nextOrd = clampOrd(pos.ord, spine);
 
@@ -21384,10 +21517,22 @@ export function Reader(props: Props) {
                 savePositionTimerRef.current = null;
             }
         };
-    }, [persistOrd, pos.ord, spine]);
+    }, [clearJumpSession, persistOrd, pos.ord, spine]);
 
     useEffect(() => {
         if (!pos.verse) return;
+
+        const session = activeJumpSessionRef.current;
+        if (session) {
+            const elapsed = nowMs() - session.startedAt;
+            const landed = ordNear(pos.ord, session.targetOrd);
+
+            if (!landed && elapsed <= PROGRAMMATIC_JUMP_SETTLE_MS) {
+                return;
+            }
+
+            clearJumpSession(session.token);
+        }
 
         const stored = makeStoredLocation(pos.verse.bookId, pos.verse.chapter, pos.verse.verse);
         if (!stored) return;
@@ -21396,7 +21541,7 @@ export function Reader(props: Props) {
         if (lastResolvedLocKeyRef.current === key) return;
 
         persistLocation(stored);
-    }, [persistLocation, pos.verse]);
+    }, [clearJumpSession, persistLocation, pos.ord, pos.verse]);
 
     const handleReady = useCallback(() => {
         setViewportReady(true);
@@ -21407,6 +21552,19 @@ export function Reader(props: Props) {
     }, []);
 
     const handlePosition = useCallback((next: ReaderPosition) => {
+        const session = activeJumpSessionRef.current;
+
+        if (session) {
+            const elapsed = nowMs() - session.startedAt;
+            const landed = ordNear(next.ord, session.targetOrd);
+
+            if (!landed && elapsed <= PROGRAMMATIC_JUMP_SETTLE_MS) {
+                return;
+            }
+
+            clearJumpSession(session.token);
+        }
+
         setPos((prev) => {
             if (
                 prev.ord === next.ord &&
@@ -21417,18 +21575,18 @@ export function Reader(props: Props) {
             }
             return next;
         });
-    }, []);
+    }, [clearJumpSession]);
 
     const handleJumpRef = useCallback(
         (bookId: string, chapter: number, verse: number | null) => {
-            void resolveAndJump(bookId, chapter, verse, "smooth");
+            void resolveAndJump(bookId, chapter, verse, "auto");
         },
         [resolveAndJump],
     );
 
     const handleNavigate = useCallback(
         (loc: ReaderLocation) => {
-            void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "smooth");
+            void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "auto");
         },
         [resolveAndJump],
     );
@@ -23464,8 +23622,17 @@ export const ReaderHeader = memo(function ReaderHeader(props: Props) {
 ```tsx
 // cspell:words oklab
 // apps/web/src/reader/ReaderSelectionToolbar.tsx
-import React, { memo, useMemo, useState } from "react";
+import React, {
+     memo,
+     useCallback,
+     useEffect,
+     useLayoutEffect,
+     useMemo,
+     useRef,
+     useState,
+} from "react";
 import type { CSSProperties, ReactNode } from "react";
+import { createPortal } from "react-dom";
 import type { SelectionAnchorInput } from "@biblia/annotation";
 import { Bookmark, Highlighter, NotebookPen, X } from "lucide-react";
 
@@ -23504,48 +23671,68 @@ type ToneStyles = {
      borderColor: string;
 };
 
-const STICKY_TOP = 10;
-const PANEL_MAX_WIDTH = 660;
+type ToolbarPlacement = "above" | "below";
 
-const TOOLBAR_WRAP_STYLE: CSSProperties = {
-     position: "sticky",
-     top: STICKY_TOP,
-     zIndex: 60,
-     width: "100%",
-     display: "flex",
-     justifyContent: "center",
-     padding: "8px 12px 10px",
-     pointerEvents: "none",
+type ToolbarPosition = {
+     left: number;
+     top: number;
+     placement: ToolbarPlacement;
 };
 
-const PANEL_STYLE: CSSProperties = {
+type ToolbarRect = {
+     width: number;
+     height: number;
+};
+
+type SelectionRectLike = {
+     left: number;
+     top: number;
+     right: number;
+     bottom: number;
+     width: number;
+     height: number;
+};
+
+const SHOW_DELAY_MS = 90;
+const HIDE_DELAY_MS = 40;
+const MAX_DETAIL_CHARS = 68;
+const VIEWPORT_PAD = 10;
+const TOOLBAR_GAP = 10;
+const MIN_TOUCH_TARGET = 30;
+const MAX_TOOLBAR_WIDTH = 480;
+const POSITION_EPSILON = 0.5;
+
+const ROOT_Z_INDEX = 160;
+
+const PANEL_BASE_STYLE: CSSProperties = {
      pointerEvents: "auto",
-     width: "min(100%, 660px)",
-     maxWidth: PANEL_MAX_WIDTH,
-     borderRadius: 16,
-     border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-     background:
-          "color-mix(in oklab, var(--panel) 92%, var(--bg))",
-     boxShadow:
-          "0 10px 24px rgba(0,0,0,0.08), 0 1px 3px rgba(0,0,0,0.04)",
-     overflow: "hidden",
-     backdropFilter: "blur(12px)",
-     WebkitBackdropFilter: "blur(12px)",
-};
-
-const PANEL_INNER_STYLE: CSSProperties = {
-     display: "grid",
-     gridTemplateColumns: "minmax(0, 1fr) auto",
+     position: "relative",
+     display: "flex",
      alignItems: "center",
-     gap: 10,
-     padding: "8px 10px",
+     gap: 8,
+     minHeight: 42,
+     padding: "6px 7px 6px 8px",
+     borderRadius: 999,
+     border: "1px solid color-mix(in oklab, var(--hairline) 88%, transparent)",
+     background: "color-mix(in oklab, var(--panel) 95%, var(--bg))",
+     boxShadow:
+         "0 18px 38px rgba(0,0,0,0.16), 0 2px 8px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.05)",
+     backdropFilter: "blur(16px) saturate(1.05)",
+     WebkitBackdropFilter: "blur(16px) saturate(1.05)",
+     maxWidth: `min(calc(100vw - ${VIEWPORT_PAD * 2}px), ${MAX_TOOLBAR_WIDTH}px)`,
+     transformOrigin: "50% 50%",
+     transition:
+         "opacity 140ms ease, transform 180ms cubic-bezier(.2,.8,.2,1), box-shadow 140ms ease",
+     willChange: "transform, opacity, left, top",
 };
 
 const META_STYLE: CSSProperties = {
      minWidth: 0,
+     flex: "1 1 auto",
      display: "flex",
      alignItems: "center",
-     gap: 10,
+     gap: 8,
+     paddingLeft: 2,
 };
 
 const BADGE_STYLE: CSSProperties = {
@@ -23557,7 +23744,7 @@ const BADGE_STYLE: CSSProperties = {
      justifyContent: "center",
      flex: "0 0 auto",
      background: "color-mix(in oklab, var(--fg) 5%, transparent)",
-     color: "color-mix(in oklab, var(--fg) 50%, transparent)",
+     color: "color-mix(in oklab, var(--fg) 56%, transparent)",
 };
 
 const TEXT_WRAP_STYLE: CSSProperties = {
@@ -23569,10 +23756,10 @@ const TEXT_WRAP_STYLE: CSSProperties = {
 
 const LABEL_STYLE: CSSProperties = {
      minWidth: 0,
-     fontSize: 12.5,
-     fontWeight: 700,
+     fontSize: 11.5,
+     fontWeight: 720,
+     lineHeight: 1.12,
      letterSpacing: "-0.015em",
-     lineHeight: 1.15,
      color: "var(--fg)",
      overflow: "hidden",
      textOverflow: "ellipsis",
@@ -23581,9 +23768,9 @@ const LABEL_STYLE: CSSProperties = {
 
 const DETAIL_STYLE: CSSProperties = {
      minWidth: 0,
-     fontSize: 11.5,
-     lineHeight: 1.25,
-     color: "color-mix(in oklab, var(--fg) 56%, transparent)",
+     fontSize: 10.5,
+     lineHeight: 1.12,
+     color: "color-mix(in oklab, var(--fg) 52%, transparent)",
      overflow: "hidden",
      textOverflow: "ellipsis",
      whiteSpace: "nowrap",
@@ -23592,20 +23779,32 @@ const DETAIL_STYLE: CSSProperties = {
 const ACTIONS_STYLE: CSSProperties = {
      display: "flex",
      alignItems: "center",
-     justifyContent: "flex-end",
-     gap: 6,
-     flexWrap: "nowrap",
-     minWidth: 0,
+     gap: 5,
+     flex: "0 0 auto",
 };
 
 function cleanText(value: string): string {
      return value.replace(/\s+/g, " ").trim();
 }
 
-function clampText(value: string, max = 96): string {
+function clampText(value: string, max = MAX_DETAIL_CHARS): string {
      const text = cleanText(value);
      if (text.length <= max) return text;
      return `${text.slice(0, max - 1).trimEnd()}…`;
+}
+
+function clamp(n: number, min: number, max: number): number {
+     return Math.max(min, Math.min(max, n));
+}
+
+function nearlyEqual(a: number, b: number): boolean {
+     return Math.abs(a - b) <= POSITION_EPSILON;
+}
+
+function samePosition(a: ToolbarPosition | null, b: ToolbarPosition | null): boolean {
+     if (a === b) return true;
+     if (!a || !b) return false;
+     return a.placement === b.placement && nearlyEqual(a.left, b.left) && nearlyEqual(a.top, b.top);
 }
 
 function getSelectionLabel(selection: SelectionAnchorInput | null): string | null {
@@ -23622,39 +23821,144 @@ function getSelectionLabel(selection: SelectionAnchorInput | null): string | nul
 function getSelectionDetail(selection: SelectionAnchorInput | null): string | null {
      if (!selection) return null;
 
-     const text = selection.text ? clampText(selection.text, 96) : "";
+     const text = selection.text ? clampText(selection.text) : "";
      if (text) return text;
 
      const translationId = selection.translationId ? cleanText(selection.translationId) : "";
      if (translationId) return translationId;
 
-     return "Text selection";
+     return "Selected text";
+}
+
+function getSelectionSignature(selection: SelectionAnchorInput | null): string {
+     if (!selection) return "";
+
+     const startKey = cleanText(selection.start.verseKey);
+     const endKey = cleanText(selection.end.verseKey);
+     const text = cleanText(selection.text ?? "");
+     const translationId = cleanText(selection.translationId ?? "");
+
+     return `${startKey}|${endKey}|${translationId}|${text}`;
+}
+
+function hasMeaningfulSelection(selection: SelectionAnchorInput | null): boolean {
+     if (!selection) return false;
+
+     const startKey = cleanText(selection.start.verseKey);
+     const endKey = cleanText(selection.end.verseKey);
+     const text = cleanText(selection.text ?? "");
+
+     if (!startKey && !endKey) return false;
+     if (text.length === 0) return false;
+
+     return true;
 }
 
 function getToneStyles(tone: ActionTone): ToneStyles {
      switch (tone) {
           case "gold":
                return {
-                    color: "color-mix(in oklab, var(--fg) 84%, #8d6800)",
+                    color: "color-mix(in oklab, var(--fg) 82%, #8d6800)",
                     background: "color-mix(in oklab, #efcf73 10%, var(--panel))",
-                    backgroundHover: "color-mix(in oklab, #efcf73 14%, var(--panel))",
-                    borderColor: "color-mix(in oklab, #ddb54c 22%, transparent)",
+                    backgroundHover: "color-mix(in oklab, #efcf73 17%, var(--panel))",
+                    borderColor: "color-mix(in oklab, #ddb54c 20%, transparent)",
                };
           case "blue":
                return {
-                    color: "color-mix(in oklab, var(--fg) 84%, #295ed8)",
+                    color: "color-mix(in oklab, var(--fg) 82%, #295ed8)",
                     background: "color-mix(in oklab, #7ba9ff 10%, var(--panel))",
-                    backgroundHover: "color-mix(in oklab, #7ba9ff 14%, var(--panel))",
-                    borderColor: "color-mix(in oklab, #6d9fff 22%, transparent)",
+                    backgroundHover: "color-mix(in oklab, #7ba9ff 17%, var(--panel))",
+                    borderColor: "color-mix(in oklab, #6d9fff 20%, transparent)",
                };
           case "violet":
                return {
-                    color: "color-mix(in oklab, var(--fg) 84%, #6b47d8)",
+                    color: "color-mix(in oklab, var(--fg) 82%, #6b47d8)",
                     background: "color-mix(in oklab, #b191ff 10%, var(--panel))",
-                    backgroundHover: "color-mix(in oklab, #b191ff 14%, var(--panel))",
-                    borderColor: "color-mix(in oklab, #a884ff 22%, transparent)",
+                    backgroundHover: "color-mix(in oklab, #b191ff 17%, var(--panel))",
+                    borderColor: "color-mix(in oklab, #a884ff 20%, transparent)",
                };
      }
+}
+
+function getCurrentSelectionRect(): DOMRect | null {
+     if (typeof window === "undefined") return null;
+
+     const domSelection = window.getSelection();
+     if (!domSelection || domSelection.rangeCount === 0 || domSelection.isCollapsed) {
+          return null;
+     }
+
+     const range = domSelection.getRangeAt(0);
+     const rect = range.getBoundingClientRect();
+
+     if ((rect.width > 0 || rect.height > 0) && Number.isFinite(rect.top) && Number.isFinite(rect.left)) {
+          return rect;
+     }
+
+     const clientRects = range.getClientRects();
+     if (clientRects.length === 0) return null;
+
+     let left = Number.POSITIVE_INFINITY;
+     let top = Number.POSITIVE_INFINITY;
+     let right = Number.NEGATIVE_INFINITY;
+     let bottom = Number.NEGATIVE_INFINITY;
+
+     for (let i = 0; i < clientRects.length; i += 1) {
+          const current = clientRects.item(i);
+          if (!current) continue;
+          if (current.width <= 0 && current.height <= 0) continue;
+
+          left = Math.min(left, current.left);
+          top = Math.min(top, current.top);
+          right = Math.max(right, current.right);
+          bottom = Math.max(bottom, current.bottom);
+     }
+
+     if (!Number.isFinite(left) || !Number.isFinite(top) || !Number.isFinite(right) || !Number.isFinite(bottom)) {
+          return null;
+     }
+
+     return new DOMRect(left, top, right - left, bottom - top);
+}
+
+function computeToolbarPosition(
+    selectionRect: SelectionRectLike,
+    toolbarRect: ToolbarRect,
+    viewportWidth: number,
+    viewportHeight: number,
+): ToolbarPosition {
+     const centeredLeft = selectionRect.left + (selectionRect.width / 2) - (toolbarRect.width / 2);
+
+     const left = clamp(
+         centeredLeft,
+         VIEWPORT_PAD,
+         Math.max(VIEWPORT_PAD, viewportWidth - toolbarRect.width - VIEWPORT_PAD),
+     );
+
+     const aboveTop = selectionRect.top - toolbarRect.height - TOOLBAR_GAP;
+     const belowTop = selectionRect.bottom + TOOLBAR_GAP;
+
+     const canFitAbove = aboveTop >= VIEWPORT_PAD;
+     const canFitBelow = belowTop + toolbarRect.height <= viewportHeight - VIEWPORT_PAD;
+
+     if (canFitAbove || !canFitBelow) {
+          return {
+               left: Math.round(left),
+               top: Math.round(Math.max(VIEWPORT_PAD, aboveTop)),
+               placement: "above",
+          };
+     }
+
+     return {
+          left: Math.round(left),
+          top: Math.round(
+              Math.min(
+                  viewportHeight - toolbarRect.height - VIEWPORT_PAD,
+                  belowTop,
+              ),
+          ),
+          placement: "below",
+     };
 }
 
 const ActionButton = memo(function ActionButton(props: ActionButtonProps) {
@@ -23664,67 +23968,69 @@ const ActionButton = memo(function ActionButton(props: ActionButtonProps) {
      const [pressing, setPressing] = useState(false);
 
      return (
-          <button
-               type="button"
-               title={title}
-               aria-label={title}
-               onClick={onClick}
-               onMouseDown={(event) => {
-                    event.preventDefault();
-                    setPressing(true);
-               }}
-               onMouseUp={() => setPressing(false)}
-               onMouseLeave={() => {
-                    setHover(false);
-                    setPressing(false);
-               }}
-               onMouseEnter={() => setHover(true)}
-               onFocus={() => setHover(true)}
-               onBlur={() => {
-                    setHover(false);
-                    setPressing(false);
-               }}
-               style={{
-                    appearance: "none",
-                    WebkitAppearance: "none",
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    gap: 6,
-                    height: 30,
-                    padding: "0 10px",
-                    borderRadius: 999,
-                    border: `1px solid ${toneStyles.borderColor}`,
-                    background: hover ? toneStyles.backgroundHover : toneStyles.background,
-                    color: toneStyles.color,
-                    cursor: "pointer",
-                    whiteSpace: "nowrap",
-                    fontSize: 11.5,
-                    fontWeight: 690,
-                    lineHeight: 1,
-                    letterSpacing: "-0.01em",
-                    transform: pressing ? "scale(0.985)" : "translateY(0)",
-                    transition:
-                         "transform 120ms ease, background 120ms ease, border-color 120ms ease, opacity 120ms ease",
-                    WebkitTapHighlightColor: "transparent",
-               }}
-          >
+         <button
+             type="button"
+             title={title}
+             aria-label={title}
+             onClick={onClick}
+             onMouseDown={(event) => {
+                  event.preventDefault();
+                  setPressing(true);
+             }}
+             onMouseUp={() => setPressing(false)}
+             onMouseEnter={() => setHover(true)}
+             onMouseLeave={() => {
+                  setHover(false);
+                  setPressing(false);
+             }}
+             onFocus={() => setHover(true)}
+             onBlur={() => {
+                  setHover(false);
+                  setPressing(false);
+             }}
+             style={{
+                  appearance: "none",
+                  WebkitAppearance: "none",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 5,
+                  minWidth: MIN_TOUCH_TARGET,
+                  height: MIN_TOUCH_TARGET,
+                  padding: "0 10px",
+                  borderRadius: 999,
+                  border: `1px solid ${toneStyles.borderColor}`,
+                  background: hover ? toneStyles.backgroundHover : toneStyles.background,
+                  color: toneStyles.color,
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                  fontSize: 10.75,
+                  fontWeight: 720,
+                  lineHeight: 1,
+                  letterSpacing: "-0.01em",
+                  transform: pressing ? "scale(0.98)" : "translateY(0)",
+                  boxShadow: hover ? "inset 0 1px 0 rgba(255,255,255,0.08)" : "none",
+                  transition:
+                      "transform 120ms ease, background 120ms ease, border-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease",
+                  WebkitTapHighlightColor: "transparent",
+             }}
+         >
             <span
-                 aria-hidden="true"
-                 style={{
-                      width: 14,
-                      height: 14,
-                      display: "inline-flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      flex: "0 0 auto",
-                      opacity: 0.9,
-                 }}
+                aria-hidden="true"
+                style={{
+                     width: 13,
+                     height: 13,
+                     display: "inline-flex",
+                     alignItems: "center",
+                     justifyContent: "center",
+                     flex: "0 0 auto",
+                     opacity: 0.92,
+                }}
             >
                 {icon}
             </span>
-               <span>{label}</span>
-          </button>
+              <span>{label}</span>
+         </button>
      );
 });
 
@@ -23733,139 +24039,315 @@ const ClearButton = memo(function ClearButton(props: { onClick: () => void }) {
      const [pressing, setPressing] = useState(false);
 
      return (
-          <button
-               type="button"
-               title="Clear selection"
-               aria-label="Clear selection"
-               onClick={props.onClick}
-               onMouseDown={(event) => {
-                    event.preventDefault();
-                    setPressing(true);
-               }}
-               onMouseUp={() => setPressing(false)}
-               onMouseEnter={() => setHover(true)}
-               onMouseLeave={() => {
-                    setHover(false);
-                    setPressing(false);
-               }}
-               onFocus={() => setHover(true)}
-               onBlur={() => {
-                    setHover(false);
-                    setPressing(false);
-               }}
-               style={{
-                    appearance: "none",
-                    WebkitAppearance: "none",
-                    width: 30,
-                    height: 30,
-                    borderRadius: 999,
-                    border: "1px solid color-mix(in oklab, var(--hairline) 90%, transparent)",
-                    background: hover
-                         ? "color-mix(in oklab, var(--fg) 5%, transparent)"
-                         : "transparent",
-                    color: "color-mix(in oklab, var(--fg) 62%, transparent)",
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    cursor: "pointer",
-                    flex: "0 0 auto",
-                    transform: pressing ? "scale(0.985)" : "translateY(0)",
-                    transition:
-                         "background 120ms ease, transform 120ms ease, border-color 120ms ease, opacity 120ms ease",
-                    WebkitTapHighlightColor: "transparent",
-               }}
-          >
-               <X size={14} strokeWidth={2.1} />
-          </button>
+         <button
+             type="button"
+             title="Clear selection"
+             aria-label="Clear selection"
+             onClick={props.onClick}
+             onMouseDown={(event) => {
+                  event.preventDefault();
+                  setPressing(true);
+             }}
+             onMouseUp={() => setPressing(false)}
+             onMouseEnter={() => setHover(true)}
+             onMouseLeave={() => {
+                  setHover(false);
+                  setPressing(false);
+             }}
+             onFocus={() => setHover(true)}
+             onBlur={() => {
+                  setHover(false);
+                  setPressing(false);
+             }}
+             style={{
+                  appearance: "none",
+                  WebkitAppearance: "none",
+                  width: MIN_TOUCH_TARGET,
+                  height: MIN_TOUCH_TARGET,
+                  borderRadius: 999,
+                  border: "1px solid color-mix(in oklab, var(--hairline) 90%, transparent)",
+                  background: hover
+                      ? "color-mix(in oklab, var(--fg) 5%, transparent)"
+                      : "transparent",
+                  color: "color-mix(in oklab, var(--fg) 62%, transparent)",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  cursor: "pointer",
+                  flex: "0 0 auto",
+                  transform: pressing ? "scale(0.98)" : "translateY(0)",
+                  transition:
+                      "background 120ms ease, transform 120ms ease, border-color 120ms ease, opacity 120ms ease",
+                  WebkitTapHighlightColor: "transparent",
+             }}
+         >
+              <X size={14} strokeWidth={2.1} />
+         </button>
      );
 });
 
 export const ReaderSelectionToolbar = memo(function ReaderSelectionToolbar(props: Props) {
      const { selection, onHighlight, onBookmark, onNote, onClear, className } = props;
 
+     const [mounted, setMounted] = useState(false);
+     const [visible, setVisible] = useState(false);
+     const [position, setPosition] = useState<ToolbarPosition | null>(null);
+
+     const panelRef = useRef<HTMLDivElement | null>(null);
+     const rafRef = useRef<number | null>(null);
+     const showTimerRef = useRef<number | null>(null);
+     const hideTimerRef = useRef<number | null>(null);
+     const lastSignatureRef = useRef<string>("");
+
+     const selectionSignature = useMemo(() => getSelectionSignature(selection), [selection]);
+     const canShow = useMemo(() => hasMeaningfulSelection(selection), [selection]);
      const label = useMemo(() => getSelectionLabel(selection), [selection]);
      const detail = useMemo(() => getSelectionDetail(selection), [selection]);
 
      const actions = useMemo<ActionSpec[]>(
-          () => [
-               {
-                    key: "highlight",
-                    label: "Highlight",
-                    title: "Create highlight",
-                    onClick: onHighlight,
-                    icon: <Highlighter size={14} strokeWidth={2.1} />,
-                    tone: "gold",
-               },
-               {
-                    key: "bookmark",
-                    label: "Bookmark",
-                    title: "Create bookmark",
-                    onClick: onBookmark,
-                    icon: <Bookmark size={14} strokeWidth={2.1} />,
-                    tone: "blue",
-               },
-               {
-                    key: "note",
-                    label: "Note",
-                    title: "Create note",
-                    onClick: onNote,
-                    icon: <NotebookPen size={14} strokeWidth={2.1} />,
-                    tone: "violet",
-               },
-          ],
-          [onBookmark, onHighlight, onNote],
+         () => [
+              {
+                   key: "highlight",
+                   label: "Highlight",
+                   title: "Create highlight",
+                   onClick: onHighlight,
+                   icon: <Highlighter size={13} strokeWidth={2.1} />,
+                   tone: "gold",
+              },
+              {
+                   key: "bookmark",
+                   label: "Bookmark",
+                   title: "Create bookmark",
+                   onClick: onBookmark,
+                   icon: <Bookmark size={13} strokeWidth={2.1} />,
+                   tone: "blue",
+              },
+              {
+                   key: "note",
+                   label: "Note",
+                   title: "Create note",
+                   onClick: onNote,
+                   icon: <NotebookPen size={13} strokeWidth={2.1} />,
+                   tone: "violet",
+              },
+         ],
+         [onBookmark, onHighlight, onNote],
      );
 
+     const clearTimers = useCallback(() => {
+          if (showTimerRef.current != null) {
+               window.clearTimeout(showTimerRef.current);
+               showTimerRef.current = null;
+          }
+          if (hideTimerRef.current != null) {
+               window.clearTimeout(hideTimerRef.current);
+               hideTimerRef.current = null;
+          }
+     }, []);
+
+     const cancelRaf = useCallback(() => {
+          if (rafRef.current != null) {
+               cancelAnimationFrame(rafRef.current);
+               rafRef.current = null;
+          }
+     }, []);
+
+     const measureAndPlace = useCallback(() => {
+          if (!mounted) return;
+          if (!canShow) return;
+          if (!panelRef.current) return;
+
+          const selectionRect = getCurrentSelectionRect();
+          if (!selectionRect) {
+               setPosition((prev) => (prev !== null ? null : prev));
+               return;
+          }
+
+          const toolbarBounds = panelRef.current.getBoundingClientRect();
+          const toolbarRect: ToolbarRect = {
+               width: Math.max(1, Math.ceil(toolbarBounds.width)),
+               height: Math.max(1, Math.ceil(toolbarBounds.height)),
+          };
+
+          const next = computeToolbarPosition(
+              selectionRect,
+              toolbarRect,
+              window.innerWidth,
+              window.innerHeight,
+          );
+
+          setPosition((prev) => (samePosition(prev, next) ? prev : next));
+     }, [canShow, mounted]);
+
+     const scheduleMeasure = useCallback(() => {
+          cancelRaf();
+          rafRef.current = requestAnimationFrame(() => {
+               rafRef.current = null;
+               measureAndPlace();
+          });
+     }, [cancelRaf, measureAndPlace]);
+
+     useEffect(() => {
+          setMounted(typeof document !== "undefined");
+     }, []);
+
+     useEffect(() => {
+          if (!mounted) return;
+
+          clearTimers();
+
+          if (canShow) {
+               const signatureChanged = lastSignatureRef.current !== selectionSignature;
+               lastSignatureRef.current = selectionSignature;
+
+               if (signatureChanged) {
+                    setVisible(false);
+               }
+
+               showTimerRef.current = window.setTimeout(() => {
+                    setVisible(true);
+               }, SHOW_DELAY_MS);
+               return;
+          }
+
+          hideTimerRef.current = window.setTimeout(() => {
+               setVisible(false);
+               setPosition((prev) => (prev !== null ? null : prev));
+          }, HIDE_DELAY_MS);
+
+          return clearTimers;
+     }, [mounted, canShow, selectionSignature, clearTimers]);
+
+     useLayoutEffect(() => {
+          if (!visible) return;
+          scheduleMeasure();
+     }, [visible, label, detail, scheduleMeasure]);
+
+     useEffect(() => {
+          if (!mounted || !visible) return;
+
+          const onScroll = (): void => {
+               scheduleMeasure();
+          };
+
+          const onResize = (): void => {
+               scheduleMeasure();
+          };
+
+          const onSelectionChange = (): void => {
+               scheduleMeasure();
+          };
+
+          window.addEventListener("scroll", onScroll, true);
+          window.addEventListener("resize", onResize);
+          document.addEventListener("selectionchange", onSelectionChange);
+
+          const resizeObserver =
+              typeof ResizeObserver !== "undefined" && panelRef.current
+                  ? new ResizeObserver(() => {
+                       scheduleMeasure();
+                  })
+                  : null;
+
+          if (resizeObserver && panelRef.current) {
+               resizeObserver.observe(panelRef.current);
+          }
+
+          return () => {
+               window.removeEventListener("scroll", onScroll, true);
+               window.removeEventListener("resize", onResize);
+               document.removeEventListener("selectionchange", onSelectionChange);
+               resizeObserver?.disconnect();
+          };
+     }, [mounted, visible, scheduleMeasure]);
+
+     useEffect(() => {
+          return () => {
+               clearTimers();
+               cancelRaf();
+          };
+     }, [cancelRaf, clearTimers]);
+
+     if (!mounted) return null;
      if (!selection) return null;
+     if (!visible) return null;
 
-     return (
-          <div
-               className={className}
-               role="toolbar"
-               aria-label="Selection actions"
-               style={TOOLBAR_WRAP_STYLE}
-          >
-               <div style={PANEL_STYLE}>
-                    <div style={PANEL_INNER_STYLE}>
-                         <div style={META_STYLE}>
-                              <div aria-hidden="true" style={BADGE_STYLE}>
-                                   <Highlighter size={11} strokeWidth={2.1} />
-                              </div>
+     const placement = position?.placement ?? "above";
+     const ready = position !== null;
 
-                              <div style={TEXT_WRAP_STYLE}>
-                                   {label ? (
-                                        <div style={LABEL_STYLE} title={label}>
-                                             {label}
-                                        </div>
-                                   ) : null}
+     return createPortal(
+         <div
+             className={className}
+             role="toolbar"
+             aria-label="Selection actions"
+             style={{
+                  position: "fixed",
+                  left: position?.left ?? VIEWPORT_PAD,
+                  top: position?.top ?? VIEWPORT_PAD,
+                  zIndex: ROOT_Z_INDEX,
+                  pointerEvents: "none",
+                  opacity: ready ? 1 : 0,
+                  transform: ready
+                      ? "translate3d(0,0,0)"
+                      : placement === "above"
+                          ? "translate3d(0,4px,0)"
+                          : "translate3d(0,-4px,0)",
+                  transition: "opacity 140ms ease, transform 180ms cubic-bezier(.2,.8,.2,1)",
+                  maxWidth: `min(calc(100vw - ${VIEWPORT_PAD * 2}px), ${MAX_TOOLBAR_WIDTH}px)`,
+             }}
+         >
+              <div
+                  ref={panelRef}
+                  style={{
+                       ...PANEL_BASE_STYLE,
+                       transform: ready
+                           ? "translate3d(0,0,0) scale(1)"
+                           : placement === "above"
+                               ? "translate3d(0,2px,0) scale(0.985)"
+                               : "translate3d(0,-2px,0) scale(0.985)",
+                  }}
+              >
+                   <div style={META_STYLE}>
+                        <div aria-hidden="true" style={BADGE_STYLE}>
+                             <Highlighter size={11} strokeWidth={2.1} />
+                        </div>
 
-                                   {detail ? (
-                                        <div style={DETAIL_STYLE} title={detail}>
-                                             {detail}
-                                        </div>
-                                   ) : null}
-                              </div>
-                         </div>
+                        <div style={TEXT_WRAP_STYLE}>
+                             {label ? (
+                                 <div style={LABEL_STYLE} title={label}>
+                                      {label}
+                                 </div>
+                             ) : null}
 
-                         <div style={ACTIONS_STYLE}>
-                              {actions.map((action) => (
-                                   <ActionButton
-                                        key={action.key}
-                                        label={action.label}
-                                        title={action.title}
-                                        onClick={action.onClick}
-                                        icon={action.icon}
-                                        tone={action.tone}
-                                   />
-                              ))}
+                             {detail ? (
+                                 <div style={DETAIL_STYLE} title={detail}>
+                                      {detail}
+                                 </div>
+                             ) : null}
+                        </div>
+                   </div>
 
-                              {onClear ? <ClearButton onClick={onClear} /> : null}
-                         </div>
-                    </div>
-               </div>
-          </div>
+                   <div style={ACTIONS_STYLE}>
+                        {actions.map((action) => (
+                            <ActionButton
+                                key={action.key}
+                                label={action.label}
+                                title={action.title}
+                                onClick={action.onClick}
+                                icon={action.icon}
+                                tone={action.tone}
+                            />
+                        ))}
+
+                        {onClear ? <ClearButton onClick={onClear} /> : null}
+                   </div>
+              </div>
+         </div>,
+         document.body,
      );
 });
+
+ReaderSelectionToolbar.displayName = "ReaderSelectionToolbar";
 ```
 
 ### apps/web/src/reader/ReaderShell.tsx
@@ -23923,6 +24405,11 @@ type Props = Readonly<{
     err?: string | null;
 }>;
 
+type ViewportMountState = Readonly<{
+    shouldMount: boolean;
+    reason: "ready" | "loading" | "fatal";
+}>;
+
 const MEASURE_WRAP_STYLE: CSSProperties = Object.freeze({
     maxWidth: "var(--bpReaderMeasure, 840px)",
     marginInline: "auto",
@@ -23932,9 +24419,18 @@ const MEASURE_WRAP_STYLE: CSSProperties = Object.freeze({
     minWidth: 0,
 });
 
+const VIEWPORT_HOST_STYLE: CSSProperties = Object.freeze({
+    position: "relative",
+    flex: "1 1 auto",
+    minHeight: 0,
+    minWidth: 0,
+    width: "100%",
+});
+
 const ERR_BANNER_OUTER_STYLE: CSSProperties = Object.freeze({
     borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
     background: "color-mix(in oklab, var(--bg) 94%, var(--panel))",
+    flex: "0 0 auto",
 });
 
 const ERR_BANNER_INNER_STYLE: CSSProperties = Object.freeze({
@@ -23945,6 +24441,14 @@ const ERR_TEXT_STYLE: CSSProperties = Object.freeze({
     fontSize: 12,
     color: "var(--muted)",
     whiteSpace: "pre-wrap",
+});
+
+const LOADING_STAGE_STYLE: CSSProperties = Object.freeze({
+    ...sx.body,
+    display: "flex",
+    alignItems: "flex-start",
+    minHeight: 0,
+    flex: "1 1 auto",
 });
 
 const LOADING_TEXT_STYLE: CSSProperties = Object.freeze({
@@ -24007,6 +24511,37 @@ function buildViewportKey(spine: SpineStats | null): string {
     return `${spine.verseOrdMin}:${spine.verseOrdMax}:${spine.verseCount}`;
 }
 
+function buildBannerMsg(
+    err: string | null | undefined,
+    spine: SpineStats | null,
+    spineCheck: SpineValidation,
+): string | null {
+    if (err) return err;
+    if (!spine) return null;
+    if (!spineCheck.ok) return spineCheck.msg;
+    return null;
+}
+
+function deriveViewportMountState(
+    spine: SpineStats | null,
+    spineCheck: SpineValidation,
+    err: string | null | undefined,
+): ViewportMountState {
+    if (err) {
+        return { shouldMount: false, reason: "fatal" };
+    }
+
+    if (!spine) {
+        return { shouldMount: false, reason: "loading" };
+    }
+
+    if (!spineCheck.ok) {
+        return { shouldMount: false, reason: "fatal" };
+    }
+
+    return { shouldMount: true, reason: "ready" };
+}
+
 const MeasureWrap = memo(function MeasureWrap(props: Readonly<{ children: ReactNode }>) {
     return <div style={MEASURE_WRAP_STYLE}>{props.children}</div>;
 });
@@ -24025,12 +24560,57 @@ const ErrBanner = memo(function ErrBanner(props: Readonly<{ msg: string }>) {
 
 const LoadingBody = memo(function LoadingBody(props: Readonly<{ msg?: string | null }>) {
     return (
-        <div style={sx.body}>
+        <div style={LOADING_STAGE_STYLE}>
             <MeasureWrap>
                 <div style={LOADING_TEXT_STYLE} role="status" aria-live="polite">
                     {props.msg ?? "Loading…"}
                 </div>
             </MeasureWrap>
+        </div>
+    );
+});
+
+const ViewportHost = memo(function ViewportHost(
+    props: Readonly<{
+        viewportKey: string;
+        viewportRef?: Ref<ReaderViewportHandle> | null;
+        spine: SpineStats;
+        bookById: Map<string, BookRow>;
+        selectionRootRef?: MutableRefObject<HTMLDivElement | null> | null;
+        annotationSnapshot?: AnnotationSnapshot | null;
+        topContent?: ReactNode;
+        onPosition: (pos: ReaderPosition) => void;
+        onError?: (msg: string) => void;
+        onReady?: () => void;
+    }>,
+) {
+    const {
+        viewportKey,
+        viewportRef,
+        spine,
+        bookById,
+        selectionRootRef,
+        annotationSnapshot,
+        topContent,
+        onPosition,
+        onError,
+        onReady,
+    } = props;
+
+    return (
+        <div style={VIEWPORT_HOST_STYLE}>
+            <ReaderViewport
+                key={viewportKey}
+                ref={viewportRef ?? null}
+                spine={spine}
+                bookById={bookById}
+                selectionRootRef={selectionRootRef ?? null}
+                annotationSnapshot={annotationSnapshot ?? null}
+                topContent={topContent ?? null}
+                onPosition={onPosition}
+                onError={onError}
+                onReady={onReady}
+            />
         </div>
     );
 });
@@ -24058,15 +24638,16 @@ export function ReaderShell(props: Props) {
     } = props;
 
     const spineCheck = useMemo(() => validateSpine(spine), [spine]);
-    const hasValidSpine = spineCheck.ok;
+    const viewportMount = useMemo(
+        () => deriveViewportMountState(spine, spineCheck, err),
+        [err, spine, spineCheck],
+    );
     const viewportKey = useMemo(() => buildViewportKey(spine), [spine]);
 
-    const bannerMsg = useMemo(() => {
-        if (err) return err;
-        if (!spine) return null;
-        if (!spineCheck.ok) return spineCheck.msg;
-        return null;
-    }, [err, spine, spineCheck]);
+    const bannerMsg = useMemo(
+        () => buildBannerMsg(err, spine, spineCheck),
+        [err, spine, spineCheck],
+    );
 
     const reportedErrorRef = useRef<string | null>(null);
 
@@ -24083,14 +24664,10 @@ export function ReaderShell(props: Props) {
         onError(bannerMsg);
     }, [bannerMsg, onError]);
 
-    const isLoading = !spine && !err;
-    const hasFatalError = !!bannerMsg && (!spine || !hasValidSpine || !!err);
-
     return (
         <main
             style={sx.page}
-            aria-busy={isLoading}
-            aria-live="polite"
+            aria-busy={viewportMount.reason === "loading"}
             data-reader-shell="1"
         >
             <ReaderHeader
@@ -24106,21 +24683,21 @@ export function ReaderShell(props: Props) {
 
             {bannerMsg ? <ErrBanner msg={bannerMsg} /> : null}
 
-            {hasValidSpine && spine ? (
-                <ReaderViewport
-                    key={viewportKey}
-                    ref={viewportRef ?? null}
+            {viewportMount.shouldMount && spine ? (
+                <ViewportHost
+                    viewportKey={viewportKey}
+                    viewportRef={viewportRef}
                     spine={spine}
                     bookById={bookById}
-                    selectionRootRef={selectionRootRef ?? null}
-                    annotationSnapshot={annotationSnapshot ?? null}
-                    topContent={topContent ?? null}
+                    selectionRootRef={selectionRootRef}
+                    annotationSnapshot={annotationSnapshot}
+                    topContent={topContent}
                     onPosition={onPosition}
                     onError={onError}
                     onReady={onReady}
                 />
             ) : (
-                <LoadingBody msg={hasFatalError ? undefined : "Loading…"} />
+                <LoadingBody msg={viewportMount.reason === "loading" ? "Loading…" : undefined} />
             )}
         </main>
     );
@@ -25216,33 +25793,113 @@ import React, {
 import type { Annotation, AnnotationSnapshot } from "@biblia/annotation";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { apiGetSlice, type BookRow } from "../api";
-import { BookTitlePage } from "./BookTitlePage";
-import { sx } from "./sx";
 import type { ReaderPosition, SliceVerse, SpineStats } from "./types";
 import { VerseRow } from "./VerseRow";
 
 const CHUNK = 240;
-const PREFETCH_CHUNKS_AHEAD = 2;
-const PREFETCH_CHUNKS_BEHIND = 1;
-const MAX_CHUNKS_IN_MEMORY = 10;
-const EST_ROW_PX = 56;
-const GATE_COOLDOWN_TICKS = 8;
-const SCROLL_SETTLE_MS = 140;
+const PREFETCH_CHUNKS_AHEAD = 4;
+const PREFETCH_CHUNKS_BEHIND = 2;
+const MAX_CHUNKS_IN_MEMORY = 18;
+const EST_ROW_PX = 64;
+const OVERSCAN = 10;
 
-const EMPTY_ANNOTATIONS: readonly Annotation[] = [];
-const GATE_BLOCK_KEYS = new Set([
-     " ",
-     "PageDown",
-     "PageUp",
-     "ArrowDown",
-     "ArrowUp",
-     "Home",
-     "End",
-]);
+const JUMP_MAX_CORRECTIONS = 8;
+const JUMP_TOLERANCE_PX = 2;
 
 type ScrollMode = "auto" | "smooth";
-type ScrollDirection = "up" | "down" | "none";
-type WritableElementRef<T> = { current: T | null };
+
+export type ReaderViewportHandle = {
+     jumpToOrd: (ord: number, behavior?: ScrollMode) => void;
+     getCurrentOrd: () => number;
+};
+
+type Props = Readonly<{
+     spine: SpineStats;
+     bookById: Map<string, BookRow>;
+     selectionRootRef?: React.MutableRefObject<HTMLDivElement | null> | null;
+     annotationSnapshot?: AnnotationSnapshot | null;
+     topContent?: React.ReactNode;
+     onPosition: (pos: ReaderPosition) => void;
+     onError?: (msg: string) => void;
+     onReady?: () => void;
+}>;
+
+type PendingJump = Readonly<{
+     ord: number;
+     behavior: ScrollMode;
+     correctionsLeft: number;
+}>;
+
+type SlicePayload =
+    | readonly SliceVerse[]
+    | Readonly<{ verses?: readonly SliceVerse[]; rows?: readonly SliceVerse[]; items?: readonly SliceVerse[] }>
+    | null
+    | undefined;
+
+const EMPTY_ANNOTATIONS: readonly Annotation[] = Object.freeze([]);
+
+const ROOT_STYLE: React.CSSProperties = Object.freeze({
+     position: "relative",
+     minHeight: 0,
+     flex: "1 1 auto",
+});
+
+const SCROLL_STYLE: React.CSSProperties = Object.freeze({
+     position: "absolute",
+     inset: 0,
+     overflowY: "auto",
+     overflowX: "hidden",
+     WebkitOverflowScrolling: "touch",
+     overscrollBehaviorY: "contain",
+     minHeight: 0,
+});
+
+const CONTAINER_STYLE: React.CSSProperties = Object.freeze({
+     width: "100%",
+     minWidth: 0,
+     maxWidth: "var(--bpReaderMeasure, 840px)",
+     marginInline: "auto",
+     paddingInline: 18,
+     boxSizing: "border-box",
+});
+
+const VIRTUAL_STAGE_STYLE: React.CSSProperties = Object.freeze({
+     position: "relative",
+     width: "100%",
+     contain: "layout paint",
+});
+
+const TOP_CONTENT_STYLE: React.CSSProperties = Object.freeze({
+     position: "absolute",
+     top: 0,
+     left: 0,
+     right: 0,
+     width: "100%",
+});
+
+const SKELETON_ROW_STYLE: React.CSSProperties = Object.freeze({
+     position: "relative",
+     minHeight: 54,
+     padding: "14px 16px 14px 44px",
+     borderRadius: 16,
+     boxSizing: "border-box",
+});
+
+const SKELETON_NUM_STYLE: React.CSSProperties = Object.freeze({
+     position: "absolute",
+     left: 12,
+     top: 14,
+     fontSize: 12,
+     color: "var(--muted)",
+     userSelect: "none",
+});
+
+const SKELETON_TEXT_STYLE: React.CSSProperties = Object.freeze({
+     height: 14,
+     width: "78%",
+     borderRadius: 999,
+     background: "color-mix(in oklab, var(--hairline) 60%, transparent)",
+});
 
 function clamp(n: number, lo: number, hi: number): number {
      return Math.max(lo, Math.min(hi, n));
@@ -25252,289 +25909,111 @@ function chunkStart(ord: number): number {
      return Math.floor((ord - 1) / CHUNK) * CHUNK + 1;
 }
 
+function chunkIndexFromOrd(ord: number): number {
+     return Math.floor((ord - 1) / CHUNK);
+}
+
+function chunkOrdFromIndex(index: number): number {
+     return index * CHUNK + 1;
+}
+
+function deriveRowCount(spine: SpineStats): number {
+     return Math.max(0, spine.verseOrdMax - spine.verseOrdMin + 1);
+}
+
+function readMaybeNumber(value: unknown): number | null {
+     if (typeof value !== "number" || !Number.isFinite(value)) return null;
+     return Math.trunc(value);
+}
+
 function readMaybeString(value: unknown): string | null {
      if (typeof value !== "string") return null;
      const trimmed = value.trim();
      return trimmed.length > 0 ? trimmed : null;
 }
 
-function getRowTranslationId(row: SliceVerse): string | null {
+function getRowBookId(row: SliceVerse): string {
      const record = row as unknown as Record<string, unknown>;
-     return readMaybeString(record.translationId) ?? readMaybeString(record.translation_id) ?? null;
+     return readMaybeString(record.bookId) ?? readMaybeString(record.book_id) ?? row.bookId;
 }
 
-function normalizeSpanBounds(
-    startOrd: number,
-    endOrd: number,
-    minOrd: number,
-    maxOrd: number,
-): { startOrd: number; endOrd: number } | null {
-     const a = clamp(startOrd, minOrd, maxOrd);
-     const b = clamp(endOrd, minOrd, maxOrd);
-     const lo = Math.min(a, b);
-     const hi = Math.max(a, b);
-
-     if (hi < minOrd || lo > maxOrd) return null;
-     return { startOrd: lo, endOrd: hi };
+function getRowVerseOrd(row: SliceVerse): number {
+     const record = row as unknown as Record<string, unknown>;
+     return readMaybeNumber(record.verseOrd) ?? readMaybeNumber(record.verse_ord) ?? 0;
 }
 
-function focusSoon(getEl: () => HTMLElement | null): void {
-     const run = () => {
-          const el = getEl();
-          if (!el) return;
+function extractSliceRows(payload: SlicePayload): readonly SliceVerse[] {
+     if (!payload) return [];
+     if (Array.isArray(payload)) return payload;
 
-          try {
-               el.focus({ preventScroll: true });
-          } catch {
-               el.focus();
-          }
-     };
+     if ("verses" in payload && Array.isArray(payload.verses)) return payload.verses;
+     if ("rows" in payload && Array.isArray(payload.rows)) return payload.rows;
+     if ("items" in payload && Array.isArray(payload.items)) return payload.items;
 
-     if (typeof queueMicrotask === "function") {
-          queueMicrotask(run);
-          return;
-     }
-
-     setTimeout(run, 0);
+     return [];
 }
 
-function useElementHeight(el: HTMLElement | null): number {
-     const [height, setHeight] = useState(0);
+function normalizeSpanRange(span: unknown): { startOrd: number; endOrd: number } | null {
+     if (!span || typeof span !== "object") return null;
 
-     useLayoutEffect(() => {
-          if (!el) {
-               setHeight(0);
-               return;
-          }
+     const record = span as Record<string, unknown>;
+     const start = (record.start as Record<string, unknown> | undefined) ?? undefined;
+     const end = (record.end as Record<string, unknown> | undefined) ?? undefined;
 
-          let raf = 0;
+     const startOrd =
+         readMaybeNumber(start?.verseOrd) ??
+         readMaybeNumber((start as Record<string, unknown> | undefined)?.verse_ord);
 
-          const measure = () => {
-               cancelAnimationFrame(raf);
-               raf = requestAnimationFrame(() => {
-                    const next = Math.max(0, Math.round(el.getBoundingClientRect().height));
-                    setHeight((prev) => (prev === next ? prev : next));
-               });
-          };
+     const endOrd =
+         readMaybeNumber(end?.verseOrd) ??
+         readMaybeNumber((end as Record<string, unknown> | undefined)?.verse_ord);
 
-          measure();
+     if (startOrd == null || endOrd == null) return null;
 
-          if (typeof ResizeObserver !== "undefined") {
-               const ro = new ResizeObserver(() => measure());
-               ro.observe(el);
-               return () => {
-                    cancelAnimationFrame(raf);
-                    ro.disconnect();
-               };
-          }
-
-          window.addEventListener("resize", measure, { passive: true });
-          return () => {
-               cancelAnimationFrame(raf);
-               window.removeEventListener("resize", measure);
-          };
-     }, [el]);
-
-     return height;
-}
-
-function hasNonCollapsedSelection(selection: Selection | null): boolean {
-     if (!selection) return false;
-     if (selection.rangeCount <= 0) return false;
-     return !selection.isCollapsed;
-}
-
-function nodeWithinRoot(node: Node | null, root: HTMLElement | null): boolean {
-     if (!node || !root) return false;
-     return root.contains(node);
-}
-
-function selectionTouchesRoot(selection: Selection | null, root: HTMLElement | null): boolean {
-     if (!selection || !hasNonCollapsedSelection(selection) || !root) return false;
-
-     const anchorNode = selection.anchorNode;
-     const focusNode = selection.focusNode;
-
-     return nodeWithinRoot(anchorNode, root) || nodeWithinRoot(focusNode, root);
-}
-
-export type ReaderViewportHandle = {
-     jumpToOrd: (ord: number, behavior?: ScrollMode) => void;
-     getCurrentOrd: () => number;
-};
-
-type Props = {
-     spine: SpineStats;
-     bookById: Map<string, BookRow>;
-     topContent?: React.ReactNode;
-     selectionRootRef?: WritableElementRef<HTMLDivElement> | null;
-     annotationSnapshot?: AnnotationSnapshot | null;
-     onPosition: (pos: ReaderPosition) => void;
-     onError?: (msg: string) => void;
-     onReady?: () => void;
-};
-
-type PendingJump = {
-     ord: number;
-     behavior: ScrollMode;
-};
-
-type BookGateState = {
-     ord: number;
-     bookId: string;
-};
-
-type ChunkState = {
-     verseMap: Map<number, SliceVerse>;
-     loadedChunks: Set<number>;
-     loadingChunks: Set<number>;
-     loadedOrder: number[];
-};
-
-function createChunkState(): ChunkState {
      return {
-          verseMap: new Map(),
-          loadedChunks: new Set(),
-          loadingChunks: new Set(),
-          loadedOrder: [],
+          startOrd: Math.min(startOrd, endOrd),
+          endOrd: Math.max(startOrd, endOrd),
      };
 }
 
-function buildAnnotationVerseIndex(
+function buildAnnotationIndex(
     snapshot: AnnotationSnapshot | null | undefined,
     minOrd: number,
     maxOrd: number,
-): Map<number, readonly Annotation[]> {
-     const buckets = new Map<number, Map<string, Annotation>>();
+): ReadonlyMap<number, readonly Annotation[]> {
      if (!snapshot) return new Map();
 
-     for (const annotation of snapshot.annotations.values()) {
+     const buckets = new Map<number, Annotation[]>();
+     const values = [...snapshot.annotations.values()] as Annotation[];
+
+     values.sort((a, b) => b.updatedAt - a.updatedAt);
+
+     for (const annotation of values) {
           if (annotation.deletedAt !== null) continue;
 
           for (const span of annotation.spans) {
-               if (span.deletedAt !== null) continue;
+               const range = normalizeSpanRange(span);
+               if (!range) continue;
 
-               const bounds = normalizeSpanBounds(
-                   span.start.verseOrd,
-                   span.end.verseOrd,
-                   minOrd,
-                   maxOrd,
-               );
-               if (!bounds) continue;
+               const startOrd = clamp(range.startOrd, minOrd, maxOrd);
+               const endOrd = clamp(range.endOrd, minOrd, maxOrd);
 
-               for (let ord = bounds.startOrd; ord <= bounds.endOrd; ord += 1) {
-                    let bucket = buckets.get(ord);
-                    if (!bucket) {
-                         bucket = new Map<string, Annotation>();
-                         buckets.set(ord, bucket);
-                    }
-                    bucket.set(annotation.annotationId, annotation);
+               for (let ord = startOrd; ord <= endOrd; ord += 1) {
+                    const bucket = buckets.get(ord);
+                    if (bucket) bucket.push(annotation);
+                    else buckets.set(ord, [annotation]);
                }
           }
      }
 
-     const out = new Map<number, readonly Annotation[]>();
-     for (const [ord, bucket] of buckets) {
-          out.set(
-              ord,
-              [...bucket.values()].sort((a, b) => {
-                   if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
-                   return a.annotationId.localeCompare(b.annotationId);
-              }),
-          );
-     }
-
-     return out;
+     return buckets;
 }
 
-function BookGate(props: {
-     book: BookRow | null;
-     bookId: string;
-     onContinue: () => void;
-}) {
-     const { book, bookId, onContinue } = props;
-     const btnRef = useRef<HTMLButtonElement | null>(null);
-
-     useEffect(() => {
-          focusSoon(() => btnRef.current);
-     }, []);
-
+function skeletonRow(verseOrd: number): React.ReactNode {
      return (
-         <div
-             role="dialog"
-             aria-modal="true"
-             aria-label={`Book: ${book?.name ?? bookId}`}
-             tabIndex={-1}
-             style={{
-                  position: "absolute",
-                  inset: 0,
-                  zIndex: 30,
-                  display: "grid",
-                  placeItems: "center",
-                  padding: 18,
-                  background: "color-mix(in oklab, var(--bg) 72%, rgba(0,0,0,0.55))",
-                  backdropFilter: "blur(10px)",
-                  WebkitBackdropFilter: "blur(10px)",
-             }}
-             onKeyDown={(event) => {
-                  if (GATE_BLOCK_KEYS.has(event.key)) {
-                       event.preventDefault();
-                       event.stopPropagation();
-                       return;
-                  }
-
-                  if (event.key === "Escape" || event.key === "Enter") {
-                       event.preventDefault();
-                       event.stopPropagation();
-                       onContinue();
-                  }
-             }}
-         >
-              <div
-                  style={{
-                       width: "min(860px, 100%)",
-                       borderRadius: 18,
-                       border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-                       background: "color-mix(in oklab, var(--bg) 82%, var(--panel))",
-                       boxShadow: "0 34px 110px rgba(0,0,0,0.34)",
-                       overflow: "hidden",
-                  }}
-              >
-                   <BookTitlePage book={book} bookId={bookId} />
-
-                   <div
-                       style={{
-                            display: "flex",
-                            justifyContent: "center",
-                            padding: "14px 14px 18px",
-                            background:
-                                "linear-gradient(to bottom, transparent, color-mix(in oklab, var(--bg) 88%, var(--panel)))",
-                       }}
-                   >
-                        <button
-                            ref={btnRef}
-                            type="button"
-                            onClick={onContinue}
-                            style={{
-                                 appearance: "none",
-                                 WebkitAppearance: "none",
-                                 height: 40,
-                                 padding: "0 16px",
-                                 borderRadius: 12,
-                                 border: "1px solid color-mix(in oklab, var(--focus) 70%, var(--hairline))",
-                                 background: "var(--focus)",
-                                 color: "var(--fg)",
-                                 fontSize: 12.6,
-                                 fontWeight: 820,
-                                 letterSpacing: "-0.01em",
-                                 cursor: "pointer",
-                                 boxShadow: "0 14px 34px color-mix(in oklab, var(--focus) 20%, transparent)",
-                            }}
-                        >
-                             Continue
-                        </button>
-                   </div>
-              </div>
+         <div style={SKELETON_ROW_STYLE} aria-hidden="true" data-skeleton-ord={verseOrd}>
+              <div style={SKELETON_NUM_STYLE}>…</div>
+              <div style={SKELETON_TEXT_STYLE} />
          </div>
      );
 }
@@ -25546,87 +26025,57 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      const {
           spine,
           bookById,
-          topContent,
           selectionRootRef,
           annotationSnapshot,
+          topContent,
           onPosition,
           onError,
           onReady,
      } = props;
 
      const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
-     const [leadEl, setLeadEl] = useState<HTMLDivElement | null>(null);
      const [dataTick, setDataTick] = useState(0);
-     const [gate, setGate] = useState<BookGateState | null>(null);
+     const [topContentHeight, setTopContentHeight] = useState(0);
 
-     const leadHeight = useElementHeight(leadEl);
+     const topContentRef = useRef<HTMLDivElement | null>(null);
 
-     const chunkRef = useRef<ChunkState>(createChunkState());
-     const measuredAtRef = useRef<WeakMap<Element, number>>(new WeakMap());
-     const selectionRootInnerRef = useRef<HTMLDivElement | null>(null);
-     const selectionActiveRef = useRef(false);
-
-     const initialOrd = useMemo(() => {
-          return clamp(spine.verseOrdMin, spine.verseOrdMin, spine.verseOrdMax);
-     }, [spine.verseOrdMin, spine.verseOrdMax]);
-
-     const posOrdRef = useRef<number>(initialOrd);
-     const [posOrd, setPosOrd] = useState<number>(initialOrd);
-
-     const pendingJumpRef = useRef<PendingJump | null>(null);
-     const readyOnceRef = useRef(false);
-     const runIdRef = useRef(0);
-
+     const verseMapRef = useRef<Map<number, SliceVerse>>(new Map());
+     const loadedChunksRef = useRef<Set<number>>(new Set());
+     const loadedOrderRef = useRef<number[]>([]);
      const inFlightRef = useRef<Map<number, AbortController>>(new Map());
 
-     const gateRef = useRef<BookGateState | null>(null);
-     const lastGatedBookIdRef = useRef<string | null>(null);
-     const gateCooldownRef = useRef(0);
-     const suppressGateUntilScrollSettlesRef = useRef(false);
-     const suppressGateTimerRef = useRef<number | null>(null);
+     const pendingJumpRef = useRef<PendingJump | null>(null);
+     const currentOrdRef = useRef<number>(spine.verseOrdMin);
+     const onReadyCalledRef = useRef(false);
+     const rafMeasureRef = useRef<number | null>(null);
+     const jumpRafRef = useRef<number | null>(null);
 
-     const rafScrollRef = useRef(0);
-     const lastSentRef = useRef<{ ord: number; hasVerse: boolean }>({
-          ord: -1,
-          hasVerse: false,
+     const rowCount = useMemo(() => deriveRowCount(spine), [spine]);
+     const lastOrd = spine.verseOrdMin + Math.max(0, rowCount - 1);
+
+     const annotationIndex = useMemo(
+         () => buildAnnotationIndex(annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax),
+         [annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax],
+     );
+
+     const rowVirtualizer = useVirtualizer({
+          count: rowCount,
+          getScrollElement: () => scrollEl,
+          estimateSize: () => EST_ROW_PX,
+          overscan: OVERSCAN,
+          paddingStart: topContentHeight,
+          measureElement: (el) => el.getBoundingClientRect().height,
+          getItemKey: (index) => spine.verseOrdMin + index,
      });
 
-     const lastScrollTopRef = useRef(0);
-     const scrollDirectionRef = useRef<ScrollDirection>("none");
-     const lastObservedOrdRef = useRef<number>(initialOrd);
+     const virtualItems = rowVirtualizer.getVirtualItems();
+     const totalSize = rowVirtualizer.getTotalSize();
 
-     const bumpTick = useCallback(() => {
-          setDataTick((t) => t + 1);
-     }, []);
-
-     const derivedCount = useMemo(() => {
-          const min = spine.verseOrdMin;
-          const max = spine.verseOrdMax;
-          return max >= min ? max - min + 1 : 0;
-     }, [spine.verseOrdMin, spine.verseOrdMax]);
-
-     const count = useMemo(() => {
-          const verseCount = Number.isFinite(spine.verseCount) ? spine.verseCount : 0;
-          if (verseCount <= 0) return derivedCount;
-          if (derivedCount > 0 && verseCount !== derivedCount) return derivedCount;
-          return verseCount;
-     }, [spine.verseCount, derivedCount]);
-
-     const annotationIndex = useMemo(() => {
-          return buildAnnotationVerseIndex(annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax);
-     }, [annotationSnapshot, spine.verseOrdMin, spine.verseOrdMax]);
-
-     const loadedTranslationId = useMemo(() => {
-          for (const row of chunkRef.current.verseMap.values()) {
-               const translationId = getRowTranslationId(row);
-               if (translationId) return translationId;
-          }
-          return null;
-     }, [dataTick]);
+     const firstVisibleIndex = virtualItems[0]?.index ?? 0;
+     const lastVisibleIndex = virtualItems[virtualItems.length - 1]?.index ?? 0;
 
      const setSelectionRootEl = useCallback(
          (el: HTMLDivElement | null) => {
-              selectionRootInnerRef.current = el;
               if (selectionRootRef) {
                    selectionRootRef.current = el;
               }
@@ -25634,460 +26083,370 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
          [selectionRootRef],
      );
 
-     const clearSuppressGateTimer = useCallback(() => {
-          if (suppressGateTimerRef.current != null) {
-               window.clearTimeout(suppressGateTimerRef.current);
-               suppressGateTimerRef.current = null;
-          }
-     }, []);
-
-     const suppressGateForProgrammaticScroll = useCallback(() => {
-          suppressGateUntilScrollSettlesRef.current = true;
-          clearSuppressGateTimer();
-          suppressGateTimerRef.current = window.setTimeout(() => {
-               suppressGateUntilScrollSettlesRef.current = false;
-               suppressGateTimerRef.current = null;
-          }, SCROLL_SETTLE_MS);
-     }, [clearSuppressGateTimer]);
-
-     const abortAllInFlight = useCallback(() => {
+     const cancelAllInFlight = useCallback(() => {
           for (const controller of inFlightRef.current.values()) {
                controller.abort();
           }
           inFlightRef.current.clear();
-          chunkRef.current.loadingChunks.clear();
      }, []);
 
-     useEffect(() => {
-          posOrdRef.current = posOrd;
-     }, [posOrd]);
-
-     useEffect(() => {
-          gateRef.current = gate;
-     }, [gate]);
+     const cancelJumpRaf = useCallback(() => {
+          if (jumpRafRef.current != null) {
+               cancelAnimationFrame(jumpRafRef.current);
+               jumpRafRef.current = null;
+          }
+     }, []);
 
      const evictFarChunks = useCallback(
-         (keepOrd: number): void => {
-              const state = chunkRef.current;
-              const keepChunk = chunkStart(clamp(keepOrd, spine.verseOrdMin, spine.verseOrdMax));
+         (keepOrd: number) => {
+              const keepIndex = chunkIndexFromOrd(clamp(keepOrd, spine.verseOrdMin, spine.verseOrdMax));
+              const keepMin = Math.max(0, keepIndex - 3);
+              const keepMax = keepIndex + 3;
 
-              while (state.loadedOrder.length > MAX_CHUNKS_IN_MEMORY) {
-                   let farIdx = 0;
-                   let farDist = -1;
+              const order = loadedOrderRef.current;
+              if (order.length <= MAX_CHUNKS_IN_MEMORY) return;
 
-                   for (let i = 0; i < state.loadedOrder.length; i += 1) {
-                        const loadedChunk = state.loadedOrder[i]!;
-                        const dist = Math.abs(loadedChunk - keepChunk);
-                        if (dist > farDist) {
-                             farDist = dist;
-                             farIdx = i;
+              let scan = 0;
+              while (order.length > MAX_CHUNKS_IN_MEMORY && scan < 64) {
+                   scan += 1;
+
+                   let evictAt = -1;
+                   let farthestDistance = -1;
+
+                   for (let i = 0; i < order.length; i += 1) {
+                        const chunk = order[i]!;
+                        const idx = chunkIndexFromOrd(chunk);
+
+                        if (idx >= keepMin && idx <= keepMax) continue;
+
+                        const distance = Math.abs(idx - keepIndex);
+                        if (distance > farthestDistance) {
+                             farthestDistance = distance;
+                             evictAt = i;
                         }
                    }
 
-                   const victim = state.loadedOrder.splice(farIdx, 1)[0]!;
-                   state.loadedChunks.delete(victim);
+                   if (evictAt < 0) break;
 
-                   const startOrd = victim;
-                   const endOrd = Math.min(victim + CHUNK - 1, spine.verseOrdMax);
+                   const [evictedChunk] = order.splice(evictAt, 1);
+                   if (evictedChunk == null) break;
 
-                   for (let ord = startOrd; ord <= endOrd; ord += 1) {
-                        state.verseMap.delete(ord);
+                   loadedChunksRef.current.delete(evictedChunk);
+
+                   const start = evictedChunk;
+                   const end = Math.min(evictedChunk + CHUNK - 1, spine.verseOrdMax);
+                   for (let ord = start; ord <= end; ord += 1) {
+                        verseMapRef.current.delete(ord);
                    }
               }
          },
-         [spine.verseOrdMin, spine.verseOrdMax],
+         [spine.verseOrdMax, spine.verseOrdMin],
      );
 
-     const ensureChunk = useCallback(
-         async (startOrd: number, keepOrd?: number): Promise<void> => {
-              const safeOrd = clamp(startOrd, spine.verseOrdMin, spine.verseOrdMax);
-              const chunk = chunkStart(safeOrd);
-              const state = chunkRef.current;
+     const applyChunk = useCallback(
+         (chunkOrd: number, rows: readonly SliceVerse[]) => {
+              let changed = false;
 
-              if (state.loadedChunks.has(chunk)) return;
-              if (state.loadingChunks.has(chunk)) return;
+              for (const row of rows) {
+                   const ord = getRowVerseOrd(row);
+                   if (ord < spine.verseOrdMin || ord > spine.verseOrdMax) continue;
 
-              const myRunId = runIdRef.current;
+                   verseMapRef.current.set(ord, row);
+                   changed = true;
+              }
+
+              if (!loadedChunksRef.current.has(chunkOrd)) {
+                   loadedChunksRef.current.add(chunkOrd);
+                   loadedOrderRef.current.push(chunkOrd);
+                   changed = true;
+              }
+
+              if (changed) {
+                   evictFarChunks(currentOrdRef.current);
+                   setDataTick((tick) => tick + 1);
+              }
+         },
+         [evictFarChunks, spine.verseOrdMax, spine.verseOrdMin],
+     );
+
+     const loadChunk = useCallback(
+         async (ord: number) => {
+              const startOrd = chunkStart(clamp(ord, spine.verseOrdMin, spine.verseOrdMax));
+
+              if (loadedChunksRef.current.has(startOrd)) return;
+              if (inFlightRef.current.has(startOrd)) return;
+
               const controller = new AbortController();
-
-              state.loadingChunks.add(chunk);
-              inFlightRef.current.set(chunk, controller);
+              inFlightRef.current.set(startOrd, controller);
 
               try {
-                   const res = await apiGetSlice(chunk, CHUNK, {
+                   const payload = (await apiGetSlice(startOrd, CHUNK, {
                         signal: controller.signal,
-                   });
+                   } as never)) as SlicePayload;
 
-                   if (runIdRef.current !== myRunId) return;
                    if (controller.signal.aborted) return;
 
-                   for (const verse of res.verses) {
-                        state.verseMap.set(verse.verseOrd, verse);
+                   const rows = extractSliceRows(payload);
+                   applyChunk(startOrd, rows);
+              } catch (error) {
+                   if (!controller.signal.aborted) {
+                        const message =
+                            error instanceof Error
+                                ? error.message
+                                : "Failed to load reader slice.";
+                        onError?.(message);
                    }
-
-                   state.loadedChunks.add(chunk);
-                   if (!state.loadedOrder.includes(chunk)) {
-                        state.loadedOrder.push(chunk);
-                   }
-
-                   evictFarChunks(keepOrd ?? posOrdRef.current);
-                   bumpTick();
-              } catch (error: unknown) {
-                   if (runIdRef.current !== myRunId) return;
-                   if (controller.signal.aborted) return;
-
-                   const message = error instanceof Error ? error.message : String(error);
-                   onError?.(message);
               } finally {
-                   state.loadingChunks.delete(chunk);
-                   inFlightRef.current.delete(chunk);
+                   const active = inFlightRef.current.get(startOrd);
+                   if (active === controller) {
+                        inFlightRef.current.delete(startOrd);
+                   }
               }
          },
-         [bumpTick, evictFarChunks, onError, spine.verseOrdMin, spine.verseOrdMax],
+         [applyChunk, onError, spine.verseOrdMax, spine.verseOrdMin],
      );
 
-     useEffect(() => {
-          abortAllInFlight();
-          runIdRef.current += 1;
+     const ensureWindowLoaded = useCallback(
+         (centerOrd: number) => {
+              const centerChunkIndex = chunkIndexFromOrd(centerOrd);
+              const startChunkIndex = Math.max(0, centerChunkIndex - PREFETCH_CHUNKS_BEHIND);
+              const endChunkIndex = centerChunkIndex + PREFETCH_CHUNKS_AHEAD;
 
-          chunkRef.current = createChunkState();
-          measuredAtRef.current = new WeakMap();
-
-          setPosOrd(initialOrd);
-          posOrdRef.current = initialOrd;
-          lastObservedOrdRef.current = initialOrd;
-
-          setGate(null);
-          gateRef.current = null;
-          lastGatedBookIdRef.current = null;
-          gateCooldownRef.current = 0;
-
-          clearSuppressGateTimer();
-          suppressGateUntilScrollSettlesRef.current = false;
-          selectionActiveRef.current = false;
-
-          pendingJumpRef.current = null;
-          readyOnceRef.current = false;
-          lastSentRef.current = { ord: -1, hasVerse: false };
-          lastScrollTopRef.current = 0;
-          scrollDirectionRef.current = "none";
-
-          void ensureChunk(chunkStart(initialOrd), initialOrd);
-          bumpTick();
-     }, [abortAllInFlight, bumpTick, clearSuppressGateTimer, ensureChunk, initialOrd]);
-
-     useEffect(() => {
-          return () => {
-               abortAllInFlight();
-               clearSuppressGateTimer();
-               if (rafScrollRef.current) {
-                    cancelAnimationFrame(rafScrollRef.current);
-                    rafScrollRef.current = 0;
-               }
-          };
-     }, [abortAllInFlight, clearSuppressGateTimer]);
-
-     useEffect(() => {
-          if (!scrollEl) return;
-          void ensureChunk(chunkStart(initialOrd), initialOrd);
-     }, [scrollEl, ensureChunk, initialOrd]);
-
-     useEffect(() => {
-          if (typeof document === "undefined") return;
-
-          const onSelectionChange = () => {
-               const selection = document.getSelection();
-               selectionActiveRef.current = selectionTouchesRoot(
-                   selection,
-                   selectionRootInnerRef.current,
-               );
-          };
-
-          document.addEventListener("selectionchange", onSelectionChange);
-          return () => {
-               document.removeEventListener("selectionchange", onSelectionChange);
-          };
-     }, []);
-
-     const rowVirtualizer = useVirtualizer({
-          count,
-          getScrollElement: () => scrollEl,
-          estimateSize: () => EST_ROW_PX,
-          overscan: 18,
-          paddingStart: leadHeight,
-          getItemKey: (index) => String(spine.verseOrdMin + index),
-     });
-
-     const virtualItems = rowVirtualizer.getVirtualItems();
-     const firstIndex = virtualItems[0]?.index ?? 0;
-     const lastIndex = virtualItems.length ? virtualItems[virtualItems.length - 1]!.index : 0;
-
-     const jumpToOrd = useCallback(
-         (ord: number, behavior: ScrollMode = "auto") => {
-              const targetOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
-              const targetIndex = targetOrd - spine.verseOrdMin;
-
-              void ensureChunk(chunkStart(targetOrd), targetOrd);
-
-              if (!scrollEl) {
-                   pendingJumpRef.current = { ord: targetOrd, behavior };
-                   return;
+              for (let chunkIdx = startChunkIndex; chunkIdx <= endChunkIndex; chunkIdx += 1) {
+                   const chunkOrd = chunkOrdFromIndex(chunkIdx);
+                   if (chunkOrd > spine.verseOrdMax) break;
+                   void loadChunk(chunkOrd);
               }
-
-              suppressGateForProgrammaticScroll();
-
-              requestAnimationFrame(() => {
-                   rowVirtualizer.scrollToIndex(targetIndex, {
-                        align: "start",
-                        behavior,
-                   });
-              });
          },
-         [
-              ensureChunk,
-              rowVirtualizer,
-              scrollEl,
-              spine.verseOrdMin,
-              spine.verseOrdMax,
-              suppressGateForProgrammaticScroll,
-         ],
+         [loadChunk, spine.verseOrdMax],
      );
 
-     useImperativeHandle(
-         ref,
-         () => ({
-              jumpToOrd,
-              getCurrentOrd: () => posOrdRef.current,
-         }),
-         [jumpToOrd],
-     );
-
-     useEffect(() => {
-          if (!scrollEl) return;
-
-          if (!readyOnceRef.current) {
-               readyOnceRef.current = true;
-               void ensureChunk(chunkStart(initialOrd), initialOrd);
-               onReady?.();
-          }
-
+     const correctJumpToMountedRow = useCallback(() => {
           const pending = pendingJumpRef.current;
-          if (pending) {
-               pendingJumpRef.current = null;
-               jumpToOrd(pending.ord, pending.behavior);
-          }
-     }, [scrollEl, ensureChunk, initialOrd, jumpToOrd, onReady]);
+          const scroller = scrollEl;
+          if (!pending || !scroller) return;
 
-     useEffect(() => {
-          if (!virtualItems.length) return;
+          const index = clamp(pending.ord - spine.verseOrdMin, 0, Math.max(0, rowCount - 1));
+          const rowEl = scroller.querySelector<HTMLElement>(`[data-vrow-index="${index}"]`);
 
-          const firstOrd = spine.verseOrdMin + firstIndex;
-          const lastOrd = spine.verseOrdMin + lastIndex;
-
-          const startChunk = chunkStart(firstOrd);
-          const endChunk = chunkStart(lastOrd);
-
-          for (let chunk = startChunk; chunk <= endChunk; chunk += CHUNK) {
-               void ensureChunk(chunk, firstOrd);
-          }
-
-          for (let i = 1; i <= PREFETCH_CHUNKS_AHEAD; i += 1) {
-               const ahead = endChunk + i * CHUNK;
-               if (ahead <= spine.verseOrdMax) {
-                    void ensureChunk(ahead, lastOrd);
-               }
-          }
-
-          for (let i = 1; i <= PREFETCH_CHUNKS_BEHIND; i += 1) {
-               const behind = startChunk - i * CHUNK;
-               if (behind >= spine.verseOrdMin) {
-                    void ensureChunk(behind, firstOrd);
-               }
-          }
-     }, [
-          ensureChunk,
-          firstIndex,
-          lastIndex,
-          spine.verseOrdMax,
-          spine.verseOrdMin,
-          virtualItems.length,
-     ]);
-
-     useEffect(() => {
-          if (!scrollEl) return;
-
-          const prevOverflowY = scrollEl.style.overflowY;
-          const prevOverscrollBehavior = scrollEl.style.overscrollBehavior;
-          const prevScrollBehavior = scrollEl.style.scrollBehavior;
-
-          if (gate) {
-               scrollEl.style.overflowY = "hidden";
-               scrollEl.style.overscrollBehavior = "contain";
-               scrollEl.style.scrollBehavior = "auto";
-          } else {
-               scrollEl.style.overflowY = prevOverflowY;
-               scrollEl.style.overscrollBehavior = prevOverscrollBehavior;
-               scrollEl.style.scrollBehavior = prevScrollBehavior;
-          }
-
-          return () => {
-               scrollEl.style.overflowY = prevOverflowY;
-               scrollEl.style.overscrollBehavior = prevOverscrollBehavior;
-               scrollEl.style.scrollBehavior = prevScrollBehavior;
-          };
-     }, [gate, scrollEl]);
-
-     const computeAndSetTopOrd = useCallback(() => {
-          rafScrollRef.current = 0;
-
-          if (!scrollEl || !virtualItems.length || gateRef.current) return;
-          if (selectionActiveRef.current) return;
-
-          const scrollTop = Math.max(0, scrollEl.scrollTop);
-          let topItem = virtualItems[0]!;
-
-          for (let i = 0; i < virtualItems.length; i += 1) {
-               const item = virtualItems[i]!;
-               if (item.start + item.size > scrollTop + 1) {
-                    topItem = item;
-                    break;
-               }
-          }
-
-          const ord = spine.verseOrdMin + topItem.index;
-          if (posOrdRef.current !== ord) {
-               posOrdRef.current = ord;
-               setPosOrd(ord);
-          }
-
-          lastObservedOrdRef.current = ord;
-          void ensureChunk(chunkStart(ord), ord);
-     }, [ensureChunk, scrollEl, spine.verseOrdMin, virtualItems]);
-
-     useLayoutEffect(() => {
-          if (!scrollEl || !virtualItems.length || gateRef.current) return;
-          if (selectionActiveRef.current) return;
-          computeAndSetTopOrd();
-     }, [computeAndSetTopOrd, firstIndex, lastIndex, scrollEl, virtualItems.length]);
-
-     useEffect(() => {
-          if (!scrollEl) return;
-
-          const onScroll = () => {
-               const nextTop = Math.max(0, scrollEl.scrollTop);
-               const prevTop = lastScrollTopRef.current;
-
-               if (nextTop > prevTop + 1) {
-                    scrollDirectionRef.current = "down";
-               } else if (nextTop < prevTop - 1) {
-                    scrollDirectionRef.current = "up";
-               } else {
-                    scrollDirectionRef.current = "none";
-               }
-
-               lastScrollTopRef.current = nextTop;
-
-               if (selectionActiveRef.current) return;
-               if (rafScrollRef.current) return;
-               rafScrollRef.current = window.requestAnimationFrame(computeAndSetTopOrd);
-          };
-
-          scrollEl.addEventListener("scroll", onScroll, { passive: true });
-
-          return () => {
-               scrollEl.removeEventListener("scroll", onScroll);
-               if (rafScrollRef.current) {
-                    cancelAnimationFrame(rafScrollRef.current);
-                    rafScrollRef.current = 0;
-               }
-          };
-     }, [computeAndSetTopOrd, scrollEl]);
-
-     useEffect(() => {
-          const effectiveOrd = posOrdRef.current;
-          const verse = chunkRef.current.verseMap.get(effectiveOrd) ?? null;
-          const book = verse ? bookById.get(verse.bookId) ?? null : null;
-
-          const next = { ord: effectiveOrd, hasVerse: verse !== null };
-          const prev = lastSentRef.current;
-          if (prev.ord === next.ord && prev.hasVerse === next.hasVerse) return;
-
-          lastSentRef.current = next;
-          onPosition({ ord: effectiveOrd, verse, book });
-     }, [bookById, dataTick, onPosition, posOrd]);
-
-     useEffect(() => {
-          if (!scrollEl || gateRef.current) return;
-          if (selectionActiveRef.current) return;
-          if (suppressGateUntilScrollSettlesRef.current) return;
-
-          if (gateCooldownRef.current > 0) {
-               gateCooldownRef.current -= 1;
-               return;
-          }
-
-          if (scrollDirectionRef.current !== "down") return;
-
-          const ord = posOrdRef.current;
-          const current = chunkRef.current.verseMap.get(ord) ?? null;
-          if (!current) return;
-
-          if (ord <= spine.verseOrdMin) return;
-
-          const previous = chunkRef.current.verseMap.get(ord - 1) ?? null;
-          if (!previous) return;
-          if (previous.bookId === current.bookId) return;
-
-          const bookId = current.bookId;
-          if (lastGatedBookIdRef.current === bookId) return;
-
-          lastGatedBookIdRef.current = bookId;
-          const index = ord - spine.verseOrdMin;
-
-          suppressGateForProgrammaticScroll();
-
-          requestAnimationFrame(() => {
+          if (!rowEl) {
                rowVirtualizer.scrollToIndex(index, {
                     align: "start",
                     behavior: "auto",
                });
+               return;
+          }
 
-               requestAnimationFrame(() => {
-                    if (selectionActiveRef.current) return;
-                    if (scrollDirectionRef.current !== "down") return;
-                    setGate({ ord, bookId });
-               });
+          const scrollerRect = scroller.getBoundingClientRect();
+          const rowRect = rowEl.getBoundingClientRect();
+          const delta = rowRect.top - scrollerRect.top;
+          const nextTop = scroller.scrollTop + delta;
+
+          if (Math.abs(delta) <= JUMP_TOLERANCE_PX) {
+               pendingJumpRef.current = null;
+               return;
+          }
+
+          scroller.scrollTo({
+               top: nextTop,
+               behavior: "auto",
+          });
+
+          if (pending.correctionsLeft <= 1) {
+               pendingJumpRef.current = null;
+               return;
+          }
+
+          pendingJumpRef.current = {
+               ...pending,
+               correctionsLeft: pending.correctionsLeft - 1,
+          };
+
+          cancelJumpRaf();
+          jumpRafRef.current = requestAnimationFrame(() => {
+               jumpRafRef.current = null;
+               correctJumpToMountedRow();
           });
      }, [
-          dataTick,
-          posOrd,
+          cancelJumpRaf,
+          rowCount,
           rowVirtualizer,
           scrollEl,
           spine.verseOrdMin,
-          suppressGateForProgrammaticScroll,
      ]);
 
-     const totalSize = rowVirtualizer.getTotalSize();
+     useEffect(() => {
+          verseMapRef.current.clear();
+          loadedChunksRef.current.clear();
+          loadedOrderRef.current = [];
+          cancelAllInFlight();
+          cancelJumpRaf();
+
+          const firstOrd = clamp(spine.verseOrdMin, spine.verseOrdMin, spine.verseOrdMax);
+          currentOrdRef.current = firstOrd;
+          pendingJumpRef.current = {
+               ord: firstOrd,
+               behavior: "auto",
+               correctionsLeft: JUMP_MAX_CORRECTIONS,
+          };
+          onReadyCalledRef.current = false;
+
+          setDataTick((tick) => tick + 1);
+     }, [cancelAllInFlight, cancelJumpRaf, spine.verseOrdMax, spine.verseOrdMin]);
+
+     useEffect(() => {
+          ensureWindowLoaded(currentOrdRef.current);
+     }, [ensureWindowLoaded]);
+
+     useEffect(() => {
+          const centerIndex = Math.floor((firstVisibleIndex + lastVisibleIndex) / 2);
+          const centerOrd = clamp(spine.verseOrdMin + centerIndex, spine.verseOrdMin, spine.verseOrdMax);
+          ensureWindowLoaded(centerOrd);
+          evictFarChunks(centerOrd);
+     }, [
+          ensureWindowLoaded,
+          evictFarChunks,
+          firstVisibleIndex,
+          lastVisibleIndex,
+          spine.verseOrdMax,
+          spine.verseOrdMin,
+     ]);
+
+     useLayoutEffect(() => {
+          if (virtualItems.length === 0) return;
+
+          const first = virtualItems[0]!;
+          const ord = clamp(spine.verseOrdMin + first.index, spine.verseOrdMin, spine.verseOrdMax);
+          const row = verseMapRef.current.get(ord) ?? null;
+
+          currentOrdRef.current = ord;
+
+          onPosition({
+               ord,
+               verse: row,
+               book: row ? (bookById.get(getRowBookId(row)) ?? null) : null,
+          });
+     }, [bookById, onPosition, spine.verseOrdMax, spine.verseOrdMin, virtualItems]);
+
+     useImperativeHandle(
+         ref,
+         () => ({
+              jumpToOrd: (ord, behavior = "auto") => {
+                   const nextOrd = clamp(Math.trunc(ord), spine.verseOrdMin, spine.verseOrdMax);
+
+                   pendingJumpRef.current = {
+                        ord: nextOrd,
+                        behavior,
+                        correctionsLeft: JUMP_MAX_CORRECTIONS,
+                   };
+
+                   ensureWindowLoaded(nextOrd);
+
+                   const index = clamp(nextOrd - spine.verseOrdMin, 0, Math.max(0, rowCount - 1));
+                   rowVirtualizer.scrollToIndex(index, {
+                        align: "start",
+                        behavior: "auto",
+                   });
+
+                   cancelJumpRaf();
+                   jumpRafRef.current = requestAnimationFrame(() => {
+                        jumpRafRef.current = null;
+                        correctJumpToMountedRow();
+                   });
+              },
+              getCurrentOrd: () => currentOrdRef.current,
+         }),
+         [
+              cancelJumpRaf,
+              correctJumpToMountedRow,
+              ensureWindowLoaded,
+              rowCount,
+              rowVirtualizer,
+              spine.verseOrdMax,
+              spine.verseOrdMin,
+         ],
+     );
+
+     useLayoutEffect(() => {
+          if (rafMeasureRef.current != null) {
+               cancelAnimationFrame(rafMeasureRef.current);
+          }
+
+          rafMeasureRef.current = requestAnimationFrame(() => {
+               rowVirtualizer.measure();
+               rafMeasureRef.current = null;
+
+               if (pendingJumpRef.current) {
+                    correctJumpToMountedRow();
+               }
+          });
+
+          return () => {
+               if (rafMeasureRef.current != null) {
+                    cancelAnimationFrame(rafMeasureRef.current);
+                    rafMeasureRef.current = null;
+               }
+          };
+     }, [dataTick, rowVirtualizer, correctJumpToMountedRow]);
+
+     useLayoutEffect(() => {
+          if (!topContentRef.current) {
+               if (topContentHeight !== 0) setTopContentHeight(0);
+               return;
+          }
+
+          const el = topContentRef.current;
+
+          const measure = () => {
+               const next = Math.max(0, Math.round(el.getBoundingClientRect().height));
+               setTopContentHeight((prev) => (prev === next ? prev : next));
+          };
+
+          measure();
+
+          const ro =
+              typeof ResizeObserver !== "undefined"
+                  ? new ResizeObserver(() => measure())
+                  : null;
+
+          ro?.observe(el);
+          window.addEventListener("resize", measure, { passive: true });
+
+          return () => {
+               ro?.disconnect();
+               window.removeEventListener("resize", measure);
+          };
+     }, [topContent, topContentHeight]);
+
+     useEffect(() => {
+          if (onReadyCalledRef.current) return;
+          if (loadedChunksRef.current.size === 0) return;
+
+          onReadyCalledRef.current = true;
+          onReady?.();
+     }, [dataTick, onReady]);
+
+     useEffect(() => {
+          return () => {
+               cancelAllInFlight();
+               cancelJumpRaf();
+               if (selectionRootRef) {
+                    selectionRootRef.current = null;
+               }
+          };
+     }, [cancelAllInFlight, cancelJumpRaf, selectionRootRef]);
 
      const renderRow = useCallback(
-         (verseOrd: number) => {
-              const row = chunkRef.current.verseMap.get(verseOrd) ?? null;
-
-              if (!row) {
-                   return (
-                       <div style={sx.skelRow}>
-                            <div style={sx.verseNum}>…</div>
-                            <div style={sx.skelText} />
-                       </div>
-                   );
-              }
+         (verseOrd: number): React.ReactNode => {
+              const row = verseMapRef.current.get(verseOrd) ?? null;
+              if (!row) return skeletonRow(verseOrd);
 
               const annotations = annotationIndex.get(verseOrd) ?? EMPTY_ANNOTATIONS;
 
               return (
                   <VerseRow
                       row={row}
-                      book={bookById.get(row.bookId) ?? null}
+                      book={bookById.get(getRowBookId(row)) ?? null}
                       annotations={annotations}
                   />
               );
@@ -26095,53 +26454,45 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
          [annotationIndex, bookById],
      );
 
-     const measureRowEl = useCallback(
-         (el: HTMLDivElement | null) => {
-              if (!el) return;
-              if (selectionActiveRef.current) return;
-
-              const mark = measuredAtRef.current;
-              const lastMeasuredAt = mark.get(el);
-              if (lastMeasuredAt === dataTick) return;
-
-              mark.set(el, dataTick);
-              rowVirtualizer.measureElement(el);
-         },
-         [dataTick, rowVirtualizer],
-     );
-
      return (
-         <div style={sx.body}>
-              <div ref={setScrollEl} style={sx.scroll}>
+         <div style={ROOT_STYLE}>
+              <div ref={setScrollEl} style={SCROLL_STYLE}>
                    <div
                        ref={setSelectionRootEl}
-                       className="container"
-                       style={sx.container}
-                       data-reader-selection-root="1"
-                       data-translation-id={loadedTranslationId ?? undefined}
+                       style={CONTAINER_STYLE}
+                       data-translation-id={undefined}
                    >
-                        {topContent ? <div ref={setLeadEl}>{topContent}</div> : null}
-
                         <div
                             style={{
-                                 position: "relative",
+                                 ...VIRTUAL_STAGE_STYLE,
                                  height: totalSize,
                             }}
                         >
+                             {topContent ? (
+                                 <div ref={topContentRef} style={TOP_CONTENT_STYLE}>
+                                      {topContent}
+                                 </div>
+                             ) : null}
+
                              {virtualItems.map((item) => {
-                                  const verseOrd = spine.verseOrdMin + item.index;
+                                  const verseOrd = clamp(
+                                      spine.verseOrdMin + item.index,
+                                      spine.verseOrdMin,
+                                      lastOrd,
+                                  );
 
                                   return (
                                       <div
                                           key={item.key}
-                                          ref={measureRowEl}
                                           data-index={item.index}
+                                          data-vrow-index={item.index}
+                                          ref={rowVirtualizer.measureElement}
                                           style={{
                                                position: "absolute",
                                                top: 0,
                                                left: 0,
                                                width: "100%",
-                                               transform: `translateY(${item.start}px)`,
+                                               transform: `translate3d(0, ${item.start}px, 0)`,
                                           }}
                                       >
                                            {renderRow(verseOrd)}
@@ -26150,29 +26501,6 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                              })}
                         </div>
                    </div>
-
-                   {gate ? (
-                       <BookGate
-                           book={bookById.get(gate.bookId) ?? null}
-                           bookId={gate.bookId}
-                           onContinue={() => {
-                                const ord = gate.ord;
-
-                                setGate(null);
-                                gateRef.current = null;
-                                gateCooldownRef.current = GATE_COOLDOWN_TICKS;
-                                suppressGateForProgrammaticScroll();
-
-                                requestAnimationFrame(() => {
-                                     const index = ord - spine.verseOrdMin;
-                                     rowVirtualizer.scrollToIndex(index, {
-                                          align: "start",
-                                          behavior: "auto",
-                                     });
-                                });
-                           }}
-                       />
-                   ) : null}
               </div>
          </div>
      );
@@ -28000,13 +28328,11 @@ export function useReaderAnnotations(
 ### apps/web/src/reader/VerseRow.tsx
 
 ```tsx
-// apps/web/src/reader/VerseRow.tsx
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useMemo } from "react";
 import type { Annotation } from "@biblia/annotation";
 import type { BookRow } from "../api";
 import { ReaderAnnotationOverlay } from "./ReaderAnnotationOverlay";
 import type { SliceToken, SliceVerse } from "./types";
-import { sx } from "./sx";
 import { BookTitlePage } from "./BookTitlePage";
 
 type Props = Readonly<{
@@ -28015,15 +28341,7 @@ type Props = Readonly<{
     annotations?: readonly Annotation[];
 }>;
 
-type TokenKind =
-    | "WORD"
-    | "PUNCT"
-    | "SPACE"
-    | "LINEBREAK"
-    | "MARKER"
-    | "NUMBER"
-    | "SYMBOL"
-    | string;
+type TokenKind = SliceToken["tokenKind"] | string;
 
 type TokenMeta = Readonly<{
     tokenIndex: number;
@@ -28048,35 +28366,86 @@ type VerseMeta = Readonly<{
     verseTextId: string;
 }>;
 
-const EMPTY_ANNOTATIONS: readonly Annotation[] = [];
+const EMPTY_ANNOTATIONS: readonly Annotation[] = Object.freeze([]);
 
-const TOKEN_SPAN_BASE_STYLE: React.CSSProperties = Object.freeze({
+const ROW_WRAP_STYLE: React.CSSProperties = Object.freeze({
+    position: "relative",
+    width: "100%",
+    boxSizing: "border-box",
+    paddingBlock: 4,
+});
+
+const CARD_STYLE: React.CSSProperties = Object.freeze({
+    position: "relative",
+    borderRadius: 16,
+    padding: "13px 14px 13px 44px",
+    minHeight: 54,
+    boxSizing: "border-box",
+});
+
+const TEXT_ROW_STYLE: React.CSSProperties = Object.freeze({
+    position: "relative",
+    zIndex: 1,
+    minWidth: 0,
+    lineHeight: "var(--bpScriptureLeading, 1.72)",
+    fontFamily: "var(--bpScriptureFont, inherit)",
+    fontSize: "var(--bpScriptureSize, 18px)",
+    fontWeight: "var(--bpScriptureWeight, 400)",
+    color: "var(--fg)",
+    overflowWrap: "anywhere",
+    wordBreak: "normal",
+});
+
+const VERSE_NUM_STYLE: React.CSSProperties = Object.freeze({
+    position: "absolute",
+    left: 12,
+    top: 13,
+    width: 22,
+    textAlign: "right",
+    fontSize: 12,
+    lineHeight: 1.2,
+    color: "var(--muted)",
+    userSelect: "none",
+    WebkitUserSelect: "none",
+    fontVariantNumeric: "tabular-nums",
+});
+
+const CHAPTER_KICK_STYLE: React.CSSProperties = Object.freeze({
+    display: "inline-block",
+    marginRight: 8,
+    fontSize: "1.2em",
+    lineHeight: 1,
+    fontWeight: 760,
+    verticalAlign: "baseline",
+    color: "var(--fg)",
+});
+
+const BOOK_HEADING_WRAP_STYLE: React.CSSProperties = Object.freeze({
+    paddingTop: 10,
+    paddingBottom: 10,
+});
+
+const INLINE_BOOK_LABEL_STYLE: React.CSSProperties = Object.freeze({
+    display: "block",
+    marginBottom: 10,
+    fontSize: 11,
+    letterSpacing: "0.12em",
+    textTransform: "uppercase",
+    color: "var(--muted)",
+    userSelect: "none",
+});
+
+const TOKEN_BASE_STYLE: React.CSSProperties = Object.freeze({
     whiteSpace: "pre-wrap",
-});
-
-const TOKEN_TEXT_STYLE: React.CSSProperties = Object.freeze({
-    ...TOKEN_SPAN_BASE_STYLE,
-    position: "relative",
-    zIndex: 1,
     userSelect: "text",
     WebkitUserSelect: "text",
-});
-
-const TOKEN_PUNCT_STYLE: React.CSSProperties = Object.freeze({
-    ...TOKEN_SPAN_BASE_STYLE,
     position: "relative",
     zIndex: 1,
-    userSelect: "text",
-    WebkitUserSelect: "text",
 });
 
 const TOKEN_MARKER_STYLE: React.CSSProperties = Object.freeze({
-    ...TOKEN_SPAN_BASE_STYLE,
-    opacity: 0.8,
-    position: "relative",
-    zIndex: 1,
-    userSelect: "text",
-    WebkitUserSelect: "text",
+    ...TOKEN_BASE_STYLE,
+    opacity: 0.82,
 });
 
 function readMaybeString(value: unknown): string | null {
@@ -28088,6 +28457,11 @@ function readMaybeString(value: unknown): string | null {
 function readMaybeNumber(value: unknown): number | null {
     if (typeof value !== "number" || !Number.isFinite(value)) return null;
     return Math.trunc(value);
+}
+
+function readMaybeBool(value: unknown): boolean | null {
+    if (typeof value === "boolean") return value;
+    return null;
 }
 
 function getRecord(value: unknown): Record<string, unknown> {
@@ -28113,6 +28487,24 @@ function getRowVerseKey(row: SliceVerse): string {
     );
 }
 
+function getRowIsBookStart(row: SliceVerse): boolean {
+    const record = getRecord(row);
+    return (
+        readMaybeBool(record.isBookStart) ??
+        readMaybeBool(record.is_book_start) ??
+        (row.chapter === 1 && row.verse === 1)
+    );
+}
+
+function getRowIsChapterStart(row: SliceVerse): boolean {
+    const record = getRecord(row);
+    return (
+        readMaybeBool(record.isChapterStart) ??
+        readMaybeBool(record.is_chapter_start) ??
+        row.verse === 1
+    );
+}
+
 function getTokenIndex(token: SliceToken, fallback: number): number {
     const record = getRecord(token);
     return readMaybeNumber(record.tokenIndex) ?? readMaybeNumber(record.token_index) ?? fallback;
@@ -28120,7 +28512,11 @@ function getTokenIndex(token: SliceToken, fallback: number): number {
 
 function getTokenKind(token: SliceToken): TokenKind | undefined {
     const record = getRecord(token);
-    return readMaybeString(record.tokenKind) ?? readMaybeString(record.token_kind) ?? undefined;
+    return (
+        readMaybeString(record.tokenKind) ??
+        readMaybeString(record.token_kind) ??
+        undefined
+    );
 }
 
 function getTokenCharStart(token: SliceToken): number | undefined {
@@ -28142,267 +28538,145 @@ function buildVerseAriaLabel(bookLabel: string, chapter: number, verse: number):
     return `${bookLabel} ${chapter}:${verse}`;
 }
 
-function buildVerseTextPlain(row: SliceVerse, tokens: readonly TokenMeta[] | null): string {
-    if (tokens && tokens.length > 0) {
-        return tokens.map((token) => token.text).join("");
-    }
-    return row.text ?? "";
-}
+function normalizeTokens(tokens: readonly SliceToken[] | null | undefined): readonly TokenMeta[] | null {
+    if (!tokens || tokens.length === 0) return null;
 
-function normalizeTokens(row: SliceVerse): readonly TokenMeta[] | null {
-    if (!Array.isArray(row.tokens) || row.tokens.length === 0) return null;
-
-    const out = row.tokens.map((token, index) => ({
+    return tokens.map((token, index) => ({
         tokenIndex: getTokenIndex(token, index),
         tokenKind: getTokenKind(token),
         charStart: getTokenCharStart(token),
         charEnd: getTokenCharEnd(token),
         text: getTokenText(token),
     }));
-
-    out.sort((a, b) => {
-        if (a.tokenIndex !== b.tokenIndex) return a.tokenIndex - b.tokenIndex;
-        return a.text.localeCompare(b.text);
-    });
-
-    return out;
 }
 
-function shouldHideTokenFromAT(tokenKind: TokenKind | undefined): boolean {
-    return tokenKind === "SPACE" || tokenKind === "LINEBREAK";
-}
-
-function isWhitespaceToken(token: TokenMeta): boolean {
-    if (token.tokenKind === "SPACE" || token.tokenKind === "LINEBREAK") return true;
-    return token.text.trim().length === 0;
-}
-
-function getTokenStyle(token: TokenMeta): React.CSSProperties | undefined {
-    if (isWhitespaceToken(token)) return undefined;
-
-    switch (token.tokenKind) {
-        case "PUNCT":
-        case "SYMBOL":
-            return TOKEN_PUNCT_STYLE;
-        case "MARKER":
-            return TOKEN_MARKER_STYLE;
-        default:
-            return TOKEN_TEXT_STYLE;
+function buildVerseTextPlain(row: SliceVerse, tokens: readonly TokenMeta[] | null): string {
+    if (tokens && tokens.length > 0) {
+        return tokens.map((token) => token.text).join("");
     }
+
+    return row.text ?? "";
 }
 
-function buildVerseMeta(row: SliceVerse, book: BookRow | null): VerseMeta {
-    const verseOrd = getRowVerseOrd(row);
-    const verseKey = getRowVerseKey(row);
-    const translationId = getRowTranslationId(row);
-    const normalizedTokens = normalizeTokens(row);
-    const hasTokens = !!normalizedTokens && normalizedTokens.length > 0;
-    const plainVerseText = buildVerseTextPlain(row, normalizedTokens);
-    const isBookStart = row.chapter === 1 && row.verse === 1;
-    const isChapterStart = row.verse === 1;
-    const rootId = verseOrd > 0 ? `ord-${verseOrd}` : `verse-${verseKey}`;
-    const verseTextId = `${rootId}-text`;
-    const bookLabel = readMaybeString(book?.name) ?? row.bookId;
-    const ariaLabel = buildVerseAriaLabel(bookLabel, row.chapter, row.verse);
-
-    return {
-        verseOrd,
-        verseKey,
-        translationId,
-        normalizedTokens,
-        plainVerseText,
-        hasTokens,
-        isBookStart,
-        isChapterStart,
-        bookLabel,
-        ariaLabel,
-        rootId,
-        verseTextId,
-    };
+function tokenStyleForKind(kind: TokenKind | undefined): React.CSSProperties {
+    if (kind === "MARKER") return TOKEN_MARKER_STYLE;
+    return TOKEN_BASE_STYLE;
 }
 
-function renderVerseBody(
-    verseOrd: number,
-    normalizedTokens: readonly TokenMeta[] | null,
-    fallbackText: string | null | undefined,
+function renderTokenSpan(
+    token: TokenMeta,
+    verseKey: string,
+    translationId: string | null,
 ): React.ReactNode {
-    if (!normalizedTokens || normalizedTokens.length === 0) {
-        return fallbackText ?? "";
-    }
-
     return (
-        <>
-            {normalizedTokens.map((token, index) => (
-                <span
-                    key={`${verseOrd}:${token.tokenIndex}:${index}`}
-                    data-token-index={token.tokenIndex}
-                    data-token-kind={token.tokenKind}
-                    data-token-char-start={token.charStart}
-                    data-token-char-end={token.charEnd}
-                    aria-hidden={shouldHideTokenFromAT(token.tokenKind) ? true : undefined}
-                    style={getTokenStyle(token)}
-                >
-                    {token.text}
-                </span>
-            ))}
-        </>
+        <span
+            key={token.tokenIndex}
+            data-verse-key={verseKey}
+            data-translation-id={translationId ?? undefined}
+            data-token-index={token.tokenIndex}
+            data-token-kind={token.tokenKind ?? undefined}
+            data-token-char-start={token.charStart ?? undefined}
+            data-token-char-end={token.charEnd ?? undefined}
+            style={tokenStyleForKind(token.tokenKind)}
+        >
+            {token.text}
+        </span>
     );
 }
 
-export const VerseRow = React.memo(
-    function VerseRow(props: Props) {
-        const { row, book, annotations = EMPTY_ANNOTATIONS } = props;
+export const VerseRow = React.memo(function VerseRow(props: Props) {
+    const { row, book } = props;
+    const annotations = props.annotations ?? EMPTY_ANNOTATIONS;
 
-        const [hovered, setHovered] = useState(false);
-        const [focused, setFocused] = useState(false);
+    const meta = useMemo<VerseMeta>(() => {
+        const verseOrd = getRowVerseOrd(row);
+        const verseKey = getRowVerseKey(row);
+        const translationId = getRowTranslationId(row);
+        const normalizedTokens = normalizeTokens(row.tokens ?? null);
+        const plainVerseText = buildVerseTextPlain(row, normalizedTokens);
+        const bookLabel = book?.name ?? row.bookId;
+        const isBookStart = getRowIsBookStart(row);
+        const isChapterStart = getRowIsChapterStart(row);
 
-        const meta = useMemo(() => buildVerseMeta(row, book), [row, book]);
-        const hasAnnotations = annotations.length > 0;
+        return {
+            verseOrd,
+            verseKey,
+            translationId,
+            normalizedTokens,
+            plainVerseText,
+            hasTokens: !!normalizedTokens && normalizedTokens.length > 0,
+            isBookStart,
+            isChapterStart,
+            bookLabel,
+            ariaLabel: buildVerseAriaLabel(bookLabel, row.chapter, row.verse),
+            rootId: `verse-${verseOrd}`,
+            verseTextId: `verse-text-${verseOrd}`,
+        };
+    }, [book, row]);
 
-        const rowStyle = useMemo<React.CSSProperties>(() => {
-            const isSelected = hasAnnotations;
-
-            return {
-                ...sx.verseRow,
-                ...(hovered ? sx.verseRowHover : null),
-                ...(focused ? sx.verseRowFocus : null),
-                ...(isSelected ? sx.verseRowSelected : null),
-                position: "relative",
-                isolation: "isolate",
-                cursor: "text",
-                transition:
-                    "background 160ms ease, box-shadow 160ms ease, border-color 160ms ease, transform 160ms ease",
-            };
-        }, [focused, hasAnnotations, hovered]);
-
-        const verseTextStyle = useMemo<React.CSSProperties>(
-            () => ({
-                ...sx.verseText,
-                position: "relative",
-                zIndex: 1,
-                cursor: "text",
-                userSelect: "text",
-                WebkitUserSelect: "text",
-            }),
-            [],
-        );
-
-        const verseNumStyle = useMemo<React.CSSProperties>(
-            () => ({
-                ...sx.verseNum,
-                userSelect: "none",
-                WebkitUserSelect: "none",
-            }),
-            [],
-        );
-
-        const onPointerEnter = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
-            if (event.pointerType === "touch") return;
-            setHovered(true);
-        }, []);
-
-        const onPointerLeave = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
-            if (event.pointerType === "touch") return;
-            setHovered(false);
-        }, []);
-
-        const onFocus = useCallback(() => {
-            setFocused(true);
-        }, []);
-
-        const onBlur = useCallback(() => {
-            setFocused(false);
-        }, []);
-
-        const verseBody = useMemo(() => {
-            return renderVerseBody(meta.verseOrd, meta.normalizedTokens, row.text);
-        }, [meta.normalizedTokens, meta.verseOrd, row.text]);
-
-        const chapterHeader = useMemo(() => {
-            if (!meta.isChapterStart) return null;
-
-            return (
-                <div
-                    style={sx.chapterHeader}
-                    data-chapter-start="1"
-                    data-book={row.bookId}
-                    data-chapter={row.chapter}
-                >
-                    <div style={sx.chapterKicker}>CHAPTER</div>
-                    <div style={sx.chapterTitle}>
-                        {meta.bookLabel} {row.chapter}
-                    </div>
+    return (
+        <article
+            id={meta.rootId}
+            data-verse-key={meta.verseKey}
+            data-verse-ord={meta.verseOrd}
+            data-book-id={row.bookId}
+            data-chapter={row.chapter}
+            data-verse={row.verse}
+            aria-label={meta.ariaLabel}
+            style={ROW_WRAP_STYLE}
+        >
+            {meta.isBookStart && book ? (
+                <div style={BOOK_HEADING_WRAP_STYLE}>
+                    <BookTitlePage book={book} bookId={row.bookId} />
                 </div>
-            );
-        }, [meta.bookLabel, meta.isChapterStart, row.bookId, row.chapter]);
+            ) : null}
 
-        return (
-            <div
-                id={meta.rootId}
-                data-ord={meta.verseOrd || undefined}
-                data-verse-ord={meta.verseOrd || undefined}
-                data-verse-key={meta.verseKey}
-                data-book={row.bookId}
-                data-chapter={row.chapter}
-                data-verse={row.verse}
-                data-translation-id={meta.translationId ?? undefined}
-                data-has-tokens={meta.hasTokens ? "1" : "0"}
-                data-book-start={meta.isBookStart ? "1" : undefined}
-                data-chapter-start={meta.isChapterStart ? "1" : undefined}
-                style={sx.verseRowWrap}
-            >
-                {meta.isBookStart ? <BookTitlePage book={book} bookId={row.bookId} /> : null}
+            <div style={CARD_STYLE}>
+                <ReaderAnnotationOverlay annotations={annotations} />
 
-                {chapterHeader}
+                <div aria-hidden="true" style={VERSE_NUM_STYLE}>
+                    {row.verse}
+                </div>
 
                 <div
-                    aria-label={meta.ariaLabel}
-                    aria-describedby={meta.verseTextId}
-                    style={rowStyle}
-                    onPointerEnter={onPointerEnter}
-                    onPointerLeave={onPointerLeave}
-                    onFocus={onFocus}
-                    onBlur={onBlur}
-                    data-has-annotations={hasAnnotations ? "1" : "0"}
-                    data-selected={hasAnnotations ? "1" : "0"}
+                    id={meta.verseTextId}
+                    data-verse-key={meta.verseKey}
+                    data-verse-ord={meta.verseOrd}
+                    data-translation-id={meta.translationId ?? undefined}
+                    style={TEXT_ROW_STYLE}
                 >
-                    <ReaderAnnotationOverlay annotations={annotations} />
+                    {!meta.isBookStart && meta.isChapterStart ? (
+                        <span aria-hidden="true" style={CHAPTER_KICK_STYLE}>
+                            {row.chapter}
+                        </span>
+                    ) : null}
 
-                    <div style={verseNumStyle} aria-hidden="true">
-                        {row.verse}
-                    </div>
+                    {!meta.isBookStart && row.verse === 1 && row.chapter > 1 ? (
+                        <span aria-hidden="true" style={INLINE_BOOK_LABEL_STYLE}>
+                            {book?.name ?? row.bookId}
+                        </span>
+                    ) : null}
 
-                    <div
-                        id={meta.verseTextId}
-                        className="scripture"
-                        style={verseTextStyle}
-                        data-verse-ord={meta.verseOrd || undefined}
-                        data-verse-key={meta.verseKey}
-                        data-translation-id={meta.translationId ?? undefined}
-                    >
-                        {verseBody}
-                    </div>
+                    {meta.hasTokens
+                        ? meta.normalizedTokens!.map((token) =>
+                            renderTokenSpan(token, meta.verseKey, meta.translationId),
+                        )
+                        : (
+                            <span
+                                data-verse-key={meta.verseKey}
+                                data-translation-id={meta.translationId ?? undefined}
+                                style={TOKEN_BASE_STYLE}
+                            >
+                                {meta.plainVerseText}
+                            </span>
+                        )}
                 </div>
             </div>
-        );
-    },
-    (prev, next) => {
-        if (prev.row !== next.row) return false;
-        if (prev.book !== next.book) return false;
+        </article>
+    );
+});
 
-        const prevAnnotations = prev.annotations ?? EMPTY_ANNOTATIONS;
-        const nextAnnotations = next.annotations ?? EMPTY_ANNOTATIONS;
-
-        if (prevAnnotations === nextAnnotations) return true;
-        if (prevAnnotations.length !== nextAnnotations.length) return false;
-
-        for (let i = 0; i < prevAnnotations.length; i += 1) {
-            if (prevAnnotations[i] !== nextAnnotations[i]) return false;
-        }
-
-        return true;
-    },
-);
+VerseRow.displayName = "VerseRow";
 ```
 
 ### apps/web/src/Search.tsx
@@ -30025,17 +30299,17 @@ export default defineConfig({
 
 ### biblia.to-code-export.md
 
-> TRUNCATED: file was 1111846 bytes; showing first 48000 chars
+> TRUNCATED: file was 1120031 bytes; showing first 48000 chars
 
 ```md
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-10T17:30:44.223Z
+Generated: 2026-03-10T18:52:21.599Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
 Total files: 70
-Total raw bytes (all included files): 2170288
+Total raw bytes (all included files): 2186976
 Truncated/skipped files: 1
-Export time: 28ms
+Export time: 26ms
 
 ## Notes
 

@@ -1,4 +1,3 @@
-// apps/web/src/Reader.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiGetBooks, apiGetSpine, apiResolveLoc, type BookRow } from "./api";
 import type { ReaderLocation } from "./Search";
@@ -23,16 +22,26 @@ type ScrollMode = "auto" | "smooth";
 const LS_LAST_ORD = "bp_last_pos_ord_v1";
 const LS_LAST_LOC = "bp_last_pos_loc_v1";
 const POSITION_SAVE_DEBOUNCE_MS = 220;
+const PROGRAMMATIC_JUMP_SETTLE_MS = 1200;
+const PROGRAMMATIC_JUMP_ORD_TOLERANCE = 1;
 
 type PendingJump = Readonly<{
     ord: number;
     behavior: ScrollMode;
+    token: number;
 }>;
 
 type StoredLocation = Readonly<{
     bookId: string;
     chapter: number;
     verse: number | null;
+}>;
+
+type JumpSession = Readonly<{
+    token: number;
+    targetOrd: number;
+    targetLocKey: string | null;
+    startedAt: number;
 }>;
 
 const INITIAL_POSITION: ReaderPosition = {
@@ -43,6 +52,10 @@ const INITIAL_POSITION: ReaderPosition = {
 
 function isBrowser(): boolean {
     return typeof window !== "undefined" && typeof localStorage !== "undefined";
+}
+
+function nowMs(): number {
+    return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
 
 function safeGetLS(key: string): string | null {
@@ -179,6 +192,10 @@ function makeStoredLocation(
     };
 }
 
+function ordNear(a: number, b: number, tolerance = PROGRAMMATIC_JUMP_ORD_TOLERANCE): boolean {
+    return Math.abs(a - b) <= tolerance;
+}
+
 export function Reader(props: Props) {
     const { styles, onBackHome, initialLocation, mode, onToggleTheme } = props;
 
@@ -196,6 +213,10 @@ export function Reader(props: Props) {
     const appliedInitialKeyRef = useRef("");
     const loadSeqRef = useRef(0);
     const resolveSeqRef = useRef(0);
+    const jumpTokenRef = useRef(0);
+
+    const activeJumpSessionRef = useRef<JumpSession | null>(null);
+
     const lastResolvedLocKeyRef = useRef("");
     const lastSavedLocJsonRef = useRef<string | null>(safeGetLS(LS_LAST_LOC));
     const lastSavedOrdRef = useRef<string | null>(safeGetLS(LS_LAST_ORD));
@@ -219,6 +240,7 @@ export function Reader(props: Props) {
     useEffect(() => {
         setViewportReady(false);
         pendingJumpRef.current = null;
+        activeJumpSessionRef.current = null;
     }, [spine?.verseOrdMin, spine?.verseOrdMax, spine?.verseCount]);
 
     useEffect(() => {
@@ -266,11 +288,30 @@ export function Reader(props: Props) {
         viewportHandleRef.current = handle;
     }, []);
 
-    const jumpToOrd = useCallback(
-        (ord: number, behavior: ScrollMode) => {
+    const beginJumpSession = useCallback((ord: number, targetLocKey: string | null): number => {
+        const token = ++jumpTokenRef.current;
+        activeJumpSessionRef.current = {
+            token,
+            targetOrd: ord,
+            targetLocKey,
+            startedAt: nowMs(),
+        };
+        return token;
+    }, []);
+
+    const clearJumpSession = useCallback((token?: number) => {
+        const session = activeJumpSessionRef.current;
+        if (!session) return;
+        if (token != null && session.token !== token) return;
+        activeJumpSessionRef.current = null;
+    }, []);
+
+    const dispatchJumpToOrd = useCallback(
+        (ord: number, behavior: ScrollMode, targetLocKey: string | null) => {
             if (!spine) return;
 
             const clamped = clampOrd(ord, spine);
+            const token = beginJumpSession(clamped, targetLocKey);
             const handle = viewportHandleRef.current;
 
             if (handle && viewportReady) {
@@ -278,9 +319,9 @@ export function Reader(props: Props) {
                 return;
             }
 
-            pendingJumpRef.current = { ord: clamped, behavior };
+            pendingJumpRef.current = { ord: clamped, behavior, token };
         },
-        [spine, viewportReady],
+        [beginJumpSession, spine, viewportReady],
     );
 
     const persistLocation = useCallback((stored: StoredLocation) => {
@@ -327,15 +368,19 @@ export function Reader(props: Props) {
                     return;
                 }
 
-                jumpToOrd(verseOrd, behavior);
                 persistLocation(stored);
+
+                // Important:
+                // for resolved location jumps, use auto.
+                // smooth fights the viewport correction logic.
+                dispatchJumpToOrd(verseOrd, behavior === "smooth" ? "auto" : behavior, locKey);
             } catch (e: unknown) {
                 if (seq !== resolveSeqRef.current) return;
                 const msg = e instanceof Error ? e.message : String(e);
                 setErr(msg);
             }
         },
-        [annotations, jumpToOrd, persistLocation],
+        [annotations, dispatchJumpToOrd, persistLocation],
     );
 
     useEffect(() => {
@@ -372,8 +417,8 @@ export function Reader(props: Props) {
         const ordRaw = parseFiniteInt(safeGetLS(LS_LAST_ORD));
         if (ordRaw == null) return;
 
-        jumpToOrd(ordRaw, "auto");
-    }, [spine, initialLocation, jumpToOrd, resolveAndJump]);
+        dispatchJumpToOrd(ordRaw, "auto", null);
+    }, [spine, initialLocation, dispatchJumpToOrd, resolveAndJump]);
 
     useEffect(() => {
         if (!viewportReady) return;
@@ -390,6 +435,18 @@ export function Reader(props: Props) {
         if (!spine) return;
         if (!Number.isFinite(pos.ord)) return;
         if (typeof window === "undefined") return;
+
+        const session = activeJumpSessionRef.current;
+        if (session) {
+            const elapsed = nowMs() - session.startedAt;
+            const landed = ordNear(pos.ord, session.targetOrd);
+
+            if (landed || elapsed > PROGRAMMATIC_JUMP_SETTLE_MS) {
+                clearJumpSession(session.token);
+            } else {
+                return;
+            }
+        }
 
         const nextOrd = clampOrd(pos.ord, spine);
 
@@ -409,10 +466,22 @@ export function Reader(props: Props) {
                 savePositionTimerRef.current = null;
             }
         };
-    }, [persistOrd, pos.ord, spine]);
+    }, [clearJumpSession, persistOrd, pos.ord, spine]);
 
     useEffect(() => {
         if (!pos.verse) return;
+
+        const session = activeJumpSessionRef.current;
+        if (session) {
+            const elapsed = nowMs() - session.startedAt;
+            const landed = ordNear(pos.ord, session.targetOrd);
+
+            if (!landed && elapsed <= PROGRAMMATIC_JUMP_SETTLE_MS) {
+                return;
+            }
+
+            clearJumpSession(session.token);
+        }
 
         const stored = makeStoredLocation(pos.verse.bookId, pos.verse.chapter, pos.verse.verse);
         if (!stored) return;
@@ -421,7 +490,7 @@ export function Reader(props: Props) {
         if (lastResolvedLocKeyRef.current === key) return;
 
         persistLocation(stored);
-    }, [persistLocation, pos.verse]);
+    }, [clearJumpSession, persistLocation, pos.ord, pos.verse]);
 
     const handleReady = useCallback(() => {
         setViewportReady(true);
@@ -432,6 +501,19 @@ export function Reader(props: Props) {
     }, []);
 
     const handlePosition = useCallback((next: ReaderPosition) => {
+        const session = activeJumpSessionRef.current;
+
+        if (session) {
+            const elapsed = nowMs() - session.startedAt;
+            const landed = ordNear(next.ord, session.targetOrd);
+
+            if (!landed && elapsed <= PROGRAMMATIC_JUMP_SETTLE_MS) {
+                return;
+            }
+
+            clearJumpSession(session.token);
+        }
+
         setPos((prev) => {
             if (
                 prev.ord === next.ord &&
@@ -442,18 +524,18 @@ export function Reader(props: Props) {
             }
             return next;
         });
-    }, []);
+    }, [clearJumpSession]);
 
     const handleJumpRef = useCallback(
         (bookId: string, chapter: number, verse: number | null) => {
-            void resolveAndJump(bookId, chapter, verse, "smooth");
+            void resolveAndJump(bookId, chapter, verse, "auto");
         },
         [resolveAndJump],
     );
 
     const handleNavigate = useCallback(
         (loc: ReaderLocation) => {
-            void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "smooth");
+            void resolveAndJump(loc.bookId, loc.chapter, loc.verse ?? null, "auto");
         },
         [resolveAndJump],
     );

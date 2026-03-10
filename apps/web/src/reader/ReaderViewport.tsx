@@ -21,6 +21,9 @@ const MAX_CHUNKS_IN_MEMORY = 18;
 const EST_ROW_PX = 64;
 const OVERSCAN = 10;
 
+const JUMP_MAX_CORRECTIONS = 8;
+const JUMP_TOLERANCE_PX = 2;
+
 type ScrollMode = "auto" | "smooth";
 
 export type ReaderViewportHandle = {
@@ -42,6 +45,7 @@ type Props = Readonly<{
 type PendingJump = Readonly<{
      ord: number;
      behavior: ScrollMode;
+     correctionsLeft: number;
 }>;
 
 type SlicePayload =
@@ -80,7 +84,15 @@ const CONTAINER_STYLE: React.CSSProperties = Object.freeze({
 const VIRTUAL_STAGE_STYLE: React.CSSProperties = Object.freeze({
      position: "relative",
      width: "100%",
-     contain: "layout paint size",
+     contain: "layout paint",
+});
+
+const TOP_CONTENT_STYLE: React.CSSProperties = Object.freeze({
+     position: "absolute",
+     top: 0,
+     left: 0,
+     right: 0,
+     width: "100%",
 });
 
 const SKELETON_ROW_STYLE: React.CSSProperties = Object.freeze({
@@ -145,11 +157,7 @@ function getRowBookId(row: SliceVerse): string {
 
 function getRowVerseOrd(row: SliceVerse): number {
      const record = row as unknown as Record<string, unknown>;
-     return (
-         readMaybeNumber(record.verseOrd) ??
-         readMaybeNumber(record.verse_ord) ??
-         0
-     );
+     return readMaybeNumber(record.verseOrd) ?? readMaybeNumber(record.verse_ord) ?? 0;
 }
 
 function extractSliceRows(payload: SlicePayload): readonly SliceVerse[] {
@@ -167,12 +175,8 @@ function normalizeSpanRange(span: unknown): { startOrd: number; endOrd: number }
      if (!span || typeof span !== "object") return null;
 
      const record = span as Record<string, unknown>;
-     const start =
-         (record.start as Record<string, unknown> | undefined) ??
-         undefined;
-     const end =
-         (record.end as Record<string, unknown> | undefined) ??
-         undefined;
+     const start = (record.start as Record<string, unknown> | undefined) ?? undefined;
+     const end = (record.end as Record<string, unknown> | undefined) ?? undefined;
 
      const startOrd =
          readMaybeNumber(start?.verseOrd) ??
@@ -214,11 +218,8 @@ function buildAnnotationIndex(
 
                for (let ord = startOrd; ord <= endOrd; ord += 1) {
                     const bucket = buckets.get(ord);
-                    if (bucket) {
-                         bucket.push(annotation);
-                    } else {
-                         buckets.set(ord, [annotation]);
-                    }
+                    if (bucket) bucket.push(annotation);
+                    else buckets.set(ord, [annotation]);
                }
           }
      }
@@ -228,7 +229,7 @@ function buildAnnotationIndex(
 
 function skeletonRow(verseOrd: number): React.ReactNode {
      return (
-         <div style={SKELETON_ROW_STYLE} aria-hidden="true">
+         <div style={SKELETON_ROW_STYLE} aria-hidden="true" data-skeleton-ord={verseOrd}>
               <div style={SKELETON_NUM_STYLE}>…</div>
               <div style={SKELETON_TEXT_STYLE} />
          </div>
@@ -252,6 +253,9 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
 
      const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
      const [dataTick, setDataTick] = useState(0);
+     const [topContentHeight, setTopContentHeight] = useState(0);
+
+     const topContentRef = useRef<HTMLDivElement | null>(null);
 
      const verseMapRef = useRef<Map<number, SliceVerse>>(new Map());
      const loadedChunksRef = useRef<Set<number>>(new Set());
@@ -262,6 +266,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      const currentOrdRef = useRef<number>(spine.verseOrdMin);
      const onReadyCalledRef = useRef(false);
      const rafMeasureRef = useRef<number | null>(null);
+     const jumpRafRef = useRef<number | null>(null);
 
      const rowCount = useMemo(() => deriveRowCount(spine), [spine]);
      const lastOrd = spine.verseOrdMin + Math.max(0, rowCount - 1);
@@ -276,6 +281,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           getScrollElement: () => scrollEl,
           estimateSize: () => EST_ROW_PX,
           overscan: OVERSCAN,
+          paddingStart: topContentHeight,
           measureElement: (el) => el.getBoundingClientRect().height,
           getItemKey: (index) => spine.verseOrdMin + index,
      });
@@ -302,6 +308,13 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           inFlightRef.current.clear();
      }, []);
 
+     const cancelJumpRaf = useCallback(() => {
+          if (jumpRafRef.current != null) {
+               cancelAnimationFrame(jumpRafRef.current);
+               jumpRafRef.current = null;
+          }
+     }, []);
+
      const evictFarChunks = useCallback(
          (keepOrd: number) => {
               const keepIndex = chunkIndexFromOrd(clamp(keepOrd, spine.verseOrdMin, spine.verseOrdMax));
@@ -322,9 +335,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                         const chunk = order[i]!;
                         const idx = chunkIndexFromOrd(chunk);
 
-                        if (idx >= keepMin && idx <= keepMax) {
-                             continue;
-                        }
+                        if (idx >= keepMin && idx <= keepMax) continue;
 
                         const distance = Math.abs(idx - keepIndex);
                         if (distance > farthestDistance) {
@@ -428,22 +439,78 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
          [loadChunk, spine.verseOrdMax],
      );
 
+     const correctJumpToMountedRow = useCallback(() => {
+          const pending = pendingJumpRef.current;
+          const scroller = scrollEl;
+          if (!pending || !scroller) return;
+
+          const index = clamp(pending.ord - spine.verseOrdMin, 0, Math.max(0, rowCount - 1));
+          const rowEl = scroller.querySelector<HTMLElement>(`[data-vrow-index="${index}"]`);
+
+          if (!rowEl) {
+               rowVirtualizer.scrollToIndex(index, {
+                    align: "start",
+                    behavior: "auto",
+               });
+               return;
+          }
+
+          const scrollerRect = scroller.getBoundingClientRect();
+          const rowRect = rowEl.getBoundingClientRect();
+          const delta = rowRect.top - scrollerRect.top;
+          const nextTop = scroller.scrollTop + delta;
+
+          if (Math.abs(delta) <= JUMP_TOLERANCE_PX) {
+               pendingJumpRef.current = null;
+               return;
+          }
+
+          scroller.scrollTo({
+               top: nextTop,
+               behavior: "auto",
+          });
+
+          if (pending.correctionsLeft <= 1) {
+               pendingJumpRef.current = null;
+               return;
+          }
+
+          pendingJumpRef.current = {
+               ...pending,
+               correctionsLeft: pending.correctionsLeft - 1,
+          };
+
+          cancelJumpRaf();
+          jumpRafRef.current = requestAnimationFrame(() => {
+               jumpRafRef.current = null;
+               correctJumpToMountedRow();
+          });
+     }, [
+          cancelJumpRaf,
+          rowCount,
+          rowVirtualizer,
+          scrollEl,
+          spine.verseOrdMin,
+     ]);
+
      useEffect(() => {
           verseMapRef.current.clear();
           loadedChunksRef.current.clear();
           loadedOrderRef.current = [];
           cancelAllInFlight();
+          cancelJumpRaf();
 
           const firstOrd = clamp(spine.verseOrdMin, spine.verseOrdMin, spine.verseOrdMax);
           currentOrdRef.current = firstOrd;
           pendingJumpRef.current = {
                ord: firstOrd,
                behavior: "auto",
+               correctionsLeft: JUMP_MAX_CORRECTIONS,
           };
           onReadyCalledRef.current = false;
 
           setDataTick((tick) => tick + 1);
-     }, [cancelAllInFlight, spine.verseOrdMax, spine.verseOrdMin]);
+     }, [cancelAllInFlight, cancelJumpRaf, spine.verseOrdMax, spine.verseOrdMin]);
 
      useEffect(() => {
           ensureWindowLoaded(currentOrdRef.current);
@@ -484,27 +551,39 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
          () => ({
               jumpToOrd: (ord, behavior = "auto") => {
                    const nextOrd = clamp(Math.trunc(ord), spine.verseOrdMin, spine.verseOrdMax);
-                   pendingJumpRef.current = { ord: nextOrd, behavior };
+
+                   pendingJumpRef.current = {
+                        ord: nextOrd,
+                        behavior,
+                        correctionsLeft: JUMP_MAX_CORRECTIONS,
+                   };
+
                    ensureWindowLoaded(nextOrd);
-                   setDataTick((tick) => tick + 1);
+
+                   const index = clamp(nextOrd - spine.verseOrdMin, 0, Math.max(0, rowCount - 1));
+                   rowVirtualizer.scrollToIndex(index, {
+                        align: "start",
+                        behavior: "auto",
+                   });
+
+                   cancelJumpRaf();
+                   jumpRafRef.current = requestAnimationFrame(() => {
+                        jumpRafRef.current = null;
+                        correctJumpToMountedRow();
+                   });
               },
               getCurrentOrd: () => currentOrdRef.current,
          }),
-         [ensureWindowLoaded, spine.verseOrdMax, spine.verseOrdMin],
+         [
+              cancelJumpRaf,
+              correctJumpToMountedRow,
+              ensureWindowLoaded,
+              rowCount,
+              rowVirtualizer,
+              spine.verseOrdMax,
+              spine.verseOrdMin,
+         ],
      );
-
-     useEffect(() => {
-          const pending = pendingJumpRef.current;
-          if (!pending) return;
-
-          const index = clamp(pending.ord - spine.verseOrdMin, 0, Math.max(0, rowCount - 1));
-          rowVirtualizer.scrollToIndex(index, {
-               align: "start",
-               behavior: pending.behavior === "smooth" ? "auto" : pending.behavior,
-          });
-
-          pendingJumpRef.current = null;
-     }, [dataTick, rowCount, rowVirtualizer, spine.verseOrdMin]);
 
      useLayoutEffect(() => {
           if (rafMeasureRef.current != null) {
@@ -514,6 +593,10 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           rafMeasureRef.current = requestAnimationFrame(() => {
                rowVirtualizer.measure();
                rafMeasureRef.current = null;
+
+               if (pendingJumpRef.current) {
+                    correctJumpToMountedRow();
+               }
           });
 
           return () => {
@@ -522,7 +605,36 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                     rafMeasureRef.current = null;
                }
           };
-     }, [dataTick, rowVirtualizer]);
+     }, [dataTick, rowVirtualizer, correctJumpToMountedRow]);
+
+     useLayoutEffect(() => {
+          if (!topContentRef.current) {
+               if (topContentHeight !== 0) setTopContentHeight(0);
+               return;
+          }
+
+          const el = topContentRef.current;
+
+          const measure = () => {
+               const next = Math.max(0, Math.round(el.getBoundingClientRect().height));
+               setTopContentHeight((prev) => (prev === next ? prev : next));
+          };
+
+          measure();
+
+          const ro =
+              typeof ResizeObserver !== "undefined"
+                  ? new ResizeObserver(() => measure())
+                  : null;
+
+          ro?.observe(el);
+          window.addEventListener("resize", measure, { passive: true });
+
+          return () => {
+               ro?.disconnect();
+               window.removeEventListener("resize", measure);
+          };
+     }, [topContent, topContentHeight]);
 
      useEffect(() => {
           if (onReadyCalledRef.current) return;
@@ -535,11 +647,12 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      useEffect(() => {
           return () => {
                cancelAllInFlight();
+               cancelJumpRaf();
                if (selectionRootRef) {
                     selectionRootRef.current = null;
                }
           };
-     }, [cancelAllInFlight, selectionRootRef]);
+     }, [cancelAllInFlight, cancelJumpRaf, selectionRootRef]);
 
      const renderRow = useCallback(
          (verseOrd: number): React.ReactNode => {
@@ -567,14 +680,18 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                        style={CONTAINER_STYLE}
                        data-translation-id={undefined}
                    >
-                        {topContent}
-
                         <div
                             style={{
                                  ...VIRTUAL_STAGE_STYLE,
                                  height: totalSize,
                             }}
                         >
+                             {topContent ? (
+                                 <div ref={topContentRef} style={TOP_CONTENT_STYLE}>
+                                      {topContent}
+                                 </div>
+                             ) : null}
+
                              {virtualItems.map((item) => {
                                   const verseOrd = clamp(
                                       spine.verseOrdMin + item.index,
@@ -586,6 +703,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                                       <div
                                           key={item.key}
                                           data-index={item.index}
+                                          data-vrow-index={item.index}
                                           ref={rowVirtualizer.measureElement}
                                           style={{
                                                position: "absolute",
