@@ -23,6 +23,10 @@ const OVERSCAN = 10;
 
 const JUMP_MAX_CORRECTIONS = 8;
 const JUMP_TOLERANCE_PX = 2;
+const POSITION_ANCHOR_RATIO = 0.2;
+const POSITION_ANCHOR_MIN_PX = 32;
+const POSITION_ANCHOR_MAX_PX = 120;
+const NEAREST_ROW_SCAN_RADIUS = 48;
 
 type ScrollMode = "auto" | "smooth";
 
@@ -43,6 +47,7 @@ type Props = Readonly<{
 }>;
 
 type PendingJump = Readonly<{
+     id: number;
      ord: number;
      behavior: ScrollMode;
      correctionsLeft: number;
@@ -50,9 +55,19 @@ type PendingJump = Readonly<{
 
 type SlicePayload =
     | readonly SliceVerse[]
-    | Readonly<{ verses?: readonly SliceVerse[]; rows?: readonly SliceVerse[]; items?: readonly SliceVerse[] }>
+    | Readonly<{
+     verses?: readonly SliceVerse[];
+     rows?: readonly SliceVerse[];
+     items?: readonly SliceVerse[];
+}>
     | null
     | undefined;
+
+type EmittedPositionSig = Readonly<{
+     ord: number;
+     verseOrd: number | null;
+     bookId: string | null;
+}>;
 
 const EMPTY_ANNOTATIONS: readonly Annotation[] = Object.freeze([]);
 
@@ -236,6 +251,74 @@ function skeletonRow(verseOrd: number): React.ReactNode {
      );
 }
 
+function getViewportAnchorOffset(clientHeight: number): number {
+     if (!Number.isFinite(clientHeight) || clientHeight <= 0) {
+          return POSITION_ANCHOR_MIN_PX;
+     }
+
+     return clamp(
+         Math.round(clientHeight * POSITION_ANCHOR_RATIO),
+         POSITION_ANCHOR_MIN_PX,
+         POSITION_ANCHOR_MAX_PX,
+     );
+}
+
+function findAnchorVirtualItem<T extends Readonly<{ index: number; start: number; size: number }>>(
+    items: readonly T[],
+    anchorY: number,
+): T | null {
+     if (items.length === 0) return null;
+
+     let best: T | null = null;
+     let bestDistance = Number.POSITIVE_INFINITY;
+
+     for (const item of items) {
+          const start = item.start;
+          const end = item.start + item.size;
+
+          if (anchorY >= start && anchorY <= end) {
+               return item;
+          }
+
+          const distance = anchorY < start ? start - anchorY : anchorY - end;
+          if (distance < bestDistance) {
+               best = item;
+               bestDistance = distance;
+          }
+     }
+
+     return best;
+}
+
+function findNearestLoadedRow(
+    verseMap: ReadonlyMap<number, SliceVerse>,
+    anchorOrd: number,
+    minOrd: number,
+    maxOrd: number,
+    maxRadius = NEAREST_ROW_SCAN_RADIUS,
+): SliceVerse | null {
+     const exact = verseMap.get(anchorOrd);
+     if (exact) return exact;
+
+     const radiusLimit = Math.max(0, Math.trunc(maxRadius));
+
+     for (let radius = 1; radius <= radiusLimit; radius += 1) {
+          const beforeOrd = anchorOrd - radius;
+          if (beforeOrd >= minOrd) {
+               const before = verseMap.get(beforeOrd);
+               if (before) return before;
+          }
+
+          const afterOrd = anchorOrd + radius;
+          if (afterOrd <= maxOrd) {
+               const after = verseMap.get(afterOrd);
+               if (after) return after;
+          }
+     }
+
+     return null;
+}
+
 export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function ReaderViewport(
     props,
     ref,
@@ -263,8 +346,11 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      const inFlightRef = useRef<Map<number, AbortController>>(new Map());
 
      const pendingJumpRef = useRef<PendingJump | null>(null);
+     const jumpSessionIdRef = useRef(0);
      const currentOrdRef = useRef<number>(spine.verseOrdMin);
      const onReadyCalledRef = useRef(false);
+     const lastEmittedRef = useRef<EmittedPositionSig | null>(null);
+
      const rafMeasureRef = useRef<number | null>(null);
      const jumpRafRef = useRef<number | null>(null);
 
@@ -314,6 +400,59 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                jumpRafRef.current = null;
           }
      }, []);
+
+     const resolvePositionData = useCallback(
+         (ord: number): { verse: SliceVerse | null; book: BookRow | null; bookId: string | null } => {
+              const verse = verseMapRef.current.get(ord) ?? null;
+              const rowForBook =
+                  verse ??
+                  findNearestLoadedRow(
+                      verseMapRef.current,
+                      ord,
+                      spine.verseOrdMin,
+                      spine.verseOrdMax,
+                  );
+
+              const bookId = rowForBook ? getRowBookId(rowForBook) : null;
+              const book = bookId ? (bookById.get(bookId) ?? null) : null;
+
+              return { verse, book, bookId };
+         },
+         [bookById, spine.verseOrdMax, spine.verseOrdMin],
+     );
+
+     const emitPosition = useCallback(
+         (ord: number) => {
+              const nextOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
+              const { verse, book, bookId } = resolvePositionData(nextOrd);
+              const sig: EmittedPositionSig = {
+                   ord: nextOrd,
+                   verseOrd: verse ? getRowVerseOrd(verse) : null,
+                   bookId,
+              };
+              const prev = lastEmittedRef.current;
+
+              if (
+                  prev &&
+                  prev.ord === sig.ord &&
+                  prev.verseOrd === sig.verseOrd &&
+                  prev.bookId === sig.bookId
+              ) {
+                   currentOrdRef.current = nextOrd;
+                   return;
+              }
+
+              lastEmittedRef.current = sig;
+              currentOrdRef.current = nextOrd;
+
+              onPosition({
+                   ord: nextOrd,
+                   verse,
+                   book,
+              });
+         },
+         [onPosition, resolvePositionData, spine.verseOrdMax, spine.verseOrdMin],
+     );
 
      const evictFarChunks = useCallback(
          (keepOrd: number) => {
@@ -409,9 +548,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
               } catch (error) {
                    if (!controller.signal.aborted) {
                         const message =
-                            error instanceof Error
-                                ? error.message
-                                : "Failed to load reader slice.";
+                            error instanceof Error ? error.message : "Failed to load reader slice.";
                         onError?.(message);
                    }
               } finally {
@@ -439,39 +576,54 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
          [loadChunk, spine.verseOrdMax],
      );
 
+     const getMountedRowAnchorDelta = useCallback(
+         (rowEl: HTMLElement, scroller: HTMLDivElement): number => {
+              const scrollerRect = scroller.getBoundingClientRect();
+              const rowRect = rowEl.getBoundingClientRect();
+              const anchorOffset = getViewportAnchorOffset(scroller.clientHeight);
+              const desiredTop = scrollerRect.top + anchorOffset;
+              return rowRect.top - desiredTop;
+         },
+         [],
+     );
+
      const correctJumpToMountedRow = useCallback(() => {
           const pending = pendingJumpRef.current;
           const scroller = scrollEl;
-          if (!pending || !scroller) return;
+          if (!pending || !scroller || rowCount <= 0) return;
 
-          const index = clamp(pending.ord - spine.verseOrdMin, 0, Math.max(0, rowCount - 1));
+          const index = clamp(pending.ord - spine.verseOrdMin, 0, rowCount - 1);
           const rowEl = scroller.querySelector<HTMLElement>(`[data-vrow-index="${index}"]`);
+
+          emitPosition(pending.ord);
 
           if (!rowEl) {
                rowVirtualizer.scrollToIndex(index, {
                     align: "start",
-                    behavior: "auto",
+                    behavior: pending.behavior,
                });
                return;
           }
 
-          const scrollerRect = scroller.getBoundingClientRect();
-          const rowRect = rowEl.getBoundingClientRect();
-          const delta = rowRect.top - scrollerRect.top;
-          const nextTop = scroller.scrollTop + delta;
+          const delta = getMountedRowAnchorDelta(rowEl, scroller);
 
           if (Math.abs(delta) <= JUMP_TOLERANCE_PX) {
                pendingJumpRef.current = null;
+               emitPosition(pending.ord);
                return;
           }
 
+          const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+          const nextTop = clamp(scroller.scrollTop + delta, 0, maxScrollTop);
+
           scroller.scrollTo({
                top: nextTop,
-               behavior: "auto",
+               behavior: pending.correctionsLeft === JUMP_MAX_CORRECTIONS ? pending.behavior : "auto",
           });
 
           if (pending.correctionsLeft <= 1) {
                pendingJumpRef.current = null;
+               emitPosition(pending.ord);
                return;
           }
 
@@ -480,13 +632,18 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                correctionsLeft: pending.correctionsLeft - 1,
           };
 
+          const scheduledId = pending.id;
           cancelJumpRaf();
           jumpRafRef.current = requestAnimationFrame(() => {
                jumpRafRef.current = null;
+               const active = pendingJumpRef.current;
+               if (!active || active.id !== scheduledId) return;
                correctJumpToMountedRow();
           });
      }, [
           cancelJumpRaf,
+          emitPosition,
+          getMountedRowAnchorDelta,
           rowCount,
           rowVirtualizer,
           scrollEl,
@@ -501,16 +658,27 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           cancelJumpRaf();
 
           const firstOrd = clamp(spine.verseOrdMin, spine.verseOrdMin, spine.verseOrdMax);
+          const sessionId = ++jumpSessionIdRef.current;
+
           currentOrdRef.current = firstOrd;
           pendingJumpRef.current = {
+               id: sessionId,
                ord: firstOrd,
                behavior: "auto",
                correctionsLeft: JUMP_MAX_CORRECTIONS,
           };
           onReadyCalledRef.current = false;
+          lastEmittedRef.current = null;
+
+          if (scrollEl) {
+               scrollEl.scrollTo({
+                    top: 0,
+                    behavior: "auto",
+               });
+          }
 
           setDataTick((tick) => tick + 1);
-     }, [cancelAllInFlight, cancelJumpRaf, spine.verseOrdMax, spine.verseOrdMin]);
+     }, [cancelAllInFlight, cancelJumpRaf, scrollEl, spine.verseOrdMax, spine.verseOrdMin]);
 
      useEffect(() => {
           ensureWindowLoaded(currentOrdRef.current);
@@ -531,44 +699,63 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      ]);
 
      useLayoutEffect(() => {
-          if (virtualItems.length === 0) return;
+          if (rowCount <= 0 || virtualItems.length === 0) return;
 
-          const first = virtualItems[0]!;
-          const ord = clamp(spine.verseOrdMin + first.index, spine.verseOrdMin, spine.verseOrdMax);
-          const row = verseMapRef.current.get(ord) ?? null;
+          const pending = pendingJumpRef.current;
+          if (pending) {
+               emitPosition(pending.ord);
+               return;
+          }
 
-          currentOrdRef.current = ord;
+          const anchorOffset = getViewportAnchorOffset(scrollEl?.clientHeight ?? 0);
+          const anchorY = (scrollEl?.scrollTop ?? 0) + anchorOffset;
+          const anchorItem = findAnchorVirtualItem(virtualItems, anchorY) ?? virtualItems[0] ?? null;
+          if (!anchorItem) return;
 
-          onPosition({
-               ord,
-               verse: row,
-               book: row ? (bookById.get(getRowBookId(row)) ?? null) : null,
-          });
-     }, [bookById, onPosition, spine.verseOrdMax, spine.verseOrdMin, virtualItems]);
+          const ord = clamp(spine.verseOrdMin + anchorItem.index, spine.verseOrdMin, spine.verseOrdMax);
+          emitPosition(ord);
+     }, [
+          emitPosition,
+          rowCount,
+          scrollEl,
+          spine.verseOrdMax,
+          spine.verseOrdMin,
+          virtualItems,
+          dataTick,
+     ]);
 
      useImperativeHandle(
          ref,
          () => ({
               jumpToOrd: (ord, behavior = "auto") => {
-                   const nextOrd = clamp(Math.trunc(ord), spine.verseOrdMin, spine.verseOrdMax);
+                   if (rowCount <= 0) return;
 
+                   const nextOrd = clamp(Math.trunc(ord), spine.verseOrdMin, spine.verseOrdMax);
+                   const sessionId = ++jumpSessionIdRef.current;
+
+                   currentOrdRef.current = nextOrd;
                    pendingJumpRef.current = {
+                        id: sessionId,
                         ord: nextOrd,
                         behavior,
                         correctionsLeft: JUMP_MAX_CORRECTIONS,
                    };
 
                    ensureWindowLoaded(nextOrd);
+                   evictFarChunks(nextOrd);
+                   emitPosition(nextOrd);
 
-                   const index = clamp(nextOrd - spine.verseOrdMin, 0, Math.max(0, rowCount - 1));
+                   const index = clamp(nextOrd - spine.verseOrdMin, 0, rowCount - 1);
                    rowVirtualizer.scrollToIndex(index, {
                         align: "start",
-                        behavior: "auto",
+                        behavior,
                    });
 
                    cancelJumpRaf();
                    jumpRafRef.current = requestAnimationFrame(() => {
                         jumpRafRef.current = null;
+                        const active = pendingJumpRef.current;
+                        if (!active || active.id !== sessionId) return;
                         correctJumpToMountedRow();
                    });
               },
@@ -577,7 +764,9 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
          [
               cancelJumpRaf,
               correctJumpToMountedRow,
+              emitPosition,
               ensureWindowLoaded,
+              evictFarChunks,
               rowCount,
               rowVirtualizer,
               spine.verseOrdMax,
@@ -605,7 +794,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                     rafMeasureRef.current = null;
                }
           };
-     }, [dataTick, rowVirtualizer, correctJumpToMountedRow]);
+     }, [correctJumpToMountedRow, dataTick, rowVirtualizer, topContentHeight]);
 
      useLayoutEffect(() => {
           if (!topContentRef.current) {
@@ -623,9 +812,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           measure();
 
           const ro =
-              typeof ResizeObserver !== "undefined"
-                  ? new ResizeObserver(() => measure())
-                  : null;
+              typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => measure()) : null;
 
           ro?.observe(el);
           window.addEventListener("resize", measure, { passive: true });
@@ -648,6 +835,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           return () => {
                cancelAllInFlight();
                cancelJumpRaf();
+
                if (selectionRootRef) {
                     selectionRootRef.current = null;
                }
@@ -675,11 +863,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      return (
          <div style={ROOT_STYLE}>
               <div ref={setScrollEl} style={SCROLL_STYLE}>
-                   <div
-                       ref={setSelectionRootEl}
-                       style={CONTAINER_STYLE}
-                       data-translation-id={undefined}
-                   >
+                   <div ref={setSelectionRootEl} style={CONTAINER_STYLE}>
                         <div
                             style={{
                                  ...VIRTUAL_STAGE_STYLE,

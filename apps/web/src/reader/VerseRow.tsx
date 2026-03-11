@@ -1,4 +1,6 @@
-import React, { useMemo } from "react";
+// apps/web/src/reader/VerseRow.tsx
+import React, { memo, useMemo } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { Annotation } from "@biblia/annotation";
 import type { BookRow } from "../api";
 import { ReaderAnnotationOverlay } from "./ReaderAnnotationOverlay";
@@ -14,6 +16,8 @@ type Props = Readonly<{
 type TokenKind = SliceToken["tokenKind"] | string;
 
 type TokenMeta = Readonly<{
+    key: string;
+    sourceIndex: number;
     tokenIndex: number;
     tokenKind?: TokenKind;
     charStart?: number;
@@ -25,35 +29,49 @@ type VerseMeta = Readonly<{
     verseOrd: number;
     verseKey: string;
     translationId: string | null;
+
     normalizedTokens: readonly TokenMeta[] | null;
     plainVerseText: string;
     hasTokens: boolean;
+
     isBookStart: boolean;
     isChapterStart: boolean;
+
     bookLabel: string;
     ariaLabel: string;
+
     rootId: string;
     verseTextId: string;
+
+    showBookTitlePage: boolean;
+    showChapterKick: boolean;
+    showInlineBookLabel: boolean;
 }>;
 
 const EMPTY_ANNOTATIONS: readonly Annotation[] = Object.freeze([]);
 
-const ROW_WRAP_STYLE: React.CSSProperties = Object.freeze({
+const ROW_WRAP_STYLE: CSSProperties = Object.freeze({
     position: "relative",
     width: "100%",
     boxSizing: "border-box",
     paddingBlock: 4,
 });
 
-const CARD_STYLE: React.CSSProperties = Object.freeze({
+const BOOK_HEADING_WRAP_STYLE: CSSProperties = Object.freeze({
+    paddingTop: 10,
+    paddingBottom: 10,
+});
+
+const CARD_STYLE: CSSProperties = Object.freeze({
     position: "relative",
     borderRadius: 16,
     padding: "13px 14px 13px 44px",
     minHeight: 54,
     boxSizing: "border-box",
+    isolation: "isolate",
 });
 
-const TEXT_ROW_STYLE: React.CSSProperties = Object.freeze({
+const TEXT_ROW_STYLE: CSSProperties = Object.freeze({
     position: "relative",
     zIndex: 1,
     minWidth: 0,
@@ -66,7 +84,7 @@ const TEXT_ROW_STYLE: React.CSSProperties = Object.freeze({
     wordBreak: "normal",
 });
 
-const VERSE_NUM_STYLE: React.CSSProperties = Object.freeze({
+const VERSE_NUM_STYLE: CSSProperties = Object.freeze({
     position: "absolute",
     left: 12,
     top: 13,
@@ -77,10 +95,11 @@ const VERSE_NUM_STYLE: React.CSSProperties = Object.freeze({
     color: "var(--muted)",
     userSelect: "none",
     WebkitUserSelect: "none",
+    pointerEvents: "none",
     fontVariantNumeric: "tabular-nums",
 });
 
-const CHAPTER_KICK_STYLE: React.CSSProperties = Object.freeze({
+const CHAPTER_KICK_STYLE: CSSProperties = Object.freeze({
     display: "inline-block",
     marginRight: 8,
     fontSize: "1.2em",
@@ -88,14 +107,12 @@ const CHAPTER_KICK_STYLE: React.CSSProperties = Object.freeze({
     fontWeight: 760,
     verticalAlign: "baseline",
     color: "var(--fg)",
+    userSelect: "none",
+    WebkitUserSelect: "none",
+    pointerEvents: "none",
 });
 
-const BOOK_HEADING_WRAP_STYLE: React.CSSProperties = Object.freeze({
-    paddingTop: 10,
-    paddingBottom: 10,
-});
-
-const INLINE_BOOK_LABEL_STYLE: React.CSSProperties = Object.freeze({
+const INLINE_BOOK_LABEL_STYLE: CSSProperties = Object.freeze({
     display: "block",
     marginBottom: 10,
     fontSize: 11,
@@ -103,9 +120,11 @@ const INLINE_BOOK_LABEL_STYLE: React.CSSProperties = Object.freeze({
     textTransform: "uppercase",
     color: "var(--muted)",
     userSelect: "none",
+    WebkitUserSelect: "none",
+    pointerEvents: "none",
 });
 
-const TOKEN_BASE_STYLE: React.CSSProperties = Object.freeze({
+const TOKEN_BASE_STYLE: CSSProperties = Object.freeze({
     whiteSpace: "pre-wrap",
     userSelect: "text",
     WebkitUserSelect: "text",
@@ -113,15 +132,19 @@ const TOKEN_BASE_STYLE: React.CSSProperties = Object.freeze({
     zIndex: 1,
 });
 
-const TOKEN_MARKER_STYLE: React.CSSProperties = Object.freeze({
+const TOKEN_MARKER_STYLE: CSSProperties = Object.freeze({
     ...TOKEN_BASE_STYLE,
     opacity: 0.82,
 });
 
-function readMaybeString(value: unknown): string | null {
+function readMaybeTrimmedString(value: unknown): string | null {
     if (typeof value !== "string") return null;
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : null;
+}
+
+function readRawString(value: unknown): string | null {
+    return typeof value === "string" ? value : null;
 }
 
 function readMaybeNumber(value: unknown): number | null {
@@ -130,17 +153,30 @@ function readMaybeNumber(value: unknown): number | null {
 }
 
 function readMaybeBool(value: unknown): boolean | null {
-    if (typeof value === "boolean") return value;
-    return null;
+    return typeof value === "boolean" ? value : null;
 }
 
 function getRecord(value: unknown): Record<string, unknown> {
     return value != null && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
-function getRowTranslationId(row: SliceVerse): string | null {
+function getBookDisplayName(book: BookRow | null, fallback: string): string {
+    if (!book) return fallback;
+
+    const record = getRecord(book);
+    return (
+        readMaybeTrimmedString(record.name) ??
+        readMaybeTrimmedString(record.title) ??
+        readMaybeTrimmedString(record.shortName) ??
+        readMaybeTrimmedString(record.short_name) ??
+        readMaybeTrimmedString(record.label) ??
+        fallback
+    );
+}
+
+function getRowBookId(row: SliceVerse): string {
     const record = getRecord(row);
-    return readMaybeString(record.translationId) ?? readMaybeString(record.translation_id) ?? null;
+    return readMaybeTrimmedString(record.bookId) ?? readMaybeTrimmedString(record.book_id) ?? row.bookId;
 }
 
 function getRowVerseOrd(row: SliceVerse): number {
@@ -151,10 +187,15 @@ function getRowVerseOrd(row: SliceVerse): number {
 function getRowVerseKey(row: SliceVerse): string {
     const record = getRecord(row);
     return (
-        readMaybeString(record.verseKey) ??
-        readMaybeString(record.verse_key) ??
-        `${row.bookId}.${row.chapter}.${row.verse}`
+        readMaybeTrimmedString(record.verseKey) ??
+        readMaybeTrimmedString(record.verse_key) ??
+        `${getRowBookId(row)}.${row.chapter}.${row.verse}`
     );
+}
+
+function getRowTranslationId(row: SliceVerse): string | null {
+    const record = getRecord(row);
+    return readMaybeTrimmedString(record.translationId) ?? readMaybeTrimmedString(record.translation_id) ?? null;
 }
 
 function getRowIsBookStart(row: SliceVerse): boolean {
@@ -175,6 +216,11 @@ function getRowIsChapterStart(row: SliceVerse): boolean {
     );
 }
 
+function getRowPlainText(row: SliceVerse): string {
+    const record = getRecord(row);
+    return readRawString(record.text) ?? row.text ?? "";
+}
+
 function getTokenIndex(token: SliceToken, fallback: number): number {
     const record = getRecord(token);
     return readMaybeNumber(record.tokenIndex) ?? readMaybeNumber(record.token_index) ?? fallback;
@@ -182,11 +228,7 @@ function getTokenIndex(token: SliceToken, fallback: number): number {
 
 function getTokenKind(token: SliceToken): TokenKind | undefined {
     const record = getRecord(token);
-    return (
-        readMaybeString(record.tokenKind) ??
-        readMaybeString(record.token_kind) ??
-        undefined
-    );
+    return readMaybeTrimmedString(record.tokenKind) ?? readMaybeTrimmedString(record.token_kind) ?? undefined;
 }
 
 function getTokenCharStart(token: SliceToken): number | undefined {
@@ -201,7 +243,7 @@ function getTokenCharEnd(token: SliceToken): number | undefined {
 
 function getTokenText(token: SliceToken): string {
     const record = getRecord(token);
-    return readMaybeString(record.token) ?? readMaybeString(record.text) ?? "";
+    return readRawString(record.token) ?? readRawString(record.text) ?? "";
 }
 
 function buildVerseAriaLabel(bookLabel: string, chapter: number, verse: number): string {
@@ -211,13 +253,20 @@ function buildVerseAriaLabel(bookLabel: string, chapter: number, verse: number):
 function normalizeTokens(tokens: readonly SliceToken[] | null | undefined): readonly TokenMeta[] | null {
     if (!tokens || tokens.length === 0) return null;
 
-    return tokens.map((token, index) => ({
-        tokenIndex: getTokenIndex(token, index),
-        tokenKind: getTokenKind(token),
-        charStart: getTokenCharStart(token),
-        charEnd: getTokenCharEnd(token),
-        text: getTokenText(token),
-    }));
+    return tokens.map((token, sourceIndex) => {
+        const tokenIndex = getTokenIndex(token, sourceIndex);
+        const text = getTokenText(token);
+
+        return {
+            key: `${tokenIndex}:${sourceIndex}:${text.length}`,
+            sourceIndex,
+            tokenIndex,
+            tokenKind: getTokenKind(token),
+            charStart: getTokenCharStart(token),
+            charEnd: getTokenCharEnd(token),
+            text,
+        };
+    });
 }
 
 function buildVerseTextPlain(row: SliceVerse, tokens: readonly TokenMeta[] | null): string {
@@ -225,24 +274,56 @@ function buildVerseTextPlain(row: SliceVerse, tokens: readonly TokenMeta[] | nul
         return tokens.map((token) => token.text).join("");
     }
 
-    return row.text ?? "";
+    return getRowPlainText(row);
 }
 
-function tokenStyleForKind(kind: TokenKind | undefined): React.CSSProperties {
-    if (kind === "MARKER") return TOKEN_MARKER_STYLE;
-    return TOKEN_BASE_STYLE;
+function tokenStyleForKind(kind: TokenKind | undefined): CSSProperties {
+    return kind === "MARKER" ? TOKEN_MARKER_STYLE : TOKEN_BASE_STYLE;
+}
+
+function buildVerseMeta(row: SliceVerse, book: BookRow | null): VerseMeta {
+    const verseOrd = getRowVerseOrd(row);
+    const verseKey = getRowVerseKey(row);
+    const translationId = getRowTranslationId(row);
+    const normalizedTokens = normalizeTokens(row.tokens ?? null);
+    const plainVerseText = buildVerseTextPlain(row, normalizedTokens);
+    const bookLabel = getBookDisplayName(book, getRowBookId(row));
+    const isBookStart = getRowIsBookStart(row);
+    const isChapterStart = getRowIsChapterStart(row);
+
+    return {
+        verseOrd,
+        verseKey,
+        translationId,
+        normalizedTokens,
+        plainVerseText,
+        hasTokens: !!normalizedTokens && normalizedTokens.length > 0,
+        isBookStart,
+        isChapterStart,
+        bookLabel,
+        ariaLabel: buildVerseAriaLabel(bookLabel, row.chapter, row.verse),
+        rootId: `verse-${verseOrd}`,
+        verseTextId: `verse-text-${verseOrd}`,
+        showBookTitlePage: isBookStart && !!book,
+        showChapterKick: !isBookStart && isChapterStart,
+        showInlineBookLabel: !isBookStart && isChapterStart && row.chapter > 1,
+    };
 }
 
 function renderTokenSpan(
     token: TokenMeta,
-    verseKey: string,
-    translationId: string | null,
-): React.ReactNode {
+    meta: VerseMeta,
+    row: SliceVerse,
+): ReactNode {
     return (
         <span
-            key={token.tokenIndex}
-            data-verse-key={verseKey}
-            data-translation-id={translationId ?? undefined}
+            key={token.key}
+            data-verse-key={meta.verseKey}
+            data-verse-ord={meta.verseOrd}
+            data-book-id={getRowBookId(row)}
+            data-chapter={row.chapter}
+            data-verse={row.verse}
+            data-translation-id={meta.translationId ?? undefined}
             data-token-index={token.tokenIndex}
             data-token-kind={token.tokenKind ?? undefined}
             data-token-char-start={token.charStart ?? undefined}
@@ -254,50 +335,28 @@ function renderTokenSpan(
     );
 }
 
-export const VerseRow = React.memo(function VerseRow(props: Props) {
+function VerseRowInner(props: Props) {
     const { row, book } = props;
     const annotations = props.annotations ?? EMPTY_ANNOTATIONS;
 
-    const meta = useMemo<VerseMeta>(() => {
-        const verseOrd = getRowVerseOrd(row);
-        const verseKey = getRowVerseKey(row);
-        const translationId = getRowTranslationId(row);
-        const normalizedTokens = normalizeTokens(row.tokens ?? null);
-        const plainVerseText = buildVerseTextPlain(row, normalizedTokens);
-        const bookLabel = book?.name ?? row.bookId;
-        const isBookStart = getRowIsBookStart(row);
-        const isChapterStart = getRowIsChapterStart(row);
-
-        return {
-            verseOrd,
-            verseKey,
-            translationId,
-            normalizedTokens,
-            plainVerseText,
-            hasTokens: !!normalizedTokens && normalizedTokens.length > 0,
-            isBookStart,
-            isChapterStart,
-            bookLabel,
-            ariaLabel: buildVerseAriaLabel(bookLabel, row.chapter, row.verse),
-            rootId: `verse-${verseOrd}`,
-            verseTextId: `verse-text-${verseOrd}`,
-        };
-    }, [book, row]);
+    const meta = useMemo(() => buildVerseMeta(row, book), [book, row]);
 
     return (
         <article
             id={meta.rootId}
             data-verse-key={meta.verseKey}
             data-verse-ord={meta.verseOrd}
-            data-book-id={row.bookId}
+            data-book-id={getRowBookId(row)}
             data-chapter={row.chapter}
             data-verse={row.verse}
+            data-translation-id={meta.translationId ?? undefined}
             aria-label={meta.ariaLabel}
+            aria-labelledby={meta.verseTextId}
             style={ROW_WRAP_STYLE}
         >
-            {meta.isBookStart && book ? (
+            {meta.showBookTitlePage ? (
                 <div style={BOOK_HEADING_WRAP_STYLE}>
-                    <BookTitlePage book={book} bookId={row.bookId} />
+                    <BookTitlePage book={book} bookId={getRowBookId(row)} />
                 </div>
             ) : null}
 
@@ -312,38 +371,53 @@ export const VerseRow = React.memo(function VerseRow(props: Props) {
                     id={meta.verseTextId}
                     data-verse-key={meta.verseKey}
                     data-verse-ord={meta.verseOrd}
+                    data-book-id={getRowBookId(row)}
+                    data-chapter={row.chapter}
+                    data-verse={row.verse}
                     data-translation-id={meta.translationId ?? undefined}
                     style={TEXT_ROW_STYLE}
+                    dir="auto"
                 >
-                    {!meta.isBookStart && meta.isChapterStart ? (
+                    {meta.showChapterKick ? (
                         <span aria-hidden="true" style={CHAPTER_KICK_STYLE}>
                             {row.chapter}
                         </span>
                     ) : null}
 
-                    {!meta.isBookStart && row.verse === 1 && row.chapter > 1 ? (
+                    {meta.showInlineBookLabel ? (
                         <span aria-hidden="true" style={INLINE_BOOK_LABEL_STYLE}>
-                            {book?.name ?? row.bookId}
+                            {meta.bookLabel}
                         </span>
                     ) : null}
 
-                    {meta.hasTokens
-                        ? meta.normalizedTokens!.map((token) =>
-                            renderTokenSpan(token, meta.verseKey, meta.translationId),
-                        )
-                        : (
-                            <span
-                                data-verse-key={meta.verseKey}
-                                data-translation-id={meta.translationId ?? undefined}
-                                style={TOKEN_BASE_STYLE}
-                            >
-                                {meta.plainVerseText}
-                            </span>
-                        )}
+                    {meta.hasTokens ? (
+                        meta.normalizedTokens!.map((token) => renderTokenSpan(token, meta, row))
+                    ) : (
+                        <span
+                            data-verse-key={meta.verseKey}
+                            data-verse-ord={meta.verseOrd}
+                            data-book-id={getRowBookId(row)}
+                            data-chapter={row.chapter}
+                            data-verse={row.verse}
+                            data-translation-id={meta.translationId ?? undefined}
+                            style={TOKEN_BASE_STYLE}
+                        >
+                            {meta.plainVerseText}
+                        </span>
+                    )}
                 </div>
             </div>
         </article>
     );
-});
+}
 
+function areEqual(prev: Props, next: Props): boolean {
+    return (
+        prev.row === next.row &&
+        prev.book === next.book &&
+        prev.annotations === next.annotations
+    );
+}
+
+export const VerseRow = memo(VerseRowInner, areEqual);
 VerseRow.displayName = "VerseRow";

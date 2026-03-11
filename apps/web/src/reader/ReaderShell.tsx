@@ -22,6 +22,10 @@ type SpineValidation =
     | { ok: true }
     | { ok: false; msg: string };
 
+type ShellState = "loading" | "ready" | "fatal";
+
+type BannerTone = "info" | "error";
+
 type Props = Readonly<{
     styles: Record<string, CSSProperties>;
     books: BookRow[] | null;
@@ -59,24 +63,43 @@ const MEASURE_WRAP_STYLE: CSSProperties = Object.freeze({
     minWidth: 0,
 });
 
-const ERR_BANNER_OUTER_STYLE: CSSProperties = Object.freeze({
+const BANNER_OUTER_BASE_STYLE: CSSProperties = Object.freeze({
     borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
+});
+
+const BANNER_OUTER_INFO_STYLE: CSSProperties = Object.freeze({
     background: "color-mix(in oklab, var(--bg) 94%, var(--panel))",
 });
 
-const ERR_BANNER_INNER_STYLE: CSSProperties = Object.freeze({
+const BANNER_OUTER_ERROR_STYLE: CSSProperties = Object.freeze({
+    background: "color-mix(in oklab, var(--bg) 86%, var(--panel))",
+});
+
+const BANNER_INNER_STYLE: CSSProperties = Object.freeze({
     paddingBlock: 9,
 });
 
-const ERR_TEXT_STYLE: CSSProperties = Object.freeze({
+const BANNER_TEXT_INFO_STYLE: CSSProperties = Object.freeze({
     fontSize: 12,
     color: "var(--muted)",
+    whiteSpace: "pre-wrap",
+});
+
+const BANNER_TEXT_ERROR_STYLE: CSSProperties = Object.freeze({
+    fontSize: 12,
+    color: "var(--fg)",
     whiteSpace: "pre-wrap",
 });
 
 const LOADING_TEXT_STYLE: CSSProperties = Object.freeze({
     ...sx.msg,
     paddingTop: 22,
+});
+
+const FATAL_BODY_STYLE: CSSProperties = Object.freeze({
+    ...sx.msg,
+    paddingTop: 22,
+    color: "var(--muted)",
 });
 
 function isFiniteIntegerLike(value: unknown): value is number {
@@ -134,16 +157,41 @@ function buildViewportKey(spine: SpineStats | null): string {
     return `${spine.verseOrdMin}:${spine.verseOrdMax}:${spine.verseCount}`;
 }
 
+function deriveShellState(spine: SpineStats | null, spineCheck: SpineValidation, err: string | null | undefined): ShellState {
+    if (!spine && !err) return "loading";
+    if (!spine) return "fatal";
+    if (!spineCheck.ok) return "fatal";
+    return "ready";
+}
+
 const MeasureWrap = memo(function MeasureWrap(props: Readonly<{ children: ReactNode }>) {
     return <div style={MEASURE_WRAP_STYLE}>{props.children}</div>;
 });
 
-const ErrBanner = memo(function ErrBanner(props: Readonly<{ msg: string }>) {
+const Banner = memo(function Banner(
+    props: Readonly<{
+        msg: string;
+        tone: BannerTone;
+        assertive?: boolean;
+    }>,
+) {
+    const outerStyle =
+        props.tone === "error"
+            ? { ...BANNER_OUTER_BASE_STYLE, ...BANNER_OUTER_ERROR_STYLE }
+            : { ...BANNER_OUTER_BASE_STYLE, ...BANNER_OUTER_INFO_STYLE };
+
+    const textStyle =
+        props.tone === "error" ? BANNER_TEXT_ERROR_STYLE : BANNER_TEXT_INFO_STYLE;
+
     return (
-        <div role="status" aria-live="polite" style={ERR_BANNER_OUTER_STYLE}>
+        <div
+            role={props.assertive ? "alert" : "status"}
+            aria-live={props.assertive ? "assertive" : "polite"}
+            style={outerStyle}
+        >
             <MeasureWrap>
-                <div style={ERR_BANNER_INNER_STYLE}>
-                    <div style={ERR_TEXT_STYLE}>{props.msg}</div>
+                <div style={BANNER_INNER_STYLE}>
+                    <div style={textStyle}>{props.msg}</div>
                 </div>
             </MeasureWrap>
         </div>
@@ -162,7 +210,19 @@ const LoadingBody = memo(function LoadingBody(props: Readonly<{ msg?: string | n
     );
 });
 
-export function ReaderShell(props: Props) {
+const FatalBody = memo(function FatalBody(props: Readonly<{ msg?: string | null }>) {
+    return (
+        <div style={sx.body}>
+            <MeasureWrap>
+                <div style={FATAL_BODY_STYLE} role="alert" aria-live="assertive">
+                    {props.msg ?? "Reader unavailable."}
+                </div>
+            </MeasureWrap>
+        </div>
+    );
+});
+
+function ReaderShellInner(props: Props) {
     const {
         styles,
         books,
@@ -185,8 +245,12 @@ export function ReaderShell(props: Props) {
     } = props;
 
     const spineCheck = useMemo(() => validateSpine(spine), [spine]);
-    const hasValidSpine = spineCheck.ok;
     const viewportKey = useMemo(() => buildViewportKey(spine), [spine]);
+
+    const shellState = useMemo(
+        () => deriveShellState(spine, spineCheck, err),
+        [err, spine, spineCheck],
+    );
 
     const bannerMsg = useMemo(() => {
         if (err) return err;
@@ -194,6 +258,17 @@ export function ReaderShell(props: Props) {
         if (!spineCheck.ok) return spineCheck.msg;
         return null;
     }, [err, spine, spineCheck]);
+
+    const bannerTone: BannerTone = shellState === "fatal" ? "error" : "info";
+    const showViewport = shellState === "ready" && !!spine && spineCheck.ok;
+
+    const bodyMessage = useMemo(() => {
+        if (shellState === "loading") return "Loading…";
+        if (shellState === "fatal") {
+            return bannerMsg ?? "Reader unavailable.";
+        }
+        return null;
+    }, [bannerMsg, shellState]);
 
     const reportedErrorRef = useRef<string | null>(null);
 
@@ -210,15 +285,12 @@ export function ReaderShell(props: Props) {
         onError(bannerMsg);
     }, [bannerMsg, onError]);
 
-    const isLoading = !spine && !err;
-    const hasFatalError = !!bannerMsg && (!spine || !hasValidSpine || !!err);
-
     return (
         <main
             style={sx.page}
-            aria-busy={isLoading}
-            aria-live="polite"
+            aria-busy={shellState === "loading"}
             data-reader-shell="1"
+            data-reader-shell-state={shellState}
         >
             <ReaderHeader
                 styles={styles}
@@ -231,9 +303,15 @@ export function ReaderShell(props: Props) {
                 onToggleTheme={onToggleTheme}
             />
 
-            {bannerMsg ? <ErrBanner msg={bannerMsg} /> : null}
+            {bannerMsg ? (
+                <Banner
+                    msg={bannerMsg}
+                    tone={bannerTone}
+                    assertive={shellState === "fatal"}
+                />
+            ) : null}
 
-            {hasValidSpine && spine ? (
+            {showViewport && spine ? (
                 <ReaderViewport
                     key={viewportKey}
                     ref={viewportRef ?? null}
@@ -246,9 +324,14 @@ export function ReaderShell(props: Props) {
                     onError={onError}
                     onReady={onReady}
                 />
+            ) : shellState === "fatal" ? (
+                <FatalBody msg={bodyMessage} />
             ) : (
-                <LoadingBody msg={hasFatalError ? undefined : "Loading…"} />
+                <LoadingBody msg={bodyMessage} />
             )}
         </main>
     );
 }
+
+export const ReaderShell = memo(ReaderShellInner);
+ReaderShell.displayName = "ReaderShell";

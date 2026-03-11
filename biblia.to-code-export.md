@@ -1,11 +1,11 @@
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-10T19:05:59.812Z
+Generated: 2026-03-11T16:53:48.067Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
 Total files: 70
-Total raw bytes (all included files): 2192917
+Total raw bytes (all included files): 2208710
 Truncated/skipped files: 1
-Export time: 22ms
+Export time: 65ms
 
 ## Notes
 
@@ -21049,6 +21049,7 @@ const sx: Record<string, React.CSSProperties> = {
 ### apps/web/src/Reader.tsx
 
 ```tsx
+// apps/web/src/Reader.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiGetBooks, apiGetSpine, apiResolveLoc, type BookRow } from "./api";
 import type { ReaderLocation } from "./Search";
@@ -21072,11 +21073,12 @@ type ScrollMode = "auto" | "smooth";
 
 const LS_LAST_ORD = "bp_last_pos_ord_v1";
 const LS_LAST_LOC = "bp_last_pos_loc_v1";
+
 const POSITION_SAVE_DEBOUNCE_MS = 220;
 const PROGRAMMATIC_JUMP_SETTLE_MS = 1200;
 const PROGRAMMATIC_JUMP_ORD_TOLERANCE = 1;
 
-type PendingJump = Readonly<{
+type QueuedJump = Readonly<{
     ord: number;
     behavior: ScrollMode;
     token: number;
@@ -21135,11 +21137,6 @@ function safeJsonStringify(value: unknown): string | null {
     }
 }
 
-function clampOrd(ord: number, spine: SpineStats): number {
-    const n = Math.trunc(ord);
-    return Math.max(spine.verseOrdMin, Math.min(spine.verseOrdMax, n));
-}
-
 function parseFiniteInt(value: string | null): number | null {
     if (!value) return null;
     const n = Number(value);
@@ -21149,6 +21146,11 @@ function parseFiniteInt(value: string | null): number | null {
 
 function normalizeBookId(value: string): string {
     return value.trim().toUpperCase();
+}
+
+function clampOrd(ord: number, spine: SpineStats): number {
+    const n = Math.trunc(ord);
+    return Math.max(spine.verseOrdMin, Math.min(spine.verseOrdMax, n));
 }
 
 function normalizeLocationInput(loc: ReaderLocation): StoredLocation | null {
@@ -21181,7 +21183,10 @@ function isStoredLocation(value: unknown): value is StoredLocation {
 
     if (typeof v.bookId !== "string" || v.bookId.trim() === "") return false;
     if (typeof v.chapter !== "number" || !Number.isFinite(v.chapter) || v.chapter < 1) return false;
-    if (v.verse !== null && (typeof v.verse !== "number" || !Number.isFinite(v.verse) || v.verse < 1)) {
+    if (
+        v.verse !== null &&
+        (typeof v.verse !== "number" || !Number.isFinite(v.verse) || v.verse < 1)
+    ) {
         return false;
     }
 
@@ -21259,7 +21264,7 @@ export function Reader(props: Props) {
     const viewportHandleRef = useRef<ReaderViewportHandle | null>(null);
     const selectionRootRef = useRef<HTMLDivElement | null>(null);
 
-    const pendingJumpRef = useRef<PendingJump | null>(null);
+    const queuedJumpRef = useRef<QueuedJump | null>(null);
     const didRestoreRef = useRef(false);
     const appliedInitialKeyRef = useRef("");
     const loadSeqRef = useRef(0);
@@ -21268,12 +21273,23 @@ export function Reader(props: Props) {
 
     const activeJumpSessionRef = useRef<JumpSession | null>(null);
 
-    const lastResolvedLocKeyRef = useRef("");
+    const skipNextPersistedLocKeyRef = useRef<string | null>(null);
     const lastSavedLocJsonRef = useRef<string | null>(safeGetLS(LS_LAST_LOC));
     const lastSavedOrdRef = useRef<string | null>(safeGetLS(LS_LAST_ORD));
     const savePositionTimerRef = useRef<number | null>(null);
 
     const annotations = useReaderAnnotations(selectionRootRef);
+
+    const clearSaveTimer = useCallback(() => {
+        if (savePositionTimerRef.current != null && typeof window !== "undefined") {
+            window.clearTimeout(savePositionTimerRef.current);
+            savePositionTimerRef.current = null;
+        }
+    }, []);
+
+    const setError = useCallback((message: string | null) => {
+        setErr((prev) => (prev === message ? prev : message));
+    }, []);
 
     useEffect(() => {
         applyReaderTypographyFromStorage();
@@ -21281,17 +21297,25 @@ export function Reader(props: Props) {
 
     useEffect(() => {
         return () => {
-            if (savePositionTimerRef.current != null && typeof window !== "undefined") {
-                window.clearTimeout(savePositionTimerRef.current);
-                savePositionTimerRef.current = null;
-            }
+            clearSaveTimer();
         };
-    }, []);
+    }, [clearSaveTimer]);
 
     useEffect(() => {
         setViewportReady(false);
-        pendingJumpRef.current = null;
+        queuedJumpRef.current = null;
         activeJumpSessionRef.current = null;
+        skipNextPersistedLocKeyRef.current = null;
+
+        if (spine) {
+            setPos({
+                ord: spine.verseOrdMin,
+                verse: null,
+                book: null,
+            });
+        } else {
+            setPos(INITIAL_POSITION);
+        }
     }, [spine?.verseOrdMin, spine?.verseOrdMax, spine?.verseCount]);
 
     useEffect(() => {
@@ -21300,30 +21324,34 @@ export function Reader(props: Props) {
 
         (async () => {
             try {
-                setErr(null);
+                setError(null);
 
                 const [bookRes, spineRes] = await Promise.all([apiGetBooks(), apiGetSpine()]);
                 if (cancelled || seq !== loadSeqRef.current) return;
 
-                setBooks(bookRes.books);
+                setBooks(Array.isArray(bookRes.books) ? [...bookRes.books] : []);
                 setSpine(spineRes);
             } catch (e: unknown) {
                 if (cancelled || seq !== loadSeqRef.current) return;
-                const msg = e instanceof Error ? e.message : String(e);
-                setErr(msg);
+
+                const message = e instanceof Error ? e.message : String(e);
+                setError(message);
             }
         })();
 
         return () => {
             cancelled = true;
         };
-    }, []);
+    }, [setError]);
 
     const bookById = useMemo(() => {
         const map = new Map<string, BookRow>();
+
         for (const book of books ?? []) {
             map.set(book.bookId, book);
+            map.set(normalizeBookId(book.bookId), book);
         }
+
         return map;
     }, [books]);
 
@@ -21357,24 +21385,6 @@ export function Reader(props: Props) {
         activeJumpSessionRef.current = null;
     }, []);
 
-    const dispatchJumpToOrd = useCallback(
-        (ord: number, behavior: ScrollMode, targetLocKey: string | null) => {
-            if (!spine) return;
-
-            const clamped = clampOrd(ord, spine);
-            const token = beginJumpSession(clamped, targetLocKey);
-            const handle = viewportHandleRef.current;
-
-            if (handle && viewportReady) {
-                handle.jumpToOrd(clamped, behavior);
-                return;
-            }
-
-            pendingJumpRef.current = { ord: clamped, behavior, token };
-        },
-        [beginJumpSession, spine, viewportReady],
-    );
-
     const persistLocation = useCallback((stored: StoredLocation) => {
         const json = safeJsonStringify(stored);
         if (!json) return;
@@ -21392,18 +21402,40 @@ export function Reader(props: Props) {
         safeSetLS(LS_LAST_ORD, next);
     }, []);
 
+    const dispatchJumpToOrd = useCallback(
+        (ord: number, behavior: ScrollMode, targetLocKey: string | null) => {
+            if (!spine) return;
+
+            const clamped = clampOrd(ord, spine);
+            const token = beginJumpSession(clamped, targetLocKey);
+            const handle = viewportHandleRef.current;
+
+            if (handle && viewportReady) {
+                queuedJumpRef.current = null;
+                handle.jumpToOrd(clamped, behavior);
+                return;
+            }
+
+            queuedJumpRef.current = {
+                ord: clamped,
+                behavior,
+                token,
+            };
+        },
+        [beginJumpSession, spine, viewportReady],
+    );
+
     const resolveAndJump = useCallback(
         async (bookId: string, chapter: number, verse: number | null, behavior: ScrollMode) => {
             const stored = makeStoredLocation(bookId, chapter, verse);
             if (!stored) return;
 
-            const locKey = makeStoredLocationKey(stored);
-            lastResolvedLocKeyRef.current = locKey;
-
+            skipNextPersistedLocKeyRef.current = null;
             annotations.clearSelection();
-            setErr(null);
+            setError(null);
 
             const seq = ++resolveSeqRef.current;
+            const locKey = makeStoredLocationKey(stored);
 
             try {
                 const loc = await apiResolveLoc(stored.bookId, stored.chapter, stored.verse);
@@ -21415,23 +21447,26 @@ export function Reader(props: Props) {
                         : null;
 
                 if (verseOrd == null) {
-                    setErr("Could not resolve that passage.");
+                    setError("Could not resolve that passage.");
                     return;
                 }
 
                 persistLocation(stored);
+                skipNextPersistedLocKeyRef.current = locKey;
 
-                // Important:
-                // for resolved location jumps, use auto.
-                // smooth fights the viewport correction logic.
-                dispatchJumpToOrd(verseOrd, behavior === "smooth" ? "auto" : behavior, locKey);
+                dispatchJumpToOrd(
+                    verseOrd,
+                    behavior === "smooth" ? "auto" : behavior,
+                    locKey,
+                );
             } catch (e: unknown) {
                 if (seq !== resolveSeqRef.current) return;
-                const msg = e instanceof Error ? e.message : String(e);
-                setErr(msg);
+
+                const message = e instanceof Error ? e.message : String(e);
+                setError(message);
             }
         },
-        [annotations, dispatchJumpToOrd, persistLocation],
+        [annotations, dispatchJumpToOrd, persistLocation, setError],
     );
 
     useEffect(() => {
@@ -21450,7 +21485,7 @@ export function Reader(props: Props) {
             initialLocation.verse ?? null,
             "auto",
         );
-    }, [spine, initialLocation, resolveAndJump]);
+    }, [initialLocation, resolveAndJump, spine]);
 
     useEffect(() => {
         if (!spine) return;
@@ -21469,17 +21504,23 @@ export function Reader(props: Props) {
         if (ordRaw == null) return;
 
         dispatchJumpToOrd(ordRaw, "auto", null);
-    }, [spine, initialLocation, dispatchJumpToOrd, resolveAndJump]);
+    }, [dispatchJumpToOrd, initialLocation, resolveAndJump, spine]);
 
     useEffect(() => {
         if (!viewportReady) return;
 
         const handle = viewportHandleRef.current;
-        const pending = pendingJumpRef.current;
-        if (!handle || !pending) return;
+        const queued = queuedJumpRef.current;
+        if (!handle || !queued) return;
 
-        pendingJumpRef.current = null;
-        handle.jumpToOrd(pending.ord, pending.behavior);
+        const session = activeJumpSessionRef.current;
+        if (session && session.token !== queued.token) {
+            queuedJumpRef.current = null;
+            return;
+        }
+
+        queuedJumpRef.current = null;
+        handle.jumpToOrd(queued.ord, queued.behavior);
     }, [viewportReady]);
 
     useEffect(() => {
@@ -21501,23 +21542,16 @@ export function Reader(props: Props) {
 
         const nextOrd = clampOrd(pos.ord, spine);
 
-        if (savePositionTimerRef.current != null) {
-            window.clearTimeout(savePositionTimerRef.current);
-            savePositionTimerRef.current = null;
-        }
-
+        clearSaveTimer();
         savePositionTimerRef.current = window.setTimeout(() => {
             persistOrd(nextOrd, spine);
             savePositionTimerRef.current = null;
         }, POSITION_SAVE_DEBOUNCE_MS);
 
         return () => {
-            if (savePositionTimerRef.current != null) {
-                window.clearTimeout(savePositionTimerRef.current);
-                savePositionTimerRef.current = null;
-            }
+            clearSaveTimer();
         };
-    }, [clearJumpSession, persistOrd, pos.ord, spine]);
+    }, [clearJumpSession, clearSaveTimer, persistOrd, pos.ord, spine]);
 
     useEffect(() => {
         if (!pos.verse) return;
@@ -21538,7 +21572,10 @@ export function Reader(props: Props) {
         if (!stored) return;
 
         const key = makeStoredLocationKey(stored);
-        if (lastResolvedLocKeyRef.current === key) return;
+        if (skipNextPersistedLocKeyRef.current === key) {
+            skipNextPersistedLocKeyRef.current = null;
+            return;
+        }
 
         persistLocation(stored);
     }, [clearJumpSession, persistLocation, pos.ord, pos.verse]);
@@ -21547,35 +21584,60 @@ export function Reader(props: Props) {
         setViewportReady(true);
     }, []);
 
-    const handleError = useCallback((message: string) => {
-        setErr(message);
-    }, []);
+    const handleError = useCallback(
+        (message: string) => {
+            setError(message);
+        },
+        [setError],
+    );
 
-    const handlePosition = useCallback((next: ReaderPosition) => {
-        const session = activeJumpSessionRef.current;
+    const handlePosition = useCallback(
+        (next: ReaderPosition) => {
+            const session = activeJumpSessionRef.current;
 
-        if (session) {
-            const elapsed = nowMs() - session.startedAt;
-            const landed = ordNear(next.ord, session.targetOrd);
+            if (session) {
+                const elapsed = nowMs() - session.startedAt;
+                const landed = ordNear(next.ord, session.targetOrd);
 
-            if (!landed && elapsed <= PROGRAMMATIC_JUMP_SETTLE_MS) {
-                return;
+                if (!landed && elapsed <= PROGRAMMATIC_JUMP_SETTLE_MS) {
+                    return;
+                }
+
+                clearJumpSession(session.token);
             }
 
-            clearJumpSession(session.token);
-        }
+            setPos((prev) => {
+                const nextVerse =
+                    next.verse ??
+                    (prev.ord === next.ord ? prev.verse ?? null : null);
 
-        setPos((prev) => {
-            if (
-                prev.ord === next.ord &&
-                sameVerse(prev.verse, next.verse) &&
-                sameBook(prev.book, next.book)
-            ) {
-                return prev;
-            }
-            return next;
-        });
-    }, [clearJumpSession]);
+                const nextBook =
+                    next.book ??
+                    (nextVerse
+                        ? (bookById.get(nextVerse.bookId) ??
+                            bookById.get(normalizeBookId(nextVerse.bookId)) ??
+                            null)
+                        : prev.ord === next.ord
+                            ? prev.book ?? null
+                            : null);
+
+                if (
+                    prev.ord === next.ord &&
+                    sameVerse(prev.verse, nextVerse) &&
+                    sameBook(prev.book, nextBook)
+                ) {
+                    return prev;
+                }
+
+                return {
+                    ord: next.ord,
+                    verse: nextVerse,
+                    book: nextBook,
+                };
+            });
+        },
+        [bookById, clearJumpSession],
+    );
 
     const handleJumpRef = useCallback(
         (bookId: string, chapter: number, verse: number | null) => {
@@ -24377,6 +24439,10 @@ type SpineValidation =
     | { ok: true }
     | { ok: false; msg: string };
 
+type ShellState = "loading" | "ready" | "fatal";
+
+type BannerTone = "info" | "error";
+
 type Props = Readonly<{
     styles: Record<string, CSSProperties>;
     books: BookRow[] | null;
@@ -24405,11 +24471,6 @@ type Props = Readonly<{
     err?: string | null;
 }>;
 
-type ViewportMountState = Readonly<{
-    shouldMount: boolean;
-    reason: "ready" | "loading" | "fatal";
-}>;
-
 const MEASURE_WRAP_STYLE: CSSProperties = Object.freeze({
     maxWidth: "var(--bpReaderMeasure, 840px)",
     marginInline: "auto",
@@ -24419,41 +24480,43 @@ const MEASURE_WRAP_STYLE: CSSProperties = Object.freeze({
     minWidth: 0,
 });
 
-const VIEWPORT_HOST_STYLE: CSSProperties = Object.freeze({
-    position: "relative",
-    flex: "1 1 auto",
-    minHeight: 0,
-    minWidth: 0,
-    width: "100%",
-});
-
-const ERR_BANNER_OUTER_STYLE: CSSProperties = Object.freeze({
+const BANNER_OUTER_BASE_STYLE: CSSProperties = Object.freeze({
     borderBottom: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
-    background: "color-mix(in oklab, var(--bg) 94%, var(--panel))",
-    flex: "0 0 auto",
 });
 
-const ERR_BANNER_INNER_STYLE: CSSProperties = Object.freeze({
+const BANNER_OUTER_INFO_STYLE: CSSProperties = Object.freeze({
+    background: "color-mix(in oklab, var(--bg) 94%, var(--panel))",
+});
+
+const BANNER_OUTER_ERROR_STYLE: CSSProperties = Object.freeze({
+    background: "color-mix(in oklab, var(--bg) 86%, var(--panel))",
+});
+
+const BANNER_INNER_STYLE: CSSProperties = Object.freeze({
     paddingBlock: 9,
 });
 
-const ERR_TEXT_STYLE: CSSProperties = Object.freeze({
+const BANNER_TEXT_INFO_STYLE: CSSProperties = Object.freeze({
     fontSize: 12,
     color: "var(--muted)",
     whiteSpace: "pre-wrap",
 });
 
-const LOADING_STAGE_STYLE: CSSProperties = Object.freeze({
-    ...sx.body,
-    display: "flex",
-    alignItems: "flex-start",
-    minHeight: 0,
-    flex: "1 1 auto",
+const BANNER_TEXT_ERROR_STYLE: CSSProperties = Object.freeze({
+    fontSize: 12,
+    color: "var(--fg)",
+    whiteSpace: "pre-wrap",
 });
 
 const LOADING_TEXT_STYLE: CSSProperties = Object.freeze({
     ...sx.msg,
     paddingTop: 22,
+});
+
+const FATAL_BODY_STYLE: CSSProperties = Object.freeze({
+    ...sx.msg,
+    paddingTop: 22,
+    color: "var(--muted)",
 });
 
 function isFiniteIntegerLike(value: unknown): value is number {
@@ -24511,47 +24574,41 @@ function buildViewportKey(spine: SpineStats | null): string {
     return `${spine.verseOrdMin}:${spine.verseOrdMax}:${spine.verseCount}`;
 }
 
-function buildBannerMsg(
-    err: string | null | undefined,
-    spine: SpineStats | null,
-    spineCheck: SpineValidation,
-): string | null {
-    if (err) return err;
-    if (!spine) return null;
-    if (!spineCheck.ok) return spineCheck.msg;
-    return null;
-}
-
-function deriveViewportMountState(
-    spine: SpineStats | null,
-    spineCheck: SpineValidation,
-    err: string | null | undefined,
-): ViewportMountState {
-    if (err) {
-        return { shouldMount: false, reason: "fatal" };
-    }
-
-    if (!spine) {
-        return { shouldMount: false, reason: "loading" };
-    }
-
-    if (!spineCheck.ok) {
-        return { shouldMount: false, reason: "fatal" };
-    }
-
-    return { shouldMount: true, reason: "ready" };
+function deriveShellState(spine: SpineStats | null, spineCheck: SpineValidation, err: string | null | undefined): ShellState {
+    if (!spine && !err) return "loading";
+    if (!spine) return "fatal";
+    if (!spineCheck.ok) return "fatal";
+    return "ready";
 }
 
 const MeasureWrap = memo(function MeasureWrap(props: Readonly<{ children: ReactNode }>) {
     return <div style={MEASURE_WRAP_STYLE}>{props.children}</div>;
 });
 
-const ErrBanner = memo(function ErrBanner(props: Readonly<{ msg: string }>) {
+const Banner = memo(function Banner(
+    props: Readonly<{
+        msg: string;
+        tone: BannerTone;
+        assertive?: boolean;
+    }>,
+) {
+    const outerStyle =
+        props.tone === "error"
+            ? { ...BANNER_OUTER_BASE_STYLE, ...BANNER_OUTER_ERROR_STYLE }
+            : { ...BANNER_OUTER_BASE_STYLE, ...BANNER_OUTER_INFO_STYLE };
+
+    const textStyle =
+        props.tone === "error" ? BANNER_TEXT_ERROR_STYLE : BANNER_TEXT_INFO_STYLE;
+
     return (
-        <div role="status" aria-live="polite" style={ERR_BANNER_OUTER_STYLE}>
+        <div
+            role={props.assertive ? "alert" : "status"}
+            aria-live={props.assertive ? "assertive" : "polite"}
+            style={outerStyle}
+        >
             <MeasureWrap>
-                <div style={ERR_BANNER_INNER_STYLE}>
-                    <div style={ERR_TEXT_STYLE}>{props.msg}</div>
+                <div style={BANNER_INNER_STYLE}>
+                    <div style={textStyle}>{props.msg}</div>
                 </div>
             </MeasureWrap>
         </div>
@@ -24560,7 +24617,7 @@ const ErrBanner = memo(function ErrBanner(props: Readonly<{ msg: string }>) {
 
 const LoadingBody = memo(function LoadingBody(props: Readonly<{ msg?: string | null }>) {
     return (
-        <div style={LOADING_STAGE_STYLE}>
+        <div style={sx.body}>
             <MeasureWrap>
                 <div style={LOADING_TEXT_STYLE} role="status" aria-live="polite">
                     {props.msg ?? "Loading…"}
@@ -24570,52 +24627,19 @@ const LoadingBody = memo(function LoadingBody(props: Readonly<{ msg?: string | n
     );
 });
 
-const ViewportHost = memo(function ViewportHost(
-    props: Readonly<{
-        viewportKey: string;
-        viewportRef?: Ref<ReaderViewportHandle> | null;
-        spine: SpineStats;
-        bookById: Map<string, BookRow>;
-        selectionRootRef?: MutableRefObject<HTMLDivElement | null> | null;
-        annotationSnapshot?: AnnotationSnapshot | null;
-        topContent?: ReactNode;
-        onPosition: (pos: ReaderPosition) => void;
-        onError?: (msg: string) => void;
-        onReady?: () => void;
-    }>,
-) {
-    const {
-        viewportKey,
-        viewportRef,
-        spine,
-        bookById,
-        selectionRootRef,
-        annotationSnapshot,
-        topContent,
-        onPosition,
-        onError,
-        onReady,
-    } = props;
-
+const FatalBody = memo(function FatalBody(props: Readonly<{ msg?: string | null }>) {
     return (
-        <div style={VIEWPORT_HOST_STYLE}>
-            <ReaderViewport
-                key={viewportKey}
-                ref={viewportRef ?? null}
-                spine={spine}
-                bookById={bookById}
-                selectionRootRef={selectionRootRef ?? null}
-                annotationSnapshot={annotationSnapshot ?? null}
-                topContent={topContent ?? null}
-                onPosition={onPosition}
-                onError={onError}
-                onReady={onReady}
-            />
+        <div style={sx.body}>
+            <MeasureWrap>
+                <div style={FATAL_BODY_STYLE} role="alert" aria-live="assertive">
+                    {props.msg ?? "Reader unavailable."}
+                </div>
+            </MeasureWrap>
         </div>
     );
 });
 
-export function ReaderShell(props: Props) {
+function ReaderShellInner(props: Props) {
     const {
         styles,
         books,
@@ -24638,16 +24662,30 @@ export function ReaderShell(props: Props) {
     } = props;
 
     const spineCheck = useMemo(() => validateSpine(spine), [spine]);
-    const viewportMount = useMemo(
-        () => deriveViewportMountState(spine, spineCheck, err),
-        [err, spine, spineCheck],
-    );
     const viewportKey = useMemo(() => buildViewportKey(spine), [spine]);
 
-    const bannerMsg = useMemo(
-        () => buildBannerMsg(err, spine, spineCheck),
+    const shellState = useMemo(
+        () => deriveShellState(spine, spineCheck, err),
         [err, spine, spineCheck],
     );
+
+    const bannerMsg = useMemo(() => {
+        if (err) return err;
+        if (!spine) return null;
+        if (!spineCheck.ok) return spineCheck.msg;
+        return null;
+    }, [err, spine, spineCheck]);
+
+    const bannerTone: BannerTone = shellState === "fatal" ? "error" : "info";
+    const showViewport = shellState === "ready" && !!spine && spineCheck.ok;
+
+    const bodyMessage = useMemo(() => {
+        if (shellState === "loading") return "Loading…";
+        if (shellState === "fatal") {
+            return bannerMsg ?? "Reader unavailable.";
+        }
+        return null;
+    }, [bannerMsg, shellState]);
 
     const reportedErrorRef = useRef<string | null>(null);
 
@@ -24667,8 +24705,9 @@ export function ReaderShell(props: Props) {
     return (
         <main
             style={sx.page}
-            aria-busy={viewportMount.reason === "loading"}
+            aria-busy={shellState === "loading"}
             data-reader-shell="1"
+            data-reader-shell-state={shellState}
         >
             <ReaderHeader
                 styles={styles}
@@ -24681,27 +24720,38 @@ export function ReaderShell(props: Props) {
                 onToggleTheme={onToggleTheme}
             />
 
-            {bannerMsg ? <ErrBanner msg={bannerMsg} /> : null}
+            {bannerMsg ? (
+                <Banner
+                    msg={bannerMsg}
+                    tone={bannerTone}
+                    assertive={shellState === "fatal"}
+                />
+            ) : null}
 
-            {viewportMount.shouldMount && spine ? (
-                <ViewportHost
-                    viewportKey={viewportKey}
-                    viewportRef={viewportRef}
+            {showViewport && spine ? (
+                <ReaderViewport
+                    key={viewportKey}
+                    ref={viewportRef ?? null}
                     spine={spine}
                     bookById={bookById}
-                    selectionRootRef={selectionRootRef}
-                    annotationSnapshot={annotationSnapshot}
-                    topContent={topContent}
+                    selectionRootRef={selectionRootRef ?? null}
+                    annotationSnapshot={annotationSnapshot ?? null}
+                    topContent={topContent ?? null}
                     onPosition={onPosition}
                     onError={onError}
                     onReady={onReady}
                 />
+            ) : shellState === "fatal" ? (
+                <FatalBody msg={bodyMessage} />
             ) : (
-                <LoadingBody msg={viewportMount.reason === "loading" ? "Loading…" : undefined} />
+                <LoadingBody msg={bodyMessage} />
             )}
         </main>
     );
 }
+
+export const ReaderShell = memo(ReaderShellInner);
+ReaderShell.displayName = "ReaderShell";
 ```
 
 ### apps/web/src/reader/ReaderTypographyControl.tsx
@@ -25805,6 +25855,10 @@ const OVERSCAN = 10;
 
 const JUMP_MAX_CORRECTIONS = 8;
 const JUMP_TOLERANCE_PX = 2;
+const POSITION_ANCHOR_RATIO = 0.2;
+const POSITION_ANCHOR_MIN_PX = 32;
+const POSITION_ANCHOR_MAX_PX = 120;
+const NEAREST_ROW_SCAN_RADIUS = 48;
 
 type ScrollMode = "auto" | "smooth";
 
@@ -25825,6 +25879,7 @@ type Props = Readonly<{
 }>;
 
 type PendingJump = Readonly<{
+     id: number;
      ord: number;
      behavior: ScrollMode;
      correctionsLeft: number;
@@ -25832,9 +25887,19 @@ type PendingJump = Readonly<{
 
 type SlicePayload =
     | readonly SliceVerse[]
-    | Readonly<{ verses?: readonly SliceVerse[]; rows?: readonly SliceVerse[]; items?: readonly SliceVerse[] }>
+    | Readonly<{
+     verses?: readonly SliceVerse[];
+     rows?: readonly SliceVerse[];
+     items?: readonly SliceVerse[];
+}>
     | null
     | undefined;
+
+type EmittedPositionSig = Readonly<{
+     ord: number;
+     verseOrd: number | null;
+     bookId: string | null;
+}>;
 
 const EMPTY_ANNOTATIONS: readonly Annotation[] = Object.freeze([]);
 
@@ -26018,6 +26083,74 @@ function skeletonRow(verseOrd: number): React.ReactNode {
      );
 }
 
+function getViewportAnchorOffset(clientHeight: number): number {
+     if (!Number.isFinite(clientHeight) || clientHeight <= 0) {
+          return POSITION_ANCHOR_MIN_PX;
+     }
+
+     return clamp(
+         Math.round(clientHeight * POSITION_ANCHOR_RATIO),
+         POSITION_ANCHOR_MIN_PX,
+         POSITION_ANCHOR_MAX_PX,
+     );
+}
+
+function findAnchorVirtualItem<T extends Readonly<{ index: number; start: number; size: number }>>(
+    items: readonly T[],
+    anchorY: number,
+): T | null {
+     if (items.length === 0) return null;
+
+     let best: T | null = null;
+     let bestDistance = Number.POSITIVE_INFINITY;
+
+     for (const item of items) {
+          const start = item.start;
+          const end = item.start + item.size;
+
+          if (anchorY >= start && anchorY <= end) {
+               return item;
+          }
+
+          const distance = anchorY < start ? start - anchorY : anchorY - end;
+          if (distance < bestDistance) {
+               best = item;
+               bestDistance = distance;
+          }
+     }
+
+     return best;
+}
+
+function findNearestLoadedRow(
+    verseMap: ReadonlyMap<number, SliceVerse>,
+    anchorOrd: number,
+    minOrd: number,
+    maxOrd: number,
+    maxRadius = NEAREST_ROW_SCAN_RADIUS,
+): SliceVerse | null {
+     const exact = verseMap.get(anchorOrd);
+     if (exact) return exact;
+
+     const radiusLimit = Math.max(0, Math.trunc(maxRadius));
+
+     for (let radius = 1; radius <= radiusLimit; radius += 1) {
+          const beforeOrd = anchorOrd - radius;
+          if (beforeOrd >= minOrd) {
+               const before = verseMap.get(beforeOrd);
+               if (before) return before;
+          }
+
+          const afterOrd = anchorOrd + radius;
+          if (afterOrd <= maxOrd) {
+               const after = verseMap.get(afterOrd);
+               if (after) return after;
+          }
+     }
+
+     return null;
+}
+
 export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function ReaderViewport(
     props,
     ref,
@@ -26045,8 +26178,11 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      const inFlightRef = useRef<Map<number, AbortController>>(new Map());
 
      const pendingJumpRef = useRef<PendingJump | null>(null);
+     const jumpSessionIdRef = useRef(0);
      const currentOrdRef = useRef<number>(spine.verseOrdMin);
      const onReadyCalledRef = useRef(false);
+     const lastEmittedRef = useRef<EmittedPositionSig | null>(null);
+
      const rafMeasureRef = useRef<number | null>(null);
      const jumpRafRef = useRef<number | null>(null);
 
@@ -26096,6 +26232,59 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                jumpRafRef.current = null;
           }
      }, []);
+
+     const resolvePositionData = useCallback(
+         (ord: number): { verse: SliceVerse | null; book: BookRow | null; bookId: string | null } => {
+              const verse = verseMapRef.current.get(ord) ?? null;
+              const rowForBook =
+                  verse ??
+                  findNearestLoadedRow(
+                      verseMapRef.current,
+                      ord,
+                      spine.verseOrdMin,
+                      spine.verseOrdMax,
+                  );
+
+              const bookId = rowForBook ? getRowBookId(rowForBook) : null;
+              const book = bookId ? (bookById.get(bookId) ?? null) : null;
+
+              return { verse, book, bookId };
+         },
+         [bookById, spine.verseOrdMax, spine.verseOrdMin],
+     );
+
+     const emitPosition = useCallback(
+         (ord: number) => {
+              const nextOrd = clamp(ord, spine.verseOrdMin, spine.verseOrdMax);
+              const { verse, book, bookId } = resolvePositionData(nextOrd);
+              const sig: EmittedPositionSig = {
+                   ord: nextOrd,
+                   verseOrd: verse ? getRowVerseOrd(verse) : null,
+                   bookId,
+              };
+              const prev = lastEmittedRef.current;
+
+              if (
+                  prev &&
+                  prev.ord === sig.ord &&
+                  prev.verseOrd === sig.verseOrd &&
+                  prev.bookId === sig.bookId
+              ) {
+                   currentOrdRef.current = nextOrd;
+                   return;
+              }
+
+              lastEmittedRef.current = sig;
+              currentOrdRef.current = nextOrd;
+
+              onPosition({
+                   ord: nextOrd,
+                   verse,
+                   book,
+              });
+         },
+         [onPosition, resolvePositionData, spine.verseOrdMax, spine.verseOrdMin],
+     );
 
      const evictFarChunks = useCallback(
          (keepOrd: number) => {
@@ -26191,9 +26380,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
               } catch (error) {
                    if (!controller.signal.aborted) {
                         const message =
-                            error instanceof Error
-                                ? error.message
-                                : "Failed to load reader slice.";
+                            error instanceof Error ? error.message : "Failed to load reader slice.";
                         onError?.(message);
                    }
               } finally {
@@ -26221,39 +26408,54 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
          [loadChunk, spine.verseOrdMax],
      );
 
+     const getMountedRowAnchorDelta = useCallback(
+         (rowEl: HTMLElement, scroller: HTMLDivElement): number => {
+              const scrollerRect = scroller.getBoundingClientRect();
+              const rowRect = rowEl.getBoundingClientRect();
+              const anchorOffset = getViewportAnchorOffset(scroller.clientHeight);
+              const desiredTop = scrollerRect.top + anchorOffset;
+              return rowRect.top - desiredTop;
+         },
+         [],
+     );
+
      const correctJumpToMountedRow = useCallback(() => {
           const pending = pendingJumpRef.current;
           const scroller = scrollEl;
-          if (!pending || !scroller) return;
+          if (!pending || !scroller || rowCount <= 0) return;
 
-          const index = clamp(pending.ord - spine.verseOrdMin, 0, Math.max(0, rowCount - 1));
+          const index = clamp(pending.ord - spine.verseOrdMin, 0, rowCount - 1);
           const rowEl = scroller.querySelector<HTMLElement>(`[data-vrow-index="${index}"]`);
+
+          emitPosition(pending.ord);
 
           if (!rowEl) {
                rowVirtualizer.scrollToIndex(index, {
                     align: "start",
-                    behavior: "auto",
+                    behavior: pending.behavior,
                });
                return;
           }
 
-          const scrollerRect = scroller.getBoundingClientRect();
-          const rowRect = rowEl.getBoundingClientRect();
-          const delta = rowRect.top - scrollerRect.top;
-          const nextTop = scroller.scrollTop + delta;
+          const delta = getMountedRowAnchorDelta(rowEl, scroller);
 
           if (Math.abs(delta) <= JUMP_TOLERANCE_PX) {
                pendingJumpRef.current = null;
+               emitPosition(pending.ord);
                return;
           }
 
+          const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+          const nextTop = clamp(scroller.scrollTop + delta, 0, maxScrollTop);
+
           scroller.scrollTo({
                top: nextTop,
-               behavior: "auto",
+               behavior: pending.correctionsLeft === JUMP_MAX_CORRECTIONS ? pending.behavior : "auto",
           });
 
           if (pending.correctionsLeft <= 1) {
                pendingJumpRef.current = null;
+               emitPosition(pending.ord);
                return;
           }
 
@@ -26262,13 +26464,18 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                correctionsLeft: pending.correctionsLeft - 1,
           };
 
+          const scheduledId = pending.id;
           cancelJumpRaf();
           jumpRafRef.current = requestAnimationFrame(() => {
                jumpRafRef.current = null;
+               const active = pendingJumpRef.current;
+               if (!active || active.id !== scheduledId) return;
                correctJumpToMountedRow();
           });
      }, [
           cancelJumpRaf,
+          emitPosition,
+          getMountedRowAnchorDelta,
           rowCount,
           rowVirtualizer,
           scrollEl,
@@ -26283,16 +26490,27 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           cancelJumpRaf();
 
           const firstOrd = clamp(spine.verseOrdMin, spine.verseOrdMin, spine.verseOrdMax);
+          const sessionId = ++jumpSessionIdRef.current;
+
           currentOrdRef.current = firstOrd;
           pendingJumpRef.current = {
+               id: sessionId,
                ord: firstOrd,
                behavior: "auto",
                correctionsLeft: JUMP_MAX_CORRECTIONS,
           };
           onReadyCalledRef.current = false;
+          lastEmittedRef.current = null;
+
+          if (scrollEl) {
+               scrollEl.scrollTo({
+                    top: 0,
+                    behavior: "auto",
+               });
+          }
 
           setDataTick((tick) => tick + 1);
-     }, [cancelAllInFlight, cancelJumpRaf, spine.verseOrdMax, spine.verseOrdMin]);
+     }, [cancelAllInFlight, cancelJumpRaf, scrollEl, spine.verseOrdMax, spine.verseOrdMin]);
 
      useEffect(() => {
           ensureWindowLoaded(currentOrdRef.current);
@@ -26313,44 +26531,63 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      ]);
 
      useLayoutEffect(() => {
-          if (virtualItems.length === 0) return;
+          if (rowCount <= 0 || virtualItems.length === 0) return;
 
-          const first = virtualItems[0]!;
-          const ord = clamp(spine.verseOrdMin + first.index, spine.verseOrdMin, spine.verseOrdMax);
-          const row = verseMapRef.current.get(ord) ?? null;
+          const pending = pendingJumpRef.current;
+          if (pending) {
+               emitPosition(pending.ord);
+               return;
+          }
 
-          currentOrdRef.current = ord;
+          const anchorOffset = getViewportAnchorOffset(scrollEl?.clientHeight ?? 0);
+          const anchorY = (scrollEl?.scrollTop ?? 0) + anchorOffset;
+          const anchorItem = findAnchorVirtualItem(virtualItems, anchorY) ?? virtualItems[0] ?? null;
+          if (!anchorItem) return;
 
-          onPosition({
-               ord,
-               verse: row,
-               book: row ? (bookById.get(getRowBookId(row)) ?? null) : null,
-          });
-     }, [bookById, onPosition, spine.verseOrdMax, spine.verseOrdMin, virtualItems]);
+          const ord = clamp(spine.verseOrdMin + anchorItem.index, spine.verseOrdMin, spine.verseOrdMax);
+          emitPosition(ord);
+     }, [
+          emitPosition,
+          rowCount,
+          scrollEl,
+          spine.verseOrdMax,
+          spine.verseOrdMin,
+          virtualItems,
+          dataTick,
+     ]);
 
      useImperativeHandle(
          ref,
          () => ({
               jumpToOrd: (ord, behavior = "auto") => {
-                   const nextOrd = clamp(Math.trunc(ord), spine.verseOrdMin, spine.verseOrdMax);
+                   if (rowCount <= 0) return;
 
+                   const nextOrd = clamp(Math.trunc(ord), spine.verseOrdMin, spine.verseOrdMax);
+                   const sessionId = ++jumpSessionIdRef.current;
+
+                   currentOrdRef.current = nextOrd;
                    pendingJumpRef.current = {
+                        id: sessionId,
                         ord: nextOrd,
                         behavior,
                         correctionsLeft: JUMP_MAX_CORRECTIONS,
                    };
 
                    ensureWindowLoaded(nextOrd);
+                   evictFarChunks(nextOrd);
+                   emitPosition(nextOrd);
 
-                   const index = clamp(nextOrd - spine.verseOrdMin, 0, Math.max(0, rowCount - 1));
+                   const index = clamp(nextOrd - spine.verseOrdMin, 0, rowCount - 1);
                    rowVirtualizer.scrollToIndex(index, {
                         align: "start",
-                        behavior: "auto",
+                        behavior,
                    });
 
                    cancelJumpRaf();
                    jumpRafRef.current = requestAnimationFrame(() => {
                         jumpRafRef.current = null;
+                        const active = pendingJumpRef.current;
+                        if (!active || active.id !== sessionId) return;
                         correctJumpToMountedRow();
                    });
               },
@@ -26359,7 +26596,9 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
          [
               cancelJumpRaf,
               correctJumpToMountedRow,
+              emitPosition,
               ensureWindowLoaded,
+              evictFarChunks,
               rowCount,
               rowVirtualizer,
               spine.verseOrdMax,
@@ -26387,7 +26626,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
                     rafMeasureRef.current = null;
                }
           };
-     }, [dataTick, rowVirtualizer, correctJumpToMountedRow]);
+     }, [correctJumpToMountedRow, dataTick, rowVirtualizer, topContentHeight]);
 
      useLayoutEffect(() => {
           if (!topContentRef.current) {
@@ -26405,9 +26644,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           measure();
 
           const ro =
-              typeof ResizeObserver !== "undefined"
-                  ? new ResizeObserver(() => measure())
-                  : null;
+              typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => measure()) : null;
 
           ro?.observe(el);
           window.addEventListener("resize", measure, { passive: true });
@@ -26430,6 +26667,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
           return () => {
                cancelAllInFlight();
                cancelJumpRaf();
+
                if (selectionRootRef) {
                     selectionRootRef.current = null;
                }
@@ -26457,11 +26695,7 @@ export const ReaderViewport = forwardRef<ReaderViewportHandle, Props>(function R
      return (
          <div style={ROOT_STYLE}>
               <div ref={setScrollEl} style={SCROLL_STYLE}>
-                   <div
-                       ref={setSelectionRootEl}
-                       style={CONTAINER_STYLE}
-                       data-translation-id={undefined}
-                   >
+                   <div ref={setSelectionRootEl} style={CONTAINER_STYLE}>
                         <div
                             style={{
                                  ...VIRTUAL_STAGE_STYLE,
@@ -28328,7 +28562,9 @@ export function useReaderAnnotations(
 ### apps/web/src/reader/VerseRow.tsx
 
 ```tsx
-import React, { useMemo } from "react";
+// apps/web/src/reader/VerseRow.tsx
+import React, { memo, useMemo } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { Annotation } from "@biblia/annotation";
 import type { BookRow } from "../api";
 import { ReaderAnnotationOverlay } from "./ReaderAnnotationOverlay";
@@ -28344,6 +28580,8 @@ type Props = Readonly<{
 type TokenKind = SliceToken["tokenKind"] | string;
 
 type TokenMeta = Readonly<{
+    key: string;
+    sourceIndex: number;
     tokenIndex: number;
     tokenKind?: TokenKind;
     charStart?: number;
@@ -28355,35 +28593,49 @@ type VerseMeta = Readonly<{
     verseOrd: number;
     verseKey: string;
     translationId: string | null;
+
     normalizedTokens: readonly TokenMeta[] | null;
     plainVerseText: string;
     hasTokens: boolean;
+
     isBookStart: boolean;
     isChapterStart: boolean;
+
     bookLabel: string;
     ariaLabel: string;
+
     rootId: string;
     verseTextId: string;
+
+    showBookTitlePage: boolean;
+    showChapterKick: boolean;
+    showInlineBookLabel: boolean;
 }>;
 
 const EMPTY_ANNOTATIONS: readonly Annotation[] = Object.freeze([]);
 
-const ROW_WRAP_STYLE: React.CSSProperties = Object.freeze({
+const ROW_WRAP_STYLE: CSSProperties = Object.freeze({
     position: "relative",
     width: "100%",
     boxSizing: "border-box",
     paddingBlock: 4,
 });
 
-const CARD_STYLE: React.CSSProperties = Object.freeze({
+const BOOK_HEADING_WRAP_STYLE: CSSProperties = Object.freeze({
+    paddingTop: 10,
+    paddingBottom: 10,
+});
+
+const CARD_STYLE: CSSProperties = Object.freeze({
     position: "relative",
     borderRadius: 16,
     padding: "13px 14px 13px 44px",
     minHeight: 54,
     boxSizing: "border-box",
+    isolation: "isolate",
 });
 
-const TEXT_ROW_STYLE: React.CSSProperties = Object.freeze({
+const TEXT_ROW_STYLE: CSSProperties = Object.freeze({
     position: "relative",
     zIndex: 1,
     minWidth: 0,
@@ -28396,7 +28648,7 @@ const TEXT_ROW_STYLE: React.CSSProperties = Object.freeze({
     wordBreak: "normal",
 });
 
-const VERSE_NUM_STYLE: React.CSSProperties = Object.freeze({
+const VERSE_NUM_STYLE: CSSProperties = Object.freeze({
     position: "absolute",
     left: 12,
     top: 13,
@@ -28407,10 +28659,11 @@ const VERSE_NUM_STYLE: React.CSSProperties = Object.freeze({
     color: "var(--muted)",
     userSelect: "none",
     WebkitUserSelect: "none",
+    pointerEvents: "none",
     fontVariantNumeric: "tabular-nums",
 });
 
-const CHAPTER_KICK_STYLE: React.CSSProperties = Object.freeze({
+const CHAPTER_KICK_STYLE: CSSProperties = Object.freeze({
     display: "inline-block",
     marginRight: 8,
     fontSize: "1.2em",
@@ -28418,14 +28671,12 @@ const CHAPTER_KICK_STYLE: React.CSSProperties = Object.freeze({
     fontWeight: 760,
     verticalAlign: "baseline",
     color: "var(--fg)",
+    userSelect: "none",
+    WebkitUserSelect: "none",
+    pointerEvents: "none",
 });
 
-const BOOK_HEADING_WRAP_STYLE: React.CSSProperties = Object.freeze({
-    paddingTop: 10,
-    paddingBottom: 10,
-});
-
-const INLINE_BOOK_LABEL_STYLE: React.CSSProperties = Object.freeze({
+const INLINE_BOOK_LABEL_STYLE: CSSProperties = Object.freeze({
     display: "block",
     marginBottom: 10,
     fontSize: 11,
@@ -28433,9 +28684,11 @@ const INLINE_BOOK_LABEL_STYLE: React.CSSProperties = Object.freeze({
     textTransform: "uppercase",
     color: "var(--muted)",
     userSelect: "none",
+    WebkitUserSelect: "none",
+    pointerEvents: "none",
 });
 
-const TOKEN_BASE_STYLE: React.CSSProperties = Object.freeze({
+const TOKEN_BASE_STYLE: CSSProperties = Object.freeze({
     whiteSpace: "pre-wrap",
     userSelect: "text",
     WebkitUserSelect: "text",
@@ -28443,15 +28696,19 @@ const TOKEN_BASE_STYLE: React.CSSProperties = Object.freeze({
     zIndex: 1,
 });
 
-const TOKEN_MARKER_STYLE: React.CSSProperties = Object.freeze({
+const TOKEN_MARKER_STYLE: CSSProperties = Object.freeze({
     ...TOKEN_BASE_STYLE,
     opacity: 0.82,
 });
 
-function readMaybeString(value: unknown): string | null {
+function readMaybeTrimmedString(value: unknown): string | null {
     if (typeof value !== "string") return null;
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : null;
+}
+
+function readRawString(value: unknown): string | null {
+    return typeof value === "string" ? value : null;
 }
 
 function readMaybeNumber(value: unknown): number | null {
@@ -28460,17 +28717,30 @@ function readMaybeNumber(value: unknown): number | null {
 }
 
 function readMaybeBool(value: unknown): boolean | null {
-    if (typeof value === "boolean") return value;
-    return null;
+    return typeof value === "boolean" ? value : null;
 }
 
 function getRecord(value: unknown): Record<string, unknown> {
     return value != null && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
-function getRowTranslationId(row: SliceVerse): string | null {
+function getBookDisplayName(book: BookRow | null, fallback: string): string {
+    if (!book) return fallback;
+
+    const record = getRecord(book);
+    return (
+        readMaybeTrimmedString(record.name) ??
+        readMaybeTrimmedString(record.title) ??
+        readMaybeTrimmedString(record.shortName) ??
+        readMaybeTrimmedString(record.short_name) ??
+        readMaybeTrimmedString(record.label) ??
+        fallback
+    );
+}
+
+function getRowBookId(row: SliceVerse): string {
     const record = getRecord(row);
-    return readMaybeString(record.translationId) ?? readMaybeString(record.translation_id) ?? null;
+    return readMaybeTrimmedString(record.bookId) ?? readMaybeTrimmedString(record.book_id) ?? row.bookId;
 }
 
 function getRowVerseOrd(row: SliceVerse): number {
@@ -28481,10 +28751,15 @@ function getRowVerseOrd(row: SliceVerse): number {
 function getRowVerseKey(row: SliceVerse): string {
     const record = getRecord(row);
     return (
-        readMaybeString(record.verseKey) ??
-        readMaybeString(record.verse_key) ??
-        `${row.bookId}.${row.chapter}.${row.verse}`
+        readMaybeTrimmedString(record.verseKey) ??
+        readMaybeTrimmedString(record.verse_key) ??
+        `${getRowBookId(row)}.${row.chapter}.${row.verse}`
     );
+}
+
+function getRowTranslationId(row: SliceVerse): string | null {
+    const record = getRecord(row);
+    return readMaybeTrimmedString(record.translationId) ?? readMaybeTrimmedString(record.translation_id) ?? null;
 }
 
 function getRowIsBookStart(row: SliceVerse): boolean {
@@ -28505,6 +28780,11 @@ function getRowIsChapterStart(row: SliceVerse): boolean {
     );
 }
 
+function getRowPlainText(row: SliceVerse): string {
+    const record = getRecord(row);
+    return readRawString(record.text) ?? row.text ?? "";
+}
+
 function getTokenIndex(token: SliceToken, fallback: number): number {
     const record = getRecord(token);
     return readMaybeNumber(record.tokenIndex) ?? readMaybeNumber(record.token_index) ?? fallback;
@@ -28512,11 +28792,7 @@ function getTokenIndex(token: SliceToken, fallback: number): number {
 
 function getTokenKind(token: SliceToken): TokenKind | undefined {
     const record = getRecord(token);
-    return (
-        readMaybeString(record.tokenKind) ??
-        readMaybeString(record.token_kind) ??
-        undefined
-    );
+    return readMaybeTrimmedString(record.tokenKind) ?? readMaybeTrimmedString(record.token_kind) ?? undefined;
 }
 
 function getTokenCharStart(token: SliceToken): number | undefined {
@@ -28531,7 +28807,7 @@ function getTokenCharEnd(token: SliceToken): number | undefined {
 
 function getTokenText(token: SliceToken): string {
     const record = getRecord(token);
-    return readMaybeString(record.token) ?? readMaybeString(record.text) ?? "";
+    return readRawString(record.token) ?? readRawString(record.text) ?? "";
 }
 
 function buildVerseAriaLabel(bookLabel: string, chapter: number, verse: number): string {
@@ -28541,13 +28817,20 @@ function buildVerseAriaLabel(bookLabel: string, chapter: number, verse: number):
 function normalizeTokens(tokens: readonly SliceToken[] | null | undefined): readonly TokenMeta[] | null {
     if (!tokens || tokens.length === 0) return null;
 
-    return tokens.map((token, index) => ({
-        tokenIndex: getTokenIndex(token, index),
-        tokenKind: getTokenKind(token),
-        charStart: getTokenCharStart(token),
-        charEnd: getTokenCharEnd(token),
-        text: getTokenText(token),
-    }));
+    return tokens.map((token, sourceIndex) => {
+        const tokenIndex = getTokenIndex(token, sourceIndex);
+        const text = getTokenText(token);
+
+        return {
+            key: `${tokenIndex}:${sourceIndex}:${text.length}`,
+            sourceIndex,
+            tokenIndex,
+            tokenKind: getTokenKind(token),
+            charStart: getTokenCharStart(token),
+            charEnd: getTokenCharEnd(token),
+            text,
+        };
+    });
 }
 
 function buildVerseTextPlain(row: SliceVerse, tokens: readonly TokenMeta[] | null): string {
@@ -28555,24 +28838,56 @@ function buildVerseTextPlain(row: SliceVerse, tokens: readonly TokenMeta[] | nul
         return tokens.map((token) => token.text).join("");
     }
 
-    return row.text ?? "";
+    return getRowPlainText(row);
 }
 
-function tokenStyleForKind(kind: TokenKind | undefined): React.CSSProperties {
-    if (kind === "MARKER") return TOKEN_MARKER_STYLE;
-    return TOKEN_BASE_STYLE;
+function tokenStyleForKind(kind: TokenKind | undefined): CSSProperties {
+    return kind === "MARKER" ? TOKEN_MARKER_STYLE : TOKEN_BASE_STYLE;
+}
+
+function buildVerseMeta(row: SliceVerse, book: BookRow | null): VerseMeta {
+    const verseOrd = getRowVerseOrd(row);
+    const verseKey = getRowVerseKey(row);
+    const translationId = getRowTranslationId(row);
+    const normalizedTokens = normalizeTokens(row.tokens ?? null);
+    const plainVerseText = buildVerseTextPlain(row, normalizedTokens);
+    const bookLabel = getBookDisplayName(book, getRowBookId(row));
+    const isBookStart = getRowIsBookStart(row);
+    const isChapterStart = getRowIsChapterStart(row);
+
+    return {
+        verseOrd,
+        verseKey,
+        translationId,
+        normalizedTokens,
+        plainVerseText,
+        hasTokens: !!normalizedTokens && normalizedTokens.length > 0,
+        isBookStart,
+        isChapterStart,
+        bookLabel,
+        ariaLabel: buildVerseAriaLabel(bookLabel, row.chapter, row.verse),
+        rootId: `verse-${verseOrd}`,
+        verseTextId: `verse-text-${verseOrd}`,
+        showBookTitlePage: isBookStart && !!book,
+        showChapterKick: !isBookStart && isChapterStart,
+        showInlineBookLabel: !isBookStart && isChapterStart && row.chapter > 1,
+    };
 }
 
 function renderTokenSpan(
     token: TokenMeta,
-    verseKey: string,
-    translationId: string | null,
-): React.ReactNode {
+    meta: VerseMeta,
+    row: SliceVerse,
+): ReactNode {
     return (
         <span
-            key={token.tokenIndex}
-            data-verse-key={verseKey}
-            data-translation-id={translationId ?? undefined}
+            key={token.key}
+            data-verse-key={meta.verseKey}
+            data-verse-ord={meta.verseOrd}
+            data-book-id={getRowBookId(row)}
+            data-chapter={row.chapter}
+            data-verse={row.verse}
+            data-translation-id={meta.translationId ?? undefined}
             data-token-index={token.tokenIndex}
             data-token-kind={token.tokenKind ?? undefined}
             data-token-char-start={token.charStart ?? undefined}
@@ -28584,50 +28899,28 @@ function renderTokenSpan(
     );
 }
 
-export const VerseRow = React.memo(function VerseRow(props: Props) {
+function VerseRowInner(props: Props) {
     const { row, book } = props;
     const annotations = props.annotations ?? EMPTY_ANNOTATIONS;
 
-    const meta = useMemo<VerseMeta>(() => {
-        const verseOrd = getRowVerseOrd(row);
-        const verseKey = getRowVerseKey(row);
-        const translationId = getRowTranslationId(row);
-        const normalizedTokens = normalizeTokens(row.tokens ?? null);
-        const plainVerseText = buildVerseTextPlain(row, normalizedTokens);
-        const bookLabel = book?.name ?? row.bookId;
-        const isBookStart = getRowIsBookStart(row);
-        const isChapterStart = getRowIsChapterStart(row);
-
-        return {
-            verseOrd,
-            verseKey,
-            translationId,
-            normalizedTokens,
-            plainVerseText,
-            hasTokens: !!normalizedTokens && normalizedTokens.length > 0,
-            isBookStart,
-            isChapterStart,
-            bookLabel,
-            ariaLabel: buildVerseAriaLabel(bookLabel, row.chapter, row.verse),
-            rootId: `verse-${verseOrd}`,
-            verseTextId: `verse-text-${verseOrd}`,
-        };
-    }, [book, row]);
+    const meta = useMemo(() => buildVerseMeta(row, book), [book, row]);
 
     return (
         <article
             id={meta.rootId}
             data-verse-key={meta.verseKey}
             data-verse-ord={meta.verseOrd}
-            data-book-id={row.bookId}
+            data-book-id={getRowBookId(row)}
             data-chapter={row.chapter}
             data-verse={row.verse}
+            data-translation-id={meta.translationId ?? undefined}
             aria-label={meta.ariaLabel}
+            aria-labelledby={meta.verseTextId}
             style={ROW_WRAP_STYLE}
         >
-            {meta.isBookStart && book ? (
+            {meta.showBookTitlePage ? (
                 <div style={BOOK_HEADING_WRAP_STYLE}>
-                    <BookTitlePage book={book} bookId={row.bookId} />
+                    <BookTitlePage book={book} bookId={getRowBookId(row)} />
                 </div>
             ) : null}
 
@@ -28642,40 +28935,55 @@ export const VerseRow = React.memo(function VerseRow(props: Props) {
                     id={meta.verseTextId}
                     data-verse-key={meta.verseKey}
                     data-verse-ord={meta.verseOrd}
+                    data-book-id={getRowBookId(row)}
+                    data-chapter={row.chapter}
+                    data-verse={row.verse}
                     data-translation-id={meta.translationId ?? undefined}
                     style={TEXT_ROW_STYLE}
+                    dir="auto"
                 >
-                    {!meta.isBookStart && meta.isChapterStart ? (
+                    {meta.showChapterKick ? (
                         <span aria-hidden="true" style={CHAPTER_KICK_STYLE}>
                             {row.chapter}
                         </span>
                     ) : null}
 
-                    {!meta.isBookStart && row.verse === 1 && row.chapter > 1 ? (
+                    {meta.showInlineBookLabel ? (
                         <span aria-hidden="true" style={INLINE_BOOK_LABEL_STYLE}>
-                            {book?.name ?? row.bookId}
+                            {meta.bookLabel}
                         </span>
                     ) : null}
 
-                    {meta.hasTokens
-                        ? meta.normalizedTokens!.map((token) =>
-                            renderTokenSpan(token, meta.verseKey, meta.translationId),
-                        )
-                        : (
-                            <span
-                                data-verse-key={meta.verseKey}
-                                data-translation-id={meta.translationId ?? undefined}
-                                style={TOKEN_BASE_STYLE}
-                            >
-                                {meta.plainVerseText}
-                            </span>
-                        )}
+                    {meta.hasTokens ? (
+                        meta.normalizedTokens!.map((token) => renderTokenSpan(token, meta, row))
+                    ) : (
+                        <span
+                            data-verse-key={meta.verseKey}
+                            data-verse-ord={meta.verseOrd}
+                            data-book-id={getRowBookId(row)}
+                            data-chapter={row.chapter}
+                            data-verse={row.verse}
+                            data-translation-id={meta.translationId ?? undefined}
+                            style={TOKEN_BASE_STYLE}
+                        >
+                            {meta.plainVerseText}
+                        </span>
+                    )}
                 </div>
             </div>
         </article>
     );
-});
+}
 
+function areEqual(prev: Props, next: Props): boolean {
+    return (
+        prev.row === next.row &&
+        prev.book === next.book &&
+        prev.annotations === next.annotations
+    );
+}
+
+export const VerseRow = memo(VerseRowInner, areEqual);
 VerseRow.displayName = "VerseRow";
 ```
 
@@ -30299,17 +30607,17 @@ export default defineConfig({
 
 ### biblia.to-code-export.md
 
-> TRUNCATED: file was 1120031 bytes; showing first 48000 chars
+> TRUNCATED: file was 1125679 bytes; showing first 48000 chars
 
 ```md
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-10T18:52:21.599Z
+Generated: 2026-03-11T15:52:23.367Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
 Total files: 70
-Total raw bytes (all included files): 2186976
+Total raw bytes (all included files): 2198565
 Truncated/skipped files: 1
-Export time: 26ms
+Export time: 65ms
 
 ## Notes
 
