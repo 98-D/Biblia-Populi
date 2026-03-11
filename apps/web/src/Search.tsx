@@ -8,6 +8,14 @@ import React, {
     useState,
 } from "react";
 import {
+    ArrowUpRight,
+    BookOpen,
+    Clock3,
+    CornerDownLeft,
+    Search as SearchIcon,
+    X,
+} from "lucide-react";
+import {
     apiGetBooks,
     apiSearch,
     type BookRow,
@@ -21,28 +29,46 @@ export type ReaderLocation = {
     verse?: number;
 };
 
-type Props = {
+type Props = Readonly<{
     styles: Record<string, React.CSSProperties>;
     onNavigate: (loc: ReaderLocation) => void;
     onStartReading?: () => void;
     initialQuery?: string;
     hint?: string;
     autoFocus?: boolean;
-};
+}>;
 
 type RefParse =
-     | { ok: true; loc: ReaderLocation; label: string }
-     | { ok: false };
+    | { ok: true; loc: ReaderLocation; label: string }
+    | { ok: false };
 
 type SearchItem =
-     | { kind: "ref"; key: string; label: string; loc: ReaderLocation }
-     | { kind: "result"; key: string; label: string; result: SearchResult }
-     | { kind: "history"; key: string; label: string; q: string };
+    | {
+    kind: "ref";
+    key: string;
+    label: string;
+    meta: string;
+    loc: ReaderLocation;
+}
+    | {
+    kind: "result";
+    key: string;
+    label: string;
+    meta: string;
+    result: SearchResult;
+}
+    | {
+    kind: "history";
+    key: string;
+    label: string;
+    meta: string;
+    q: string;
+};
 
-type HistoryItem = {
+type HistoryItem = Readonly<{
     q: string;
     at: number;
-};
+}>;
 
 const HISTORY_KEY = "bp_search_history_v1";
 const MAX_HISTORY = 14;
@@ -54,11 +80,20 @@ function normalizeSpaces(s: string): string {
 }
 
 function toKey(s: string): string {
-    return normalizeSpaces(s.toLowerCase().replace(/[.,]/g, " "));
+    return normalizeSpaces(
+        s
+            .toLowerCase()
+            .replace(/[.,]/g, " ")
+            .replace(/\s*:\s*/g, ":"),
+    );
 }
 
 function insertSpaceBeforeDigits(s: string): string {
     return s.replace(/([a-zA-Z])(\d)/g, "$1 $2");
+}
+
+function normalizeRefInput(s: string): string {
+    return normalizeSpaces(insertSpaceBeforeDigits(s).replace(/\s*:\s*/g, ":"));
 }
 
 function safeJsonParseUnknown(text: string | null): unknown {
@@ -76,15 +111,15 @@ function parseAbbrs(abbrs: string | null): string[] {
 
     if (Array.isArray(v)) {
         return v
-             .map((x) => (typeof x === "string" ? x : ""))
-             .map((s) => s.trim())
-             .filter(Boolean);
+            .map((x) => (typeof x === "string" ? x : ""))
+            .map((s) => s.trim())
+            .filter(Boolean);
     }
 
     return abbrs
-         .split(/[,|]/g)
-         .map((s) => s.trim())
-         .filter(Boolean);
+        .split(/[,|]/g)
+        .map((s) => s.trim())
+        .filter(Boolean);
 }
 
 function buildBookLookup(books: BookRow[]): Map<string, string> {
@@ -105,14 +140,20 @@ function buildBookLookup(books: BookRow[]): Map<string, string> {
         add(b.nameShort);
         add(b.osised);
 
-        for (const a of parseAbbrs(b.abbrs)) add(a);
+        for (const a of parseAbbrs(b.abbrs)) {
+            add(a);
+        }
     }
 
     return m;
 }
 
-function parseRef(books: BookRow[] | null, raw: string): RefParse {
-    const q = normalizeSpaces(insertSpaceBeforeDigits(raw));
+function parseRef(
+    bookLookup: Map<string, string>,
+    bookNameById: Map<string, string>,
+    raw: string,
+): RefParse {
+    const q = normalizeRefInput(raw);
     if (!q) return { ok: false };
 
     const m = q.match(/^(.+?)\s+(\d+)(?::(\d+))?$/);
@@ -125,14 +166,17 @@ function parseRef(books: BookRow[] | null, raw: string): RefParse {
     if (!Number.isFinite(chapter) || chapter < 1) return { ok: false };
     if (verse != null && (!Number.isFinite(verse) || verse < 1)) return { ok: false };
 
-    if (!books) return { ok: false };
-
-    const lookup = buildBookLookup(books);
-    const bookId = lookup.get(book);
+    const bookId = bookLookup.get(book);
     if (!bookId) return { ok: false };
 
-    const label = verse != null ? `${bookId} ${chapter}:${verse}` : `${bookId} ${chapter}`;
-    return { ok: true, label, loc: { bookId, chapter, verse } };
+    const bookName = bookNameById.get(bookId) ?? bookId;
+    const label = verse != null ? `${bookName} ${chapter}:${verse}` : `${bookName} ${chapter}`;
+
+    return {
+        ok: true,
+        label,
+        loc: { bookId, chapter, verse },
+    };
 }
 
 function isHistoryItem(v: unknown): v is HistoryItem {
@@ -147,11 +191,11 @@ function loadHistory(): HistoryItem[] {
     if (!Array.isArray(raw)) return [];
 
     return raw
-         .filter(isHistoryItem)
-         .map((x) => ({ q: normalizeSpaces(x.q), at: x.at }))
-         .filter((x) => x.q.length > 0 && Number.isFinite(x.at))
-         .sort((a, b) => b.at - a.at)
-         .slice(0, MAX_HISTORY);
+        .filter(isHistoryItem)
+        .map((x) => ({ q: normalizeSpaces(x.q), at: x.at }))
+        .filter((x) => x.q.length > 0 && Number.isFinite(x.at))
+        .sort((a, b) => b.at - a.at)
+        .slice(0, MAX_HISTORY);
 }
 
 function persistHistory(history: HistoryItem[]): void {
@@ -188,6 +232,21 @@ function clearHistory(): void {
     }
 }
 
+function decodeHtmlEntities(text: string): string {
+    if (typeof document === "undefined") {
+        return text
+            .replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'");
+    }
+
+    const el = document.createElement("textarea");
+    el.innerHTML = text;
+    return el.value;
+}
+
 function splitSnippet(snippet: string): Array<{ text: string; hi: boolean }> {
     const parts: Array<{ text: string; hi: boolean }> = [];
     const re = /<em>(.*?)<\/em>/gi;
@@ -199,17 +258,24 @@ function splitSnippet(snippet: string): Array<{ text: string; hi: boolean }> {
         const start = m.index;
         const end = start + m[0].length;
 
-        if (start > last) parts.push({ text: snippet.slice(last, start), hi: false });
+        if (start > last) {
+            parts.push({ text: snippet.slice(last, start), hi: false });
+        }
+
         parts.push({ text: m[1] ?? "", hi: true });
         last = end;
     }
 
-    if (last < snippet.length) parts.push({ text: snippet.slice(last), hi: false });
+    if (last < snippet.length) {
+        parts.push({ text: snippet.slice(last), hi: false });
+    }
 
-    return parts.map((p) => ({
-        ...p,
-        text: p.text.replace(/<\/?[^>]+>/g, ""),
-    }));
+    return parts
+        .map((p) => ({
+            ...p,
+            text: decodeHtmlEntities(p.text.replace(/<\/?[^>]+>/g, "")),
+        }))
+        .filter((p) => p.text.length > 0);
 }
 
 function eventComposedPath(e: Event): EventTarget[] | null {
@@ -226,9 +292,9 @@ function pathContainsNode(path: EventTarget[] | null, node: Node | null): boolea
 }
 
 function isWithinEventTarget(
-     target: Node | null,
-     path: EventTarget[] | null,
-     el: HTMLElement | null,
+    target: Node | null,
+    path: EventTarget[] | null,
+    el: HTMLElement | null,
 ): boolean {
     if (!el) return false;
     if (target && el.contains(target)) return true;
@@ -241,15 +307,21 @@ function itemMetaLabel(kind: SearchItem["kind"], payload: SearchPayload | null):
     return payload?.mode ?? "search";
 }
 
+function itemIcon(kind: SearchItem["kind"]): React.ReactNode {
+    if (kind === "ref") return <ArrowUpRight size={14} />;
+    if (kind === "history") return <Clock3 size={14} />;
+    return <BookOpen size={14} />;
+}
+
 export function Search(props: Props) {
     const { styles, onNavigate, onStartReading, autoFocus } = props;
 
     const inputRef = useRef<HTMLInputElement | null>(null);
-    const panelRef = useRef<HTMLDivElement | null>(null);
     const wrapRef = useRef<HTMLDivElement | null>(null);
     const listRef = useRef<HTMLDivElement | null>(null);
     const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
     const requestSeqRef = useRef(0);
+    const composingRef = useRef(false);
 
     const listboxId = useId();
 
@@ -266,27 +338,34 @@ export function Search(props: Props) {
         let alive = true;
 
         apiGetBooks()
-             .then((r) => {
-                 if (!alive) return;
-                 setBooks(r.books);
-             })
-             .catch(() => {
-                 if (!alive) return;
-                 setBooks(null);
-             });
+            .then((r) => {
+                if (!alive) return;
+                setBooks(r.books);
+            })
+            .catch(() => {
+                if (!alive) return;
+                setBooks(null);
+            });
 
         return () => {
             alive = false;
         };
     }, []);
 
-    const ref = useMemo(() => parseRef(books, q), [books, q]);
+    const bookLookup = useMemo(() => buildBookLookup(books ?? []), [books]);
 
     const bookNameById = useMemo(() => {
         const m = new Map<string, string>();
-        for (const b of books ?? []) m.set(b.bookId, b.name ?? b.bookId);
+        for (const b of books ?? []) {
+            m.set(b.bookId, b.name ?? b.bookId);
+        }
         return m;
     }, [books]);
+
+    const ref = useMemo(
+        () => parseRef(bookLookup, bookNameById, q),
+        [bookLookup, bookNameById, q],
+    );
 
     useEffect(() => {
         if (!autoFocus) return;
@@ -295,7 +374,7 @@ export function Search(props: Props) {
     }, [autoFocus]);
 
     useEffect(() => {
-        const qq = q.trim();
+        const qq = normalizeSpaces(q);
         const myReqId = ++requestSeqRef.current;
 
         if (!qq) {
@@ -319,43 +398,45 @@ export function Search(props: Props) {
 
         setLoading(true);
         setErr(null);
+        setPayload(null);
 
         const timer = window.setTimeout(() => {
             apiSearch(qq, MAX_RESULTS, { signal: ctrl.signal })
-                 .then((r) => {
-                     if (!alive) return;
-                     if (myReqId !== requestSeqRef.current) return;
-                     setPayload(r);
-                     setLoading(false);
-                     setErr(null);
-                     setActiveIdx(0);
-                 })
-                 .catch((e: unknown) => {
-                     if (!alive) return;
-                     if (myReqId !== requestSeqRef.current) return;
+                .then((r) => {
+                    if (!alive) return;
+                    if (myReqId !== requestSeqRef.current) return;
 
-                     const name =
-                          typeof e === "object" &&
-                          e !== null &&
-                          "name" in e &&
-                          typeof (e as { name?: unknown }).name === "string"
-                               ? (e as { name: string }).name
-                               : "";
+                    setPayload(r);
+                    setLoading(false);
+                    setErr(null);
+                    setActiveIdx(0);
+                })
+                .catch((e: unknown) => {
+                    if (!alive) return;
+                    if (myReqId !== requestSeqRef.current) return;
 
-                     if (name === "AbortError") return;
+                    const name =
+                        typeof e === "object" &&
+                        e !== null &&
+                        "name" in e &&
+                        typeof (e as { name?: unknown }).name === "string"
+                            ? (e as { name: string }).name
+                            : "";
 
-                     const message =
-                          typeof e === "object" &&
-                          e !== null &&
-                          "message" in e &&
-                          typeof (e as { message?: unknown }).message === "string"
-                               ? (e as { message: string }).message
-                               : String(e);
+                    if (name === "AbortError") return;
 
-                     setPayload(null);
-                     setErr(message);
-                     setLoading(false);
-                 });
+                    const message =
+                        typeof e === "object" &&
+                        e !== null &&
+                        "message" in e &&
+                        typeof (e as { message?: unknown }).message === "string"
+                            ? (e as { message: string }).message
+                            : "Search failed.";
+
+                    setPayload(null);
+                    setErr(message);
+                    setLoading(false);
+                });
         }, SEARCH_DEBOUNCE_MS);
 
         return () => {
@@ -365,19 +446,20 @@ export function Search(props: Props) {
         };
     }, [q, ref.ok]);
 
-    const hasTypedQuery = q.trim().length > 0;
+    const hasTypedQuery = normalizeSpaces(q).length > 0;
     const hasVisibleHistory = focused && !hasTypedQuery && history.length > 0;
 
     const results = payload?.results ?? [];
 
-    const items = useMemo(() => {
+    const items = useMemo<SearchItem[]>(() => {
         const list: SearchItem[] = [];
 
         if (ref.ok) {
             list.push({
                 kind: "ref",
-                key: `ref:${ref.label}`,
+                key: `ref:${ref.loc.bookId}:${ref.loc.chapter}:${ref.loc.verse ?? 0}`,
                 label: `Go to ${ref.label}`,
+                meta: "ref",
                 loc: ref.loc,
             });
             return list;
@@ -389,6 +471,7 @@ export function Search(props: Props) {
                     kind: "history",
                     key: `history:${it.q.toLowerCase()}`,
                     label: it.q,
+                    meta: "history",
                     q: it.q,
                 });
             }
@@ -401,14 +484,16 @@ export function Search(props: Props) {
                 kind: "result",
                 key: `result:${r.bookId}:${r.chapter}:${r.verse}:${r.verseKey ?? ""}`,
                 label: `${fullBook} ${r.chapter}:${r.verse}`,
+                meta: payload?.mode ?? "search",
                 result: r,
             });
         }
 
         return list;
-    }, [ref, hasTypedQuery, history, results, bookNameById]);
+    }, [bookNameById, hasTypedQuery, history, payload?.mode, ref, results]);
 
     useEffect(() => {
+        itemRefs.current.length = items.length;
         if (activeIdx < items.length) return;
         setActiveIdx(items.length > 0 ? items.length - 1 : 0);
     }, [activeIdx, items.length]);
@@ -423,8 +508,11 @@ export function Search(props: Props) {
         const viewTop = list.scrollTop;
         const viewBottom = viewTop + list.clientHeight;
 
-        if (top < viewTop) list.scrollTop = top;
-        else if (bottom > viewBottom) list.scrollTop = bottom - list.clientHeight;
+        if (top < viewTop) {
+            list.scrollTop = top;
+        } else if (bottom > viewBottom) {
+            list.scrollTop = bottom - list.clientHeight;
+        }
     }, [activeIdx]);
 
     const showPanel = focused && (hasTypedQuery || hasVisibleHistory || loading || err != null);
@@ -446,41 +534,45 @@ export function Search(props: Props) {
 
         document.addEventListener("pointerdown", onPointerDownCapture, { capture: true });
         return () => {
-            document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
+            document.removeEventListener("pointerdown", onPointerDownCapture, {
+                capture: true,
+            });
         };
     }, [showPanel]);
 
     const commitSelection = useCallback(
-         (idx: number): void => {
-             const item = items[idx];
-             if (!item) return;
+        (idx: number): void => {
+            const item = items[idx];
+            if (!item) return;
 
-             if (item.kind === "ref") {
-                 const nextHistory = saveHistory(q);
-                 setHistory(nextHistory);
-                 onNavigate(item.loc);
-                 setFocused(false);
-                 inputRef.current?.blur();
-                 return;
-             }
+            if (item.kind === "ref") {
+                const nextHistory = saveHistory(q);
+                setHistory(nextHistory);
+                onNavigate(item.loc);
+                setFocused(false);
+                inputRef.current?.blur();
+                return;
+            }
 
-             if (item.kind === "result") {
-                 const nextHistory = saveHistory(q);
-                 setHistory(nextHistory);
-                 const r = item.result;
-                 onNavigate({ bookId: r.bookId, chapter: r.chapter, verse: r.verse });
-                 setFocused(false);
-                 inputRef.current?.blur();
-                 return;
-             }
+            if (item.kind === "result") {
+                const nextHistory = saveHistory(q);
+                setHistory(nextHistory);
+                const r = item.result;
+                onNavigate({ bookId: r.bookId, chapter: r.chapter, verse: r.verse });
+                setFocused(false);
+                inputRef.current?.blur();
+                return;
+            }
 
-             if (item.kind === "history") {
-                 setQ(item.q);
-                 setFocused(true);
-                 queueMicrotask(() => inputRef.current?.focus());
-             }
-         },
-         [items, onNavigate, q],
+            setQ(item.q);
+            setFocused(true);
+            setActiveIdx(0);
+
+            requestAnimationFrame(() => {
+                inputRef.current?.focus();
+            });
+        },
+        [items, onNavigate, q],
     );
 
     const clearQuery = useCallback(() => {
@@ -492,265 +584,335 @@ export function Search(props: Props) {
     }, []);
 
     const onInputKeyDown = useCallback(
-         (e: React.KeyboardEvent<HTMLInputElement>): void => {
-             if (e.key === "Escape") {
-                 e.preventDefault();
+        (e: React.KeyboardEvent<HTMLInputElement>): void => {
+            if (composingRef.current) return;
 
-                 if (q.trim()) {
-                     clearQuery();
-                     return;
-                 }
+            if (e.key === "Escape") {
+                e.preventDefault();
 
-                 setFocused(false);
-                 inputRef.current?.blur();
-                 return;
-             }
+                if (normalizeSpaces(q)) {
+                    clearQuery();
+                    return;
+                }
 
-             if (e.key === "Enter") {
-                 e.preventDefault();
+                setFocused(false);
+                inputRef.current?.blur();
+                return;
+            }
 
-                 if (!q.trim()) {
-                     if (items.length > 0) {
-                         commitSelection(activeIdx);
-                         return;
-                     }
+            if (e.key === "Enter") {
+                e.preventDefault();
 
-                     onStartReading?.();
-                     setFocused(false);
-                     inputRef.current?.blur();
-                     return;
-                 }
+                if (!normalizeSpaces(q)) {
+                    if (items.length > 0) {
+                        commitSelection(activeIdx);
+                        return;
+                    }
 
-                 if (items.length > 0) {
-                     commitSelection(activeIdx);
-                     return;
-                 }
+                    onStartReading?.();
+                    setFocused(false);
+                    inputRef.current?.blur();
+                    return;
+                }
 
-                 if (ref.ok) {
-                     const nextHistory = saveHistory(q);
-                     setHistory(nextHistory);
-                     onNavigate(ref.loc);
-                     setFocused(false);
-                     inputRef.current?.blur();
-                 }
+                if (items.length > 0) {
+                    commitSelection(activeIdx);
+                    return;
+                }
 
-                 return;
-             }
+                if (ref.ok) {
+                    const nextHistory = saveHistory(q);
+                    setHistory(nextHistory);
+                    onNavigate(ref.loc);
+                    setFocused(false);
+                    inputRef.current?.blur();
+                }
 
-             if (e.key === "ArrowDown") {
-                 if (!showPanel || items.length === 0) return;
-                 e.preventDefault();
-                 setActiveIdx((i) => Math.min(items.length - 1, Math.max(0, i + 1)));
-                 return;
-             }
+                return;
+            }
 
-             if (e.key === "ArrowUp") {
-                 if (!showPanel || items.length === 0) return;
-                 e.preventDefault();
-                 setActiveIdx((i) => Math.max(0, i - 1));
-                 return;
-             }
+            if (e.key === "ArrowDown") {
+                if (!showPanel || items.length === 0) return;
+                e.preventDefault();
+                setActiveIdx((i) => (i + 1) % items.length);
+                return;
+            }
 
-             if (e.key === "Home" && showPanel && items.length > 0) {
-                 e.preventDefault();
-                 setActiveIdx(0);
-                 return;
-             }
+            if (e.key === "ArrowUp") {
+                if (!showPanel || items.length === 0) return;
+                e.preventDefault();
+                setActiveIdx((i) => (i - 1 + items.length) % items.length);
+                return;
+            }
 
-             if (e.key === "End" && showPanel && items.length > 0) {
-                 e.preventDefault();
-                 setActiveIdx(items.length - 1);
-             }
-         },
-         [q, items, activeIdx, ref, showPanel, clearQuery, commitSelection, onNavigate, onStartReading],
+            if (e.key === "Home" && showPanel && items.length > 0) {
+                e.preventDefault();
+                setActiveIdx(0);
+                return;
+            }
+
+            if (e.key === "End" && showPanel && items.length > 0) {
+                e.preventDefault();
+                setActiveIdx(items.length - 1);
+            }
+        },
+        [
+            q,
+            items,
+            activeIdx,
+            ref,
+            showPanel,
+            clearQuery,
+            commitSelection,
+            onNavigate,
+            onStartReading,
+        ],
     );
 
     const searchRowStyle: React.CSSProperties = {
         ...(styles.searchRow ?? {}),
-        ...(focused ? (styles.searchRowFocused ?? {}) : null),
+        ...(focused ? (styles.searchRowFocused ?? {}) : {}),
     };
 
     const wrapStyle: React.CSSProperties = {
         position: "relative",
         width: "100%",
         minWidth: 0,
-        ...(styles.searchWrap ?? null),
+        ...(styles.searchWrap ?? {}),
     };
 
     const panelStyle: React.CSSProperties = {
         ...sx.panel,
-        ...(styles.searchPanel ?? null),
+        ...(styles.searchPanel ?? {}),
     };
 
     const hintText = props.hint ?? "Type a word or a reference";
     const placeholder = props.hint ?? "Search… (or John 3:16)";
     const activeDescendant =
-         showPanel && items[activeIdx] ? `${listboxId}-option-${activeIdx}` : undefined;
+        showPanel && items[activeIdx] ? `${listboxId}-option-${activeIdx}` : undefined;
+
+    const panelStatus = err
+        ? "error"
+        : loading
+            ? "loading"
+            : !hasTypedQuery && hasVisibleHistory
+                ? "history"
+                : ref.ok
+                    ? "ref"
+                    : hasTypedQuery
+                        ? "results"
+                        : "idle";
 
     return (
-         <div ref={wrapRef} style={wrapStyle}>
-             <div
-                  style={searchRowStyle}
-                  aria-label="Search"
-                  onPointerDown={(e) => {
-                      e.preventDefault();
-                      inputRef.current?.focus();
-                  }}
-             >
-                <span style={styles.searchIcon} aria-hidden>
-                    ⌕
+        <div ref={wrapRef} style={wrapStyle}>
+            <div
+                style={searchRowStyle}
+                aria-label="Search"
+                onPointerDown={(e) => {
+                    e.preventDefault();
+                    inputRef.current?.focus();
+                }}
+            >
+                <span style={sx.searchIcon} aria-hidden>
+                    <SearchIcon size={15} strokeWidth={2.1} />
                 </span>
 
-                 <input
-                      ref={inputRef}
-                      value={q}
-                      onChange={(e) => setQ(e.target.value)}
-                      placeholder={placeholder}
-                      style={{ ...styles.searchInput, width: "100%", maxWidth: "100%", minWidth: 0 }}
-                      aria-label="Search scripture"
-                      aria-expanded={showPanel}
-                      aria-controls={showPanel ? listboxId : undefined}
-                      aria-activedescendant={activeDescendant}
-                      aria-autocomplete="list"
-                      role="combobox"
-                      spellCheck={false}
-                      inputMode="search"
-                      onFocus={() => setFocused(true)}
-                      onKeyDown={onInputKeyDown}
-                 />
+                <input
+                    ref={inputRef}
+                    value={q}
+                    onChange={(e) => {
+                        setQ(e.target.value);
+                        setFocused(true);
+                    }}
+                    placeholder={placeholder}
+                    style={{
+                        ...styles.searchInput,
+                        width: "100%",
+                        maxWidth: "100%",
+                        minWidth: 0,
+                    }}
+                    aria-label="Search scripture"
+                    aria-expanded={showPanel}
+                    aria-controls={showPanel ? listboxId : undefined}
+                    aria-activedescendant={activeDescendant}
+                    aria-autocomplete="list"
+                    role="combobox"
+                    spellCheck={false}
+                    inputMode="search"
+                    onFocus={() => setFocused(true)}
+                    onKeyDown={onInputKeyDown}
+                    onCompositionStart={() => {
+                        composingRef.current = true;
+                    }}
+                    onCompositionEnd={() => {
+                        composingRef.current = false;
+                    }}
+                />
 
-                 {q.trim() ? (
-                      <button
-                           type="button"
-                           style={sx.clearBtn}
-                           aria-label="Clear search"
-                           onPointerDown={(e) => e.preventDefault()}
-                           onClick={() => {
-                               clearQuery();
-                               inputRef.current?.focus();
-                           }}
-                      >
-                          ✕
-                      </button>
-                 ) : null}
-             </div>
+                {normalizeSpaces(q) ? (
+                    <button
+                        type="button"
+                        style={sx.clearBtn}
+                        aria-label="Clear search"
+                        onPointerDown={(e) => e.preventDefault()}
+                        onClick={() => {
+                            clearQuery();
+                            inputRef.current?.focus();
+                        }}
+                    >
+                        <X size={12} strokeWidth={2.4} />
+                    </button>
+                ) : null}
+            </div>
 
-             <div
-                  style={{ ...sx.hintSlot, ...(showPanel ? sx.hintHidden : null) }}
-                  aria-hidden={showPanel}
-             >
-                 {hintText ? <div style={sx.hint}>{hintText}</div> : null}
-             </div>
+            <div
+                style={{ ...sx.hintSlot, ...(showPanel ? sx.hintHidden : null) }}
+                aria-hidden={showPanel}
+            >
+                {hintText ? <div style={sx.hint}>{hintText}</div> : null}
+            </div>
 
-             {showPanel ? (
-                  <div ref={panelRef} style={panelStyle}>
-                      <div style={sx.panelMsg}>
-                          {err ? (
-                               <span>{err}</span>
-                          ) : loading ? (
-                               <span>Searching…</span>
-                          ) : !hasTypedQuery && hasVisibleHistory ? (
-                               <>
-                                   <span>Recent searches</span>
-                                   <button
-                                        type="button"
-                                        style={sx.inlineBtn}
-                                        onPointerDown={(e) => e.preventDefault()}
-                                        onClick={() => {
-                                            clearHistory();
-                                            setHistory([]);
-                                            setActiveIdx(0);
-                                            inputRef.current?.focus();
+            {showPanel ? (
+                <div style={panelStyle}>
+                    <div style={sx.panelMsg}>
+                        {panelStatus === "error" ? (
+                            <>
+                                <div style={sx.panelMsgLeft}>
+                                    <span style={sx.panelBadge}>Error</span>
+                                    <span>{err}</span>
+                                </div>
+                            </>
+                        ) : panelStatus === "loading" ? (
+                            <>
+                                <div style={sx.panelMsgLeft}>
+                                    <span style={sx.panelBadge}>Search</span>
+                                    <span>Searching…</span>
+                                </div>
+                            </>
+                        ) : panelStatus === "history" ? (
+                            <>
+                                <div style={sx.panelMsgLeft}>
+                                    <span style={sx.panelBadge}>Recent</span>
+                                    <span>Recent searches</span>
+                                </div>
+
+                                <button
+                                    type="button"
+                                    style={sx.inlineBtn}
+                                    onPointerDown={(e) => e.preventDefault()}
+                                    onClick={() => {
+                                        clearHistory();
+                                        setHistory([]);
+                                        setActiveIdx(0);
+                                        inputRef.current?.focus();
+                                    }}
+                                >
+                                    Clear
+                                </button>
+                            </>
+                        ) : panelStatus === "ref" ? (
+                            <>
+                                <div style={sx.panelMsgLeft}>
+                                    <span style={sx.panelBadge}>Ref</span>
+                                    <span>Direct reference match</span>
+                                </div>
+                                <span style={sx.panelMeta}>ref</span>
+                            </>
+                        ) : panelStatus === "results" ? (
+                            <>
+                                <div style={sx.panelMsgLeft}>
+                                    <span style={sx.panelBadge}>Search</span>
+                                    <span>
+                                        {items.length
+                                            ? `${items.length}${items.length === 1 ? " result" : " results"}`
+                                            : "No results"}
+                                    </span>
+                                </div>
+                                <span style={sx.panelMeta}>{payload?.mode ?? "search"}</span>
+                            </>
+                        ) : (
+                            <div style={sx.panelMsgLeft}>
+                                <span style={sx.panelBadge}>Search</span>
+                                <span>Type to search</span>
+                            </div>
+                        )}
+                    </div>
+
+                    {items.length > 0 ? (
+                        <div
+                            id={listboxId}
+                            ref={listRef}
+                            style={sx.list}
+                            role="listbox"
+                            aria-label="Search results"
+                        >
+                            {items.map((it, idx) => {
+                                const active = idx === activeIdx;
+                                const meta = itemMetaLabel(it.kind, payload);
+
+                                return (
+                                    <button
+                                        key={it.key}
+                                        id={`${listboxId}-option-${idx}`}
+                                        ref={(el) => {
+                                            itemRefs.current[idx] = el;
                                         }}
-                                   >
-                                       Clear
-                                   </button>
-                               </>
-                          ) : ref.ok ? (
-                               <>
-                                   <span>Direct reference match</span>
-                                   <span style={sx.panelMeta}>ref</span>
-                               </>
-                          ) : hasTypedQuery ? (
-                               <>
-                                <span>
-                                    {items.length
-                                         ? `${items.length}${items.length === 1 ? " result" : " results"}`
-                                         : "No results."}
-                                </span>
-                                   <span style={sx.panelMeta}>{payload?.mode ?? "search"}</span>
-                               </>
-                          ) : (
-                               <span>Type to search.</span>
-                          )}
-                      </div>
+                                        type="button"
+                                        style={{ ...sx.item, ...(active ? sx.itemActive : null) }}
+                                        onMouseEnter={() => setActiveIdx(idx)}
+                                        onPointerDown={(e) => {
+                                            e.preventDefault();
+                                            commitSelection(idx);
+                                        }}
+                                        role="option"
+                                        aria-selected={active}
+                                    >
+                                        <div style={sx.itemIcon}>{itemIcon(it.kind)}</div>
 
-                      {items.length > 0 ? (
-                           <div
-                                id={listboxId}
-                                ref={listRef}
-                                style={sx.list}
-                                role="listbox"
-                                aria-label="Search results"
-                           >
-                               {items.map((it, idx) => {
-                                   const active = idx === activeIdx;
-                                   const meta = itemMetaLabel(it.kind, payload);
-
-                                   return (
-                                        <button
-                                             key={it.key}
-                                             id={`${listboxId}-option-${idx}`}
-                                             ref={(el) => {
-                                                 itemRefs.current[idx] = el;
-                                             }}
-                                             type="button"
-                                             style={{ ...sx.item, ...(active ? sx.itemActive : null) }}
-                                             onMouseEnter={() => setActiveIdx(idx)}
-                                             onPointerDown={(e) => {
-                                                 e.preventDefault();
-                                                 commitSelection(idx);
-                                             }}
-                                             role="option"
-                                             aria-selected={active}
-                                        >
+                                        <div style={sx.itemBody}>
                                             <div style={sx.itemTop}>
                                                 <span style={sx.itemLabel}>{it.label}</span>
                                                 <span style={sx.itemMeta}>{meta}</span>
                                             </div>
 
                                             {it.kind === "result" && it.result.snippet ? (
-                                                 <div style={sx.snippet}>
-                                                     {splitSnippet(it.result.snippet).map((seg, i) => (
-                                                          <span key={i} style={seg.hi ? sx.hi : undefined}>
-                                                        {seg.text}
-                                                    </span>
-                                                     ))}
-                                                 </div>
+                                                <div style={sx.snippet}>
+                                                    {splitSnippet(it.result.snippet).map((seg, i) => (
+                                                        <span
+                                                            key={`${it.key}-seg-${i}`}
+                                                            style={seg.hi ? sx.hi : undefined}
+                                                        >
+                                                            {seg.text}
+                                                        </span>
+                                                    ))}
+                                                </div>
                                             ) : null}
 
                                             {it.kind === "history" ? (
-                                                 <div style={sx.historySub}>Press Enter to reuse this search.</div>
+                                                <div style={sx.historySub}>
+                                                    Press Enter to reuse this search.
+                                                </div>
                                             ) : null}
-                                        </button>
-                                   );
-                               })}
-                           </div>
-                      ) : null}
+                                        </div>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    ) : null}
 
-                      <div style={sx.footer}>
-                          <span style={sx.footerText}>↑↓</span>
-                          <span style={sx.footerSep}>navigate</span>
-                          <span style={sx.footerDot}>•</span>
-                          <span style={sx.footerText}>Enter</span>
-                          <span style={sx.footerSep}>open</span>
-                          <span style={sx.footerDot}>•</span>
-                          <span style={sx.footerText}>Esc</span>
-                          <span style={sx.footerSep}>{q.trim() ? "clear" : "close"}</span>
-                      </div>
-                  </div>
-             ) : null}
-         </div>
+                    <div style={sx.footer}>
+                        <span style={sx.footerKey}>↑↓</span>
+                        <span style={sx.footerText}>move</span>
+                        <span style={sx.footerDot}>•</span>
+                        <CornerDownLeft size={11} />
+                        <span style={sx.footerText}>open</span>
+                        <span style={sx.footerDot}>•</span>
+                        <span style={sx.footerKey}>Esc</span>
+                        <span style={sx.footerText}>{normalizeSpaces(q) ? "clear" : "close"}</span>
+                    </div>
+                </div>
+            ) : null}
+        </div>
     );
 }
 
@@ -761,7 +923,7 @@ const sx: Record<string, React.CSSProperties> = {
         right: 0,
         marginTop: 8,
         borderRadius: 16,
-        border: "1px solid var(--hairline)",
+        border: "1px solid color-mix(in srgb, var(--hairline) 92%, transparent)",
         background: "var(--overlay)",
         boxShadow: "var(--shadowPop)",
         overflow: "hidden",
@@ -769,17 +931,39 @@ const sx: Record<string, React.CSSProperties> = {
         backdropFilter: "blur(12px)",
         WebkitBackdropFilter: "blur(12px)",
     },
+
     panelMsg: {
         padding: "9px 12px",
         fontSize: 12,
         color: "var(--muted)",
         display: "flex",
-        alignItems: "baseline",
+        alignItems: "center",
         justifyContent: "space-between",
         gap: 8,
-        borderBottom: "1px solid var(--hairline)",
+        borderBottom: "1px solid color-mix(in srgb, var(--hairline) 92%, transparent)",
         background: "var(--overlay2)",
+        minWidth: 0,
     },
+
+    panelMsgLeft: {
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        minWidth: 0,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+    },
+
+    panelBadge: {
+        fontSize: 9.8,
+        letterSpacing: "0.16em",
+        textTransform: "uppercase",
+        opacity: 0.9,
+        userSelect: "none",
+        whiteSpace: "nowrap",
+    },
+
     panelMeta: {
         fontSize: 9.8,
         letterSpacing: "0.16em",
@@ -787,37 +971,67 @@ const sx: Record<string, React.CSSProperties> = {
         opacity: 0.85,
         userSelect: "none",
         whiteSpace: "nowrap",
+        flex: "0 0 auto",
     },
+
     list: {
         display: "flex",
         flexDirection: "column",
         maxHeight: 340,
         overflowY: "auto",
     },
+
     item: {
+        display: "grid",
+        gridTemplateColumns: "16px minmax(0, 1fr)",
+        alignItems: "start",
+        gap: 10,
         textAlign: "left",
         border: "none",
         background: "transparent",
         color: "inherit",
         cursor: "pointer",
         padding: "10px 14px",
-        borderTop: "1px solid var(--hairline)",
+        borderTop: "1px solid color-mix(in srgb, var(--hairline) 92%, transparent)",
         transition: "background 140ms ease",
         fontSize: 13,
+        width: "100%",
+        minWidth: 0,
     },
+
     itemActive: {
         background: "var(--activeBg)",
     },
+
+    itemIcon: {
+        display: "grid",
+        placeItems: "center",
+        marginTop: 2,
+        color: "var(--muted)",
+        opacity: 0.9,
+    },
+
+    itemBody: {
+        minWidth: 0,
+    },
+
     itemTop: {
         display: "flex",
         alignItems: "baseline",
         justifyContent: "space-between",
         gap: 10,
+        minWidth: 0,
     },
+
     itemLabel: {
         fontSize: 13.2,
         letterSpacing: "0.01em",
+        minWidth: 0,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
     },
+
     itemMeta: {
         fontSize: 10,
         color: "var(--muted)",
@@ -825,25 +1039,32 @@ const sx: Record<string, React.CSSProperties> = {
         textTransform: "uppercase",
         userSelect: "none",
         whiteSpace: "nowrap",
+        flex: "0 0 auto",
     },
+
     snippet: {
         marginTop: 5,
-        fontSize: 12.2,
+        fontSize: 12.15,
         color: "var(--muted)",
         lineHeight: 1.55,
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
     },
+
     historySub: {
         marginTop: 5,
-        fontSize: 11.6,
+        fontSize: 11.5,
         color: "var(--muted)",
         lineHeight: 1.4,
     },
+
     hi: {
         color: "var(--fg)",
-        fontWeight: 550,
+        fontWeight: 600,
     },
+
     footer: {
-        borderTop: "1px solid var(--hairline)",
+        borderTop: "1px solid color-mix(in srgb, var(--hairline) 92%, transparent)",
         padding: "9px 14px",
         display: "flex",
         alignItems: "center",
@@ -853,28 +1074,34 @@ const sx: Record<string, React.CSSProperties> = {
         background: "var(--overlay2)",
         fontSize: 10.2,
     },
-    footerText: {
+
+    footerKey: {
         fontSize: 10,
         letterSpacing: "0.12em",
         textTransform: "uppercase",
     },
-    footerSep: {
+
+    footerText: {
         fontSize: 10,
-        opacity: 0.75,
+        opacity: 0.78,
     },
+
     footerDot: {
         opacity: 0.5,
         fontSize: 10,
-        paddingInline: 4,
+        paddingInline: 3,
     },
+
     hintSlot: {
         height: 18,
         marginTop: 8,
     },
+
     hintHidden: {
         opacity: 0,
         pointerEvents: "none",
     },
+
     hint: {
         fontSize: 10.5,
         letterSpacing: "0.12em",
@@ -885,6 +1112,14 @@ const sx: Record<string, React.CSSProperties> = {
         overflow: "hidden",
         textOverflow: "ellipsis",
     },
+
+    searchIcon: {
+        display: "inline-grid",
+        placeItems: "center",
+        flex: "0 0 auto",
+        color: "var(--muted)",
+    },
+
     clearBtn: {
         border: "none",
         background: "transparent",
@@ -892,8 +1127,6 @@ const sx: Record<string, React.CSSProperties> = {
         cursor: "pointer",
         padding: 0,
         marginLeft: 8,
-        fontSize: 12,
-        lineHeight: 1,
         width: 18,
         height: 18,
         display: "inline-flex",
@@ -902,6 +1135,7 @@ const sx: Record<string, React.CSSProperties> = {
         borderRadius: 999,
         flex: "0 0 auto",
     },
+
     inlineBtn: {
         border: "none",
         background: "transparent",
@@ -912,5 +1146,6 @@ const sx: Record<string, React.CSSProperties> = {
         lineHeight: 1.2,
         textDecoration: "underline",
         textUnderlineOffset: "0.14em",
+        flex: "0 0 auto",
     },
 };

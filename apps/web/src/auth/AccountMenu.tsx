@@ -12,10 +12,12 @@ import React, {
 import { createPortal } from "react-dom";
 import {
     ChevronDown,
+    ChevronRight,
     LogIn,
     LogOut,
     RefreshCcw,
     Settings2,
+    ShieldCheck,
     UserRound,
 } from "lucide-react";
 import { useAuth } from "./useAuth";
@@ -58,6 +60,7 @@ type UiDims = Readonly<{
     avatar: number;
     labelMax: number;
     chevron: number;
+    menuWidth: number;
 }>;
 
 type ViewportBox = Readonly<{
@@ -67,10 +70,11 @@ type ViewportBox = Readonly<{
     height: number;
 }>;
 
-const MENU_WIDTH = 276;
-const MENU_MIN_WIDTH = 196;
-const MENU_GAP = 10;
+type Ui = ReturnType<typeof createUiStyles>;
+
 const VIEWPORT_MARGIN = 12;
+const MENU_MIN_WIDTH = 208;
+const MENU_GAP = 10;
 const MENU_Z_INDEX = 300;
 const POINTER_DOWN_FOCUS_RESTORE_DELAY_MS = 0;
 
@@ -118,18 +122,25 @@ function usePrefersReducedMotion(): boolean {
     const [reduced, setReduced] = useState(false);
 
     useEffect(() => {
-        if (typeof window === "undefined" || !window.matchMedia) return;
+        if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+            return;
+        }
 
         const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-        const onChange = (event: MediaQueryListEvent) => {
-            setReduced(event.matches);
-        };
+        const apply = () => setReduced(mq.matches);
 
-        setReduced(mq.matches);
-        mq.addEventListener("change", onChange);
+        apply();
 
+        if (typeof mq.addEventListener === "function") {
+            mq.addEventListener("change", apply);
+            return () => {
+                mq.removeEventListener("change", apply);
+            };
+        }
+
+        mq.addListener(apply);
         return () => {
-            mq.removeEventListener("change", onChange);
+            mq.removeListener(apply);
         };
     }, []);
 
@@ -190,6 +201,7 @@ function getDims(size: Size): UiDims {
             avatar: 28,
             labelMax: 220,
             chevron: 16,
+            menuWidth: 272,
         };
     }
 
@@ -198,10 +210,11 @@ function getDims(size: Size): UiDims {
         avatar: 24,
         labelMax: 164,
         chevron: 14,
+        menuWidth: 252,
     };
 }
 
-function uiToken(state: {
+function createUiTokens(state: {
     open: boolean;
     hovered: boolean;
     pressed: boolean;
@@ -217,8 +230,8 @@ function uiToken(state: {
     const ringOpen = "0 0 0 1px color-mix(in srgb, var(--border) 80%, transparent)";
 
     const shadowIdle = "0 8px 20px color-mix(in srgb, black 10%, transparent)";
-    const shadowHover = "0 10px 26px color-mix(in srgb, black 13%, transparent)";
-    const shadowOpen = "0 14px 36px color-mix(in srgb, black 16%, transparent)";
+    const shadowHover = "0 10px 24px color-mix(in srgb, black 13%, transparent)";
+    const shadowOpen = "0 14px 34px color-mix(in srgb, black 16%, transparent)";
 
     return {
         triggerRing: docked ? "none" : open ? ringOpen : active ? ringHover : ringIdle,
@@ -230,30 +243,32 @@ function uiToken(state: {
                     ? shadowHover
                     : shadowIdle,
         triggerBg: open
-            ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 66%, transparent), transparent)"
+            ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 68%, transparent), transparent)"
             : active
-                ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 42%, transparent), transparent)"
+                ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 46%, transparent), transparent)"
                 : "transparent",
         triggerScale: pressed ? "scale(0.972)" : "scale(1)",
         motionFast: reducedMotion ? undefined : "140ms cubic-bezier(0.16, 1, 0.3, 1)",
         motionMed: reducedMotion ? undefined : "180ms cubic-bezier(0.16, 1, 0.3, 1)",
         menuBorder: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
         menuBg:
-            "linear-gradient(180deg, color-mix(in srgb, var(--card) 96%, white), color-mix(in srgb, var(--card) 99%, transparent))",
+            "linear-gradient(180deg, color-mix(in srgb, var(--card) 97%, white), color-mix(in srgb, var(--card) 99%, transparent))",
         menuShadow: "0 18px 56px color-mix(in srgb, black 20%, transparent)",
         menuDivider: "color-mix(in srgb, var(--border) 72%, transparent)",
         menuAlertBorder: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
         menuAlertBg: "color-mix(in srgb, var(--activeBg) 44%, transparent)",
-        rowHoverBg: "color-mix(in srgb, var(--activeBg) 60%, transparent)",
+        rowHoverBg: "color-mix(in srgb, var(--activeBg) 58%, transparent)",
         rowHoverBorder: "color-mix(in srgb, var(--border) 62%, transparent)",
         rowFocusRing: "0 0 0 3px color-mix(in srgb, var(--focusRing) 78%, transparent)",
         avatarRing: "0 0 0 1px color-mix(in srgb, var(--border) 70%, transparent)",
         avatarBg:
             "linear-gradient(180deg, color-mix(in srgb, var(--card) 96%, white), color-mix(in srgb, var(--card) 99%, transparent))",
+        chipBg: "color-mix(in srgb, var(--activeBg) 34%, transparent)",
+        chipBorder: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
     } as const;
 }
 
-function styles(args: {
+function createUiStyles(args: {
     dims: UiDims;
     showLabel: boolean;
     showChevron: boolean;
@@ -280,25 +295,25 @@ function styles(args: {
         style,
     } = args;
 
-    const t = uiToken({ open, hovered, pressed, reducedMotion, chrome });
+    const t = createUiTokens({ open, hovered, pressed, reducedMotion, chrome });
     const trailingVisible = showLabel || showChevron;
     const docked = chrome === "docked";
 
     const triggerPad = showLabel
-        ? "0 9px 0 4px"
+        ? "0 8px 0 4px"
         : trailingVisible
-            ? "0 7px 0 4px"
+            ? "0 6px 0 4px"
             : 0;
 
     const triggerGap = trailingVisible ? 6 : 0;
     const minWidth = showLabel
-        ? dims.avatar + dims.chevron + 38
+        ? dims.avatar + dims.chevron + 36
         : showChevron
-            ? dims.avatar + dims.chevron + 18
+            ? dims.avatar + dims.chevron + 16
             : dims.btn;
 
     const maxWidth = showLabel
-        ? dims.labelMax + dims.avatar + dims.chevron + 42
+        ? dims.labelMax + dims.avatar + dims.chevron + 40
         : minWidth;
 
     return {
@@ -346,7 +361,7 @@ function styles(args: {
         triggerChevron: {
             display: "grid",
             placeItems: "center",
-            opacity: open ? 0.82 : 0.62,
+            opacity: open ? 0.82 : 0.58,
             marginLeft: showLabel ? -1 : 0,
             flex: "0 0 auto",
             transform: open ? "rotate(180deg)" : "rotate(0deg)",
@@ -368,7 +383,7 @@ function styles(args: {
                 boxShadow: t.menuShadow,
                 backdropFilter: "blur(12px)",
                 WebkitBackdropFilter: "blur(12px)",
-                padding: 10,
+                padding: 8,
                 transformOrigin: pos.transformOrigin,
                 opacity: 1,
                 transform: "translateY(0) scale(1)",
@@ -379,15 +394,24 @@ function styles(args: {
             : null,
 
         menuHeader: {
-            display: "flex",
+            display: "grid",
+            gridTemplateColumns: "auto minmax(0, 1fr)",
             alignItems: "center",
             gap: 10,
-            padding: "6px 6px 8px 6px",
+            padding: "6px 6px 8px",
         } satisfies React.CSSProperties,
 
         menuHeaderTextWrap: {
             minWidth: 0,
-            flex: 1,
+            display: "grid",
+            gap: 4,
+        } satisfies React.CSSProperties,
+
+        menuHeaderTopRow: {
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            minWidth: 0,
         } satisfies React.CSSProperties,
 
         menuHeaderTitle: {
@@ -397,6 +421,23 @@ function styles(args: {
             overflow: "hidden",
             textOverflow: "ellipsis",
             opacity: loading ? 0.74 : 1,
+            minWidth: 0,
+        } satisfies React.CSSProperties,
+
+        statusChip: {
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 5,
+            minHeight: 20,
+            padding: "0 7px",
+            borderRadius: 999,
+            border: t.chipBorder,
+            background: t.chipBg,
+            fontSize: 11,
+            fontWeight: 700,
+            letterSpacing: "0.01em",
+            whiteSpace: "nowrap",
+            flex: "0 0 auto",
         } satisfies React.CSSProperties,
 
         menuHeaderSubline: {
@@ -405,7 +446,6 @@ function styles(args: {
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
-            marginTop: 2,
         } satisfies React.CSSProperties,
 
         menuAlert: {
@@ -415,14 +455,14 @@ function styles(args: {
             border: t.menuAlertBorder,
             background: t.menuAlertBg,
             fontSize: 12,
-            lineHeight: 1.35,
+            lineHeight: 1.4,
             opacity: 0.92,
         } satisfies React.CSSProperties,
 
         divider: {
             height: 1,
             background: t.menuDivider,
-            margin: "8px 0",
+            margin: "6px 0",
         } satisfies React.CSSProperties,
 
         avatar: (signedIn: boolean, sizePx: number): React.CSSProperties => ({
@@ -443,7 +483,7 @@ function styles(args: {
             display: "flex",
             alignItems: "center",
             gap: 10,
-            padding: "10px 10px",
+            padding: "9px 10px",
             borderRadius: 12,
             border: "1px solid transparent",
             textAlign: "left",
@@ -453,7 +493,7 @@ function styles(args: {
             WebkitTapHighlightColor: "transparent",
             outline: "none",
             transition:
-                "background 140ms ease, border-color 140ms ease, box-shadow 140ms ease, opacity 140ms ease, transform 140ms ease",
+                "background 140ms ease, border-color 140ms ease, box-shadow 140ms ease, opacity 140ms ease, transform 120ms ease",
         } satisfies React.CSSProperties,
 
         rowHoverBg: t.rowHoverBg,
@@ -580,7 +620,7 @@ function AvatarCircle(props: {
     user: UserLike;
     sizePx: number;
     signedIn: boolean;
-    ui: ReturnType<typeof styles>;
+    ui: Ui;
 }) {
     const { user, sizePx, signedIn, ui } = props;
 
@@ -607,12 +647,12 @@ function AvatarCircle(props: {
     );
 }
 
-function MenuDivider(props: { ui: ReturnType<typeof styles> }) {
+function MenuDivider(props: { ui: Ui }) {
     return <div aria-hidden="true" style={props.ui.divider} />;
 }
 
 function RowButton(props: {
-    ui: ReturnType<typeof styles>;
+    ui: Ui;
     label: string;
     hint?: string;
     icon?: React.ReactNode;
@@ -621,9 +661,23 @@ function RowButton(props: {
     autoFocus?: boolean;
     danger?: boolean;
     busy?: boolean;
+    trailing?: React.ReactNode;
 }) {
-    const { ui, label, hint, icon, onClick, disabled, autoFocus, danger, busy } = props;
+    const {
+        ui,
+        label,
+        hint,
+        icon,
+        onClick,
+        disabled,
+        autoFocus,
+        danger,
+        busy,
+        trailing,
+    } = props;
+
     const [hover, setHover] = useState(false);
+    const [pressed, setPressed] = useState(false);
     const [focusVisible, setFocusVisible] = useState(false);
 
     const isDisabled = !!disabled || !!busy;
@@ -638,6 +692,7 @@ function RowButton(props: {
         opacity: isDisabled ? 0.56 : 1,
         borderColor: hover && !isDisabled ? ui.rowHoverBorder : "transparent",
         boxShadow: focusVisible ? ui.rowFocusRing : "none",
+        transform: pressed && !isDisabled ? "scale(0.992)" : "scale(1)",
     };
 
     return (
@@ -652,7 +707,13 @@ function RowButton(props: {
                 void onClick();
             }}
             onPointerEnter={() => setHover(true)}
-            onPointerLeave={() => setHover(false)}
+            onPointerLeave={() => {
+                setHover(false);
+                setPressed(false);
+            }}
+            onPointerDown={() => setPressed(true)}
+            onPointerUp={() => setPressed(false)}
+            onPointerCancel={() => setPressed(false)}
             onFocus={() => {
                 setHover(true);
                 setFocusVisible(true);
@@ -660,6 +721,7 @@ function RowButton(props: {
             onBlur={() => {
                 setHover(false);
                 setFocusVisible(false);
+                setPressed(false);
             }}
             style={base}
         >
@@ -670,7 +732,7 @@ function RowButton(props: {
                         width: 18,
                         display: "grid",
                         placeItems: "center",
-                        opacity: busy ? 0.7 : 0.92,
+                        opacity: busy ? 0.68 : 0.92,
                         flex: "0 0 auto",
                     }}
                 >
@@ -685,9 +747,20 @@ function RowButton(props: {
                         display: "flex",
                         alignItems: "center",
                         gap: 8,
+                        minWidth: 0,
                     }}
                 >
-                    <span>{label}</span>
+                    <span
+                        style={{
+                            minWidth: 0,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                        }}
+                    >
+                        {label}
+                    </span>
+
                     {busy ? (
                         <span
                             aria-hidden="true"
@@ -706,7 +779,7 @@ function RowButton(props: {
                     <div
                         style={{
                             fontSize: 12,
-                            opacity: 0.72,
+                            opacity: 0.68,
                             marginTop: 2,
                             whiteSpace: "nowrap",
                             overflow: "hidden",
@@ -717,6 +790,20 @@ function RowButton(props: {
                     </div>
                 ) : null}
             </div>
+
+            {trailing ? (
+                <span
+                    aria-hidden="true"
+                    style={{
+                        display: "grid",
+                        placeItems: "center",
+                        opacity: 0.5,
+                        flex: "0 0 auto",
+                    }}
+                >
+                    {trailing}
+                </span>
+            ) : null}
         </button>
     );
 }
@@ -760,6 +847,7 @@ export function AccountMenu({
 
     const triggerTitle = formatTriggerTitle(user, signedIn);
     const showLabel = signedIn && showLabelWhenSignedIn;
+    const busy = loading || actionState !== "idle";
 
     const close = useCallback((opts?: { restoreFocus?: boolean }) => {
         restoreFocusOnCloseRef.current = opts?.restoreFocus ?? true;
@@ -779,14 +867,14 @@ export function AccountMenu({
     const pos = usePopoverPosition({
         open,
         align,
-        menuWidth: MENU_WIDTH,
+        menuWidth: dims.menuWidth,
         anchorRef: btnRef,
         menuRef,
     });
 
     const ui = useMemo(
         () =>
-            styles({
+            createUiStyles({
                 dims,
                 showLabel,
                 showChevron,
@@ -913,7 +1001,6 @@ export function AccountMenu({
 
             return () => window.clearTimeout(t);
         }
-
         return;
     }, [open]);
 
@@ -1009,6 +1096,8 @@ export function AccountMenu({
     );
 
     const handleRefresh = useCallback(async () => {
+        if (busy) return;
+
         setActionState("refreshing");
         try {
             await refresh();
@@ -1018,9 +1107,11 @@ export function AccountMenu({
                 close();
             }
         }
-    }, [refresh, close]);
+    }, [busy, refresh, close]);
 
     const handleOpenAccount = useCallback(async () => {
+        if (busy) return;
+
         setActionState("opening_account");
         try {
             openAccountPage();
@@ -1030,9 +1121,11 @@ export function AccountMenu({
                 close({ restoreFocus: false });
             }
         }
-    }, [openAccountPage, close]);
+    }, [busy, openAccountPage, close]);
 
     const handleSignOut = useCallback(async () => {
+        if (busy) return;
+
         setActionState("signing_out");
         try {
             await signOut();
@@ -1042,9 +1135,11 @@ export function AccountMenu({
                 close();
             }
         }
-    }, [signOut, close]);
+    }, [busy, signOut, close]);
 
     const handleSignIn = useCallback(() => {
+        if (busy) return;
+
         setActionState("signing_in");
         close({ restoreFocus: false });
 
@@ -1056,7 +1151,7 @@ export function AccountMenu({
                 setActionState("idle");
             }
         });
-    }, [signInWithGoogle, close]);
+    }, [busy, signInWithGoogle, close]);
 
     const menuStatusTitle = loading
         ? "Checking…"
@@ -1069,6 +1164,12 @@ export function AccountMenu({
         : signedIn
             ? user?.email?.trim() || "—"
             : "Sign in to sync";
+
+    const sessionChipLabel = loading
+        ? "Syncing"
+        : signedIn
+            ? "Signed in"
+            : "Guest";
 
     const triggerText = loading ? "…" : triggerTitle;
     const triggerAriaLabel = open ? "Close account menu" : "Open account menu";
@@ -1097,7 +1198,15 @@ export function AccountMenu({
                         />
 
                         <div style={ui.menuHeaderTextWrap}>
-                            <div style={ui.menuHeaderTitle}>{menuStatusTitle}</div>
+                            <div style={ui.menuHeaderTopRow}>
+                                <div style={ui.menuHeaderTitle}>{menuStatusTitle}</div>
+
+                                <div style={ui.statusChip}>
+                                    <ShieldCheck size={11} />
+                                    {sessionChipLabel}
+                                </div>
+                            </div>
+
                             <div style={ui.menuHeaderSubline}>{menuStatusSubline}</div>
                         </div>
                     </div>
@@ -1116,29 +1225,31 @@ export function AccountMenu({
                             autoFocus
                             label="Continue with Google"
                             hint="Secure sign-in"
-                            disabled={loading}
+                            disabled={busy}
                             busy={actionState === "signing_in"}
                             icon={<LogIn size={16} />}
                             onClick={handleSignIn}
+                            trailing={<ChevronRight size={15} />}
                         />
                     ) : (
                         <>
                             <RowButton
                                 ui={ui}
                                 autoFocus
-                                label="Account"
+                                label="Open account"
                                 hint="Manage your session"
-                                disabled={loading}
+                                disabled={busy}
                                 busy={actionState === "opening_account"}
                                 icon={<Settings2 size={16} />}
                                 onClick={handleOpenAccount}
+                                trailing={<ChevronRight size={15} />}
                             />
 
                             <RowButton
                                 ui={ui}
                                 label="Refresh session"
                                 hint="Re-check login state"
-                                disabled={loading}
+                                disabled={busy}
                                 busy={actionState === "refreshing"}
                                 icon={<RefreshCcw size={16} />}
                                 onClick={handleRefresh}
@@ -1148,7 +1259,7 @@ export function AccountMenu({
                                 ui={ui}
                                 label="Sign out"
                                 hint="End this session"
-                                disabled={loading}
+                                disabled={busy}
                                 busy={actionState === "signing_out"}
                                 danger
                                 icon={<LogOut size={16} />}

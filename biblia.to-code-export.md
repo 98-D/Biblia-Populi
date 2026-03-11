@@ -1,11 +1,11 @@
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-11T16:53:48.067Z
+Generated: 2026-03-11T18:02:18.887Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
 Total files: 70
-Total raw bytes (all included files): 2208710
+Total raw bytes (all included files): 2240811
 Truncated/skipped files: 1
-Export time: 65ms
+Export time: 59ms
 
 ## Notes
 
@@ -13713,18 +13713,19 @@ export default defineConfig([
 
 ```ts
 // apps/web/src/api.ts
-// Biblia.to — hardened typed API client
+// Biblia.to — upgraded hardened typed API client
 //
 // Goals:
 // - same-origin by default, optional VITE_API_BASE override
 // - stable translation selection + reconciliation
-// - GET envelope decoding with safe 204 / 304 handling
+// - GET envelope decoding with safe 204 / 205 / 304 handling
 // - in-memory ETag cache that cannot freeze on 304
 // - merged abort signals + timeout classification
-// - safer parsing / narrower envelope assumptions
+// - stricter path / query hygiene
 // - explicit diagnostics with request id + body snippet
-// - stricter query encoding / path hygiene
-// - deterministic cache-keying + cache invalidation hooks
+// - deterministic cache keys + selective invalidation hooks
+// - in-flight GET dedupe for identical requests
+// - safer numeric normalization at the call boundary
 
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: { code: string; message: string } };
@@ -14076,8 +14077,14 @@ function normalizeApiBase(raw: string): string {
     return stripTrailingSlashes(withLeading);
 }
 
+function ensureApiPath(path: string): string {
+    const trimmed = path.trim();
+    if (!trimmed) return "/";
+    return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
 function joinUrl(base: string, path: string): string {
-    const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+    const normalizedPath = ensureApiPath(path);
     const normalizedBase = normalizeApiBase(base);
 
     if (!normalizedBase) return normalizedPath;
@@ -14126,6 +14133,15 @@ function safeLocalStorageRemove(key: string): void {
 
 function normalizeTranslationId(id: string): string {
     return id.trim();
+}
+
+function normalizeBookId(bookId: string): string {
+    return bookId.trim().toUpperCase();
+}
+
+function hasQueryParam(path: string, name: string): boolean {
+    const url = new URL(ensureApiPath(path), "http://local");
+    return url.searchParams.has(name);
 }
 
 export function getTranslationId(): string | null {
@@ -14182,12 +14198,15 @@ export function reconcileTranslationId(
 
 function withTranslation(path: string, opts?: ApiRequestOptions): string {
     const translationId = (opts?.translationId ?? getTranslationId())?.trim() ?? "";
-    if (!translationId) return path;
+    if (!translationId) return ensureApiPath(path);
 
-    if (/[?&](t|translationId)=/i.test(path)) return path;
+    const normalizedPath = ensureApiPath(path);
+    if (hasQueryParam(normalizedPath, "t") || hasQueryParam(normalizedPath, "translationId")) {
+        return normalizedPath;
+    }
 
-    const sep = path.includes("?") ? "&" : "?";
-    return `${path}${sep}t=${encodeURIComponent(translationId)}`;
+    const sep = normalizedPath.includes("?") ? "&" : "?";
+    return `${normalizedPath}${sep}t=${encodeURIComponent(translationId)}`;
 }
 
 /* ------------------------------ Query helpers ---------------------------- */
@@ -14195,7 +14214,7 @@ function withTranslation(path: string, opts?: ApiRequestOptions): string {
 type QueryValue = string | number | boolean | null | undefined;
 
 function addQuery(path: string, params: Record<string, QueryValue>): string {
-    const url = new URL(path, "http://local");
+    const url = new URL(ensureApiPath(path), "http://local");
     for (const [key, value] of Object.entries(params)) {
         if (value == null) continue;
         url.searchParams.set(key, String(value));
@@ -14249,13 +14268,16 @@ function formatHttpMessage(res: Response): string {
 }
 
 function getRequestId(res: Response): string | undefined {
-    const id = res.headers.get("x-request-id") ?? res.headers.get("cf-ray");
+    const id =
+        res.headers.get("x-request-id") ??
+        res.headers.get("x-correlation-id") ??
+        res.headers.get("cf-ray");
     return id?.trim() || undefined;
 }
 
 function bodySnippet(text: string | undefined): string | undefined {
     if (!text) return undefined;
-    const normalized = text.trim();
+    const normalized = text.replace(/\s+/g, " ").trim();
     if (!normalized) return undefined;
     return normalized.length > 320 ? `${normalized.slice(0, 320)}…` : normalized;
 }
@@ -14362,6 +14384,7 @@ type CacheEntry = Readonly<{
 
 const DEFAULT_CACHE_TTL_MS = 30_000;
 const responseCache = new Map<string, CacheEntry>();
+const inflightGetRequests = new Map<string, Promise<unknown>>();
 
 function cacheKey(method: string, url: string): string {
     return `${method.toUpperCase()} ${url}`;
@@ -14403,26 +14426,49 @@ function shouldCacheResponse(method: string, res: Response): boolean {
     return Boolean((res.headers.get("etag") ?? "").trim());
 }
 
+function invalidateCacheByPath(pathPrefix: string): void {
+    const normalized = ensureApiPath(pathPrefix);
+    for (const key of responseCache.keys()) {
+        const space = key.indexOf(" ");
+        const url = space >= 0 ? key.slice(space + 1) : key;
+        if (url.includes(normalized)) {
+            responseCache.delete(key);
+        }
+    }
+    for (const key of inflightGetRequests.keys()) {
+        const space = key.indexOf(" ");
+        const url = space >= 0 ? key.slice(space + 1) : key;
+        if (url.includes(normalized)) {
+            inflightGetRequests.delete(key);
+        }
+    }
+}
+
 /* ----------------------------- Request core ------------------------------ */
 
 type HttpMethod = "GET" | "POST";
 
 function normalizeTimeoutMs(value: number | undefined): number {
-    if (!Number.isFinite(value ?? NaN)) return 12_000;
+    if (!Number.isFinite(value ?? Number.NaN)) return 12_000;
     return Math.max(1, Math.trunc(value as number));
 }
 
 function normalizeCacheTtlMs(value: number | undefined): number {
-    if (!Number.isFinite(value ?? NaN)) return DEFAULT_CACHE_TTL_MS;
+    if (!Number.isFinite(value ?? Number.NaN)) return DEFAULT_CACHE_TTL_MS;
     return Math.max(0, Math.trunc(value as number));
 }
 
-function buildHeaders(source: Record<string, string> | undefined): Record<string, string> {
-    const out: Record<string, string> = {};
+function normalizePositiveInt(value: number, fallback: number, min = 1): number {
+    if (!Number.isFinite(value)) return fallback;
+    return Math.max(min, Math.trunc(value));
+}
+
+function buildHeaders(source: Record<string, string> | undefined): Headers {
+    const out = new Headers();
     if (!source) return out;
 
     for (const [key, value] of Object.entries(source)) {
-        out[key] = value;
+        out.set(key, value);
     }
 
     return out;
@@ -14436,7 +14482,7 @@ async function readResponseBodyText(res: Response): Promise<string> {
     }
 }
 
-async function requestJson<T>(
+async function performRequestJson<T>(
     method: HttpMethod,
     path: string,
     body: unknown | undefined,
@@ -14451,31 +14497,31 @@ async function requestJson<T>(
     const credentials = opts.credentials ?? "same-origin";
 
     const merged = mergeSignalsWithTimeout(opts.signal, timeoutMs);
-
     const headers = buildHeaders(opts.headers);
-    if (headers.Accept == null) {
-        headers.Accept = "application/json";
+
+    if (!headers.has("Accept")) {
+        headers.set("Accept", "application/json");
     }
 
-    if (cacheMode === "no-store" && headers["Cache-Control"] == null) {
-        headers["Cache-Control"] = "no-store";
-    } else if (cacheMode === "reload" && headers["Cache-Control"] == null) {
-        headers["Cache-Control"] = "no-cache";
+    if (cacheMode === "no-store" && !headers.has("Cache-Control")) {
+        headers.set("Cache-Control", "no-store");
+    } else if (cacheMode === "reload" && !headers.has("Cache-Control")) {
+        headers.set("Cache-Control", "no-cache");
     }
 
     const key = cacheKey(method, url);
     const prior = cacheMode === "default" ? cacheGet(key, cacheTtlMs) : null;
 
     if (method === "GET" && cacheMode === "default" && prior?.etag) {
-        headers["If-None-Match"] = prior.etag;
+        headers.set("If-None-Match", prior.etag);
     }
 
     try {
         let payload: string | undefined;
         if (method === "POST" && body !== undefined) {
             payload = JSON.stringify(body);
-            if (headers["Content-Type"] == null) {
-                headers["Content-Type"] = "application/json";
+            if (!headers.has("Content-Type")) {
+                headers.set("Content-Type", "application/json");
             }
         }
 
@@ -14506,7 +14552,10 @@ async function requestJson<T>(
             return prior.data as T;
         }
 
-        if (res.status === 204) {
+        if (res.status === 204 || res.status === 205) {
+            if (method === "GET" && cacheMode !== "default") {
+                cacheDelete(key);
+            }
             return null as T;
         }
 
@@ -14583,6 +14632,34 @@ async function requestJson<T>(
     }
 }
 
+async function requestJson<T>(
+    method: HttpMethod,
+    path: string,
+    body: unknown | undefined,
+    opts: ApiRequestOptions = {},
+): Promise<T> {
+    const pathWithTranslation = withTranslation(path, opts);
+    const url = joinUrl(API_BASE, pathWithTranslation);
+    const key = cacheKey(method, url);
+    const cacheMode = opts.cacheMode ?? "default";
+
+    if (method === "GET" && cacheMode === "default") {
+        const existing = inflightGetRequests.get(key);
+        if (existing) {
+            return existing as Promise<T>;
+        }
+
+        const promise = performRequestJson<T>(method, path, body, opts).finally(() => {
+            inflightGetRequests.delete(key);
+        });
+
+        inflightGetRequests.set(key, promise as Promise<unknown>);
+        return promise;
+    }
+
+    return performRequestJson<T>(method, path, body, opts);
+}
+
 async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T> {
     return requestJson<T>("GET", path, undefined, opts);
 }
@@ -14613,7 +14690,7 @@ export function apiGetChapters(
     bookId: string,
     opts?: ApiRequestOptions,
 ): Promise<ChaptersPayload> {
-    return getJson(`/chapters/${encodeURIComponent(bookId)}`, opts);
+    return getJson(`/chapters/${encodeURIComponent(normalizeBookId(bookId))}`, opts);
 }
 
 export function apiGetChapter(
@@ -14621,8 +14698,9 @@ export function apiGetChapter(
     chapter: number,
     opts?: ApiRequestOptions,
 ): Promise<ChapterPayload> {
+    const cleanChapter = normalizePositiveInt(chapter, 1, 1);
     return getJson(
-        `/chapter/${encodeURIComponent(bookId)}/${encodeURIComponent(String(Math.trunc(chapter)))}`,
+        `/chapter/${encodeURIComponent(normalizeBookId(bookId))}/${encodeURIComponent(String(cleanChapter))}`,
         opts,
     );
 }
@@ -14634,23 +14712,23 @@ export function apiSearch(
 ): Promise<SearchPayload> {
     return getJson(
         addQuery("/search", {
-            q,
-            limit: Math.max(1, Math.trunc(limit)),
+            q: q.trim(),
+            limit: normalizePositiveInt(limit, 30, 1),
         }),
         opts,
     );
 }
 
 export function apiGetPerson(id: string, opts?: ApiRequestOptions): Promise<PersonPayload> {
-    return getJson(`/people/${encodeURIComponent(id)}`, opts);
+    return getJson(`/people/${encodeURIComponent(id.trim())}`, opts);
 }
 
 export function apiGetPlace(id: string, opts?: ApiRequestOptions): Promise<PlacePayload> {
-    return getJson(`/places/${encodeURIComponent(id)}`, opts);
+    return getJson(`/places/${encodeURIComponent(id.trim())}`, opts);
 }
 
 export function apiGetEvent(id: string, opts?: ApiRequestOptions): Promise<EventPayload> {
-    return getJson(`/events/${encodeURIComponent(id)}`, opts);
+    return getJson(`/events/${encodeURIComponent(id.trim())}`, opts);
 }
 
 export function apiGetSpine(opts?: ApiRequestOptions): Promise<SpineStats> {
@@ -14664,8 +14742,8 @@ export function apiGetSlice(
 ): Promise<SlicePayload> {
     return getJson(
         addQuery("/slice", {
-            fromOrd: Math.trunc(fromOrd),
-            limit: Math.max(1, Math.trunc(limit)),
+            fromOrd: normalizePositiveInt(fromOrd, 1, 1),
+            limit: normalizePositiveInt(limit, 240, 1),
         }),
         opts,
     );
@@ -14678,11 +14756,15 @@ export function apiResolveLoc(
     opts?: ApiRequestOptions,
 ): Promise<LocPayload> {
     const cleanBookId = normalizeBookId(bookId);
+    const cleanChapter = normalizePositiveInt(chapter, 1, 1);
+    const cleanVerse =
+        verse == null ? undefined : normalizePositiveInt(verse, 1, 1);
+
     return getJson(
         addQuery("/loc", {
             bookId: cleanBookId,
-            chapter: Math.trunc(chapter),
-            ...(verse != null ? { verse: Math.trunc(verse) } : {}),
+            chapter: cleanChapter,
+            ...(cleanVerse != null ? { verse: cleanVerse } : {}),
         }),
         opts,
     );
@@ -14692,15 +14774,18 @@ export function apiAuthMe(opts?: ApiRequestOptions): Promise<{ user: unknown | n
     return getJson("/auth/me", opts);
 }
 
-export function apiAuthLogout(opts?: ApiRequestOptions): Promise<{ redirect: string }> {
-    return postJson("/auth/logout", undefined, opts);
+export async function apiAuthLogout(
+    opts?: ApiRequestOptions,
+): Promise<{ redirect: string }> {
+    const result = await postJson<{ redirect: string }>("/auth/logout", undefined, opts);
+
+    invalidateApiCacheByPrefix("/auth/me");
+    invalidateApiCacheByPrefix("/meta");
+
+    return result;
 }
 
 /* -------------------------- Convenience / debug -------------------------- */
-
-function normalizeBookId(bookId: string): string {
-    return bookId.trim().toUpperCase();
-}
 
 export function formatApiError(error: unknown): string {
     if (!(error instanceof ApiError)) {
@@ -14721,6 +14806,11 @@ export function formatApiError(error: unknown): string {
 
 export function clearApiResponseCache(): void {
     responseCache.clear();
+    inflightGetRequests.clear();
+}
+
+export function invalidateApiCacheByPrefix(pathPrefix: string): void {
+    invalidateCacheByPath(pathPrefix);
 }
 
 export function getApiBase(): string {
@@ -14747,6 +14837,7 @@ import { Search, type ReaderLocation } from "./Search";
 import { ThemeProvider, ThemeShell, ThemeTogglePill, useTheme } from "./theme";
 
 type Page = "home" | "learn" | "reader" | "account";
+type HistoryMode = "push" | "replace";
 
 const LS_LAST_PAGE = "bt_nav_last_page_v1";
 const LS_LAST_LOC = "bt_nav_last_loc_v1";
@@ -14758,11 +14849,11 @@ const LEARN_HASH = "#/learn";
 const READER_HASH = "#/reader";
 const ACCOUNT_HASH = "#/account";
 
-const DEFAULT_READER_LOCATION: ReaderLocation = {
+const DEFAULT_READER_LOCATION: ReaderLocation = Object.freeze({
     bookId: "GEN",
     chapter: 1,
     verse: 1,
-};
+});
 
 type AppStyles = Readonly<{
     page: React.CSSProperties;
@@ -14780,12 +14871,22 @@ type AppStyles = Readonly<{
     secondaryBtnButton: React.CSSProperties;
     subtleBtnButton: React.CSSProperties;
     signedInPill: React.CSSProperties;
+    learnMoreWrap: React.CSSProperties;
 }>;
 
 type UrlIntent = Readonly<{
     page?: Page;
     loc?: ReaderLocation;
 }>;
+
+type RouteState = Readonly<{
+    page: Page;
+    readerLoc: ReaderLocation;
+}>;
+
+function css<T extends React.CSSProperties>(value: T): React.CSSProperties {
+    return value;
+}
 
 function isBrowser(): boolean {
     return typeof window !== "undefined";
@@ -14827,35 +14928,39 @@ function isPage(value: unknown): value is Page {
 
 function toInt(value: unknown): number | null {
     const n =
-         typeof value === "number"
-              ? value
-              : typeof value === "string" && value.trim() !== ""
-                   ? Number(value)
-                   : Number.NaN;
+        typeof value === "number"
+            ? value
+            : typeof value === "string" && value.trim() !== ""
+                ? Number(value)
+                : Number.NaN;
 
     return Number.isFinite(n) ? Math.trunc(n) : null;
 }
 
-function normalizeLoc(loc: Partial<ReaderLocation> | null | undefined): ReaderLocation | null {
-    if (!loc || typeof loc.bookId !== "string" || loc.bookId.trim().length === 0) {
-        return null;
-    }
+function normalizeBookId(value: unknown): string | null {
+    if (typeof value !== "string") return null;
 
-    const bookId = loc.bookId.trim().toUpperCase();
+    const normalized = value.trim().toUpperCase();
+    return normalized.length > 0 ? normalized : null;
+}
+
+function normalizeLoc(loc: Partial<ReaderLocation> | null | undefined): ReaderLocation | null {
+    if (!loc) return null;
+
+    const bookId = normalizeBookId(loc.bookId);
     const chapter = toInt((loc as { chapter?: unknown }).chapter);
     const verseRaw = (loc as { verse?: unknown }).verse;
 
-    if (chapter == null || chapter < 1) {
+    if (!bookId || chapter == null || chapter < 1) {
         return null;
     }
 
-    const verse = verseRaw == null ? undefined : toInt(verseRaw) ?? undefined;
+    const verseInt = verseRaw == null ? undefined : toInt(verseRaw) ?? undefined;
+    const verse = verseInt != null && verseInt >= 1 ? verseInt : undefined;
 
-    if (verse != null && verse < 1) {
-        return { bookId, chapter };
-    }
-
-    return { bookId, chapter, verse };
+    return verse != null
+        ? { bookId, chapter, verse }
+        : { bookId, chapter };
 }
 
 function parseLoc(raw: string | null): ReaderLocation | null {
@@ -14879,39 +14984,56 @@ function encodeLoc(loc: ReaderLocation | null): string | null {
     });
 }
 
+function safeDecode(value: string): string {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
+
+function normalizePathname(pathname: string): string {
+    const trimmed = pathname.trim();
+    if (trimmed === "" || trimmed === "/") return "/";
+
+    const normalized = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+    return normalized.toLowerCase() || "/";
+}
+
+function parseReadHash(hash: string): ReaderLocation | null {
+    const raw = hash.trim();
+    if (!raw.toLowerCase().startsWith("#/read/")) return null;
+
+    const parts = raw
+        .slice("#/read/".length)
+        .split("/")
+        .map((part) => safeDecode(part).trim())
+        .filter(Boolean);
+
+    return normalizeLoc({
+        bookId: parts[0],
+        chapter: parts[1],
+        verse: parts[2],
+    });
+}
+
 function readUrlIntent(): UrlIntent {
     if (!isBrowser()) return {};
 
     try {
         const { hash, search, pathname } = window.location;
         const trimmedHash = hash.trim();
+        const lowerHash = trimmedHash.toLowerCase();
 
-        if (trimmedHash.startsWith("#/read/")) {
-            const parts = trimmedHash
-                 .slice("#/read/".length)
-                 .split("/")
-                 .map((part) => part.trim())
-                 .filter(Boolean);
-
-            const bookId = parts[0]?.toUpperCase();
-            const chapter = toInt(parts[1]);
-            const verse = parts[2] == null ? undefined : toInt(parts[2]) ?? undefined;
-
-            const loc = normalizeLoc({
-                bookId,
-                chapter: chapter ?? undefined,
-                verse,
-            });
-
-            if (loc) {
-                return { page: "reader", loc };
-            }
+        const readLoc = parseReadHash(trimmedHash);
+        if (readLoc) {
+            return { page: "reader", loc: readLoc };
         }
 
-        if (trimmedHash === READER_HASH) return { page: "reader" };
-        if (trimmedHash === LEARN_HASH) return { page: "learn" };
-        if (trimmedHash === HOME_HASH) return { page: "home" };
-        if (trimmedHash === ACCOUNT_HASH) return { page: "account" };
+        if (lowerHash === READER_HASH) return { page: "reader" };
+        if (lowerHash === LEARN_HASH) return { page: "learn" };
+        if (lowerHash === HOME_HASH) return { page: "home" };
+        if (lowerHash === ACCOUNT_HASH) return { page: "account" };
 
         const query = new URLSearchParams(search);
         const pageQuery = query.get("page")?.trim().toLowerCase();
@@ -14921,10 +15043,12 @@ function readUrlIntent(): UrlIntent {
         if (pageQuery === "home") return { page: "home" };
         if (pageQuery === "account") return { page: "account" };
 
-        if (pathname === "/account") return { page: "account" };
-        if (pathname === "/reader") return { page: "reader" };
-        if (pathname === "/learn") return { page: "learn" };
-        if (pathname === "/" || pathname === "") return { page: "home" };
+        const normalizedPath = normalizePathname(pathname);
+
+        if (normalizedPath === "/account") return { page: "account" };
+        if (normalizedPath === "/reader") return { page: "reader" };
+        if (normalizedPath === "/learn") return { page: "learn" };
+        if (normalizedPath === "/") return { page: "home" };
     } catch {
         // ignore
     }
@@ -14935,8 +15059,8 @@ function readUrlIntent(): UrlIntent {
 function hashForPage(page: Page, loc: ReaderLocation | null): string {
     if (page === "reader" && loc) {
         return loc.verse != null
-             ? `#/read/${loc.bookId}/${loc.chapter}/${loc.verse}`
-             : `#/read/${loc.bookId}/${loc.chapter}`;
+            ? `#/read/${loc.bookId}/${loc.chapter}/${loc.verse}`
+            : `#/read/${loc.bookId}/${loc.chapter}`;
     }
 
     switch (page) {
@@ -14952,13 +15076,16 @@ function hashForPage(page: Page, loc: ReaderLocation | null): string {
     }
 }
 
-function writeUrl(page: Page, loc: ReaderLocation | null): void {
+function writeUrl(mode: HistoryMode, page: Page, loc: ReaderLocation | null): void {
     if (!isBrowser()) return;
 
     const nextHash = hashForPage(page, loc);
     if (window.location.hash === nextHash) return;
 
-    window.history.replaceState(null, "", nextHash);
+    const nextUrl = `${window.location.pathname}${window.location.search}${nextHash}`;
+    const method = mode === "push" ? "pushState" : "replaceState";
+
+    window.history[method](null, "", nextUrl);
 }
 
 function getSavedPage(): Page | null {
@@ -14990,231 +15117,311 @@ function saveLoc(loc: ReaderLocation | null): void {
     safeDel(LS_LAST_LOC);
 }
 
-function createAppStyles(): AppStyles {
+const APP_STYLES: AppStyles = Object.freeze({
+    page: css({
+        minHeight: "100dvh",
+        background: "var(--bg)",
+        color: "var(--fg)",
+        minWidth: 0,
+    }),
+
+    stage: css({
+        minHeight: "100dvh",
+        minWidth: 0,
+    }),
+
+    centerStage: css({
+        minHeight: "100dvh",
+        display: "grid",
+        placeItems: "center",
+        padding: "28px 20px",
+        minWidth: 0,
+    }),
+
+    centerBlock: css({
+        width: "100%",
+        maxWidth: 880,
+        display: "grid",
+        justifyItems: "center",
+        textAlign: "center",
+        minWidth: 0,
+    }),
+
+    cornerControls: css({
+        position: "fixed",
+        top: "calc(16px + env(safe-area-inset-top, 0px))",
+        right: "calc(16px + env(safe-area-inset-right, 0px))",
+        zIndex: 20,
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+    }),
+
+    crossWrap: css({
+        width: 108,
+        height: 108,
+        marginBottom: 18,
+        display: "grid",
+        placeItems: "center",
+        flex: "0 0 auto",
+    }),
+
+    crossImg: css({
+        width: "100%",
+        height: "100%",
+        objectFit: "contain",
+        userSelect: "none",
+        pointerEvents: "none",
+    }),
+
+    h1: css({
+        margin: 0,
+        fontSize: "clamp(42px, 7vw, 82px)",
+        lineHeight: 0.95,
+        letterSpacing: "-0.04em",
+        fontWeight: 820,
+        minWidth: 0,
+    }),
+
+    lede: css({
+        margin: "16px 0 0",
+        maxWidth: 700,
+        fontSize: "clamp(16px, 2.1vw, 20px)",
+        lineHeight: 1.55,
+        opacity: 0.84,
+        minWidth: 0,
+    }),
+
+    searchContainer: css({
+        width: "100%",
+        maxWidth: 760,
+        marginTop: 28,
+        minWidth: 0,
+    }),
+
+    ctaRow: css({
+        marginTop: 18,
+        display: "flex",
+        flexWrap: "wrap",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 10,
+    }),
+
+    primaryBtnButton: css({
+        height: 44,
+        borderRadius: 999,
+        padding: "0 18px",
+        border: "1px solid transparent",
+        background: "var(--fg)",
+        color: "var(--bg)",
+        fontSize: 14,
+        fontWeight: 760,
+        cursor: "pointer",
+        boxShadow: "0 14px 32px color-mix(in srgb, black 14%, transparent)",
+        appearance: "none",
+        WebkitAppearance: "none",
+        outline: "none",
+        WebkitTapHighlightColor: "transparent",
+    }),
+
+    secondaryBtnButton: css({
+        height: 44,
+        borderRadius: 999,
+        padding: "0 18px",
+        border: "1px solid color-mix(in srgb, var(--border) 76%, transparent)",
+        background: "transparent",
+        color: "var(--fg)",
+        fontSize: 14,
+        fontWeight: 760,
+        cursor: "pointer",
+        appearance: "none",
+        WebkitAppearance: "none",
+        outline: "none",
+        WebkitTapHighlightColor: "transparent",
+    }),
+
+    subtleBtnButton: css({
+        height: 42,
+        borderRadius: 999,
+        padding: "0 16px",
+        border: "1px solid transparent",
+        background: "transparent",
+        color: "var(--fg)",
+        fontSize: 13,
+        fontWeight: 700,
+        cursor: "pointer",
+        opacity: 0.78,
+        appearance: "none",
+        WebkitAppearance: "none",
+        outline: "none",
+        WebkitTapHighlightColor: "transparent",
+    }),
+
+    signedInPill: css({
+        marginTop: 12,
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+        minHeight: 34,
+        borderRadius: 999,
+        padding: "0 12px",
+        border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
+        background: "color-mix(in srgb, var(--activeBg) 36%, transparent)",
+        fontSize: 13,
+        fontWeight: 650,
+        opacity: 0.9,
+        minWidth: 0,
+        maxWidth: "100%",
+    }),
+
+    learnMoreWrap: css({
+        marginTop: 10,
+    }),
+});
+
+function getInitialRouteState(): RouteState {
+    const intent = readUrlIntent();
+    const savedPage = getSavedPage();
+    const savedLoc = getSavedLoc();
+    const readerLoc = intent.loc ?? savedLoc ?? DEFAULT_READER_LOCATION;
+    const page = intent.page ?? savedPage ?? "home";
+
     return {
-        page: {
-            minHeight: "100dvh",
-            background: "var(--bg)",
-            color: "var(--fg)",
-        },
-        stage: {
-            minHeight: "100dvh",
-        },
-        centerStage: {
-            minHeight: "100dvh",
-            display: "grid",
-            placeItems: "center",
-            padding: "28px 20px",
-        },
-        centerBlock: {
-            width: "100%",
-            maxWidth: 880,
-            display: "grid",
-            justifyItems: "center",
-            textAlign: "center",
-        },
-        cornerControls: {
-            position: "fixed",
-            top: 16,
-            right: 16,
-            zIndex: 20,
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-        },
-        crossWrap: {
-            width: 108,
-            height: 108,
-            marginBottom: 18,
-            display: "grid",
-            placeItems: "center",
-        },
-        crossImg: {
-            width: "100%",
-            height: "100%",
-            objectFit: "contain",
-            userSelect: "none",
-        },
-        h1: {
-            margin: 0,
-            fontSize: "clamp(42px, 7vw, 82px)",
-            lineHeight: 0.95,
-            letterSpacing: "-0.04em",
-            fontWeight: 820,
-        },
-        lede: {
-            margin: "16px 0 0",
-            maxWidth: 700,
-            fontSize: "clamp(16px, 2.1vw, 20px)",
-            lineHeight: 1.55,
-            opacity: 0.84,
-        },
-        searchContainer: {
-            width: "100%",
-            maxWidth: 760,
-            marginTop: 28,
-        },
-        ctaRow: {
-            marginTop: 18,
-            display: "flex",
-            flexWrap: "wrap",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: 10,
-        },
-        primaryBtnButton: {
-            height: 44,
-            borderRadius: 999,
-            padding: "0 18px",
-            border: "1px solid transparent",
-            background: "var(--fg)",
-            color: "var(--bg)",
-            fontSize: 14,
-            fontWeight: 760,
-            cursor: "pointer",
-            boxShadow: "0 14px 32px color-mix(in srgb, black 14%, transparent)",
-        },
-        secondaryBtnButton: {
-            height: 44,
-            borderRadius: 999,
-            padding: "0 18px",
-            border: "1px solid color-mix(in srgb, var(--border) 76%, transparent)",
-            background: "transparent",
-            color: "var(--fg)",
-            fontSize: 14,
-            fontWeight: 760,
-            cursor: "pointer",
-        },
-        subtleBtnButton: {
-            height: 42,
-            borderRadius: 999,
-            padding: "0 16px",
-            border: "1px solid transparent",
-            background: "transparent",
-            color: "var(--fg)",
-            fontSize: 13,
-            fontWeight: 700,
-            cursor: "pointer",
-            opacity: 0.78,
-        },
-        signedInPill: {
-            marginTop: 12,
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 8,
-            minHeight: 34,
-            borderRadius: 999,
-            padding: "0 12px",
-            border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
-            background: "color-mix(in srgb, var(--activeBg) 36%, transparent)",
-            fontSize: 13,
-            fontWeight: 650,
-            opacity: 0.9,
-        },
+        page,
+        readerLoc,
     };
 }
 
 function AppInner() {
     const { mode, toggle } = useTheme();
-    const { openAccountPage } = useAuth();
 
-    const initialUrlIntentRef = useRef<UrlIntent>(readUrlIntent());
+    const initialRouteRef = useRef<RouteState>(getInitialRouteState());
 
-    const [page, setPage] = useState<Page>(() => {
-        const initialPage = initialUrlIntentRef.current.page;
-        return initialPage ?? getSavedPage() ?? "home";
-    });
+    const [page, setPage] = useState<Page>(initialRouteRef.current.page);
+    const [readerLoc, setReaderLoc] = useState<ReaderLocation>(initialRouteRef.current.readerLoc);
 
-    const [readerLoc, setReaderLoc] = useState<ReaderLocation | null>(() => {
-        return initialUrlIntentRef.current.loc ?? getSavedLoc() ?? DEFAULT_READER_LOCATION;
-    });
-
-    const styles = useMemo<AppStyles>(() => createAppStyles(), []);
+    const readerLocRef = useRef(readerLoc);
 
     useEffect(() => {
-        if (!isBrowser()) return;
+        readerLocRef.current = readerLoc;
+    }, [readerLoc]);
 
-        const onHashChange = () => {
-            const next = readUrlIntent();
+    const styles = useMemo<AppStyles>(() => APP_STYLES, []);
+    const readerRouteKey = useMemo(
+        () => `${readerLoc.bookId}:${readerLoc.chapter}:${readerLoc.verse ?? 0}`,
+        [readerLoc],
+    );
 
-            if (next.page) {
-                setPage(next.page);
-            }
+    const navigateToPage = useCallback(
+        (nextPage: Page, historyMode: HistoryMode = "push") => {
+            setPage(nextPage);
+            savePage(nextPage);
+            writeUrl(historyMode, nextPage, nextPage === "reader" ? readerLocRef.current : null);
+        },
+        [],
+    );
 
-            if (next.loc) {
-                setReaderLoc(next.loc);
-            }
-        };
+    const navigateToReader = useCallback(
+        (loc: ReaderLocation, historyMode: HistoryMode = "push") => {
+            const normalized = normalizeLoc(loc);
+            if (!normalized) return;
 
-        window.addEventListener("hashchange", onHashChange);
-        return () => window.removeEventListener("hashchange", onHashChange);
-    }, []);
+            setReaderLoc(normalized);
+            setPage("reader");
+
+            saveLoc(normalized);
+            savePage("reader");
+            writeUrl(historyMode, "reader", normalized);
+        },
+        [],
+    );
 
     useEffect(() => {
         savePage(page);
-        writeUrl(page, page === "reader" ? readerLoc : null);
-    }, [page, readerLoc]);
+    }, [page]);
 
     useEffect(() => {
         saveLoc(readerLoc);
     }, [readerLoc]);
 
-    const goHome = useCallback(() => {
-        setPage("home");
+    useEffect(() => {
+        if (!isBrowser()) return;
+        writeUrl("replace", page, page === "reader" ? readerLoc : null);
+        // intentional one-time canonical sync
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    useEffect(() => {
+        if (!isBrowser()) return;
+
+        const syncFromUrl = () => {
+            const intent = readUrlIntent();
+            const nextPage = intent.page ?? "home";
+            const fallbackLoc = readerLocRef.current ?? DEFAULT_READER_LOCATION;
+            const nextLoc = intent.loc ?? fallbackLoc;
+
+            setPage(nextPage);
+
+            const normalized = normalizeLoc(nextLoc);
+            if (normalized) {
+                setReaderLoc(normalized);
+            }
+        };
+
+        window.addEventListener("hashchange", syncFromUrl);
+        window.addEventListener("popstate", syncFromUrl);
+
+        return () => {
+            window.removeEventListener("hashchange", syncFromUrl);
+            window.removeEventListener("popstate", syncFromUrl);
+        };
+    }, []);
+
+    const goHome = useCallback(() => {
+        navigateToPage("home");
+    }, [navigateToPage]);
 
     const goLearn = useCallback(() => {
-        setPage("learn");
-    }, []);
+        navigateToPage("learn");
+    }, [navigateToPage]);
 
     const goAccount = useCallback(() => {
-        setPage("account");
-        openAccountPage();
-    }, [openAccountPage]);
-
-    const beginReader = useCallback((loc: ReaderLocation) => {
-        const normalized = normalizeLoc(loc);
-        if (!normalized) return;
-
-        setReaderLoc(normalized);
-        setPage("reader");
-    }, []);
+        navigateToPage("account");
+    }, [navigateToPage]);
 
     const startReading = useCallback(() => {
-        beginReader(readerLoc ?? DEFAULT_READER_LOCATION);
-    }, [beginReader, readerLoc]);
+        navigateToReader(readerLocRef.current ?? DEFAULT_READER_LOCATION);
+    }, [navigateToReader]);
 
     const navigateTo = useCallback(
-         (loc: ReaderLocation) => {
-             const normalized = normalizeLoc(loc);
-             if (!normalized) return;
-
-             beginReader(normalized);
-         },
-         [beginReader],
+        (loc: ReaderLocation) => {
+            navigateToReader(loc);
+        },
+        [navigateToReader],
     );
 
     const renderPage = useCallback((): React.ReactNode => {
         if (page === "home") {
             return (
-                 <Home
-                      styles={styles}
-                      onLearnMore={goLearn}
-                      onStartReading={startReading}
-                      onNavigate={navigateTo}
-                      onOpenAccount={goAccount}
-                 />
+                <Home
+                    styles={styles}
+                    onLearnMore={goLearn}
+                    onStartReading={startReading}
+                    onNavigate={navigateTo}
+                    onOpenAccount={goAccount}
+                />
             );
         }
 
         if (page === "learn") {
             return (
-                 <LearnMorePage
-                      mode={mode}
-                      onToggleTheme={toggle}
-                      onBack={goHome}
-                      styles={styles}
-                 />
+                <LearnMorePage
+                    mode={mode}
+                    onToggleTheme={toggle}
+                    onBack={goHome}
+                    styles={styles}
+                />
             );
         }
 
@@ -15223,28 +15430,29 @@ function AppInner() {
         }
 
         return (
-             <Reader
-                  styles={styles}
-                  initialLocation={readerLoc ?? undefined}
-                  onBackHome={goHome}
-                  mode={mode}
-                  onToggleTheme={toggle}
-             />
+            <Reader
+                key={readerRouteKey}
+                styles={styles}
+                initialLocation={readerLoc}
+                onBackHome={goHome}
+                mode={mode}
+                onToggleTheme={toggle}
+            />
         );
-    }, [goAccount, goHome, goLearn, mode, navigateTo, page, readerLoc, startReading, styles, toggle]);
+    }, [goAccount, goHome, goLearn, mode, navigateTo, page, readerLoc, readerRouteKey, startReading, styles, toggle]);
 
     const showCornerTheme = page !== "reader";
 
     return (
-         <ThemeShell style={styles.page}>
-             {showCornerTheme ? (
-                  <div style={styles.cornerControls} aria-label="Theme">
-                      <ThemeTogglePill mode={mode} onToggle={toggle} />
-                  </div>
-             ) : null}
+        <ThemeShell style={styles.page}>
+            {showCornerTheme ? (
+                <div style={styles.cornerControls} aria-label="Theme">
+                    <ThemeTogglePill mode={mode} onToggle={toggle} />
+                </div>
+            ) : null}
 
-             <div style={styles.stage}>{renderPage()}</div>
-         </ThemeShell>
+            <div style={styles.stage}>{renderPage()}</div>
+        </ThemeShell>
     );
 }
 
@@ -15261,104 +15469,106 @@ function Home(props: HomeProps) {
     const { user, signedIn, signInWithGoogle } = useAuth();
 
     const onSignIn = useCallback(() => {
-        signInWithGoogle({
-            returnTo: isBrowser() ? window.location.href : undefined,
+        const returnTo = isBrowser() ? window.location.href : undefined;
+
+        Promise.resolve(signInWithGoogle({ returnTo })).catch(() => {
+            // auth layer can surface its own error UI
         });
     }, [signInWithGoogle]);
 
     const signedInLabel = user?.displayName?.trim() || user?.email?.trim() || "User";
 
     return (
-         <main style={styles.centerStage} aria-label="Landing">
-             <div style={styles.centerBlock}>
-                 <div style={styles.crossWrap} aria-hidden="true">
-                     <img
-                          src="/cross.png"
-                          alt=""
-                          style={styles.crossImg}
-                          draggable={false}
-                          decoding="async"
-                          loading="eager"
-                     />
-                 </div>
+        <main style={styles.centerStage} aria-label="Landing">
+            <div style={styles.centerBlock}>
+                <div style={styles.crossWrap} aria-hidden="true">
+                    <img
+                        src="/cross.png"
+                        alt=""
+                        style={styles.crossImg}
+                        draggable={false}
+                        decoding="async"
+                        loading="eager"
+                    />
+                </div>
 
-                 <h1 style={styles.h1}>Biblia.to</h1>
+                <h1 style={styles.h1}>Biblia.to</h1>
 
-                 <p style={styles.lede}>
-                     A public, open-access KJV Scripture platform centered on{" "}
-                     <strong>Jesus Christ</strong>, crucified and risen.
-                 </p>
+                <p style={styles.lede}>
+                    A public, open-access KJV Scripture platform centered on{" "}
+                    <strong>Jesus Christ</strong>, crucified and risen.
+                </p>
 
-                 {signedIn ? (
-                      <div style={styles.signedInPill}>
-                          Signed in as {signedInLabel}
-                      </div>
-                 ) : null}
+                {signedIn ? (
+                    <div style={styles.signedInPill} title={signedInLabel}>
+                        Signed in as {signedInLabel}
+                    </div>
+                ) : null}
 
-                 <div style={styles.searchContainer}>
-                     <Search
-                          styles={styles}
-                          onNavigate={onNavigate}
-                          onStartReading={onStartReading}
-                          hint="Type a word or a reference (John 3:16)"
-                     />
-                 </div>
+                <div style={styles.searchContainer}>
+                    <Search
+                        styles={styles}
+                        onNavigate={onNavigate}
+                        onStartReading={onStartReading}
+                        hint="Type a word or a reference (John 3:16)"
+                    />
+                </div>
 
-                 <div style={styles.ctaRow}>
-                     <button
-                          type="button"
-                          onClick={onStartReading}
-                          style={styles.primaryBtnButton}
-                          aria-label="Start reading"
-                     >
-                         Start reading
-                     </button>
+                <div style={styles.ctaRow}>
+                    <button
+                        type="button"
+                        onClick={onStartReading}
+                        style={styles.primaryBtnButton}
+                        aria-label="Start reading"
+                    >
+                        Start reading
+                    </button>
 
-                     {signedIn ? (
-                          <button
-                               type="button"
-                               onClick={onOpenAccount}
-                               style={styles.secondaryBtnButton}
-                               aria-label="Open account"
-                          >
-                              Account
-                          </button>
-                     ) : (
-                          <button
-                               type="button"
-                               onClick={onSignIn}
-                               style={styles.secondaryBtnButton}
-                               aria-label="Continue with Google"
-                          >
-                              Continue with Google
-                          </button>
-                     )}
-                 </div>
+                    {signedIn ? (
+                        <button
+                            type="button"
+                            onClick={onOpenAccount}
+                            style={styles.secondaryBtnButton}
+                            aria-label="Open account"
+                        >
+                            Account
+                        </button>
+                    ) : (
+                        <button
+                            type="button"
+                            onClick={onSignIn}
+                            style={styles.secondaryBtnButton}
+                            aria-label="Continue with Google"
+                        >
+                            Continue with Google
+                        </button>
+                    )}
+                </div>
 
-                 <div style={{ marginTop: 10 }}>
-                     <button
-                          type="button"
-                          onClick={onLearnMore}
-                          style={styles.subtleBtnButton}
-                          aria-label="Learn more"
-                     >
-                         Learn more
-                     </button>
-                 </div>
-             </div>
-         </main>
+                <div style={styles.learnMoreWrap}>
+                    <button
+                        type="button"
+                        onClick={onLearnMore}
+                        style={styles.subtleBtnButton}
+                        aria-label="Learn more"
+                    >
+                        Learn more
+                    </button>
+                </div>
+            </div>
+        </main>
     );
 }
 
 export default function App() {
     return (
-         <ThemeProvider>
-             <AuthProvider>
-                 <ReaderPrefsProvider>
-                     <AppInner />
-                 </ReaderPrefsProvider>
-             </AuthProvider>
-         </ThemeProvider>
+        <ThemeProvider>
+            <AuthProvider>
+                <ReaderPrefsProvider>
+                    <AppInner />
+                </ReaderPrefsProvider>
+            </AuthProvider>
+        </ThemeProvider>
     );
 }
 ```
@@ -15366,6 +15576,7 @@ export default function App() {
 ### apps/web/src/auth/AccountMenu.tsx
 
 ```tsx
+// apps/web/src/auth/AccountMenu.tsx
 // cspell:words oklab
 import React, {
     useCallback,
@@ -15379,30 +15590,36 @@ import React, {
 import { createPortal } from "react-dom";
 import {
     ChevronDown,
+    ChevronRight,
     LogIn,
     LogOut,
     RefreshCcw,
     Settings2,
+    ShieldCheck,
     UserRound,
 } from "lucide-react";
 import { useAuth } from "./useAuth";
 
 type Size = "sm" | "md";
+type Align = "left" | "right";
+type Chrome = "standalone" | "docked";
 
-export type Props = {
+export type Props = Readonly<{
     size?: Size;
     showLabelWhenSignedIn?: boolean;
-    align?: "left" | "right";
+    showChevron?: boolean;
+    align?: Align;
+    chrome?: Chrome;
     style?: React.CSSProperties;
-};
+}>;
 
-type PopPos = {
+type PopPos = Readonly<{
     top: number;
     left: number;
     width: number;
     placement: "top" | "bottom";
     transformOrigin: string;
-};
+}>;
 
 type MenuActionState =
     | "idle"
@@ -15411,21 +15628,31 @@ type MenuActionState =
     | "signing_in"
     | "opening_account";
 
-type UserLike = {
+type UserLike = Readonly<{
     displayName: string | null;
     email: string | null;
-} | null;
+}> | null;
 
 type UiDims = Readonly<{
     btn: number;
     avatar: number;
     labelMax: number;
     chevron: number;
+    menuWidth: number;
 }>;
 
-const MENU_WIDTH = 276;
-const MENU_GAP = 10;
+type ViewportBox = Readonly<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+}>;
+
+type Ui = ReturnType<typeof createUiStyles>;
+
 const VIEWPORT_MARGIN = 12;
+const MENU_MIN_WIDTH = 208;
+const MENU_GAP = 10;
 const MENU_Z_INDEX = 300;
 const POINTER_DOWN_FOCUS_RESTORE_DELAY_MS = 0;
 
@@ -15446,22 +15673,52 @@ function safeFocus(el: HTMLElement | null | undefined): void {
     }
 }
 
+function getViewportBox(): ViewportBox {
+    if (typeof window === "undefined") {
+        return { left: 0, top: 0, width: 0, height: 0 };
+    }
+
+    const vv = window.visualViewport;
+    if (vv) {
+        return {
+            left: vv.offsetLeft,
+            top: vv.offsetTop,
+            width: vv.width,
+            height: vv.height,
+        };
+    }
+
+    return {
+        left: 0,
+        top: 0,
+        width: window.innerWidth,
+        height: window.innerHeight,
+    };
+}
+
 function usePrefersReducedMotion(): boolean {
     const [reduced, setReduced] = useState(false);
 
     useEffect(() => {
-        if (typeof window === "undefined" || !window.matchMedia) return;
+        if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+            return;
+        }
 
         const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-        const onChange = (event: MediaQueryListEvent) => {
-            setReduced(event.matches);
-        };
+        const apply = () => setReduced(mq.matches);
 
-        setReduced(mq.matches);
-        mq.addEventListener("change", onChange);
+        apply();
 
+        if (typeof mq.addEventListener === "function") {
+            mq.addEventListener("change", apply);
+            return () => {
+                mq.removeEventListener("change", apply);
+            };
+        }
+
+        mq.addListener(apply);
         return () => {
-            mq.removeEventListener("change", onChange);
+            mq.removeListener(apply);
         };
     }, []);
 
@@ -15472,16 +15729,16 @@ function formatUserLabel(user: UserLike): string {
     return user?.displayName?.trim() || user?.email?.trim() || "User";
 }
 
-function formatTriggerTitle(user: UserLike): string {
-    if (!user) return "Sign in";
-    return user.displayName?.trim() || user.email?.trim() || "Account";
+function formatTriggerTitle(user: UserLike, signedIn: boolean): string {
+    if (!signedIn) return "Account";
+    return user?.displayName?.trim() || user?.email?.trim() || "Account";
 }
 
 function initialsFromUser(user: UserLike): string {
     const base = formatUserLabel(user).trim();
     if (!base) return "U";
 
-    const emailName = base.includes("@") ? base.split("@")[0] ?? base : base;
+    const emailName = base.includes("@") ? (base.split("@")[0] ?? base) : base;
     const normalized = emailName.replace(/[._-]+/g, " ").trim();
     const parts = normalized.split(/\s+/g).filter(Boolean);
 
@@ -15522,6 +15779,7 @@ function getDims(size: Size): UiDims {
             avatar: 28,
             labelMax: 220,
             chevron: 16,
+            menuWidth: 272,
         };
     }
 
@@ -15530,82 +15788,127 @@ function getDims(size: Size): UiDims {
         avatar: 24,
         labelMax: 164,
         chevron: 14,
+        menuWidth: 252,
     };
 }
 
-function uiToken(state: {
+function createUiTokens(state: {
     open: boolean;
     hovered: boolean;
     pressed: boolean;
     reducedMotion: boolean;
+    chrome: Chrome;
 }) {
-    const { open, hovered, pressed, reducedMotion } = state;
+    const { open, hovered, pressed, reducedMotion, chrome } = state;
     const active = open || hovered;
+    const docked = chrome === "docked";
 
     const ringIdle = "0 0 0 1px color-mix(in srgb, var(--border) 60%, transparent)";
     const ringHover = "0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent)";
     const ringOpen = "0 0 0 1px color-mix(in srgb, var(--border) 80%, transparent)";
 
     const shadowIdle = "0 8px 20px color-mix(in srgb, black 10%, transparent)";
-    const shadowHover = "0 10px 26px color-mix(in srgb, black 13%, transparent)";
-    const shadowOpen = "0 14px 36px color-mix(in srgb, black 16%, transparent)";
+    const shadowHover = "0 10px 24px color-mix(in srgb, black 13%, transparent)";
+    const shadowOpen = "0 14px 34px color-mix(in srgb, black 16%, transparent)";
 
     return {
-        triggerRing: open ? ringOpen : active ? ringHover : ringIdle,
-        triggerShadow: open ? shadowOpen : active ? shadowHover : shadowIdle,
+        triggerRing: docked ? "none" : open ? ringOpen : active ? ringHover : ringIdle,
+        triggerShadow: docked
+            ? "none"
+            : open
+                ? shadowOpen
+                : active
+                    ? shadowHover
+                    : shadowIdle,
         triggerBg: open
-            ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 66%, transparent), transparent)"
+            ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 68%, transparent), transparent)"
             : active
-                ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 42%, transparent), transparent)"
+                ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 46%, transparent), transparent)"
                 : "transparent",
         triggerScale: pressed ? "scale(0.972)" : "scale(1)",
         motionFast: reducedMotion ? undefined : "140ms cubic-bezier(0.16, 1, 0.3, 1)",
         motionMed: reducedMotion ? undefined : "180ms cubic-bezier(0.16, 1, 0.3, 1)",
         menuBorder: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
         menuBg:
-            "linear-gradient(180deg, color-mix(in srgb, var(--card) 96%, white), color-mix(in srgb, var(--card) 99%, transparent))",
+            "linear-gradient(180deg, color-mix(in srgb, var(--card) 97%, white), color-mix(in srgb, var(--card) 99%, transparent))",
         menuShadow: "0 18px 56px color-mix(in srgb, black 20%, transparent)",
         menuDivider: "color-mix(in srgb, var(--border) 72%, transparent)",
         menuAlertBorder: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
         menuAlertBg: "color-mix(in srgb, var(--activeBg) 44%, transparent)",
-        rowHoverBg: "color-mix(in srgb, var(--activeBg) 60%, transparent)",
+        rowHoverBg: "color-mix(in srgb, var(--activeBg) 58%, transparent)",
         rowHoverBorder: "color-mix(in srgb, var(--border) 62%, transparent)",
         rowFocusRing: "0 0 0 3px color-mix(in srgb, var(--focusRing) 78%, transparent)",
         avatarRing: "0 0 0 1px color-mix(in srgb, var(--border) 70%, transparent)",
         avatarBg:
             "linear-gradient(180deg, color-mix(in srgb, var(--card) 96%, white), color-mix(in srgb, var(--card) 99%, transparent))",
+        chipBg: "color-mix(in srgb, var(--activeBg) 34%, transparent)",
+        chipBorder: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
     } as const;
 }
 
-function styles(args: {
+function createUiStyles(args: {
     dims: UiDims;
     showLabel: boolean;
+    showChevron: boolean;
     loading: boolean;
     open: boolean;
     hovered: boolean;
     pressed: boolean;
     reducedMotion: boolean;
     pos: PopPos | null;
+    chrome: Chrome;
     style?: React.CSSProperties;
 }) {
-    const { dims, showLabel, loading, open, hovered, pressed, reducedMotion, pos, style } = args;
-    const t = uiToken({ open, hovered, pressed, reducedMotion });
+    const {
+        dims,
+        showLabel,
+        showChevron,
+        loading,
+        open,
+        hovered,
+        pressed,
+        reducedMotion,
+        pos,
+        chrome,
+        style,
+    } = args;
+
+    const t = createUiTokens({ open, hovered, pressed, reducedMotion, chrome });
+    const trailingVisible = showLabel || showChevron;
+    const docked = chrome === "docked";
+
+    const triggerPad = showLabel
+        ? "0 8px 0 4px"
+        : trailingVisible
+            ? "0 6px 0 4px"
+            : 0;
+
+    const triggerGap = trailingVisible ? 6 : 0;
+    const minWidth = showLabel
+        ? dims.avatar + dims.chevron + 36
+        : showChevron
+            ? dims.avatar + dims.chevron + 16
+            : dims.btn;
+
+    const maxWidth = showLabel
+        ? dims.labelMax + dims.avatar + dims.chevron + 40
+        : minWidth;
 
     return {
         trigger: {
             height: dims.btn,
-            minWidth: dims.btn,
-            maxWidth: showLabel ? dims.labelMax + dims.avatar + 34 : dims.btn,
+            minWidth,
+            maxWidth,
             display: "inline-flex",
             alignItems: "center",
-            justifyContent: "center",
-            gap: showLabel ? 8 : 0,
-            padding: showLabel ? "0 9px 0 4px" : 0,
+            justifyContent: trailingVisible ? "flex-start" : "center",
+            gap: triggerGap,
+            padding: triggerPad,
             borderRadius: 999,
             border: "1px solid transparent",
             background: t.triggerBg,
             color: "var(--fg)",
-            boxShadow: `${t.triggerRing}, ${t.triggerShadow}`,
+            boxShadow: docked ? "none" : `${t.triggerRing}, ${t.triggerShadow}`,
             cursor: "pointer",
             userSelect: "none",
             WebkitTapHighlightColor: "transparent",
@@ -15636,8 +15939,8 @@ function styles(args: {
         triggerChevron: {
             display: "grid",
             placeItems: "center",
-            opacity: 0.62,
-            marginLeft: -1,
+            opacity: open ? 0.82 : 0.58,
+            marginLeft: showLabel ? -1 : 0,
             flex: "0 0 auto",
             transform: open ? "rotate(180deg)" : "rotate(0deg)",
             transition: reducedMotion
@@ -15658,7 +15961,7 @@ function styles(args: {
                 boxShadow: t.menuShadow,
                 backdropFilter: "blur(12px)",
                 WebkitBackdropFilter: "blur(12px)",
-                padding: 10,
+                padding: 8,
                 transformOrigin: pos.transformOrigin,
                 opacity: 1,
                 transform: "translateY(0) scale(1)",
@@ -15669,15 +15972,24 @@ function styles(args: {
             : null,
 
         menuHeader: {
-            display: "flex",
+            display: "grid",
+            gridTemplateColumns: "auto minmax(0, 1fr)",
             alignItems: "center",
             gap: 10,
-            padding: "6px 6px 8px 6px",
+            padding: "6px 6px 8px",
         } satisfies React.CSSProperties,
 
         menuHeaderTextWrap: {
             minWidth: 0,
-            flex: 1,
+            display: "grid",
+            gap: 4,
+        } satisfies React.CSSProperties,
+
+        menuHeaderTopRow: {
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            minWidth: 0,
         } satisfies React.CSSProperties,
 
         menuHeaderTitle: {
@@ -15687,6 +15999,23 @@ function styles(args: {
             overflow: "hidden",
             textOverflow: "ellipsis",
             opacity: loading ? 0.74 : 1,
+            minWidth: 0,
+        } satisfies React.CSSProperties,
+
+        statusChip: {
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 5,
+            minHeight: 20,
+            padding: "0 7px",
+            borderRadius: 999,
+            border: t.chipBorder,
+            background: t.chipBg,
+            fontSize: 11,
+            fontWeight: 700,
+            letterSpacing: "0.01em",
+            whiteSpace: "nowrap",
+            flex: "0 0 auto",
         } satisfies React.CSSProperties,
 
         menuHeaderSubline: {
@@ -15695,7 +16024,6 @@ function styles(args: {
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
-            marginTop: 2,
         } satisfies React.CSSProperties,
 
         menuAlert: {
@@ -15705,14 +16033,14 @@ function styles(args: {
             border: t.menuAlertBorder,
             background: t.menuAlertBg,
             fontSize: 12,
-            lineHeight: 1.35,
+            lineHeight: 1.4,
             opacity: 0.92,
         } satisfies React.CSSProperties,
 
         divider: {
             height: 1,
             background: t.menuDivider,
-            margin: "8px 0",
+            margin: "6px 0",
         } satisfies React.CSSProperties,
 
         avatar: (signedIn: boolean, sizePx: number): React.CSSProperties => ({
@@ -15727,12 +16055,34 @@ function styles(args: {
             userSelect: signedIn ? "none" : undefined,
             flex: "0 0 auto",
         }),
+
+        rowBase: {
+            width: "100%",
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            padding: "9px 10px",
+            borderRadius: 12,
+            border: "1px solid transparent",
+            textAlign: "left",
+            fontSize: 13,
+            lineHeight: 1.2,
+            userSelect: "none",
+            WebkitTapHighlightColor: "transparent",
+            outline: "none",
+            transition:
+                "background 140ms ease, border-color 140ms ease, box-shadow 140ms ease, opacity 140ms ease, transform 120ms ease",
+        } satisfies React.CSSProperties,
+
+        rowHoverBg: t.rowHoverBg,
+        rowHoverBorder: t.rowHoverBorder,
+        rowFocusRing: t.rowFocusRing,
     } as const;
 }
 
 function usePopoverPosition(args: {
     open: boolean;
-    align: "left" | "right";
+    align: Align;
     menuWidth: number;
     anchorRef: React.RefObject<HTMLElement | null>;
     menuRef: React.RefObject<HTMLElement | null>;
@@ -15746,30 +16096,34 @@ function usePopoverPosition(args: {
         const anchor = anchorRef.current;
         if (!anchor || typeof window === "undefined") return;
 
+        const viewport = getViewportBox();
         const r = anchor.getBoundingClientRect();
-        const mw = menuWidth;
         const mh = menuRef.current?.getBoundingClientRect().height ?? 0;
+        const maxWidth = Math.max(MENU_MIN_WIDTH, viewport.width - VIEWPORT_MARGIN * 2);
+        const mw = Math.min(menuWidth, maxWidth);
+
+        const minLeft = viewport.left + VIEWPORT_MARGIN;
+        const maxLeft = Math.max(minLeft, viewport.left + viewport.width - mw - VIEWPORT_MARGIN);
 
         const left =
             align === "right"
-                ? clamp(r.right - mw, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN)
-                : clamp(r.left, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN);
+                ? clamp(r.right - mw, minLeft, maxLeft)
+                : clamp(r.left, minLeft, maxLeft);
 
         const belowTop = r.bottom + MENU_GAP;
         const aboveTop = r.top - MENU_GAP - mh;
 
-        const canFitBelow = belowTop + mh <= window.innerHeight - VIEWPORT_MARGIN;
-        const canFitAbove = aboveTop >= VIEWPORT_MARGIN;
+        const minTop = viewport.top + VIEWPORT_MARGIN;
+        const maxTop = Math.max(minTop, viewport.top + viewport.height - mh - VIEWPORT_MARGIN);
+
+        const canFitBelow = belowTop + mh <= viewport.top + viewport.height - VIEWPORT_MARGIN;
+        const canFitAbove = aboveTop >= minTop;
 
         const placement: PopPos["placement"] =
             !canFitBelow && canFitAbove ? "top" : "bottom";
 
         const unclampedTop = placement === "top" ? aboveTop : belowTop;
-        const top = clamp(
-            unclampedTop,
-            VIEWPORT_MARGIN,
-            Math.max(VIEWPORT_MARGIN, window.innerHeight - mh - VIEWPORT_MARGIN),
-        );
+        const top = clamp(unclampedTop, minTop, maxTop);
 
         const originX = align === "right" ? "right" : "left";
         const originY = placement === "top" ? "bottom" : "top";
@@ -15803,11 +16157,14 @@ function usePopoverPosition(args: {
 
         if (typeof window === "undefined") return;
 
-        const onScroll = () => schedule();
-        const onResize = () => schedule();
+        const onResizeOrScroll = () => schedule();
 
-        window.addEventListener("resize", onResize);
-        window.addEventListener("scroll", onScroll, true);
+        window.addEventListener("resize", onResizeOrScroll);
+        window.addEventListener("scroll", onResizeOrScroll, true);
+
+        const vv = window.visualViewport;
+        vv?.addEventListener("resize", onResizeOrScroll);
+        vv?.addEventListener("scroll", onResizeOrScroll);
 
         const t = window.setTimeout(() => schedule(), 0);
 
@@ -15820,8 +16177,10 @@ function usePopoverPosition(args: {
 
         return () => {
             window.clearTimeout(t);
-            window.removeEventListener("resize", onResize);
-            window.removeEventListener("scroll", onScroll, true);
+            window.removeEventListener("resize", onResizeOrScroll);
+            window.removeEventListener("scroll", onResizeOrScroll, true);
+            vv?.removeEventListener("resize", onResizeOrScroll);
+            vv?.removeEventListener("scroll", onResizeOrScroll);
 
             if (rafRef.current != null) {
                 window.cancelAnimationFrame(rafRef.current);
@@ -15839,7 +16198,7 @@ function AvatarCircle(props: {
     user: UserLike;
     sizePx: number;
     signedIn: boolean;
-    ui: ReturnType<typeof styles>;
+    ui: Ui;
 }) {
     const { user, sizePx, signedIn, ui } = props;
 
@@ -15866,11 +16225,12 @@ function AvatarCircle(props: {
     );
 }
 
-function MenuDivider(props: { ui: ReturnType<typeof styles> }) {
+function MenuDivider(props: { ui: Ui }) {
     return <div aria-hidden="true" style={props.ui.divider} />;
 }
 
 function RowButton(props: {
+    ui: Ui;
     label: string;
     hint?: string;
     icon?: React.ReactNode;
@@ -15879,43 +16239,38 @@ function RowButton(props: {
     autoFocus?: boolean;
     danger?: boolean;
     busy?: boolean;
+    trailing?: React.ReactNode;
 }) {
-    const { label, hint, icon, onClick, disabled, autoFocus, danger, busy } = props;
+    const {
+        ui,
+        label,
+        hint,
+        icon,
+        onClick,
+        disabled,
+        autoFocus,
+        danger,
+        busy,
+        trailing,
+    } = props;
+
     const [hover, setHover] = useState(false);
+    const [pressed, setPressed] = useState(false);
     const [focusVisible, setFocusVisible] = useState(false);
 
     const isDisabled = !!disabled || !!busy;
 
     const base: React.CSSProperties = {
-        width: "100%",
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        padding: "10px 10px",
-        borderRadius: 12,
-        border: "1px solid transparent",
-        background: hover && !isDisabled
-            ? "color-mix(in srgb, var(--activeBg) 60%, transparent)"
-            : "transparent",
+        ...ui.rowBase,
+        background: hover && !isDisabled ? ui.rowHoverBg : "transparent",
         color: danger
             ? "color-mix(in srgb, var(--fg) 82%, #b00020)"
             : "var(--fg)",
         cursor: isDisabled ? "default" : "pointer",
-        textAlign: "left",
-        fontSize: 13,
-        lineHeight: 1.2,
         opacity: isDisabled ? 0.56 : 1,
-        userSelect: "none",
-        WebkitTapHighlightColor: "transparent",
-        outline: "none",
-        borderColor: hover && !isDisabled
-            ? "color-mix(in srgb, var(--border) 62%, transparent)"
-            : "transparent",
-        boxShadow: focusVisible
-            ? "0 0 0 3px color-mix(in srgb, var(--focusRing) 78%, transparent)"
-            : "none",
-        transition:
-            "background 140ms ease, border-color 140ms ease, box-shadow 140ms ease, opacity 140ms ease, transform 140ms ease",
+        borderColor: hover && !isDisabled ? ui.rowHoverBorder : "transparent",
+        boxShadow: focusVisible ? ui.rowFocusRing : "none",
+        transform: pressed && !isDisabled ? "scale(0.992)" : "scale(1)",
     };
 
     return (
@@ -15930,7 +16285,13 @@ function RowButton(props: {
                 void onClick();
             }}
             onPointerEnter={() => setHover(true)}
-            onPointerLeave={() => setHover(false)}
+            onPointerLeave={() => {
+                setHover(false);
+                setPressed(false);
+            }}
+            onPointerDown={() => setPressed(true)}
+            onPointerUp={() => setPressed(false)}
+            onPointerCancel={() => setPressed(false)}
             onFocus={() => {
                 setHover(true);
                 setFocusVisible(true);
@@ -15938,6 +16299,7 @@ function RowButton(props: {
             onBlur={() => {
                 setHover(false);
                 setFocusVisible(false);
+                setPressed(false);
             }}
             style={base}
         >
@@ -15948,7 +16310,7 @@ function RowButton(props: {
                         width: 18,
                         display: "grid",
                         placeItems: "center",
-                        opacity: busy ? 0.7 : 0.92,
+                        opacity: busy ? 0.68 : 0.92,
                         flex: "0 0 auto",
                     }}
                 >
@@ -15963,9 +16325,20 @@ function RowButton(props: {
                         display: "flex",
                         alignItems: "center",
                         gap: 8,
+                        minWidth: 0,
                     }}
                 >
-                    <span>{label}</span>
+                    <span
+                        style={{
+                            minWidth: 0,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                        }}
+                    >
+                        {label}
+                    </span>
+
                     {busy ? (
                         <span
                             aria-hidden="true"
@@ -15984,7 +16357,7 @@ function RowButton(props: {
                     <div
                         style={{
                             fontSize: 12,
-                            opacity: 0.72,
+                            opacity: 0.68,
                             marginTop: 2,
                             whiteSpace: "nowrap",
                             overflow: "hidden",
@@ -15995,6 +16368,20 @@ function RowButton(props: {
                     </div>
                 ) : null}
             </div>
+
+            {trailing ? (
+                <span
+                    aria-hidden="true"
+                    style={{
+                        display: "grid",
+                        placeItems: "center",
+                        opacity: 0.5,
+                        flex: "0 0 auto",
+                    }}
+                >
+                    {trailing}
+                </span>
+            ) : null}
         </button>
     );
 }
@@ -16002,7 +16389,9 @@ function RowButton(props: {
 export function AccountMenu({
                                 size = "sm",
                                 align = "right",
+                                chrome = "standalone",
                                 showLabelWhenSignedIn = false,
+                                showChevron = true,
                                 style,
                             }: Props) {
     const {
@@ -16020,6 +16409,7 @@ export function AccountMenu({
     const menuRef = useRef<HTMLDivElement | null>(null);
     const mountedRef = useRef(true);
     const restoreFocusOnCloseRef = useRef(true);
+    const prevSignedInRef = useRef(signedIn);
 
     const [open, setOpen] = useState(false);
     const [pressed, setPressed] = useState(false);
@@ -16033,8 +16423,9 @@ export function AccountMenu({
     const reducedMotion = usePrefersReducedMotion();
     const dims = useMemo(() => getDims(size), [size]);
 
-    const triggerTitle = formatTriggerTitle(user);
+    const triggerTitle = formatTriggerTitle(user, signedIn);
     const showLabel = signedIn && showLabelWhenSignedIn;
+    const busy = loading || actionState !== "idle";
 
     const close = useCallback((opts?: { restoreFocus?: boolean }) => {
         restoreFocusOnCloseRef.current = opts?.restoreFocus ?? true;
@@ -16042,6 +16433,7 @@ export function AccountMenu({
     }, []);
 
     const openMenu = useCallback(() => {
+        restoreFocusOnCloseRef.current = true;
         setOpen(true);
     }, []);
 
@@ -16053,25 +16445,39 @@ export function AccountMenu({
     const pos = usePopoverPosition({
         open,
         align,
-        menuWidth: MENU_WIDTH,
+        menuWidth: dims.menuWidth,
         anchorRef: btnRef,
         menuRef,
     });
 
     const ui = useMemo(
         () =>
-            styles({
+            createUiStyles({
                 dims,
                 showLabel,
+                showChevron,
                 loading,
                 open,
                 hovered,
                 pressed,
                 reducedMotion,
                 pos,
+                chrome,
                 style,
             }),
-        [dims, showLabel, loading, open, hovered, pressed, reducedMotion, pos, style],
+        [
+            dims,
+            showLabel,
+            showChevron,
+            loading,
+            open,
+            hovered,
+            pressed,
+            reducedMotion,
+            pos,
+            chrome,
+            style,
+        ],
     );
 
     useEffect(() => {
@@ -16082,9 +16488,10 @@ export function AccountMenu({
     }, []);
 
     useEffect(() => {
-        if (!signedIn && open) {
+        if (open && prevSignedInRef.current && !signedIn) {
             setOpen(false);
         }
+        prevSignedInRef.current = signedIn;
     }, [signedIn, open]);
 
     const focusableItems = useCallback((): HTMLElement[] => {
@@ -16152,9 +16559,15 @@ export function AccountMenu({
 
     useEffect(() => {
         if (!open || typeof window === "undefined") return;
+
         const t = window.setTimeout(() => {
-            focusFirstItem();
+            const active = document.activeElement as HTMLElement | null;
+            const menuContainsActive = !!(active && menuRef.current?.contains(active));
+            if (!menuContainsActive) {
+                focusFirstItem();
+            }
         }, 0);
+
         return () => window.clearTimeout(t);
     }, [open, focusFirstItem]);
 
@@ -16163,6 +16576,7 @@ export function AccountMenu({
             const t = window.setTimeout(() => {
                 safeFocus(btnRef.current);
             }, POINTER_DOWN_FOCUS_RESTORE_DELAY_MS);
+
             return () => window.clearTimeout(t);
         }
         return;
@@ -16175,9 +16589,11 @@ export function AccountMenu({
             if (e.key === "Tab") {
                 if (!items.length) return;
 
-                const first = items[0]!;
-                const last = items[items.length - 1]!;
+                const first = items[0] ?? null;
+                const last = items[items.length - 1] ?? null;
                 const active = document.activeElement as HTMLElement | null;
+
+                if (!first || !last) return;
 
                 if (e.shiftKey) {
                     if (active === first || !menuRef.current?.contains(active)) {
@@ -16258,6 +16674,8 @@ export function AccountMenu({
     );
 
     const handleRefresh = useCallback(async () => {
+        if (busy) return;
+
         setActionState("refreshing");
         try {
             await refresh();
@@ -16267,9 +16685,11 @@ export function AccountMenu({
                 close();
             }
         }
-    }, [refresh, close]);
+    }, [busy, refresh, close]);
 
     const handleOpenAccount = useCallback(async () => {
+        if (busy) return;
+
         setActionState("opening_account");
         try {
             openAccountPage();
@@ -16279,9 +16699,11 @@ export function AccountMenu({
                 close({ restoreFocus: false });
             }
         }
-    }, [openAccountPage, close]);
+    }, [busy, openAccountPage, close]);
 
     const handleSignOut = useCallback(async () => {
+        if (busy) return;
+
         setActionState("signing_out");
         try {
             await signOut();
@@ -16291,22 +16713,23 @@ export function AccountMenu({
                 close();
             }
         }
-    }, [signOut, close]);
+    }, [busy, signOut, close]);
 
     const handleSignIn = useCallback(() => {
+        if (busy) return;
+
         setActionState("signing_in");
         close({ restoreFocus: false });
 
-        try {
-            const returnTo =
-                typeof window !== "undefined" ? window.location.href : undefined;
-            signInWithGoogle({ returnTo });
-        } catch {
+        const returnTo =
+            typeof window !== "undefined" ? window.location.href : undefined;
+
+        Promise.resolve(signInWithGoogle({ returnTo })).catch(() => {
             if (mountedRef.current) {
                 setActionState("idle");
             }
-        }
-    }, [signInWithGoogle, close]);
+        });
+    }, [busy, signInWithGoogle, close]);
 
     const menuStatusTitle = loading
         ? "Checking…"
@@ -16320,7 +16743,14 @@ export function AccountMenu({
             ? user?.email?.trim() || "—"
             : "Sign in to sync";
 
+    const sessionChipLabel = loading
+        ? "Syncing"
+        : signedIn
+            ? "Signed in"
+            : "Guest";
+
     const triggerText = loading ? "…" : triggerTitle;
+    const triggerAriaLabel = open ? "Close account menu" : "Open account menu";
 
     const menu =
         open &&
@@ -16346,7 +16776,15 @@ export function AccountMenu({
                         />
 
                         <div style={ui.menuHeaderTextWrap}>
-                            <div style={ui.menuHeaderTitle}>{menuStatusTitle}</div>
+                            <div style={ui.menuHeaderTopRow}>
+                                <div style={ui.menuHeaderTitle}>{menuStatusTitle}</div>
+
+                                <div style={ui.statusChip}>
+                                    <ShieldCheck size={11} />
+                                    {sessionChipLabel}
+                                </div>
+                            </div>
+
                             <div style={ui.menuHeaderSubline}>{menuStatusSubline}</div>
                         </div>
                     </div>
@@ -16361,39 +16799,45 @@ export function AccountMenu({
 
                     {!signedIn ? (
                         <RowButton
+                            ui={ui}
                             autoFocus
                             label="Continue with Google"
                             hint="Secure sign-in"
-                            disabled={loading}
+                            disabled={busy}
                             busy={actionState === "signing_in"}
                             icon={<LogIn size={16} />}
                             onClick={handleSignIn}
+                            trailing={<ChevronRight size={15} />}
                         />
                     ) : (
                         <>
                             <RowButton
+                                ui={ui}
                                 autoFocus
-                                label="Account"
+                                label="Open account"
                                 hint="Manage your session"
-                                disabled={loading}
+                                disabled={busy}
                                 busy={actionState === "opening_account"}
                                 icon={<Settings2 size={16} />}
                                 onClick={handleOpenAccount}
+                                trailing={<ChevronRight size={15} />}
                             />
 
                             <RowButton
+                                ui={ui}
                                 label="Refresh session"
                                 hint="Re-check login state"
-                                disabled={loading}
+                                disabled={busy}
                                 busy={actionState === "refreshing"}
                                 icon={<RefreshCcw size={16} />}
                                 onClick={handleRefresh}
                             />
 
                             <RowButton
+                                ui={ui}
                                 label="Sign out"
                                 hint="End this session"
-                                disabled={loading}
+                                disabled={busy}
                                 busy={actionState === "signing_out"}
                                 danger
                                 icon={<LogOut size={16} />}
@@ -16412,6 +16856,7 @@ export function AccountMenu({
                 ref={btnRef}
                 id={triggerId}
                 type="button"
+                aria-label={triggerAriaLabel}
                 aria-haspopup="menu"
                 aria-controls={open ? menuId : undefined}
                 aria-expanded={open}
@@ -16440,14 +16885,12 @@ export function AccountMenu({
                     ui={ui}
                 />
 
-                {showLabel ? (
-                    <>
-                        <span style={ui.triggerLabel}>{triggerText}</span>
+                {showLabel ? <span style={ui.triggerLabel}>{triggerText}</span> : null}
 
-                        <span aria-hidden="true" style={ui.triggerChevron}>
-                            <ChevronDown size={dims.chevron} />
-                        </span>
-                    </>
+                {showChevron ? (
+                    <span aria-hidden="true" style={ui.triggerChevron}>
+                        <ChevronDown size={dims.chevron} />
+                    </span>
                 ) : null}
             </button>
 
@@ -16460,312 +16903,493 @@ export function AccountMenu({
 ### apps/web/src/auth/AccountPage.tsx
 
 ```tsx
-import React, { useCallback, useMemo } from "react";
-import { LogIn, LogOut, RefreshCcw, ArrowLeft, ShieldCheck, UserRound } from "lucide-react";
+// apps/web/src/auth/AccountPage.tsx
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+    ArrowLeft,
+    LogIn,
+    LogOut,
+    RefreshCcw,
+    ShieldCheck,
+    UserRound,
+} from "lucide-react";
 import { useAuth } from "./useAuth";
 
-export type AccountPageProps = {
-     onBackHome: () => void;
-};
+export type AccountPageProps = Readonly<{
+    onBackHome: () => void;
+}>;
 
-function initialsFrom(displayName: string | null | undefined, email: string | null | undefined): string {
-     const base = (displayName?.trim() || email?.trim() || "User").trim();
-     if (!base) return "U";
+type ActionState = "idle" | "signing_in" | "refreshing" | "signing_out";
 
-     const emailName = base.includes("@") ? base.split("@")[0] ?? base : base;
-     const normalized = emailName.replace(/[._-]+/g, " ").trim();
-     const parts = normalized.split(/\s+/g).filter(Boolean);
-
-     if (parts.length >= 2) {
-          return `${parts[0]?.[0] ?? ""}${parts[1]?.[0] ?? ""}`.toUpperCase();
-     }
-     return normalized.slice(0, 2).toUpperCase() || "U";
+function css<T extends React.CSSProperties>(value: T): React.CSSProperties {
+    return value;
 }
 
-function cardStyle(): React.CSSProperties {
-     return {
-          width: "100%",
-          maxWidth: 760,
-          borderRadius: 24,
-          border: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
-          background:
-               "linear-gradient(180deg, color-mix(in srgb, var(--card) 94%, white), color-mix(in srgb, var(--card) 98%, transparent))",
-          boxShadow: "0 22px 70px color-mix(in srgb, black 12%, transparent)",
-          padding: 24,
-          backdropFilter: "blur(10px)",
-          WebkitBackdropFilter: "blur(10px)",
-     };
+function isBrowser(): boolean {
+    return typeof window !== "undefined";
 }
 
-function buttonStyle(kind: "primary" | "secondary" | "danger"): React.CSSProperties {
-     const common: React.CSSProperties = {
-          height: 42,
-          minWidth: 0,
-          display: "inline-flex",
-          alignItems: "center",
-          justifyContent: "center",
-          gap: 8,
-          borderRadius: 999,
-          padding: "0 16px",
-          border: "1px solid transparent",
-          cursor: "pointer",
-          fontSize: 14,
-          fontWeight: 760,
-          transition: "all 0.16s cubic-bezier(0.16, 1, 0.3, 1)",
-          textDecoration: "none",
-     };
+function initialsFrom(
+    displayName: string | null | undefined,
+    email: string | null | undefined,
+): string {
+    const base = (displayName?.trim() || email?.trim() || "User").trim();
+    if (!base) return "U";
 
-     if (kind === "primary") {
-          return {
-               ...common,
-               color: "white",
-               background: "var(--fg)",
-               boxShadow: "0 12px 28px color-mix(in srgb, black 18%, transparent)",
-          };
-     }
+    const emailName = base.includes("@") ? (base.split("@")[0] ?? base) : base;
+    const normalized = emailName.replace(/[._-]+/g, " ").trim();
+    const parts = normalized.split(/\s+/g).filter(Boolean);
 
-     if (kind === "danger") {
-          return {
-               ...common,
-               color: "color-mix(in srgb, var(--fg) 78%, #b00020)",
-               background: "transparent",
-               border: "1px solid color-mix(in srgb, var(--border) 76%, transparent)",
-          };
-     }
+    if (parts.length >= 2) {
+        return `${parts[0]?.[0] ?? ""}${parts[1]?.[0] ?? ""}`.toUpperCase();
+    }
 
-     return {
-          ...common,
-          color: "var(--fg)",
-          background: "transparent",
-          border: "1px solid color-mix(in srgb, var(--border) 76%, transparent)",
-     };
+    return normalized.slice(0, 2).toUpperCase() || "U";
+}
+
+function getReturnToAccountUrl(): string | undefined {
+    if (!isBrowser()) return undefined;
+    return `${window.location.origin}${window.location.pathname}${window.location.search}#/account`;
+}
+
+const styles = Object.freeze({
+    page: css({
+        minHeight: "100dvh",
+        display: "grid",
+        placeItems: "center",
+        padding:
+            "calc(32px + env(safe-area-inset-top, 0px)) calc(20px + env(safe-area-inset-right, 0px)) calc(32px + env(safe-area-inset-bottom, 0px)) calc(20px + env(safe-area-inset-left, 0px))",
+        minWidth: 0,
+        boxSizing: "border-box",
+    }),
+
+    card: css({
+        width: "100%",
+        maxWidth: 760,
+        minWidth: 0,
+        borderRadius: 24,
+        border: "1px solid color-mix(in srgb, var(--border) 78%, transparent)",
+        background:
+            "linear-gradient(180deg, color-mix(in srgb, var(--card) 94%, white), color-mix(in srgb, var(--card) 98%, transparent))",
+        boxShadow: "0 22px 70px color-mix(in srgb, black 12%, transparent)",
+        padding: 24,
+        backdropFilter: "blur(10px)",
+        WebkitBackdropFilter: "blur(10px)",
+        boxSizing: "border-box",
+    }),
+
+    topRow: css({
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 16,
+        marginBottom: 22,
+        flexWrap: "wrap",
+    }),
+
+    sessionBadge: css({
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+        minHeight: 36,
+        borderRadius: 999,
+        padding: "0 12px",
+        border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
+        background: "color-mix(in srgb, var(--activeBg) 20%, transparent)",
+        fontSize: 13,
+        fontWeight: 650,
+        opacity: 0.84,
+        whiteSpace: "nowrap",
+    }),
+
+    hero: css({
+        display: "grid",
+        gridTemplateColumns: "auto minmax(0, 1fr)",
+        alignItems: "center",
+        gap: 16,
+        marginBottom: 22,
+        minWidth: 0,
+    }),
+
+    avatar: css({
+        width: 56,
+        height: 56,
+        borderRadius: 999,
+        display: "grid",
+        placeItems: "center",
+        fontSize: 19,
+        fontWeight: 820,
+        letterSpacing: "0.04em",
+        color: "var(--fg)",
+        background:
+            "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))",
+        boxShadow: "0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent)",
+        userSelect: "none",
+        flex: "0 0 auto",
+    }),
+
+    heroText: css({
+        minWidth: 0,
+    }),
+
+    title: css({
+        margin: 0,
+        fontSize: "clamp(26px, 2vw, 30px)",
+        lineHeight: 1.05,
+        letterSpacing: "-0.02em",
+    }),
+
+    subtitle: css({
+        marginTop: 8,
+        fontSize: 14,
+        lineHeight: 1.5,
+        opacity: 0.78,
+    }),
+
+    identityCard: css({
+        borderRadius: 18,
+        border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
+        background: "color-mix(in srgb, var(--activeBg) 36%, transparent)",
+        padding: 16,
+        minWidth: 0,
+    }),
+
+    sectionKicker: css({
+        fontSize: 12,
+        fontWeight: 760,
+        letterSpacing: "0.08em",
+        textTransform: "uppercase",
+        opacity: 0.64,
+        marginBottom: 12,
+    }),
+
+    identityGrid: css({
+        display: "grid",
+        gap: 12,
+        minWidth: 0,
+    }),
+
+    field: css({
+        minWidth: 0,
+    }),
+
+    fieldLabel: css({
+        fontSize: 12,
+        opacity: 0.62,
+        marginBottom: 4,
+    }),
+
+    fieldValueStrong: css({
+        fontSize: 15,
+        fontWeight: 720,
+        lineHeight: 1.35,
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
+    }),
+
+    fieldValue: css({
+        fontSize: 15,
+        fontWeight: 640,
+        lineHeight: 1.35,
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
+    }),
+
+    error: css({
+        marginTop: 14,
+        borderRadius: 16,
+        border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
+        background: "color-mix(in srgb, var(--activeBg) 42%, transparent)",
+        padding: 12,
+        fontSize: 13,
+        lineHeight: 1.45,
+    }),
+
+    actions: css({
+        display: "flex",
+        flexWrap: "wrap",
+        gap: 10,
+        marginTop: 18,
+    }),
+});
+
+function buttonStyle(
+    kind: "primary" | "secondary" | "danger",
+    disabled: boolean,
+): React.CSSProperties {
+    const common = css({
+        height: 42,
+        minWidth: 0,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 8,
+        borderRadius: 999,
+        padding: "0 16px",
+        border: "1px solid transparent",
+        cursor: disabled ? "default" : "pointer",
+        fontSize: 14,
+        fontWeight: 760,
+        lineHeight: 1,
+        transition:
+            "transform 160ms cubic-bezier(0.16, 1, 0.3, 1), opacity 160ms ease, background 160ms ease, border-color 160ms ease, box-shadow 160ms ease",
+        textDecoration: "none",
+        appearance: "none",
+        WebkitAppearance: "none",
+        outline: "none",
+        opacity: disabled ? 0.58 : 1,
+        WebkitTapHighlightColor: "transparent",
+        userSelect: "none",
+        whiteSpace: "nowrap",
+    });
+
+    if (kind === "primary") {
+        return {
+            ...common,
+            color: "white",
+            background: "var(--fg)",
+            boxShadow: "0 12px 28px color-mix(in srgb, black 18%, transparent)",
+        };
+    }
+
+    if (kind === "danger") {
+        return {
+            ...common,
+            color: "color-mix(in srgb, var(--fg) 78%, #b00020)",
+            background: "transparent",
+            border: "1px solid color-mix(in srgb, var(--border) 76%, transparent)",
+        };
+    }
+
+    return {
+        ...common,
+        color: "var(--fg)",
+        background: "transparent",
+        border: "1px solid color-mix(in srgb, var(--border) 76%, transparent)",
+    };
 }
 
 export function AccountPage({ onBackHome }: AccountPageProps) {
-     const {
-          loading,
-          signedIn,
-          user,
-          error,
-          refresh,
-          signInWithGoogle,
-          signOut,
-     } = useAuth();
+    const {
+        loading,
+        signedIn,
+        user,
+        error,
+        refresh,
+        signInWithGoogle,
+        signOut,
+    } = useAuth();
 
-     const onSignIn = useCallback(() => {
-          const returnTo = typeof window !== "undefined" ? `${window.location.origin}${window.location.pathname}#/account` : undefined;
-          signInWithGoogle({ returnTo });
-     }, [signInWithGoogle]);
+    const mountedRef = useRef(true);
+    const [actionState, setActionState] = useState<ActionState>("idle");
 
-     const onRefresh = useCallback(async () => {
-          await refresh();
-     }, [refresh]);
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+        };
+    }, []);
 
-     const displayName = user?.displayName?.trim() || "Signed in";
-     const email = user?.email?.trim() || "—";
-     const initials = useMemo(() => initialsFrom(user?.displayName, user?.email), [user?.displayName, user?.email]);
+    const displayName = user?.displayName?.trim() || "Signed in";
+    const email = user?.email?.trim() || "—";
+    const initials = useMemo(
+        () => initialsFrom(user?.displayName, user?.email),
+        [user?.displayName, user?.email],
+    );
 
-     return (
-          <main
-               aria-label="Account"
-               style={{
-                    minHeight: "100%",
-                    display: "grid",
-                    placeItems: "center",
-                    padding: "40px 20px",
-               }}
-          >
-               <div style={cardStyle()}>
-                    <div
-                         style={{
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "space-between",
-                              gap: 16,
-                              marginBottom: 22,
-                         }}
+    const busy = loading || actionState !== "idle";
+    const sessionLabel = loading
+        ? "Checking session"
+        : signedIn
+            ? "Authenticated"
+            : "Guest session";
+
+    const title = signedIn ? "Your account" : "Sign in";
+    const subtitle = loading
+        ? "Checking your current session."
+        : signedIn
+            ? "Manage the current browser session."
+            : "Use Google sign-in to sync your account session.";
+
+    const handleSignIn = useCallback(async () => {
+        if (busy) return;
+
+        setActionState("signing_in");
+        try {
+            await Promise.resolve(
+                signInWithGoogle({
+                    returnTo: getReturnToAccountUrl(),
+                }),
+            );
+        } catch {
+            if (mountedRef.current) {
+                setActionState("idle");
+            }
+            return;
+        }
+
+        if (mountedRef.current) {
+            setActionState("idle");
+        }
+    }, [busy, signInWithGoogle]);
+
+    const handleRefresh = useCallback(async () => {
+        if (busy) return;
+
+        setActionState("refreshing");
+        try {
+            await refresh();
+        } finally {
+            if (mountedRef.current) {
+                setActionState("idle");
+            }
+        }
+    }, [busy, refresh]);
+
+    const handleSignOut = useCallback(async () => {
+        if (busy) return;
+
+        setActionState("signing_out");
+        try {
+            await signOut();
+        } finally {
+            if (mountedRef.current) {
+                setActionState("idle");
+            }
+        }
+    }, [busy, signOut]);
+
+    const primaryBusyLabel =
+        actionState === "signing_in"
+            ? "Connecting…"
+            : actionState === "refreshing"
+                ? "Refreshing…"
+                : actionState === "signing_out"
+                    ? "Signing out…"
+                    : null;
+
+    return (
+        <main style={styles.page} aria-label="Account">
+            <section style={styles.card} aria-busy={busy || undefined}>
+                <div style={styles.topRow}>
+                    <button
+                        type="button"
+                        onClick={onBackHome}
+                        style={buttonStyle("secondary", busy)}
+                        aria-label="Back home"
                     >
-                         <button
-                              type="button"
-                              onClick={onBackHome}
-                              style={buttonStyle("secondary")}
-                              aria-label="Back home"
-                         >
-                              <ArrowLeft size={16} />
-                              Home
-                         </button>
+                        <ArrowLeft size={16} />
+                        Home
+                    </button>
 
-                         <div
-                              style={{
-                                   display: "inline-flex",
-                                   alignItems: "center",
-                                   gap: 8,
-                                   fontSize: 13,
-                                   opacity: 0.8,
-                              }}
-                         >
-                              <ShieldCheck size={15} />
-                              Session
-                         </div>
+                    <div style={styles.sessionBadge}>
+                        <ShieldCheck size={15} />
+                        {sessionLabel}
+                    </div>
+                </div>
+
+                <div style={styles.hero}>
+                    <div aria-hidden="true" style={styles.avatar}>
+                        {signedIn ? initials : <UserRound size={24} />}
                     </div>
 
-                    <div
-                         style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: 16,
-                              marginBottom: 22,
-                         }}
-                    >
-                         <div
-                              aria-hidden="true"
-                              style={{
-                                   width: 56,
-                                   height: 56,
-                                   borderRadius: 999,
-                                   display: "grid",
-                                   placeItems: "center",
-                                   fontSize: 19,
-                                   fontWeight: 820,
-                                   letterSpacing: "0.04em",
-                                   color: "var(--fg)",
-                                   background:
-                                        "linear-gradient(180deg, color-mix(in srgb, var(--card) 92%, white), color-mix(in srgb, var(--card) 98%, transparent))",
-                                   boxShadow: "0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent)",
-                                   userSelect: "none",
-                                   flex: "0 0 auto",
-                              }}
-                         >
-                              {signedIn ? initials : <UserRound size={24} />}
-                         </div>
-
-                         <div style={{ minWidth: 0 }}>
-                              <h1
-                                   style={{
-                                        margin: 0,
-                                        fontSize: 28,
-                                        lineHeight: 1.05,
-                                        letterSpacing: "-0.02em",
-                                   }}
-                              >
-                                   {signedIn ? "Your account" : "Sign in"}
-                              </h1>
-
-                              <div
-                                   style={{
-                                        marginTop: 8,
-                                        fontSize: 14,
-                                        opacity: 0.78,
-                                   }}
-                              >
-                                   {loading
-                                        ? "Checking session…"
-                                        : signedIn
-                                             ? "Manage the current browser session."
-                                             : "Use Google sign-in to sync your account session."}
-                              </div>
-                         </div>
+                    <div style={styles.heroText}>
+                        <h1 style={styles.title}>{title}</h1>
+                        <div style={styles.subtitle}>{subtitle}</div>
                     </div>
+                </div>
 
-                    <div
-                         style={{
-                              borderRadius: 18,
-                              border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
-                              background: "color-mix(in srgb, var(--activeBg) 36%, transparent)",
-                              padding: 16,
-                         }}
-                    >
-                         <div
-                              style={{
-                                   fontSize: 12,
-                                   fontWeight: 760,
-                                   letterSpacing: "0.08em",
-                                   textTransform: "uppercase",
-                                   opacity: 0.64,
-                                   marginBottom: 10,
-                              }}
-                         >
-                              Identity
-                         </div>
+                <div style={styles.identityCard}>
+                    <div style={styles.sectionKicker}>Identity</div>
 
-                         <div style={{ display: "grid", gap: 10 }}>
-                              <div>
-                                   <div style={{ fontSize: 12, opacity: 0.62, marginBottom: 4 }}>Name</div>
-                                   <div style={{ fontSize: 15, fontWeight: 720 }}>
-                                        {signedIn ? displayName : "Not signed in"}
-                                   </div>
-                              </div>
+                    <div style={styles.identityGrid}>
+                        <div style={styles.field}>
+                            <div style={styles.fieldLabel}>Name</div>
+                            <div style={styles.fieldValueStrong}>
+                                {signedIn ? displayName : "Not signed in"}
+                            </div>
+                        </div>
 
-                              <div>
-                                   <div style={{ fontSize: 12, opacity: 0.62, marginBottom: 4 }}>Email</div>
-                                   <div style={{ fontSize: 15, fontWeight: 640 }}>{signedIn ? email : "—"}</div>
-                              </div>
-                         </div>
+                        <div style={styles.field}>
+                            <div style={styles.fieldLabel}>Email</div>
+                            <div style={styles.fieldValue}>
+                                {signedIn ? email : "—"}
+                            </div>
+                        </div>
                     </div>
+                </div>
 
-                    {error ? (
-                         <div
-                              role="alert"
-                              style={{
-                                   marginTop: 14,
-                                   borderRadius: 16,
-                                   border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
-                                   background: "color-mix(in srgb, var(--activeBg) 42%, transparent)",
-                                   padding: 12,
-                                   fontSize: 13,
-                              }}
-                         >
-                              {error}
-                         </div>
-                    ) : null}
-
-                    <div
-                         style={{
-                              display: "flex",
-                              flexWrap: "wrap",
-                              gap: 10,
-                              marginTop: 18,
-                         }}
-                    >
-                         {!signedIn ? (
-                              <button
-                                   type="button"
-                                   onClick={onSignIn}
-                                   disabled={loading}
-                                   style={buttonStyle("primary")}
-                              >
-                                   <LogIn size={16} />
-                                   Continue with Google
-                              </button>
-                         ) : (
-                              <>
-                                   <button
-                                        type="button"
-                                        onClick={onRefresh}
-                                        disabled={loading}
-                                        style={buttonStyle("secondary")}
-                                   >
-                                        <RefreshCcw size={16} />
-                                        Refresh session
-                                   </button>
-
-                                   <button
-                                        type="button"
-                                        onClick={() => {
-                                             void signOut();
-                                        }}
-                                        disabled={loading}
-                                        style={buttonStyle("danger")}
-                                   >
-                                        <LogOut size={16} />
-                                        Sign out
-                                   </button>
-                              </>
-                         )}
+                {error ? (
+                    <div role="alert" style={styles.error}>
+                        {error}
                     </div>
-               </div>
-          </main>
-     );
+                ) : null}
+
+                <div style={styles.actions}>
+                    {!signedIn ? (
+                        <button
+                            type="button"
+                            onClick={() => {
+                                void handleSignIn();
+                            }}
+                            disabled={busy}
+                            aria-busy={actionState === "signing_in" || undefined}
+                            style={buttonStyle("primary", busy)}
+                        >
+                            <LogIn size={16} />
+                            {actionState === "signing_in"
+                                ? "Connecting…"
+                                : "Continue with Google"}
+                        </button>
+                    ) : (
+                        <>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    void handleRefresh();
+                                }}
+                                disabled={busy}
+                                aria-busy={actionState === "refreshing" || undefined}
+                                style={buttonStyle("secondary", busy)}
+                            >
+                                <RefreshCcw size={16} />
+                                {actionState === "refreshing"
+                                    ? "Refreshing…"
+                                    : "Refresh session"}
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    void handleSignOut();
+                                }}
+                                disabled={busy}
+                                aria-busy={actionState === "signing_out" || undefined}
+                                style={buttonStyle("danger", busy)}
+                            >
+                                <LogOut size={16} />
+                                {actionState === "signing_out"
+                                    ? "Signing out…"
+                                    : "Sign out"}
+                            </button>
+                        </>
+                    )}
+                </div>
+
+                {primaryBusyLabel ? (
+                    <div
+                        style={{
+                            marginTop: 12,
+                            fontSize: 12,
+                            opacity: 0.66,
+                        }}
+                    >
+                        {primaryBusyLabel}
+                    </div>
+                ) : null}
+            </section>
+        </main>
+    );
 }
 ```
 
@@ -23301,15 +23925,15 @@ import { sx } from "./sx";
 import { ReaderTypographyControl } from "./ReaderTypographyControl";
 import { Home } from "lucide-react";
 
-type CurrentPos = {
+type CurrentPos = Readonly<{
     label: string;
     ord: number;
     bookId: string | null;
     chapter: number | null;
     verse: number | null;
-};
+}>;
 
-type Props = {
+type Props = Readonly<{
     styles: Record<string, React.CSSProperties>;
     books: BookRow[] | null;
 
@@ -23318,23 +23942,28 @@ type Props = {
     current: CurrentPos;
     onJumpRef: (bookId: string, chapter: number, verse: number | null) => void;
 
-    // retained for API compatibility, not used by header anymore
+    // retained for API compatibility
     onNavigate: (loc: { bookId: string; chapter: number; verse?: number }) => void;
 
-    // legacy: keep props but header uses global theme now
+    // retained for API compatibility
     mode?: "light" | "dark";
     onToggleTheme?: () => void;
-};
+}>;
 
-type DockProps = {
+type DockProps = Readonly<{
     children: ReactNode;
     title?: string;
     ariaLabel?: string;
     pad?: number;
     minHeight?: number;
-};
+}>;
 
+// @ts-ignore
 const TOKENS = Object.freeze({
+    topGap: 8,
+    groupGap: 8,
+    subtleGap: 6,
+
     dockRadius: 999,
     dockMinHeight: 38,
     dockPad: 3,
@@ -23351,15 +23980,16 @@ const TOKENS = Object.freeze({
     iconBtnTransition:
         "transform 120ms ease, background 140ms ease, border-color 140ms ease, opacity 140ms ease, box-shadow 140ms ease",
 
-    groupGap: 8,
-    subtleGap: 6,
     dividerColor: "color-mix(in srgb, var(--border) 68%, transparent)",
     dividerHeight: 20,
     dividerWidth: 1,
-});
+
+    centerMaxWidth: 520,
+    centerMinWidth: 0,
+}) as const;
 
 function releasePointerCaptureSafe(target: EventTarget | null, pointerId: number): void {
-    if (!(target instanceof Element)) return;
+    if (typeof Element === "undefined" || !(target instanceof Element)) return;
 
     const el = target as Element & {
         releasePointerCapture?: (id: number) => void;
@@ -23383,19 +24013,63 @@ function releasePointerCaptureSafe(target: EventTarget | null, pointerId: number
 }
 
 const ui = {
-    shell: Object.freeze<CSSProperties>({
+    headerRoot: Object.freeze<CSSProperties>({
+        ...sx.topBar,
+        display: "grid",
+        gridTemplateColumns: "auto minmax(0, 1fr) auto",
+        alignItems: "center",
+        columnGap: TOKENS.topGap,
+        rowGap: TOKENS.topGap,
+        minWidth: 0,
+    }),
+
+    leftSlot: Object.freeze<CSSProperties>({
+        ...sx.topLeft,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "flex-start",
+        minWidth: 0,
+    }),
+
+    centerSlot: Object.freeze<CSSProperties>({
+        ...sx.topCenter,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        minWidth: TOKENS.centerMinWidth,
+        width: "100%",
+    }),
+
+    rightSlot: Object.freeze<CSSProperties>({
+        ...sx.topRight,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "flex-end",
+        minWidth: 0,
+    }),
+
+    headerGroup: Object.freeze<CSSProperties>({
         display: "flex",
         alignItems: "center",
         gap: TOKENS.groupGap,
         minWidth: 0,
+        flexWrap: "nowrap",
     }),
 
-    centerWrap: Object.freeze<CSSProperties>({
+    centerOuter: Object.freeze<CSSProperties>({
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        minWidth: 0,
         width: "100%",
+        minWidth: 0,
+    }),
+
+    centerInner: Object.freeze<CSSProperties>({
+        width: "min(100%, 520px)",
+        minWidth: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
     }),
 
     rightCluster: Object.freeze<CSSProperties>({
@@ -23461,11 +24135,8 @@ const HeaderGroup = memo(function HeaderGroup(props: {
 
     const style = useMemo<CSSProperties>(
         () => ({
-            display: "flex",
-            alignItems: "center",
+            ...ui.headerGroup,
             gap,
-            minWidth: 0,
-            flexWrap: "nowrap",
         }),
         [gap],
     );
@@ -23481,13 +24152,13 @@ const Divider = memo(function Divider() {
     return <div aria-hidden style={ui.divider} />;
 });
 
-type IconDockButtonProps = {
+type IconDockButtonProps = Readonly<{
     ariaLabel: string;
     title: string;
     onClick: () => void;
     icon: ReactNode;
     pressed?: boolean;
-};
+}>;
 
 const IconDockButton = memo(function IconDockButton(props: IconDockButtonProps) {
     const { ariaLabel, title, onClick, icon, pressed = false } = props;
@@ -23576,14 +24247,12 @@ const IconDockButton = memo(function IconDockButton(props: IconDockButtonProps) 
 });
 
 const HomeDock = memo(function HomeDock(props: { onBackHome: () => void }) {
-    const { onBackHome } = props;
-
     return (
         <Dock title="Home" ariaLabel="Home">
             <IconDockButton
                 ariaLabel="Home"
                 title="Home"
-                onClick={onBackHome}
+                onClick={props.onBackHome}
                 icon={<Home size={17} aria-hidden />}
             />
         </Dock>
@@ -23592,8 +24261,14 @@ const HomeDock = memo(function HomeDock(props: { onBackHome: () => void }) {
 
 const AccountDock = memo(function AccountDock() {
     return (
-        <Dock title="Account" ariaLabel="Account">
-            <AccountMenu size="sm" />
+        <Dock title="Account" ariaLabel="Account" pad={2}>
+            <AccountMenu
+                size="sm"
+                align="left"
+                chrome="docked"
+                showChevron
+                showLabelWhenSignedIn={false}
+            />
         </Dock>
     );
 });
@@ -23623,13 +24298,15 @@ const PositionDock = memo(function PositionDock(props: {
     const { styles, books, current, onJump } = props;
 
     return (
-        <div style={ui.centerWrap}>
-            <PositionPill
-                styles={styles}
-                books={books}
-                current={current}
-                onJump={onJump}
-            />
+        <div style={ui.centerOuter}>
+            <div style={ui.centerInner}>
+                <PositionPill
+                    styles={styles}
+                    books={books}
+                    current={current}
+                    onJump={onJump}
+                />
+            </div>
         </div>
     );
 });
@@ -23645,15 +24322,15 @@ export const ReaderHeader = memo(function ReaderHeader(props: Props) {
     );
 
     return (
-        <div style={sx.topBar}>
-            <div style={sx.topLeft}>
+        <header style={ui.headerRoot} aria-label="Reader header">
+            <div style={ui.leftSlot}>
                 <HeaderGroup ariaLabel="Navigation and account">
                     <HomeDock onBackHome={onBackHome} />
                     <AccountDock />
                 </HeaderGroup>
             </div>
 
-            <div style={sx.topCenter}>
+            <div style={ui.centerSlot}>
                 <PositionDock
                     styles={styles}
                     books={books}
@@ -23662,7 +24339,7 @@ export const ReaderHeader = memo(function ReaderHeader(props: Props) {
                 />
             </div>
 
-            <div style={sx.topRight}>
+            <div style={ui.rightSlot}>
                 <div style={ui.rightCluster}>
                     <HeaderGroup ariaLabel="Reader controls">
                         <TypographyDock />
@@ -23674,7 +24351,7 @@ export const ReaderHeader = memo(function ReaderHeader(props: Props) {
                     </HeaderGroup>
                 </div>
             </div>
-        </div>
+        </header>
     );
 });
 ```
@@ -24785,12 +25462,13 @@ import {
 /**
  * Biblia.to — Reader Typography Control
  *
- * Upgraded:
- * - narrower / denser panel
- * - more premium controls
- * - press-and-hold acceleration for weight / size / font arrows
- * - stable floating portal
- * - locked typography contract (measure + leading fixed)
+ * Micropolished upgrade:
+ * - Reliable initial typography load
+ * - Size & weight cycle by exact step increments
+ * - More intuitive keyboard shortcuts (+/- size, [] weight)
+ * - Slightly tighter spacing, smoother hold timing
+ * - Better visual feedback on hold / disabled states
+ * - No structural/layout changes, no previews, no extra deps
  */
 
 type FontOpt = ReturnType<typeof fontOptions>[number] & {
@@ -24821,10 +25499,10 @@ const VIEWPORT_PAD = 10;
 const STYLE_ATTR = "data-bp-reader-typo-style";
 const PORTAL_PANEL_ID = "bp-reader-typo-panel";
 
-const HOLD_INITIAL_DELAY_MS = 260;
-const HOLD_REPEAT_START_MS = 120;
-const HOLD_REPEAT_FAST_MS = 52;
-const HOLD_ACCEL_AFTER_MS = 560;
+const HOLD_INITIAL_DELAY_MS = 240;
+const HOLD_REPEAT_START_MS = 110;
+const HOLD_REPEAT_FAST_MS = 50;
+const HOLD_ACCEL_AFTER_MS = 520;
 
 function clampNum(n: number, lo: number, hi: number): number {
     if (!Number.isFinite(n)) return lo;
@@ -24862,22 +25540,16 @@ function getViewportSize(): { width: number; height: number } {
     if (typeof window === "undefined") return { width: 0, height: 0 };
     const vv = window.visualViewport;
     if (vv) {
-        return {
-            width: Math.round(vv.width),
-            height: Math.round(vv.height),
-        };
+        return { width: Math.round(vv.width), height: Math.round(vv.height) };
     }
-    return {
-        width: window.innerWidth,
-        height: window.innerHeight,
-    };
+    return { width: window.innerWidth, height: window.innerHeight };
 }
 
 function computePanelLayout(trigger: DOMRect, preferredWidth: number): PanelLayout {
     const { width: viewportW, height: viewportH } = getViewportSize();
 
     const width = Math.round(
-        clampNum(preferredWidth, PANEL_MIN_W, Math.max(PANEL_MIN_W, viewportW - VIEWPORT_PAD * 2)),
+        clampNum(preferredWidth, PANEL_MIN_W, Math.max(PANEL_MIN_W, viewportW - VIEWPORT_PAD * 2))
     );
     const height = Math.min(PANEL_H, Math.max(210, viewportH - VIEWPORT_PAD * 2));
 
@@ -24895,24 +25567,17 @@ function computePanelLayout(trigger: DOMRect, preferredWidth: number): PanelLayo
     left = clampNum(
         Math.round(left),
         VIEWPORT_PAD,
-        Math.max(VIEWPORT_PAD, viewportW - width - VIEWPORT_PAD),
+        Math.max(VIEWPORT_PAD, viewportW - width - VIEWPORT_PAD)
     );
 
     let top = placeY === "bottom" ? trigger.bottom + PANEL_GAP : trigger.top - PANEL_GAP - height;
     top = clampNum(
         Math.round(top),
         VIEWPORT_PAD,
-        Math.max(VIEWPORT_PAD, viewportH - height - VIEWPORT_PAD),
+        Math.max(VIEWPORT_PAD, viewportH - height - VIEWPORT_PAD)
     );
 
-    return {
-        left,
-        top,
-        width,
-        height,
-        placeX,
-        placeY,
-    };
+    return { left, top, width, height, placeX, placeY };
 }
 
 function usePrefersReducedMotion(): boolean {
@@ -24920,10 +25585,8 @@ function usePrefersReducedMotion(): boolean {
 
     useEffect(() => {
         if (typeof window === "undefined" || !window.matchMedia) return;
-
         const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
         const onChange = (event: MediaQueryListEvent) => setReduced(event.matches);
-
         setReduced(mq.matches);
         mq.addEventListener("change", onChange);
         return () => mq.removeEventListener("change", onChange);
@@ -24951,62 +25614,44 @@ function useHoldToRepeat(action: () => void, enabled: boolean) {
     const intervalRef = useRef<number | null>(null);
     const holdStartedAtRef = useRef<number>(0);
 
-    useEffect(() => {
-        actionRef.current = action;
-    }, [action]);
-
-    useEffect(() => {
-        enabledRef.current = enabled;
-    }, [enabled]);
+    useEffect(() => { actionRef.current = action; }, [action]);
+    useEffect(() => { enabledRef.current = enabled; }, [enabled]);
 
     const clearTimers = useCallback(() => {
-        if (timeoutRef.current != null && typeof window !== "undefined") {
-            window.clearTimeout(timeoutRef.current);
-            timeoutRef.current = null;
-        }
-        if (intervalRef.current != null && typeof window !== "undefined") {
-            window.clearInterval(intervalRef.current);
-            intervalRef.current = null;
-        }
+        if (timeoutRef.current) window.clearTimeout(timeoutRef.current);
+        if (intervalRef.current) window.clearInterval(intervalRef.current);
+        timeoutRef.current = null;
+        intervalRef.current = null;
     }, []);
 
     useEffect(() => clearTimers, [clearTimers]);
 
     const start = useCallback(() => {
-        if (!enabledRef.current || typeof window === "undefined") return;
-
+        if (!enabledRef.current) return;
         clearTimers();
         actionRef.current();
         holdStartedAtRef.current = Date.now();
 
         timeoutRef.current = window.setTimeout(() => {
             let fast = false;
-
             const tick = () => {
                 if (!enabledRef.current) {
                     clearTimers();
                     return;
                 }
-
                 actionRef.current();
-
                 const elapsed = Date.now() - holdStartedAtRef.current;
                 if (!fast && elapsed >= HOLD_ACCEL_AFTER_MS) {
                     fast = true;
-                    if (intervalRef.current != null) {
-                        window.clearInterval(intervalRef.current);
-                    }
+                    if (intervalRef.current) window.clearInterval(intervalRef.current);
                     intervalRef.current = window.setInterval(tick, HOLD_REPEAT_FAST_MS);
                 }
             };
-
             intervalRef.current = window.setInterval(tick, HOLD_REPEAT_START_MS);
         }, HOLD_INITIAL_DELAY_MS);
     }, [clearTimers]);
 
-    const stop = useCallback(() => {
-        clearTimers();
-    }, [clearTimers]);
+    const stop = useCallback(() => clearTimers(), [clearTimers]);
 
     return { start, stop };
 }
@@ -25035,13 +25680,13 @@ function ArrowButton(props: {
     return (
         <button
             type="button"
-            style={{ ...sx.arrowBtn, ...(disabled ? sx.arrowBtnDisabled : null) }}
-            onClick={(e) => {
-                e.preventDefault();
+            style={{
+                ...sx.arrowBtn,
+                ...(disabled ? sx.arrowBtnDisabled : null),
             }}
+            onClick={(e) => e.preventDefault()}
             onPointerDown={(e) => {
-                if (disabled) return;
-                if (e.button !== 0) return;
+                if (disabled || e.button !== 0) return;
                 e.preventDefault();
                 hold.start();
             }}
@@ -25097,15 +25742,12 @@ function ControlCard(props: {
 }
 
 export function ReaderTypographyControl() {
-    const storageLoadedRef = useRef<ReaderTypography | null>(null);
-    if (storageLoadedRef.current === null) {
-        storageLoadedRef.current = loadReaderTypography();
-    }
+    // Reliable initial load — only once on mount
+    const stored = useMemo(() => loadReaderTypography(), []);
 
-    const stored = storageLoadedRef.current;
     const [enabled, setEnabled] = useState<boolean>(!!stored);
     const [t, setT] = useState<ReaderTypography>(
-        normalizeLockedTypography(stored ?? DEFAULT_TYPOGRAPHY),
+        normalizeLockedTypography(stored ?? DEFAULT_TYPOGRAPHY)
     );
     const [open, setOpen] = useState(false);
     const [panelLayout, setPanelLayout] = useState<PanelLayout | null>(null);
@@ -25135,7 +25777,7 @@ export function ReaderTypographyControl() {
   border-radius: 999px;
 }
 `,
-        STYLE_ATTR,
+        STYLE_ATTR
     );
 
     const current = useMemo(() => normalizeLockedTypography(t), [t]);
@@ -25154,7 +25796,7 @@ export function ReaderTypographyControl() {
             out.push(n);
         }
         return out;
-    }, [limits.sizePx.hi, limits.sizePx.lo, limits.sizePx.step]);
+    }, [limits.sizePx.lo, limits.sizePx.hi, limits.sizePx.step]);
 
     const weightValues = useMemo(() => {
         const out: number[] = [];
@@ -25162,7 +25804,7 @@ export function ReaderTypographyControl() {
             out.push(n);
         }
         return out;
-    }, [limits.weight.hi, limits.weight.lo, limits.weight.step]);
+    }, [limits.weight.lo, limits.weight.hi, limits.weight.step]);
 
     const summary = useMemo(() => {
         const font = currentFont?.label ?? String(current.font);
@@ -25186,9 +25828,7 @@ export function ReaderTypographyControl() {
     const closePanel = useCallback(() => {
         setOpen(false);
         setPanelLayout(null);
-        queueMicrotask(() => {
-            triggerRef.current?.focus();
-        });
+        queueMicrotask(() => triggerRef.current?.focus());
     }, []);
 
     const resetToDefaults = useCallback(() => {
@@ -25196,9 +25836,7 @@ export function ReaderTypographyControl() {
         setT(normalizeLockedTypography(DEFAULT_TYPOGRAPHY));
         setOpen(false);
         setPanelLayout(null);
-        queueMicrotask(() => {
-            triggerRef.current?.focus();
-        });
+        queueMicrotask(() => triggerRef.current?.focus());
     }, []);
 
     const cycleFont = useCallback(
@@ -25206,25 +25844,27 @@ export function ReaderTypographyControl() {
             if (!fontIds.length) return;
             setPatch({ font: nextOf(fontIds, current.font, dir) });
         },
-        [current.font, fontIds, setPatch],
+        [current.font, fontIds, setPatch]
     );
 
     const cycleSize = useCallback(
         (dir: -1 | 1) => {
             if (!sizeValues.length) return;
             const cur = Math.round(current.sizePx);
-            setPatch({ sizePx: nextOf(sizeValues, cur, dir) });
+            const nextValue = nextOf(sizeValues, cur, dir);
+            setPatch({ sizePx: nextValue });
         },
-        [current.sizePx, setPatch, sizeValues],
+        [current.sizePx, setPatch, sizeValues]
     );
 
     const cycleWeight = useCallback(
         (dir: -1 | 1) => {
             if (!weightValues.length) return;
             const cur = Math.round(current.weight);
-            setPatch({ weight: nextOf(weightValues, cur, dir) });
+            const nextValue = nextOf(weightValues, cur, dir);
+            setPatch({ weight: nextValue });
         },
-        [current.weight, setPatch, weightValues],
+        [current.weight, setPatch, weightValues]
     );
 
     useEffect(() => {
@@ -25238,6 +25878,7 @@ export function ReaderTypographyControl() {
         applyReaderTypography(locked);
         saveReaderTypography(locked);
 
+        // Only correct if something drifted — rare case
         if (
             locked.measurePx !== current.measurePx ||
             locked.leading !== current.leading ||
@@ -25256,18 +25897,15 @@ export function ReaderTypographyControl() {
 
     useEffect(() => {
         if (!open) return;
-
         const id = requestAnimationFrame(() => {
             recomputeLayout();
             panelRef.current?.focus();
         });
-
         return () => cancelAnimationFrame(id);
     }, [open, recomputeLayout]);
 
     useEffect(() => {
         if (!open) return;
-
         const update = () => recomputeLayout();
         const vv = typeof window !== "undefined" ? window.visualViewport : null;
 
@@ -25329,20 +25967,20 @@ export function ReaderTypographyControl() {
                     e.preventDefault();
                     return;
                 case "[":
-                    cycleSize(-1);
+                    cycleWeight(-1);
                     e.preventDefault();
                     return;
                 case "]":
-                    cycleSize(1);
+                    cycleWeight(1);
                     e.preventDefault();
                     return;
                 case "-":
-                    cycleWeight(-1);
+                    cycleSize(-1);
                     e.preventDefault();
                     return;
                 case "=":
                 case "+":
-                    cycleWeight(1);
+                    cycleSize(1);
                     e.preventDefault();
                     return;
                 default:
@@ -25356,11 +25994,7 @@ export function ReaderTypographyControl() {
 
     const panelStyle = useMemo<React.CSSProperties>(() => {
         if (!panelLayout) {
-            return {
-                ...sx.panel,
-                opacity: 0,
-                pointerEvents: "none",
-            };
+            return { ...sx.panel, opacity: 0, pointerEvents: "none" };
         }
 
         const originX = panelLayout.placeX === "right" ? "right" : "left";
@@ -25464,7 +26098,7 @@ export function ReaderTypographyControl() {
                         </button>
                     </div>
                 </div>,
-                document.body,
+                document.body
             )
             : null;
 
@@ -25491,13 +26125,13 @@ export function ReaderTypographyControl() {
                 aria-label="Typography settings"
                 title={triggerLabel}
             >
-                <span style={sx.triggerGlyph}>
-                    <IconAa />
-                </span>
+        <span style={sx.triggerGlyph}>
+          <IconAa />
+        </span>
                 <span style={sx.triggerMeta}>
-                    <span style={sx.triggerMetaTop}>Type</span>
-                    <span style={sx.triggerMetaBottom}>{enabled ? "On" : "Off"}</span>
-                </span>
+          <span style={sx.triggerMetaTop}>Type</span>
+          <span style={sx.triggerMetaBottom}>{enabled ? "On" : "Off"}</span>
+        </span>
                 <span style={{ ...sx.dot, ...(enabled ? sx.dotOn : sx.dotOff) }} aria-hidden />
             </button>
 
@@ -25526,8 +26160,7 @@ const sx: Record<string, React.CSSProperties> = {
         padding: "0 10px",
         cursor: "pointer",
         userSelect: "none",
-        boxShadow:
-            "0 1px 0 rgba(255,255,255,0.28) inset, 0 10px 24px rgba(0,0,0,0.075)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.28) inset, 0 10px 24px rgba(0,0,0,0.075)",
         transition:
             "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 140ms ease, background 140ms ease, opacity 140ms ease",
         position: "relative",
@@ -25537,17 +26170,13 @@ const sx: Record<string, React.CSSProperties> = {
     triggerOpen: {
         transform: "translateY(-1px)",
         borderColor: "color-mix(in oklab, var(--focus) 58%, var(--hairline))",
-        boxShadow:
-            "0 1px 0 rgba(255,255,255,0.32) inset, 0 18px 34px rgba(0,0,0,0.14)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.32) inset, 0 18px 34px rgba(0,0,0,0.14)",
         background:
             "linear-gradient(180deg, color-mix(in oklab, var(--panel) 99%, transparent), color-mix(in oklab, var(--panel) 92%, var(--bg)))",
     },
-    triggerEnabled: {
-        opacity: 1,
-    },
-    triggerDisabled: {
-        opacity: 0.95,
-    },
+    triggerEnabled: { opacity: 1 },
+    triggerDisabled: { opacity: 0.95 },
+
     triggerGlyph: {
         width: 16,
         display: "inline-flex",
@@ -25558,6 +26187,7 @@ const sx: Record<string, React.CSSProperties> = {
         letterSpacing: "-0.05em",
         flexShrink: 0,
     },
+
     triggerMeta: {
         display: "flex",
         flexDirection: "column",
@@ -25602,8 +26232,7 @@ const sx: Record<string, React.CSSProperties> = {
         border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
         background:
             "linear-gradient(180deg, color-mix(in oklab, var(--bg) 99%, var(--panel)), color-mix(in oklab, var(--bg) 96%, var(--panel)))",
-        boxShadow:
-            "0 1px 0 rgba(255,255,255,0.26) inset, 0 28px 68px rgba(0,0,0,0.22)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.26) inset, 0 28px 68px rgba(0,0,0,0.22)",
         overflow: "hidden",
         padding: 9,
         display: "grid",
@@ -25721,7 +26350,8 @@ const sx: Record<string, React.CSSProperties> = {
         boxShadow: "0 1px 0 rgba(255,255,255,0.12) inset",
     },
     controlCardDisabled: {
-        opacity: 0.62,
+        opacity: 0.64,
+        filter: "grayscale(0.4)",
     },
     controlMain: {
         display: "grid",
@@ -25774,15 +26404,14 @@ const sx: Record<string, React.CSSProperties> = {
         flexShrink: 0,
         WebkitTapHighlightColor: "transparent",
         padding: 0,
-        boxShadow:
-            "0 1px 0 rgba(255,255,255,0.1) inset, 0 8px 16px rgba(0,0,0,0.16)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.1) inset, 0 8px 16px rgba(0,0,0,0.16)",
         userSelect: "none",
         transition:
-            "transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease, filter 120ms ease",
+            "transform 110ms ease, box-shadow 110ms ease, opacity 110ms ease, filter 110ms ease",
     },
     arrowBtnDisabled: {
         cursor: "not-allowed",
-        opacity: 0.38,
+        opacity: 0.4,
         boxShadow: "none",
     },
 
@@ -25805,8 +26434,7 @@ const sx: Record<string, React.CSSProperties> = {
         fontWeight: 860,
         padding: "0 11px",
         cursor: "pointer",
-        boxShadow:
-            "0 1px 0 rgba(255,255,255,0.1) inset, 0 10px 18px rgba(0,0,0,0.16)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.1) inset, 0 10px 18px rgba(0,0,0,0.16)",
         WebkitTapHighlightColor: "transparent",
     },
     resetBtn: {
@@ -26752,39 +27380,37 @@ import type { CSSProperties } from "react";
 /**
  * Reader UI tokens (inline styles)
  *
- * Hardened / improved:
- * - stable virtualized reader viewport
- * - safe-area aware shell/header/body
- * - explicit z/layer tokens
- * - true shrinkable center header column
- * - calmer premium row states
- * - no invalid / non-portable inline style tokens
- * - explicit row wrapper surface for verse containers
- * - safer cross-browser fallbacks for inline React CSSProperties
- * - stricter reusable constants to reduce drift
- *
- * Notes:
- * - keep layout-critical surfaces simple and deterministic
- * - avoid size containment on virtualized row wrappers
- * - inline styles only: no pseudo selectors, no unsupported token tricks
- * - values are chosen to cooperate with base.css tokens
+ * Upgraded:
+ * - calmer, stricter shared layout tokens
+ * - safer header geometry for narrow widths
+ * - more deterministic viewport / scroll surfaces
+ * - better center-column shrink behavior
+ * - slightly more premium verse row states
+ * - cross-browser inline-style friendly values only
  */
 
 type SxMap = Readonly<Record<string, CSSProperties>>;
 
 const RADIUS_PX = 14;
-const HEADER_Z = 60;
+
+const Z = Object.freeze({
+    header: 60,
+});
 
 const mix = (value: string) => `color-mix(in oklab, ${value})`;
 
 const HAIRLINE = mix("var(--hairline) 92%, transparent");
 const HAIRLINE_STRONG = mix("var(--hairline) 98%, transparent");
+
 const PANEL_WASH = mix("var(--panel) 22%, transparent");
 const PANEL_WASH_FOCUS = mix("var(--panel) 26%, transparent");
 const PANEL_WASH_SELECTED = mix("var(--panel) 30%, transparent");
+
 const FOCUS_RING_WASH = mix("var(--focusRing) 90%, transparent");
+
 const PANEL_BG_SOFT = mix("var(--panel) 90%, transparent");
 const PANEL_BG_SOFT_HOVER = mix("var(--panel) 94%, transparent");
+
 const HEADER_BG = mix("var(--bg) 88%, transparent");
 const SKELETON_BG = mix("var(--hairline) 92%, transparent");
 const SCROLLBAR_THUMB = mix("var(--hairline) 86%, transparent");
@@ -26796,25 +27422,31 @@ const SAFE_RIGHT = "env(safe-area-inset-right, 0px)";
 
 const HEADER_HORIZONTAL_PAD = 12;
 const BODY_HORIZONTAL_PAD = 16;
+
 const HEADER_TOP_PAD = 10;
 const HEADER_BOTTOM_PAD = 10;
+
 const SCROLL_TOP_PAD = 18;
 const SCROLL_BOTTOM_PAD = 96;
 
 const HEADER_MIN_HEIGHT = 60;
 const HEADER_BLUR = 12;
 const HEADER_SHADOW = "0 10px 22px rgba(0, 0, 0, 0.032)";
+
 const BUTTON_SHADOW = "0 8px 18px rgba(0,0,0,0.055)";
 const BUTTON_SHADOW_HOVER = "0 10px 20px rgba(0,0,0,0.07)";
 const BUTTON_SHADOW_ACTIVE = "0 6px 14px rgba(0,0,0,0.06)";
+
+const HEADER_GAP = 12;
+const HEADER_SIDE_MIN_HEIGHT = 40;
 
 const VERSE_NUM_COL = 34;
 const VERSE_ROW_GAP = 12;
 const VERSE_ROW_PAD_Y = 9;
 const VERSE_ROW_PAD_X = 6;
 
-const BOOK_TITLE_SIZE = 24;
-const CHAPTER_TITLE_SIZE = 16;
+const BOOK_TITLE_SIZE = "clamp(22px, 1.2vw + 18px, 28px)";
+const CHAPTER_TITLE_SIZE = "clamp(15px, 0.5vw + 14px, 18px)";
 
 const ROW_SCROLL_MARGIN_TOP = `calc(${HEADER_MIN_HEIGHT}px + ${SCROLL_TOP_PAD}px + ${SAFE_TOP})`;
 
@@ -26822,9 +27454,9 @@ const BUTTON_TRANSITION =
     "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease";
 
 const ROW_TRANSITION =
-    "background 140ms ease, transform 140ms ease, box-shadow 140ms ease";
+    "background 140ms ease, transform 140ms ease, box-shadow 140ms ease, opacity 140ms ease";
 
-export const sx = {
+const sxMap = {
     /* ---------- Shell ---------- */
     page: {
         height: "100dvh",
@@ -26836,18 +27468,23 @@ export const sx = {
         isolation: "isolate",
         overflow: "hidden",
         minWidth: 0,
+        width: "100%",
+        boxSizing: "border-box",
     },
 
     /* ---------- Header ---------- */
     topBar: {
         position: "sticky",
         top: 0,
-        zIndex: HEADER_Z,
+        zIndex: Z.header,
         display: "grid",
-        gridTemplateColumns: "auto minmax(0, 1fr) auto",
+        gridTemplateColumns: "max-content minmax(0, 1fr) max-content",
         alignItems: "center",
-        columnGap: 12,
+        columnGap: HEADER_GAP,
+        rowGap: 8,
         minHeight: HEADER_MIN_HEIGHT,
+        width: "100%",
+        minWidth: 0,
         paddingTop: `calc(${HEADER_TOP_PAD}px + ${SAFE_TOP})`,
         paddingBottom: HEADER_BOTTOM_PAD,
         paddingLeft: `calc(${HEADER_HORIZONTAL_PAD}px + ${SAFE_LEFT})`,
@@ -26867,7 +27504,8 @@ export const sx = {
         justifyContent: "flex-start",
         gap: 10,
         minWidth: 0,
-        minHeight: 40,
+        minHeight: HEADER_SIDE_MIN_HEIGHT,
+        flex: "0 1 auto",
     },
 
     topCenter: {
@@ -26875,7 +27513,9 @@ export const sx = {
         alignItems: "center",
         justifyContent: "center",
         minWidth: 0,
+        width: "100%",
         textAlign: "center",
+        justifySelf: "stretch",
     },
 
     topRight: {
@@ -26883,7 +27523,8 @@ export const sx = {
         alignItems: "center",
         justifyContent: "flex-end",
         minWidth: 0,
-        minHeight: 40,
+        minHeight: HEADER_SIDE_MIN_HEIGHT,
+        flex: "0 1 auto",
     },
 
     rightCluster: {
@@ -26896,7 +27537,7 @@ export const sx = {
     },
 
     searchWrap: {
-        width: "clamp(200px, 26vw, 520px)",
+        width: "min(100%, clamp(220px, 28vw, 520px))",
         minWidth: 0,
         maxWidth: "100%",
         flex: "1 1 auto",
@@ -26918,6 +27559,7 @@ export const sx = {
         alignItems: "center",
         justifyContent: "center",
         fontSize: 12,
+        fontWeight: 600,
         lineHeight: 1,
         whiteSpace: "nowrap",
         userSelect: "none",
@@ -26958,6 +27600,8 @@ export const sx = {
         minWidth: 0,
         overflow: "hidden",
         contain: "layout paint",
+        background: "var(--bg)",
+        isolation: "isolate",
     },
 
     scroll: {
@@ -26968,6 +27612,7 @@ export const sx = {
         paddingTop: SCROLL_TOP_PAD,
         paddingBottom: `calc(${SCROLL_BOTTOM_PAD}px + ${SAFE_BOTTOM})`,
         overscrollBehaviorY: "contain",
+        overscrollBehaviorX: "none",
         scrollbarGutter: "stable",
         scrollbarWidth: "thin",
         scrollbarColor: `${SCROLLBAR_THUMB} transparent`,
@@ -26975,6 +27620,7 @@ export const sx = {
         touchAction: "pan-y",
         transform: "translateZ(0)",
         minWidth: 0,
+        width: "100%",
         boxSizing: "border-box",
     },
 
@@ -26991,6 +27637,7 @@ export const sx = {
     msg: {
         padding: "18px 0",
         fontSize: 12,
+        lineHeight: 1.45,
         color: "var(--muted)",
         whiteSpace: "pre-wrap",
     },
@@ -27016,10 +27663,11 @@ export const sx = {
         marginTop: 9,
         fontSize: BOOK_TITLE_SIZE,
         fontWeight: 650,
-        lineHeight: 1.15,
+        lineHeight: 1.12,
         letterSpacing: "-0.03em",
         overflowWrap: "anywhere",
         wordBreak: "break-word",
+        minWidth: 0,
     },
 
     chapterHeader: {
@@ -27045,6 +27693,7 @@ export const sx = {
         letterSpacing: "-0.02em",
         overflowWrap: "anywhere",
         wordBreak: "break-word",
+        minWidth: 0,
     },
 
     /* ---------- Verse rows ---------- */
@@ -27131,6 +27780,8 @@ export const sx = {
         minWidth: 0,
     },
 } satisfies SxMap;
+
+export const sx = sxMap;
 ```
 
 ### apps/web/src/reader/types.ts
@@ -29000,6 +29651,14 @@ import React, {
     useState,
 } from "react";
 import {
+    ArrowUpRight,
+    BookOpen,
+    Clock3,
+    CornerDownLeft,
+    Search as SearchIcon,
+    X,
+} from "lucide-react";
+import {
     apiGetBooks,
     apiSearch,
     type BookRow,
@@ -29013,28 +29672,46 @@ export type ReaderLocation = {
     verse?: number;
 };
 
-type Props = {
+type Props = Readonly<{
     styles: Record<string, React.CSSProperties>;
     onNavigate: (loc: ReaderLocation) => void;
     onStartReading?: () => void;
     initialQuery?: string;
     hint?: string;
     autoFocus?: boolean;
-};
+}>;
 
 type RefParse =
-     | { ok: true; loc: ReaderLocation; label: string }
-     | { ok: false };
+    | { ok: true; loc: ReaderLocation; label: string }
+    | { ok: false };
 
 type SearchItem =
-     | { kind: "ref"; key: string; label: string; loc: ReaderLocation }
-     | { kind: "result"; key: string; label: string; result: SearchResult }
-     | { kind: "history"; key: string; label: string; q: string };
+    | {
+    kind: "ref";
+    key: string;
+    label: string;
+    meta: string;
+    loc: ReaderLocation;
+}
+    | {
+    kind: "result";
+    key: string;
+    label: string;
+    meta: string;
+    result: SearchResult;
+}
+    | {
+    kind: "history";
+    key: string;
+    label: string;
+    meta: string;
+    q: string;
+};
 
-type HistoryItem = {
+type HistoryItem = Readonly<{
     q: string;
     at: number;
-};
+}>;
 
 const HISTORY_KEY = "bp_search_history_v1";
 const MAX_HISTORY = 14;
@@ -29046,11 +29723,20 @@ function normalizeSpaces(s: string): string {
 }
 
 function toKey(s: string): string {
-    return normalizeSpaces(s.toLowerCase().replace(/[.,]/g, " "));
+    return normalizeSpaces(
+        s
+            .toLowerCase()
+            .replace(/[.,]/g, " ")
+            .replace(/\s*:\s*/g, ":"),
+    );
 }
 
 function insertSpaceBeforeDigits(s: string): string {
     return s.replace(/([a-zA-Z])(\d)/g, "$1 $2");
+}
+
+function normalizeRefInput(s: string): string {
+    return normalizeSpaces(insertSpaceBeforeDigits(s).replace(/\s*:\s*/g, ":"));
 }
 
 function safeJsonParseUnknown(text: string | null): unknown {
@@ -29068,15 +29754,15 @@ function parseAbbrs(abbrs: string | null): string[] {
 
     if (Array.isArray(v)) {
         return v
-             .map((x) => (typeof x === "string" ? x : ""))
-             .map((s) => s.trim())
-             .filter(Boolean);
+            .map((x) => (typeof x === "string" ? x : ""))
+            .map((s) => s.trim())
+            .filter(Boolean);
     }
 
     return abbrs
-         .split(/[,|]/g)
-         .map((s) => s.trim())
-         .filter(Boolean);
+        .split(/[,|]/g)
+        .map((s) => s.trim())
+        .filter(Boolean);
 }
 
 function buildBookLookup(books: BookRow[]): Map<string, string> {
@@ -29097,14 +29783,20 @@ function buildBookLookup(books: BookRow[]): Map<string, string> {
         add(b.nameShort);
         add(b.osised);
 
-        for (const a of parseAbbrs(b.abbrs)) add(a);
+        for (const a of parseAbbrs(b.abbrs)) {
+            add(a);
+        }
     }
 
     return m;
 }
 
-function parseRef(books: BookRow[] | null, raw: string): RefParse {
-    const q = normalizeSpaces(insertSpaceBeforeDigits(raw));
+function parseRef(
+    bookLookup: Map<string, string>,
+    bookNameById: Map<string, string>,
+    raw: string,
+): RefParse {
+    const q = normalizeRefInput(raw);
     if (!q) return { ok: false };
 
     const m = q.match(/^(.+?)\s+(\d+)(?::(\d+))?$/);
@@ -29117,14 +29809,17 @@ function parseRef(books: BookRow[] | null, raw: string): RefParse {
     if (!Number.isFinite(chapter) || chapter < 1) return { ok: false };
     if (verse != null && (!Number.isFinite(verse) || verse < 1)) return { ok: false };
 
-    if (!books) return { ok: false };
-
-    const lookup = buildBookLookup(books);
-    const bookId = lookup.get(book);
+    const bookId = bookLookup.get(book);
     if (!bookId) return { ok: false };
 
-    const label = verse != null ? `${bookId} ${chapter}:${verse}` : `${bookId} ${chapter}`;
-    return { ok: true, label, loc: { bookId, chapter, verse } };
+    const bookName = bookNameById.get(bookId) ?? bookId;
+    const label = verse != null ? `${bookName} ${chapter}:${verse}` : `${bookName} ${chapter}`;
+
+    return {
+        ok: true,
+        label,
+        loc: { bookId, chapter, verse },
+    };
 }
 
 function isHistoryItem(v: unknown): v is HistoryItem {
@@ -29139,11 +29834,11 @@ function loadHistory(): HistoryItem[] {
     if (!Array.isArray(raw)) return [];
 
     return raw
-         .filter(isHistoryItem)
-         .map((x) => ({ q: normalizeSpaces(x.q), at: x.at }))
-         .filter((x) => x.q.length > 0 && Number.isFinite(x.at))
-         .sort((a, b) => b.at - a.at)
-         .slice(0, MAX_HISTORY);
+        .filter(isHistoryItem)
+        .map((x) => ({ q: normalizeSpaces(x.q), at: x.at }))
+        .filter((x) => x.q.length > 0 && Number.isFinite(x.at))
+        .sort((a, b) => b.at - a.at)
+        .slice(0, MAX_HISTORY);
 }
 
 function persistHistory(history: HistoryItem[]): void {
@@ -29180,6 +29875,21 @@ function clearHistory(): void {
     }
 }
 
+function decodeHtmlEntities(text: string): string {
+    if (typeof document === "undefined") {
+        return text
+            .replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'");
+    }
+
+    const el = document.createElement("textarea");
+    el.innerHTML = text;
+    return el.value;
+}
+
 function splitSnippet(snippet: string): Array<{ text: string; hi: boolean }> {
     const parts: Array<{ text: string; hi: boolean }> = [];
     const re = /<em>(.*?)<\/em>/gi;
@@ -29191,17 +29901,24 @@ function splitSnippet(snippet: string): Array<{ text: string; hi: boolean }> {
         const start = m.index;
         const end = start + m[0].length;
 
-        if (start > last) parts.push({ text: snippet.slice(last, start), hi: false });
+        if (start > last) {
+            parts.push({ text: snippet.slice(last, start), hi: false });
+        }
+
         parts.push({ text: m[1] ?? "", hi: true });
         last = end;
     }
 
-    if (last < snippet.length) parts.push({ text: snippet.slice(last), hi: false });
+    if (last < snippet.length) {
+        parts.push({ text: snippet.slice(last), hi: false });
+    }
 
-    return parts.map((p) => ({
-        ...p,
-        text: p.text.replace(/<\/?[^>]+>/g, ""),
-    }));
+    return parts
+        .map((p) => ({
+            ...p,
+            text: decodeHtmlEntities(p.text.replace(/<\/?[^>]+>/g, "")),
+        }))
+        .filter((p) => p.text.length > 0);
 }
 
 function eventComposedPath(e: Event): EventTarget[] | null {
@@ -29218,9 +29935,9 @@ function pathContainsNode(path: EventTarget[] | null, node: Node | null): boolea
 }
 
 function isWithinEventTarget(
-     target: Node | null,
-     path: EventTarget[] | null,
-     el: HTMLElement | null,
+    target: Node | null,
+    path: EventTarget[] | null,
+    el: HTMLElement | null,
 ): boolean {
     if (!el) return false;
     if (target && el.contains(target)) return true;
@@ -29233,15 +29950,21 @@ function itemMetaLabel(kind: SearchItem["kind"], payload: SearchPayload | null):
     return payload?.mode ?? "search";
 }
 
+function itemIcon(kind: SearchItem["kind"]): React.ReactNode {
+    if (kind === "ref") return <ArrowUpRight size={14} />;
+    if (kind === "history") return <Clock3 size={14} />;
+    return <BookOpen size={14} />;
+}
+
 export function Search(props: Props) {
     const { styles, onNavigate, onStartReading, autoFocus } = props;
 
     const inputRef = useRef<HTMLInputElement | null>(null);
-    const panelRef = useRef<HTMLDivElement | null>(null);
     const wrapRef = useRef<HTMLDivElement | null>(null);
     const listRef = useRef<HTMLDivElement | null>(null);
     const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
     const requestSeqRef = useRef(0);
+    const composingRef = useRef(false);
 
     const listboxId = useId();
 
@@ -29258,27 +29981,34 @@ export function Search(props: Props) {
         let alive = true;
 
         apiGetBooks()
-             .then((r) => {
-                 if (!alive) return;
-                 setBooks(r.books);
-             })
-             .catch(() => {
-                 if (!alive) return;
-                 setBooks(null);
-             });
+            .then((r) => {
+                if (!alive) return;
+                setBooks(r.books);
+            })
+            .catch(() => {
+                if (!alive) return;
+                setBooks(null);
+            });
 
         return () => {
             alive = false;
         };
     }, []);
 
-    const ref = useMemo(() => parseRef(books, q), [books, q]);
+    const bookLookup = useMemo(() => buildBookLookup(books ?? []), [books]);
 
     const bookNameById = useMemo(() => {
         const m = new Map<string, string>();
-        for (const b of books ?? []) m.set(b.bookId, b.name ?? b.bookId);
+        for (const b of books ?? []) {
+            m.set(b.bookId, b.name ?? b.bookId);
+        }
         return m;
     }, [books]);
+
+    const ref = useMemo(
+        () => parseRef(bookLookup, bookNameById, q),
+        [bookLookup, bookNameById, q],
+    );
 
     useEffect(() => {
         if (!autoFocus) return;
@@ -29287,7 +30017,7 @@ export function Search(props: Props) {
     }, [autoFocus]);
 
     useEffect(() => {
-        const qq = q.trim();
+        const qq = normalizeSpaces(q);
         const myReqId = ++requestSeqRef.current;
 
         if (!qq) {
@@ -29311,43 +30041,45 @@ export function Search(props: Props) {
 
         setLoading(true);
         setErr(null);
+        setPayload(null);
 
         const timer = window.setTimeout(() => {
             apiSearch(qq, MAX_RESULTS, { signal: ctrl.signal })
-                 .then((r) => {
-                     if (!alive) return;
-                     if (myReqId !== requestSeqRef.current) return;
-                     setPayload(r);
-                     setLoading(false);
-                     setErr(null);
-                     setActiveIdx(0);
-                 })
-                 .catch((e: unknown) => {
-                     if (!alive) return;
-                     if (myReqId !== requestSeqRef.current) return;
+                .then((r) => {
+                    if (!alive) return;
+                    if (myReqId !== requestSeqRef.current) return;
 
-                     const name =
-                          typeof e === "object" &&
-                          e !== null &&
-                          "name" in e &&
-                          typeof (e as { name?: unknown }).name === "string"
-                               ? (e as { name: string }).name
-                               : "";
+                    setPayload(r);
+                    setLoading(false);
+                    setErr(null);
+                    setActiveIdx(0);
+                })
+                .catch((e: unknown) => {
+                    if (!alive) return;
+                    if (myReqId !== requestSeqRef.current) return;
 
-                     if (name === "AbortError") return;
+                    const name =
+                        typeof e === "object" &&
+                        e !== null &&
+                        "name" in e &&
+                        typeof (e as { name?: unknown }).name === "string"
+                            ? (e as { name: string }).name
+                            : "";
 
-                     const message =
-                          typeof e === "object" &&
-                          e !== null &&
-                          "message" in e &&
-                          typeof (e as { message?: unknown }).message === "string"
-                               ? (e as { message: string }).message
-                               : String(e);
+                    if (name === "AbortError") return;
 
-                     setPayload(null);
-                     setErr(message);
-                     setLoading(false);
-                 });
+                    const message =
+                        typeof e === "object" &&
+                        e !== null &&
+                        "message" in e &&
+                        typeof (e as { message?: unknown }).message === "string"
+                            ? (e as { message: string }).message
+                            : "Search failed.";
+
+                    setPayload(null);
+                    setErr(message);
+                    setLoading(false);
+                });
         }, SEARCH_DEBOUNCE_MS);
 
         return () => {
@@ -29357,19 +30089,20 @@ export function Search(props: Props) {
         };
     }, [q, ref.ok]);
 
-    const hasTypedQuery = q.trim().length > 0;
+    const hasTypedQuery = normalizeSpaces(q).length > 0;
     const hasVisibleHistory = focused && !hasTypedQuery && history.length > 0;
 
     const results = payload?.results ?? [];
 
-    const items = useMemo(() => {
+    const items = useMemo<SearchItem[]>(() => {
         const list: SearchItem[] = [];
 
         if (ref.ok) {
             list.push({
                 kind: "ref",
-                key: `ref:${ref.label}`,
+                key: `ref:${ref.loc.bookId}:${ref.loc.chapter}:${ref.loc.verse ?? 0}`,
                 label: `Go to ${ref.label}`,
+                meta: "ref",
                 loc: ref.loc,
             });
             return list;
@@ -29381,6 +30114,7 @@ export function Search(props: Props) {
                     kind: "history",
                     key: `history:${it.q.toLowerCase()}`,
                     label: it.q,
+                    meta: "history",
                     q: it.q,
                 });
             }
@@ -29393,14 +30127,16 @@ export function Search(props: Props) {
                 kind: "result",
                 key: `result:${r.bookId}:${r.chapter}:${r.verse}:${r.verseKey ?? ""}`,
                 label: `${fullBook} ${r.chapter}:${r.verse}`,
+                meta: payload?.mode ?? "search",
                 result: r,
             });
         }
 
         return list;
-    }, [ref, hasTypedQuery, history, results, bookNameById]);
+    }, [bookNameById, hasTypedQuery, history, payload?.mode, ref, results]);
 
     useEffect(() => {
+        itemRefs.current.length = items.length;
         if (activeIdx < items.length) return;
         setActiveIdx(items.length > 0 ? items.length - 1 : 0);
     }, [activeIdx, items.length]);
@@ -29415,8 +30151,11 @@ export function Search(props: Props) {
         const viewTop = list.scrollTop;
         const viewBottom = viewTop + list.clientHeight;
 
-        if (top < viewTop) list.scrollTop = top;
-        else if (bottom > viewBottom) list.scrollTop = bottom - list.clientHeight;
+        if (top < viewTop) {
+            list.scrollTop = top;
+        } else if (bottom > viewBottom) {
+            list.scrollTop = bottom - list.clientHeight;
+        }
     }, [activeIdx]);
 
     const showPanel = focused && (hasTypedQuery || hasVisibleHistory || loading || err != null);
@@ -29438,41 +30177,45 @@ export function Search(props: Props) {
 
         document.addEventListener("pointerdown", onPointerDownCapture, { capture: true });
         return () => {
-            document.removeEventListener("pointerdown", onPointerDownCapture, { capture: true });
+            document.removeEventListener("pointerdown", onPointerDownCapture, {
+                capture: true,
+            });
         };
     }, [showPanel]);
 
     const commitSelection = useCallback(
-         (idx: number): void => {
-             const item = items[idx];
-             if (!item) return;
+        (idx: number): void => {
+            const item = items[idx];
+            if (!item) return;
 
-             if (item.kind === "ref") {
-                 const nextHistory = saveHistory(q);
-                 setHistory(nextHistory);
-                 onNavigate(item.loc);
-                 setFocused(false);
-                 inputRef.current?.blur();
-                 return;
-             }
+            if (item.kind === "ref") {
+                const nextHistory = saveHistory(q);
+                setHistory(nextHistory);
+                onNavigate(item.loc);
+                setFocused(false);
+                inputRef.current?.blur();
+                return;
+            }
 
-             if (item.kind === "result") {
-                 const nextHistory = saveHistory(q);
-                 setHistory(nextHistory);
-                 const r = item.result;
-                 onNavigate({ bookId: r.bookId, chapter: r.chapter, verse: r.verse });
-                 setFocused(false);
-                 inputRef.current?.blur();
-                 return;
-             }
+            if (item.kind === "result") {
+                const nextHistory = saveHistory(q);
+                setHistory(nextHistory);
+                const r = item.result;
+                onNavigate({ bookId: r.bookId, chapter: r.chapter, verse: r.verse });
+                setFocused(false);
+                inputRef.current?.blur();
+                return;
+            }
 
-             if (item.kind === "history") {
-                 setQ(item.q);
-                 setFocused(true);
-                 queueMicrotask(() => inputRef.current?.focus());
-             }
-         },
-         [items, onNavigate, q],
+            setQ(item.q);
+            setFocused(true);
+            setActiveIdx(0);
+
+            requestAnimationFrame(() => {
+                inputRef.current?.focus();
+            });
+        },
+        [items, onNavigate, q],
     );
 
     const clearQuery = useCallback(() => {
@@ -29484,265 +30227,335 @@ export function Search(props: Props) {
     }, []);
 
     const onInputKeyDown = useCallback(
-         (e: React.KeyboardEvent<HTMLInputElement>): void => {
-             if (e.key === "Escape") {
-                 e.preventDefault();
+        (e: React.KeyboardEvent<HTMLInputElement>): void => {
+            if (composingRef.current) return;
 
-                 if (q.trim()) {
-                     clearQuery();
-                     return;
-                 }
+            if (e.key === "Escape") {
+                e.preventDefault();
 
-                 setFocused(false);
-                 inputRef.current?.blur();
-                 return;
-             }
+                if (normalizeSpaces(q)) {
+                    clearQuery();
+                    return;
+                }
 
-             if (e.key === "Enter") {
-                 e.preventDefault();
+                setFocused(false);
+                inputRef.current?.blur();
+                return;
+            }
 
-                 if (!q.trim()) {
-                     if (items.length > 0) {
-                         commitSelection(activeIdx);
-                         return;
-                     }
+            if (e.key === "Enter") {
+                e.preventDefault();
 
-                     onStartReading?.();
-                     setFocused(false);
-                     inputRef.current?.blur();
-                     return;
-                 }
+                if (!normalizeSpaces(q)) {
+                    if (items.length > 0) {
+                        commitSelection(activeIdx);
+                        return;
+                    }
 
-                 if (items.length > 0) {
-                     commitSelection(activeIdx);
-                     return;
-                 }
+                    onStartReading?.();
+                    setFocused(false);
+                    inputRef.current?.blur();
+                    return;
+                }
 
-                 if (ref.ok) {
-                     const nextHistory = saveHistory(q);
-                     setHistory(nextHistory);
-                     onNavigate(ref.loc);
-                     setFocused(false);
-                     inputRef.current?.blur();
-                 }
+                if (items.length > 0) {
+                    commitSelection(activeIdx);
+                    return;
+                }
 
-                 return;
-             }
+                if (ref.ok) {
+                    const nextHistory = saveHistory(q);
+                    setHistory(nextHistory);
+                    onNavigate(ref.loc);
+                    setFocused(false);
+                    inputRef.current?.blur();
+                }
 
-             if (e.key === "ArrowDown") {
-                 if (!showPanel || items.length === 0) return;
-                 e.preventDefault();
-                 setActiveIdx((i) => Math.min(items.length - 1, Math.max(0, i + 1)));
-                 return;
-             }
+                return;
+            }
 
-             if (e.key === "ArrowUp") {
-                 if (!showPanel || items.length === 0) return;
-                 e.preventDefault();
-                 setActiveIdx((i) => Math.max(0, i - 1));
-                 return;
-             }
+            if (e.key === "ArrowDown") {
+                if (!showPanel || items.length === 0) return;
+                e.preventDefault();
+                setActiveIdx((i) => (i + 1) % items.length);
+                return;
+            }
 
-             if (e.key === "Home" && showPanel && items.length > 0) {
-                 e.preventDefault();
-                 setActiveIdx(0);
-                 return;
-             }
+            if (e.key === "ArrowUp") {
+                if (!showPanel || items.length === 0) return;
+                e.preventDefault();
+                setActiveIdx((i) => (i - 1 + items.length) % items.length);
+                return;
+            }
 
-             if (e.key === "End" && showPanel && items.length > 0) {
-                 e.preventDefault();
-                 setActiveIdx(items.length - 1);
-             }
-         },
-         [q, items, activeIdx, ref, showPanel, clearQuery, commitSelection, onNavigate, onStartReading],
+            if (e.key === "Home" && showPanel && items.length > 0) {
+                e.preventDefault();
+                setActiveIdx(0);
+                return;
+            }
+
+            if (e.key === "End" && showPanel && items.length > 0) {
+                e.preventDefault();
+                setActiveIdx(items.length - 1);
+            }
+        },
+        [
+            q,
+            items,
+            activeIdx,
+            ref,
+            showPanel,
+            clearQuery,
+            commitSelection,
+            onNavigate,
+            onStartReading,
+        ],
     );
 
     const searchRowStyle: React.CSSProperties = {
         ...(styles.searchRow ?? {}),
-        ...(focused ? (styles.searchRowFocused ?? {}) : null),
+        ...(focused ? (styles.searchRowFocused ?? {}) : {}),
     };
 
     const wrapStyle: React.CSSProperties = {
         position: "relative",
         width: "100%",
         minWidth: 0,
-        ...(styles.searchWrap ?? null),
+        ...(styles.searchWrap ?? {}),
     };
 
     const panelStyle: React.CSSProperties = {
         ...sx.panel,
-        ...(styles.searchPanel ?? null),
+        ...(styles.searchPanel ?? {}),
     };
 
     const hintText = props.hint ?? "Type a word or a reference";
     const placeholder = props.hint ?? "Search… (or John 3:16)";
     const activeDescendant =
-         showPanel && items[activeIdx] ? `${listboxId}-option-${activeIdx}` : undefined;
+        showPanel && items[activeIdx] ? `${listboxId}-option-${activeIdx}` : undefined;
+
+    const panelStatus = err
+        ? "error"
+        : loading
+            ? "loading"
+            : !hasTypedQuery && hasVisibleHistory
+                ? "history"
+                : ref.ok
+                    ? "ref"
+                    : hasTypedQuery
+                        ? "results"
+                        : "idle";
 
     return (
-         <div ref={wrapRef} style={wrapStyle}>
-             <div
-                  style={searchRowStyle}
-                  aria-label="Search"
-                  onPointerDown={(e) => {
-                      e.preventDefault();
-                      inputRef.current?.focus();
-                  }}
-             >
-                <span style={styles.searchIcon} aria-hidden>
-                    ⌕
+        <div ref={wrapRef} style={wrapStyle}>
+            <div
+                style={searchRowStyle}
+                aria-label="Search"
+                onPointerDown={(e) => {
+                    e.preventDefault();
+                    inputRef.current?.focus();
+                }}
+            >
+                <span style={sx.searchIcon} aria-hidden>
+                    <SearchIcon size={15} strokeWidth={2.1} />
                 </span>
 
-                 <input
-                      ref={inputRef}
-                      value={q}
-                      onChange={(e) => setQ(e.target.value)}
-                      placeholder={placeholder}
-                      style={{ ...styles.searchInput, width: "100%", maxWidth: "100%", minWidth: 0 }}
-                      aria-label="Search scripture"
-                      aria-expanded={showPanel}
-                      aria-controls={showPanel ? listboxId : undefined}
-                      aria-activedescendant={activeDescendant}
-                      aria-autocomplete="list"
-                      role="combobox"
-                      spellCheck={false}
-                      inputMode="search"
-                      onFocus={() => setFocused(true)}
-                      onKeyDown={onInputKeyDown}
-                 />
+                <input
+                    ref={inputRef}
+                    value={q}
+                    onChange={(e) => {
+                        setQ(e.target.value);
+                        setFocused(true);
+                    }}
+                    placeholder={placeholder}
+                    style={{
+                        ...styles.searchInput,
+                        width: "100%",
+                        maxWidth: "100%",
+                        minWidth: 0,
+                    }}
+                    aria-label="Search scripture"
+                    aria-expanded={showPanel}
+                    aria-controls={showPanel ? listboxId : undefined}
+                    aria-activedescendant={activeDescendant}
+                    aria-autocomplete="list"
+                    role="combobox"
+                    spellCheck={false}
+                    inputMode="search"
+                    onFocus={() => setFocused(true)}
+                    onKeyDown={onInputKeyDown}
+                    onCompositionStart={() => {
+                        composingRef.current = true;
+                    }}
+                    onCompositionEnd={() => {
+                        composingRef.current = false;
+                    }}
+                />
 
-                 {q.trim() ? (
-                      <button
-                           type="button"
-                           style={sx.clearBtn}
-                           aria-label="Clear search"
-                           onPointerDown={(e) => e.preventDefault()}
-                           onClick={() => {
-                               clearQuery();
-                               inputRef.current?.focus();
-                           }}
-                      >
-                          ✕
-                      </button>
-                 ) : null}
-             </div>
+                {normalizeSpaces(q) ? (
+                    <button
+                        type="button"
+                        style={sx.clearBtn}
+                        aria-label="Clear search"
+                        onPointerDown={(e) => e.preventDefault()}
+                        onClick={() => {
+                            clearQuery();
+                            inputRef.current?.focus();
+                        }}
+                    >
+                        <X size={12} strokeWidth={2.4} />
+                    </button>
+                ) : null}
+            </div>
 
-             <div
-                  style={{ ...sx.hintSlot, ...(showPanel ? sx.hintHidden : null) }}
-                  aria-hidden={showPanel}
-             >
-                 {hintText ? <div style={sx.hint}>{hintText}</div> : null}
-             </div>
+            <div
+                style={{ ...sx.hintSlot, ...(showPanel ? sx.hintHidden : null) }}
+                aria-hidden={showPanel}
+            >
+                {hintText ? <div style={sx.hint}>{hintText}</div> : null}
+            </div>
 
-             {showPanel ? (
-                  <div ref={panelRef} style={panelStyle}>
-                      <div style={sx.panelMsg}>
-                          {err ? (
-                               <span>{err}</span>
-                          ) : loading ? (
-                               <span>Searching…</span>
-                          ) : !hasTypedQuery && hasVisibleHistory ? (
-                               <>
-                                   <span>Recent searches</span>
-                                   <button
-                                        type="button"
-                                        style={sx.inlineBtn}
-                                        onPointerDown={(e) => e.preventDefault()}
-                                        onClick={() => {
-                                            clearHistory();
-                                            setHistory([]);
-                                            setActiveIdx(0);
-                                            inputRef.current?.focus();
+            {showPanel ? (
+                <div style={panelStyle}>
+                    <div style={sx.panelMsg}>
+                        {panelStatus === "error" ? (
+                            <>
+                                <div style={sx.panelMsgLeft}>
+                                    <span style={sx.panelBadge}>Error</span>
+                                    <span>{err}</span>
+                                </div>
+                            </>
+                        ) : panelStatus === "loading" ? (
+                            <>
+                                <div style={sx.panelMsgLeft}>
+                                    <span style={sx.panelBadge}>Search</span>
+                                    <span>Searching…</span>
+                                </div>
+                            </>
+                        ) : panelStatus === "history" ? (
+                            <>
+                                <div style={sx.panelMsgLeft}>
+                                    <span style={sx.panelBadge}>Recent</span>
+                                    <span>Recent searches</span>
+                                </div>
+
+                                <button
+                                    type="button"
+                                    style={sx.inlineBtn}
+                                    onPointerDown={(e) => e.preventDefault()}
+                                    onClick={() => {
+                                        clearHistory();
+                                        setHistory([]);
+                                        setActiveIdx(0);
+                                        inputRef.current?.focus();
+                                    }}
+                                >
+                                    Clear
+                                </button>
+                            </>
+                        ) : panelStatus === "ref" ? (
+                            <>
+                                <div style={sx.panelMsgLeft}>
+                                    <span style={sx.panelBadge}>Ref</span>
+                                    <span>Direct reference match</span>
+                                </div>
+                                <span style={sx.panelMeta}>ref</span>
+                            </>
+                        ) : panelStatus === "results" ? (
+                            <>
+                                <div style={sx.panelMsgLeft}>
+                                    <span style={sx.panelBadge}>Search</span>
+                                    <span>
+                                        {items.length
+                                            ? `${items.length}${items.length === 1 ? " result" : " results"}`
+                                            : "No results"}
+                                    </span>
+                                </div>
+                                <span style={sx.panelMeta}>{payload?.mode ?? "search"}</span>
+                            </>
+                        ) : (
+                            <div style={sx.panelMsgLeft}>
+                                <span style={sx.panelBadge}>Search</span>
+                                <span>Type to search</span>
+                            </div>
+                        )}
+                    </div>
+
+                    {items.length > 0 ? (
+                        <div
+                            id={listboxId}
+                            ref={listRef}
+                            style={sx.list}
+                            role="listbox"
+                            aria-label="Search results"
+                        >
+                            {items.map((it, idx) => {
+                                const active = idx === activeIdx;
+                                const meta = itemMetaLabel(it.kind, payload);
+
+                                return (
+                                    <button
+                                        key={it.key}
+                                        id={`${listboxId}-option-${idx}`}
+                                        ref={(el) => {
+                                            itemRefs.current[idx] = el;
                                         }}
-                                   >
-                                       Clear
-                                   </button>
-                               </>
-                          ) : ref.ok ? (
-                               <>
-                                   <span>Direct reference match</span>
-                                   <span style={sx.panelMeta}>ref</span>
-                               </>
-                          ) : hasTypedQuery ? (
-                               <>
-                                <span>
-                                    {items.length
-                                         ? `${items.length}${items.length === 1 ? " result" : " results"}`
-                                         : "No results."}
-                                </span>
-                                   <span style={sx.panelMeta}>{payload?.mode ?? "search"}</span>
-                               </>
-                          ) : (
-                               <span>Type to search.</span>
-                          )}
-                      </div>
+                                        type="button"
+                                        style={{ ...sx.item, ...(active ? sx.itemActive : null) }}
+                                        onMouseEnter={() => setActiveIdx(idx)}
+                                        onPointerDown={(e) => {
+                                            e.preventDefault();
+                                            commitSelection(idx);
+                                        }}
+                                        role="option"
+                                        aria-selected={active}
+                                    >
+                                        <div style={sx.itemIcon}>{itemIcon(it.kind)}</div>
 
-                      {items.length > 0 ? (
-                           <div
-                                id={listboxId}
-                                ref={listRef}
-                                style={sx.list}
-                                role="listbox"
-                                aria-label="Search results"
-                           >
-                               {items.map((it, idx) => {
-                                   const active = idx === activeIdx;
-                                   const meta = itemMetaLabel(it.kind, payload);
-
-                                   return (
-                                        <button
-                                             key={it.key}
-                                             id={`${listboxId}-option-${idx}`}
-                                             ref={(el) => {
-                                                 itemRefs.current[idx] = el;
-                                             }}
-                                             type="button"
-                                             style={{ ...sx.item, ...(active ? sx.itemActive : null) }}
-                                             onMouseEnter={() => setActiveIdx(idx)}
-                                             onPointerDown={(e) => {
-                                                 e.preventDefault();
-                                                 commitSelection(idx);
-                                             }}
-                                             role="option"
-                                             aria-selected={active}
-                                        >
+                                        <div style={sx.itemBody}>
                                             <div style={sx.itemTop}>
                                                 <span style={sx.itemLabel}>{it.label}</span>
                                                 <span style={sx.itemMeta}>{meta}</span>
                                             </div>
 
                                             {it.kind === "result" && it.result.snippet ? (
-                                                 <div style={sx.snippet}>
-                                                     {splitSnippet(it.result.snippet).map((seg, i) => (
-                                                          <span key={i} style={seg.hi ? sx.hi : undefined}>
-                                                        {seg.text}
-                                                    </span>
-                                                     ))}
-                                                 </div>
+                                                <div style={sx.snippet}>
+                                                    {splitSnippet(it.result.snippet).map((seg, i) => (
+                                                        <span
+                                                            key={`${it.key}-seg-${i}`}
+                                                            style={seg.hi ? sx.hi : undefined}
+                                                        >
+                                                            {seg.text}
+                                                        </span>
+                                                    ))}
+                                                </div>
                                             ) : null}
 
                                             {it.kind === "history" ? (
-                                                 <div style={sx.historySub}>Press Enter to reuse this search.</div>
+                                                <div style={sx.historySub}>
+                                                    Press Enter to reuse this search.
+                                                </div>
                                             ) : null}
-                                        </button>
-                                   );
-                               })}
-                           </div>
-                      ) : null}
+                                        </div>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    ) : null}
 
-                      <div style={sx.footer}>
-                          <span style={sx.footerText}>↑↓</span>
-                          <span style={sx.footerSep}>navigate</span>
-                          <span style={sx.footerDot}>•</span>
-                          <span style={sx.footerText}>Enter</span>
-                          <span style={sx.footerSep}>open</span>
-                          <span style={sx.footerDot}>•</span>
-                          <span style={sx.footerText}>Esc</span>
-                          <span style={sx.footerSep}>{q.trim() ? "clear" : "close"}</span>
-                      </div>
-                  </div>
-             ) : null}
-         </div>
+                    <div style={sx.footer}>
+                        <span style={sx.footerKey}>↑↓</span>
+                        <span style={sx.footerText}>move</span>
+                        <span style={sx.footerDot}>•</span>
+                        <CornerDownLeft size={11} />
+                        <span style={sx.footerText}>open</span>
+                        <span style={sx.footerDot}>•</span>
+                        <span style={sx.footerKey}>Esc</span>
+                        <span style={sx.footerText}>{normalizeSpaces(q) ? "clear" : "close"}</span>
+                    </div>
+                </div>
+            ) : null}
+        </div>
     );
 }
 
@@ -29753,7 +30566,7 @@ const sx: Record<string, React.CSSProperties> = {
         right: 0,
         marginTop: 8,
         borderRadius: 16,
-        border: "1px solid var(--hairline)",
+        border: "1px solid color-mix(in srgb, var(--hairline) 92%, transparent)",
         background: "var(--overlay)",
         boxShadow: "var(--shadowPop)",
         overflow: "hidden",
@@ -29761,17 +30574,39 @@ const sx: Record<string, React.CSSProperties> = {
         backdropFilter: "blur(12px)",
         WebkitBackdropFilter: "blur(12px)",
     },
+
     panelMsg: {
         padding: "9px 12px",
         fontSize: 12,
         color: "var(--muted)",
         display: "flex",
-        alignItems: "baseline",
+        alignItems: "center",
         justifyContent: "space-between",
         gap: 8,
-        borderBottom: "1px solid var(--hairline)",
+        borderBottom: "1px solid color-mix(in srgb, var(--hairline) 92%, transparent)",
         background: "var(--overlay2)",
+        minWidth: 0,
     },
+
+    panelMsgLeft: {
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        minWidth: 0,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+    },
+
+    panelBadge: {
+        fontSize: 9.8,
+        letterSpacing: "0.16em",
+        textTransform: "uppercase",
+        opacity: 0.9,
+        userSelect: "none",
+        whiteSpace: "nowrap",
+    },
+
     panelMeta: {
         fontSize: 9.8,
         letterSpacing: "0.16em",
@@ -29779,37 +30614,67 @@ const sx: Record<string, React.CSSProperties> = {
         opacity: 0.85,
         userSelect: "none",
         whiteSpace: "nowrap",
+        flex: "0 0 auto",
     },
+
     list: {
         display: "flex",
         flexDirection: "column",
         maxHeight: 340,
         overflowY: "auto",
     },
+
     item: {
+        display: "grid",
+        gridTemplateColumns: "16px minmax(0, 1fr)",
+        alignItems: "start",
+        gap: 10,
         textAlign: "left",
         border: "none",
         background: "transparent",
         color: "inherit",
         cursor: "pointer",
         padding: "10px 14px",
-        borderTop: "1px solid var(--hairline)",
+        borderTop: "1px solid color-mix(in srgb, var(--hairline) 92%, transparent)",
         transition: "background 140ms ease",
         fontSize: 13,
+        width: "100%",
+        minWidth: 0,
     },
+
     itemActive: {
         background: "var(--activeBg)",
     },
+
+    itemIcon: {
+        display: "grid",
+        placeItems: "center",
+        marginTop: 2,
+        color: "var(--muted)",
+        opacity: 0.9,
+    },
+
+    itemBody: {
+        minWidth: 0,
+    },
+
     itemTop: {
         display: "flex",
         alignItems: "baseline",
         justifyContent: "space-between",
         gap: 10,
+        minWidth: 0,
     },
+
     itemLabel: {
         fontSize: 13.2,
         letterSpacing: "0.01em",
+        minWidth: 0,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
     },
+
     itemMeta: {
         fontSize: 10,
         color: "var(--muted)",
@@ -29817,25 +30682,32 @@ const sx: Record<string, React.CSSProperties> = {
         textTransform: "uppercase",
         userSelect: "none",
         whiteSpace: "nowrap",
+        flex: "0 0 auto",
     },
+
     snippet: {
         marginTop: 5,
-        fontSize: 12.2,
+        fontSize: 12.15,
         color: "var(--muted)",
         lineHeight: 1.55,
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
     },
+
     historySub: {
         marginTop: 5,
-        fontSize: 11.6,
+        fontSize: 11.5,
         color: "var(--muted)",
         lineHeight: 1.4,
     },
+
     hi: {
         color: "var(--fg)",
-        fontWeight: 550,
+        fontWeight: 600,
     },
+
     footer: {
-        borderTop: "1px solid var(--hairline)",
+        borderTop: "1px solid color-mix(in srgb, var(--hairline) 92%, transparent)",
         padding: "9px 14px",
         display: "flex",
         alignItems: "center",
@@ -29845,28 +30717,34 @@ const sx: Record<string, React.CSSProperties> = {
         background: "var(--overlay2)",
         fontSize: 10.2,
     },
-    footerText: {
+
+    footerKey: {
         fontSize: 10,
         letterSpacing: "0.12em",
         textTransform: "uppercase",
     },
-    footerSep: {
+
+    footerText: {
         fontSize: 10,
-        opacity: 0.75,
+        opacity: 0.78,
     },
+
     footerDot: {
         opacity: 0.5,
         fontSize: 10,
-        paddingInline: 4,
+        paddingInline: 3,
     },
+
     hintSlot: {
         height: 18,
         marginTop: 8,
     },
+
     hintHidden: {
         opacity: 0,
         pointerEvents: "none",
     },
+
     hint: {
         fontSize: 10.5,
         letterSpacing: "0.12em",
@@ -29877,6 +30755,14 @@ const sx: Record<string, React.CSSProperties> = {
         overflow: "hidden",
         textOverflow: "ellipsis",
     },
+
+    searchIcon: {
+        display: "inline-grid",
+        placeItems: "center",
+        flex: "0 0 auto",
+        color: "var(--muted)",
+    },
+
     clearBtn: {
         border: "none",
         background: "transparent",
@@ -29884,8 +30770,6 @@ const sx: Record<string, React.CSSProperties> = {
         cursor: "pointer",
         padding: 0,
         marginLeft: 8,
-        fontSize: 12,
-        lineHeight: 1,
         width: 18,
         height: 18,
         display: "inline-flex",
@@ -29894,6 +30778,7 @@ const sx: Record<string, React.CSSProperties> = {
         borderRadius: 999,
         flex: "0 0 auto",
     },
+
     inlineBtn: {
         border: "none",
         background: "transparent",
@@ -29904,6 +30789,7 @@ const sx: Record<string, React.CSSProperties> = {
         lineHeight: 1.2,
         textDecoration: "underline",
         textUnderlineOffset: "0.14em",
+        flex: "0 0 auto",
     },
 };
 ```
@@ -30607,15 +31493,15 @@ export default defineConfig({
 
 ### biblia.to-code-export.md
 
-> TRUNCATED: file was 1125679 bytes; showing first 48000 chars
+> TRUNCATED: file was 1135512 bytes; showing first 48000 chars
 
 ```md
 # Biblia.to — Clean Codebase Export
 
-Generated: 2026-03-11T15:52:23.367Z
+Generated: 2026-03-11T16:53:48.067Z
 Root: C:\Users\dannydekker\Desktop\Biblia-Populi
 Total files: 70
-Total raw bytes (all included files): 2198565
+Total raw bytes (all included files): 2208710
 Truncated/skipped files: 1
 Export time: 65ms
 

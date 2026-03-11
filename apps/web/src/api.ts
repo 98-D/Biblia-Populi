@@ -1,16 +1,17 @@
 // apps/web/src/api.ts
-// Biblia.to — hardened typed API client
+// Biblia.to — upgraded hardened typed API client
 //
 // Goals:
 // - same-origin by default, optional VITE_API_BASE override
 // - stable translation selection + reconciliation
-// - GET envelope decoding with safe 204 / 304 handling
+// - GET envelope decoding with safe 204 / 205 / 304 handling
 // - in-memory ETag cache that cannot freeze on 304
 // - merged abort signals + timeout classification
-// - safer parsing / narrower envelope assumptions
+// - stricter path / query hygiene
 // - explicit diagnostics with request id + body snippet
-// - stricter query encoding / path hygiene
-// - deterministic cache-keying + cache invalidation hooks
+// - deterministic cache keys + selective invalidation hooks
+// - in-flight GET dedupe for identical requests
+// - safer numeric normalization at the call boundary
 
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: { code: string; message: string } };
@@ -362,8 +363,14 @@ function normalizeApiBase(raw: string): string {
     return stripTrailingSlashes(withLeading);
 }
 
+function ensureApiPath(path: string): string {
+    const trimmed = path.trim();
+    if (!trimmed) return "/";
+    return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
 function joinUrl(base: string, path: string): string {
-    const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+    const normalizedPath = ensureApiPath(path);
     const normalizedBase = normalizeApiBase(base);
 
     if (!normalizedBase) return normalizedPath;
@@ -412,6 +419,15 @@ function safeLocalStorageRemove(key: string): void {
 
 function normalizeTranslationId(id: string): string {
     return id.trim();
+}
+
+function normalizeBookId(bookId: string): string {
+    return bookId.trim().toUpperCase();
+}
+
+function hasQueryParam(path: string, name: string): boolean {
+    const url = new URL(ensureApiPath(path), "http://local");
+    return url.searchParams.has(name);
 }
 
 export function getTranslationId(): string | null {
@@ -468,12 +484,15 @@ export function reconcileTranslationId(
 
 function withTranslation(path: string, opts?: ApiRequestOptions): string {
     const translationId = (opts?.translationId ?? getTranslationId())?.trim() ?? "";
-    if (!translationId) return path;
+    if (!translationId) return ensureApiPath(path);
 
-    if (/[?&](t|translationId)=/i.test(path)) return path;
+    const normalizedPath = ensureApiPath(path);
+    if (hasQueryParam(normalizedPath, "t") || hasQueryParam(normalizedPath, "translationId")) {
+        return normalizedPath;
+    }
 
-    const sep = path.includes("?") ? "&" : "?";
-    return `${path}${sep}t=${encodeURIComponent(translationId)}`;
+    const sep = normalizedPath.includes("?") ? "&" : "?";
+    return `${normalizedPath}${sep}t=${encodeURIComponent(translationId)}`;
 }
 
 /* ------------------------------ Query helpers ---------------------------- */
@@ -481,7 +500,7 @@ function withTranslation(path: string, opts?: ApiRequestOptions): string {
 type QueryValue = string | number | boolean | null | undefined;
 
 function addQuery(path: string, params: Record<string, QueryValue>): string {
-    const url = new URL(path, "http://local");
+    const url = new URL(ensureApiPath(path), "http://local");
     for (const [key, value] of Object.entries(params)) {
         if (value == null) continue;
         url.searchParams.set(key, String(value));
@@ -535,13 +554,16 @@ function formatHttpMessage(res: Response): string {
 }
 
 function getRequestId(res: Response): string | undefined {
-    const id = res.headers.get("x-request-id") ?? res.headers.get("cf-ray");
+    const id =
+        res.headers.get("x-request-id") ??
+        res.headers.get("x-correlation-id") ??
+        res.headers.get("cf-ray");
     return id?.trim() || undefined;
 }
 
 function bodySnippet(text: string | undefined): string | undefined {
     if (!text) return undefined;
-    const normalized = text.trim();
+    const normalized = text.replace(/\s+/g, " ").trim();
     if (!normalized) return undefined;
     return normalized.length > 320 ? `${normalized.slice(0, 320)}…` : normalized;
 }
@@ -648,6 +670,7 @@ type CacheEntry = Readonly<{
 
 const DEFAULT_CACHE_TTL_MS = 30_000;
 const responseCache = new Map<string, CacheEntry>();
+const inflightGetRequests = new Map<string, Promise<unknown>>();
 
 function cacheKey(method: string, url: string): string {
     return `${method.toUpperCase()} ${url}`;
@@ -689,26 +712,49 @@ function shouldCacheResponse(method: string, res: Response): boolean {
     return Boolean((res.headers.get("etag") ?? "").trim());
 }
 
+function invalidateCacheByPath(pathPrefix: string): void {
+    const normalized = ensureApiPath(pathPrefix);
+    for (const key of responseCache.keys()) {
+        const space = key.indexOf(" ");
+        const url = space >= 0 ? key.slice(space + 1) : key;
+        if (url.includes(normalized)) {
+            responseCache.delete(key);
+        }
+    }
+    for (const key of inflightGetRequests.keys()) {
+        const space = key.indexOf(" ");
+        const url = space >= 0 ? key.slice(space + 1) : key;
+        if (url.includes(normalized)) {
+            inflightGetRequests.delete(key);
+        }
+    }
+}
+
 /* ----------------------------- Request core ------------------------------ */
 
 type HttpMethod = "GET" | "POST";
 
 function normalizeTimeoutMs(value: number | undefined): number {
-    if (!Number.isFinite(value ?? NaN)) return 12_000;
+    if (!Number.isFinite(value ?? Number.NaN)) return 12_000;
     return Math.max(1, Math.trunc(value as number));
 }
 
 function normalizeCacheTtlMs(value: number | undefined): number {
-    if (!Number.isFinite(value ?? NaN)) return DEFAULT_CACHE_TTL_MS;
+    if (!Number.isFinite(value ?? Number.NaN)) return DEFAULT_CACHE_TTL_MS;
     return Math.max(0, Math.trunc(value as number));
 }
 
-function buildHeaders(source: Record<string, string> | undefined): Record<string, string> {
-    const out: Record<string, string> = {};
+function normalizePositiveInt(value: number, fallback: number, min = 1): number {
+    if (!Number.isFinite(value)) return fallback;
+    return Math.max(min, Math.trunc(value));
+}
+
+function buildHeaders(source: Record<string, string> | undefined): Headers {
+    const out = new Headers();
     if (!source) return out;
 
     for (const [key, value] of Object.entries(source)) {
-        out[key] = value;
+        out.set(key, value);
     }
 
     return out;
@@ -722,7 +768,7 @@ async function readResponseBodyText(res: Response): Promise<string> {
     }
 }
 
-async function requestJson<T>(
+async function performRequestJson<T>(
     method: HttpMethod,
     path: string,
     body: unknown | undefined,
@@ -737,31 +783,31 @@ async function requestJson<T>(
     const credentials = opts.credentials ?? "same-origin";
 
     const merged = mergeSignalsWithTimeout(opts.signal, timeoutMs);
-
     const headers = buildHeaders(opts.headers);
-    if (headers.Accept == null) {
-        headers.Accept = "application/json";
+
+    if (!headers.has("Accept")) {
+        headers.set("Accept", "application/json");
     }
 
-    if (cacheMode === "no-store" && headers["Cache-Control"] == null) {
-        headers["Cache-Control"] = "no-store";
-    } else if (cacheMode === "reload" && headers["Cache-Control"] == null) {
-        headers["Cache-Control"] = "no-cache";
+    if (cacheMode === "no-store" && !headers.has("Cache-Control")) {
+        headers.set("Cache-Control", "no-store");
+    } else if (cacheMode === "reload" && !headers.has("Cache-Control")) {
+        headers.set("Cache-Control", "no-cache");
     }
 
     const key = cacheKey(method, url);
     const prior = cacheMode === "default" ? cacheGet(key, cacheTtlMs) : null;
 
     if (method === "GET" && cacheMode === "default" && prior?.etag) {
-        headers["If-None-Match"] = prior.etag;
+        headers.set("If-None-Match", prior.etag);
     }
 
     try {
         let payload: string | undefined;
         if (method === "POST" && body !== undefined) {
             payload = JSON.stringify(body);
-            if (headers["Content-Type"] == null) {
-                headers["Content-Type"] = "application/json";
+            if (!headers.has("Content-Type")) {
+                headers.set("Content-Type", "application/json");
             }
         }
 
@@ -792,7 +838,10 @@ async function requestJson<T>(
             return prior.data as T;
         }
 
-        if (res.status === 204) {
+        if (res.status === 204 || res.status === 205) {
+            if (method === "GET" && cacheMode !== "default") {
+                cacheDelete(key);
+            }
             return null as T;
         }
 
@@ -869,6 +918,34 @@ async function requestJson<T>(
     }
 }
 
+async function requestJson<T>(
+    method: HttpMethod,
+    path: string,
+    body: unknown | undefined,
+    opts: ApiRequestOptions = {},
+): Promise<T> {
+    const pathWithTranslation = withTranslation(path, opts);
+    const url = joinUrl(API_BASE, pathWithTranslation);
+    const key = cacheKey(method, url);
+    const cacheMode = opts.cacheMode ?? "default";
+
+    if (method === "GET" && cacheMode === "default") {
+        const existing = inflightGetRequests.get(key);
+        if (existing) {
+            return existing as Promise<T>;
+        }
+
+        const promise = performRequestJson<T>(method, path, body, opts).finally(() => {
+            inflightGetRequests.delete(key);
+        });
+
+        inflightGetRequests.set(key, promise as Promise<unknown>);
+        return promise;
+    }
+
+    return performRequestJson<T>(method, path, body, opts);
+}
+
 async function getJson<T>(path: string, opts: ApiRequestOptions = {}): Promise<T> {
     return requestJson<T>("GET", path, undefined, opts);
 }
@@ -899,7 +976,7 @@ export function apiGetChapters(
     bookId: string,
     opts?: ApiRequestOptions,
 ): Promise<ChaptersPayload> {
-    return getJson(`/chapters/${encodeURIComponent(bookId)}`, opts);
+    return getJson(`/chapters/${encodeURIComponent(normalizeBookId(bookId))}`, opts);
 }
 
 export function apiGetChapter(
@@ -907,8 +984,9 @@ export function apiGetChapter(
     chapter: number,
     opts?: ApiRequestOptions,
 ): Promise<ChapterPayload> {
+    const cleanChapter = normalizePositiveInt(chapter, 1, 1);
     return getJson(
-        `/chapter/${encodeURIComponent(bookId)}/${encodeURIComponent(String(Math.trunc(chapter)))}`,
+        `/chapter/${encodeURIComponent(normalizeBookId(bookId))}/${encodeURIComponent(String(cleanChapter))}`,
         opts,
     );
 }
@@ -920,23 +998,23 @@ export function apiSearch(
 ): Promise<SearchPayload> {
     return getJson(
         addQuery("/search", {
-            q,
-            limit: Math.max(1, Math.trunc(limit)),
+            q: q.trim(),
+            limit: normalizePositiveInt(limit, 30, 1),
         }),
         opts,
     );
 }
 
 export function apiGetPerson(id: string, opts?: ApiRequestOptions): Promise<PersonPayload> {
-    return getJson(`/people/${encodeURIComponent(id)}`, opts);
+    return getJson(`/people/${encodeURIComponent(id.trim())}`, opts);
 }
 
 export function apiGetPlace(id: string, opts?: ApiRequestOptions): Promise<PlacePayload> {
-    return getJson(`/places/${encodeURIComponent(id)}`, opts);
+    return getJson(`/places/${encodeURIComponent(id.trim())}`, opts);
 }
 
 export function apiGetEvent(id: string, opts?: ApiRequestOptions): Promise<EventPayload> {
-    return getJson(`/events/${encodeURIComponent(id)}`, opts);
+    return getJson(`/events/${encodeURIComponent(id.trim())}`, opts);
 }
 
 export function apiGetSpine(opts?: ApiRequestOptions): Promise<SpineStats> {
@@ -950,8 +1028,8 @@ export function apiGetSlice(
 ): Promise<SlicePayload> {
     return getJson(
         addQuery("/slice", {
-            fromOrd: Math.trunc(fromOrd),
-            limit: Math.max(1, Math.trunc(limit)),
+            fromOrd: normalizePositiveInt(fromOrd, 1, 1),
+            limit: normalizePositiveInt(limit, 240, 1),
         }),
         opts,
     );
@@ -964,11 +1042,15 @@ export function apiResolveLoc(
     opts?: ApiRequestOptions,
 ): Promise<LocPayload> {
     const cleanBookId = normalizeBookId(bookId);
+    const cleanChapter = normalizePositiveInt(chapter, 1, 1);
+    const cleanVerse =
+        verse == null ? undefined : normalizePositiveInt(verse, 1, 1);
+
     return getJson(
         addQuery("/loc", {
             bookId: cleanBookId,
-            chapter: Math.trunc(chapter),
-            ...(verse != null ? { verse: Math.trunc(verse) } : {}),
+            chapter: cleanChapter,
+            ...(cleanVerse != null ? { verse: cleanVerse } : {}),
         }),
         opts,
     );
@@ -978,15 +1060,18 @@ export function apiAuthMe(opts?: ApiRequestOptions): Promise<{ user: unknown | n
     return getJson("/auth/me", opts);
 }
 
-export function apiAuthLogout(opts?: ApiRequestOptions): Promise<{ redirect: string }> {
-    return postJson("/auth/logout", undefined, opts);
+export async function apiAuthLogout(
+    opts?: ApiRequestOptions,
+): Promise<{ redirect: string }> {
+    const result = await postJson<{ redirect: string }>("/auth/logout", undefined, opts);
+
+    invalidateApiCacheByPrefix("/auth/me");
+    invalidateApiCacheByPrefix("/meta");
+
+    return result;
 }
 
 /* -------------------------- Convenience / debug -------------------------- */
-
-function normalizeBookId(bookId: string): string {
-    return bookId.trim().toUpperCase();
-}
 
 export function formatApiError(error: unknown): string {
     if (!(error instanceof ApiError)) {
@@ -1007,6 +1092,11 @@ export function formatApiError(error: unknown): string {
 
 export function clearApiResponseCache(): void {
     responseCache.clear();
+    inflightGetRequests.clear();
+}
+
+export function invalidateApiCacheByPrefix(pathPrefix: string): void {
+    invalidateCacheByPath(pathPrefix);
 }
 
 export function getApiBase(): string {
