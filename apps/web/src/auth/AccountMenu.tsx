@@ -1,3 +1,4 @@
+// apps/web/src/auth/AccountMenu.tsx
 // cspell:words oklab
 import React, {
     useCallback,
@@ -20,21 +21,25 @@ import {
 import { useAuth } from "./useAuth";
 
 type Size = "sm" | "md";
+type Align = "left" | "right";
+type Chrome = "standalone" | "docked";
 
-export type Props = {
+export type Props = Readonly<{
     size?: Size;
     showLabelWhenSignedIn?: boolean;
-    align?: "left" | "right";
+    showChevron?: boolean;
+    align?: Align;
+    chrome?: Chrome;
     style?: React.CSSProperties;
-};
+}>;
 
-type PopPos = {
+type PopPos = Readonly<{
     top: number;
     left: number;
     width: number;
     placement: "top" | "bottom";
     transformOrigin: string;
-};
+}>;
 
 type MenuActionState =
     | "idle"
@@ -43,10 +48,10 @@ type MenuActionState =
     | "signing_in"
     | "opening_account";
 
-type UserLike = {
+type UserLike = Readonly<{
     displayName: string | null;
     email: string | null;
-} | null;
+}> | null;
 
 type UiDims = Readonly<{
     btn: number;
@@ -55,7 +60,15 @@ type UiDims = Readonly<{
     chevron: number;
 }>;
 
+type ViewportBox = Readonly<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+}>;
+
 const MENU_WIDTH = 276;
+const MENU_MIN_WIDTH = 196;
 const MENU_GAP = 10;
 const VIEWPORT_MARGIN = 12;
 const MENU_Z_INDEX = 300;
@@ -76,6 +89,29 @@ function safeFocus(el: HTMLElement | null | undefined): void {
     } catch {
         el.focus();
     }
+}
+
+function getViewportBox(): ViewportBox {
+    if (typeof window === "undefined") {
+        return { left: 0, top: 0, width: 0, height: 0 };
+    }
+
+    const vv = window.visualViewport;
+    if (vv) {
+        return {
+            left: vv.offsetLeft,
+            top: vv.offsetTop,
+            width: vv.width,
+            height: vv.height,
+        };
+    }
+
+    return {
+        left: 0,
+        top: 0,
+        width: window.innerWidth,
+        height: window.innerHeight,
+    };
 }
 
 function usePrefersReducedMotion(): boolean {
@@ -104,16 +140,16 @@ function formatUserLabel(user: UserLike): string {
     return user?.displayName?.trim() || user?.email?.trim() || "User";
 }
 
-function formatTriggerTitle(user: UserLike): string {
-    if (!user) return "Sign in";
-    return user.displayName?.trim() || user.email?.trim() || "Account";
+function formatTriggerTitle(user: UserLike, signedIn: boolean): string {
+    if (!signedIn) return "Account";
+    return user?.displayName?.trim() || user?.email?.trim() || "Account";
 }
 
 function initialsFromUser(user: UserLike): string {
     const base = formatUserLabel(user).trim();
     if (!base) return "U";
 
-    const emailName = base.includes("@") ? base.split("@")[0] ?? base : base;
+    const emailName = base.includes("@") ? (base.split("@")[0] ?? base) : base;
     const normalized = emailName.replace(/[._-]+/g, " ").trim();
     const parts = normalized.split(/\s+/g).filter(Boolean);
 
@@ -170,9 +206,11 @@ function uiToken(state: {
     hovered: boolean;
     pressed: boolean;
     reducedMotion: boolean;
+    chrome: Chrome;
 }) {
-    const { open, hovered, pressed, reducedMotion } = state;
+    const { open, hovered, pressed, reducedMotion, chrome } = state;
     const active = open || hovered;
+    const docked = chrome === "docked";
 
     const ringIdle = "0 0 0 1px color-mix(in srgb, var(--border) 60%, transparent)";
     const ringHover = "0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent)";
@@ -183,8 +221,14 @@ function uiToken(state: {
     const shadowOpen = "0 14px 36px color-mix(in srgb, black 16%, transparent)";
 
     return {
-        triggerRing: open ? ringOpen : active ? ringHover : ringIdle,
-        triggerShadow: open ? shadowOpen : active ? shadowHover : shadowIdle,
+        triggerRing: docked ? "none" : open ? ringOpen : active ? ringHover : ringIdle,
+        triggerShadow: docked
+            ? "none"
+            : open
+                ? shadowOpen
+                : active
+                    ? shadowHover
+                    : shadowIdle,
         triggerBg: open
             ? "linear-gradient(180deg, color-mix(in srgb, var(--card) 66%, transparent), transparent)"
             : active
@@ -212,32 +256,66 @@ function uiToken(state: {
 function styles(args: {
     dims: UiDims;
     showLabel: boolean;
+    showChevron: boolean;
     loading: boolean;
     open: boolean;
     hovered: boolean;
     pressed: boolean;
     reducedMotion: boolean;
     pos: PopPos | null;
+    chrome: Chrome;
     style?: React.CSSProperties;
 }) {
-    const { dims, showLabel, loading, open, hovered, pressed, reducedMotion, pos, style } = args;
-    const t = uiToken({ open, hovered, pressed, reducedMotion });
+    const {
+        dims,
+        showLabel,
+        showChevron,
+        loading,
+        open,
+        hovered,
+        pressed,
+        reducedMotion,
+        pos,
+        chrome,
+        style,
+    } = args;
+
+    const t = uiToken({ open, hovered, pressed, reducedMotion, chrome });
+    const trailingVisible = showLabel || showChevron;
+    const docked = chrome === "docked";
+
+    const triggerPad = showLabel
+        ? "0 9px 0 4px"
+        : trailingVisible
+            ? "0 7px 0 4px"
+            : 0;
+
+    const triggerGap = trailingVisible ? 6 : 0;
+    const minWidth = showLabel
+        ? dims.avatar + dims.chevron + 38
+        : showChevron
+            ? dims.avatar + dims.chevron + 18
+            : dims.btn;
+
+    const maxWidth = showLabel
+        ? dims.labelMax + dims.avatar + dims.chevron + 42
+        : minWidth;
 
     return {
         trigger: {
             height: dims.btn,
-            minWidth: dims.btn,
-            maxWidth: showLabel ? dims.labelMax + dims.avatar + 34 : dims.btn,
+            minWidth,
+            maxWidth,
             display: "inline-flex",
             alignItems: "center",
-            justifyContent: "center",
-            gap: showLabel ? 8 : 0,
-            padding: showLabel ? "0 9px 0 4px" : 0,
+            justifyContent: trailingVisible ? "flex-start" : "center",
+            gap: triggerGap,
+            padding: triggerPad,
             borderRadius: 999,
             border: "1px solid transparent",
             background: t.triggerBg,
             color: "var(--fg)",
-            boxShadow: `${t.triggerRing}, ${t.triggerShadow}`,
+            boxShadow: docked ? "none" : `${t.triggerRing}, ${t.triggerShadow}`,
             cursor: "pointer",
             userSelect: "none",
             WebkitTapHighlightColor: "transparent",
@@ -268,8 +346,8 @@ function styles(args: {
         triggerChevron: {
             display: "grid",
             placeItems: "center",
-            opacity: 0.62,
-            marginLeft: -1,
+            opacity: open ? 0.82 : 0.62,
+            marginLeft: showLabel ? -1 : 0,
             flex: "0 0 auto",
             transform: open ? "rotate(180deg)" : "rotate(0deg)",
             transition: reducedMotion
@@ -359,12 +437,34 @@ function styles(args: {
             userSelect: signedIn ? "none" : undefined,
             flex: "0 0 auto",
         }),
+
+        rowBase: {
+            width: "100%",
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            padding: "10px 10px",
+            borderRadius: 12,
+            border: "1px solid transparent",
+            textAlign: "left",
+            fontSize: 13,
+            lineHeight: 1.2,
+            userSelect: "none",
+            WebkitTapHighlightColor: "transparent",
+            outline: "none",
+            transition:
+                "background 140ms ease, border-color 140ms ease, box-shadow 140ms ease, opacity 140ms ease, transform 140ms ease",
+        } satisfies React.CSSProperties,
+
+        rowHoverBg: t.rowHoverBg,
+        rowHoverBorder: t.rowHoverBorder,
+        rowFocusRing: t.rowFocusRing,
     } as const;
 }
 
 function usePopoverPosition(args: {
     open: boolean;
-    align: "left" | "right";
+    align: Align;
     menuWidth: number;
     anchorRef: React.RefObject<HTMLElement | null>;
     menuRef: React.RefObject<HTMLElement | null>;
@@ -378,30 +478,34 @@ function usePopoverPosition(args: {
         const anchor = anchorRef.current;
         if (!anchor || typeof window === "undefined") return;
 
+        const viewport = getViewportBox();
         const r = anchor.getBoundingClientRect();
-        const mw = menuWidth;
         const mh = menuRef.current?.getBoundingClientRect().height ?? 0;
+        const maxWidth = Math.max(MENU_MIN_WIDTH, viewport.width - VIEWPORT_MARGIN * 2);
+        const mw = Math.min(menuWidth, maxWidth);
+
+        const minLeft = viewport.left + VIEWPORT_MARGIN;
+        const maxLeft = Math.max(minLeft, viewport.left + viewport.width - mw - VIEWPORT_MARGIN);
 
         const left =
             align === "right"
-                ? clamp(r.right - mw, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN)
-                : clamp(r.left, VIEWPORT_MARGIN, window.innerWidth - mw - VIEWPORT_MARGIN);
+                ? clamp(r.right - mw, minLeft, maxLeft)
+                : clamp(r.left, minLeft, maxLeft);
 
         const belowTop = r.bottom + MENU_GAP;
         const aboveTop = r.top - MENU_GAP - mh;
 
-        const canFitBelow = belowTop + mh <= window.innerHeight - VIEWPORT_MARGIN;
-        const canFitAbove = aboveTop >= VIEWPORT_MARGIN;
+        const minTop = viewport.top + VIEWPORT_MARGIN;
+        const maxTop = Math.max(minTop, viewport.top + viewport.height - mh - VIEWPORT_MARGIN);
+
+        const canFitBelow = belowTop + mh <= viewport.top + viewport.height - VIEWPORT_MARGIN;
+        const canFitAbove = aboveTop >= minTop;
 
         const placement: PopPos["placement"] =
             !canFitBelow && canFitAbove ? "top" : "bottom";
 
         const unclampedTop = placement === "top" ? aboveTop : belowTop;
-        const top = clamp(
-            unclampedTop,
-            VIEWPORT_MARGIN,
-            Math.max(VIEWPORT_MARGIN, window.innerHeight - mh - VIEWPORT_MARGIN),
-        );
+        const top = clamp(unclampedTop, minTop, maxTop);
 
         const originX = align === "right" ? "right" : "left";
         const originY = placement === "top" ? "bottom" : "top";
@@ -435,11 +539,14 @@ function usePopoverPosition(args: {
 
         if (typeof window === "undefined") return;
 
-        const onScroll = () => schedule();
-        const onResize = () => schedule();
+        const onResizeOrScroll = () => schedule();
 
-        window.addEventListener("resize", onResize);
-        window.addEventListener("scroll", onScroll, true);
+        window.addEventListener("resize", onResizeOrScroll);
+        window.addEventListener("scroll", onResizeOrScroll, true);
+
+        const vv = window.visualViewport;
+        vv?.addEventListener("resize", onResizeOrScroll);
+        vv?.addEventListener("scroll", onResizeOrScroll);
 
         const t = window.setTimeout(() => schedule(), 0);
 
@@ -452,8 +559,10 @@ function usePopoverPosition(args: {
 
         return () => {
             window.clearTimeout(t);
-            window.removeEventListener("resize", onResize);
-            window.removeEventListener("scroll", onScroll, true);
+            window.removeEventListener("resize", onResizeOrScroll);
+            window.removeEventListener("scroll", onResizeOrScroll, true);
+            vv?.removeEventListener("resize", onResizeOrScroll);
+            vv?.removeEventListener("scroll", onResizeOrScroll);
 
             if (rafRef.current != null) {
                 window.cancelAnimationFrame(rafRef.current);
@@ -503,6 +612,7 @@ function MenuDivider(props: { ui: ReturnType<typeof styles> }) {
 }
 
 function RowButton(props: {
+    ui: ReturnType<typeof styles>;
     label: string;
     hint?: string;
     icon?: React.ReactNode;
@@ -512,42 +622,22 @@ function RowButton(props: {
     danger?: boolean;
     busy?: boolean;
 }) {
-    const { label, hint, icon, onClick, disabled, autoFocus, danger, busy } = props;
+    const { ui, label, hint, icon, onClick, disabled, autoFocus, danger, busy } = props;
     const [hover, setHover] = useState(false);
     const [focusVisible, setFocusVisible] = useState(false);
 
     const isDisabled = !!disabled || !!busy;
 
     const base: React.CSSProperties = {
-        width: "100%",
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        padding: "10px 10px",
-        borderRadius: 12,
-        border: "1px solid transparent",
-        background: hover && !isDisabled
-            ? "color-mix(in srgb, var(--activeBg) 60%, transparent)"
-            : "transparent",
+        ...ui.rowBase,
+        background: hover && !isDisabled ? ui.rowHoverBg : "transparent",
         color: danger
             ? "color-mix(in srgb, var(--fg) 82%, #b00020)"
             : "var(--fg)",
         cursor: isDisabled ? "default" : "pointer",
-        textAlign: "left",
-        fontSize: 13,
-        lineHeight: 1.2,
         opacity: isDisabled ? 0.56 : 1,
-        userSelect: "none",
-        WebkitTapHighlightColor: "transparent",
-        outline: "none",
-        borderColor: hover && !isDisabled
-            ? "color-mix(in srgb, var(--border) 62%, transparent)"
-            : "transparent",
-        boxShadow: focusVisible
-            ? "0 0 0 3px color-mix(in srgb, var(--focusRing) 78%, transparent)"
-            : "none",
-        transition:
-            "background 140ms ease, border-color 140ms ease, box-shadow 140ms ease, opacity 140ms ease, transform 140ms ease",
+        borderColor: hover && !isDisabled ? ui.rowHoverBorder : "transparent",
+        boxShadow: focusVisible ? ui.rowFocusRing : "none",
     };
 
     return (
@@ -634,7 +724,9 @@ function RowButton(props: {
 export function AccountMenu({
                                 size = "sm",
                                 align = "right",
+                                chrome = "standalone",
                                 showLabelWhenSignedIn = false,
+                                showChevron = true,
                                 style,
                             }: Props) {
     const {
@@ -652,6 +744,7 @@ export function AccountMenu({
     const menuRef = useRef<HTMLDivElement | null>(null);
     const mountedRef = useRef(true);
     const restoreFocusOnCloseRef = useRef(true);
+    const prevSignedInRef = useRef(signedIn);
 
     const [open, setOpen] = useState(false);
     const [pressed, setPressed] = useState(false);
@@ -665,7 +758,7 @@ export function AccountMenu({
     const reducedMotion = usePrefersReducedMotion();
     const dims = useMemo(() => getDims(size), [size]);
 
-    const triggerTitle = formatTriggerTitle(user);
+    const triggerTitle = formatTriggerTitle(user, signedIn);
     const showLabel = signedIn && showLabelWhenSignedIn;
 
     const close = useCallback((opts?: { restoreFocus?: boolean }) => {
@@ -674,6 +767,7 @@ export function AccountMenu({
     }, []);
 
     const openMenu = useCallback(() => {
+        restoreFocusOnCloseRef.current = true;
         setOpen(true);
     }, []);
 
@@ -695,15 +789,29 @@ export function AccountMenu({
             styles({
                 dims,
                 showLabel,
+                showChevron,
                 loading,
                 open,
                 hovered,
                 pressed,
                 reducedMotion,
                 pos,
+                chrome,
                 style,
             }),
-        [dims, showLabel, loading, open, hovered, pressed, reducedMotion, pos, style],
+        [
+            dims,
+            showLabel,
+            showChevron,
+            loading,
+            open,
+            hovered,
+            pressed,
+            reducedMotion,
+            pos,
+            chrome,
+            style,
+        ],
     );
 
     useEffect(() => {
@@ -714,9 +822,10 @@ export function AccountMenu({
     }, []);
 
     useEffect(() => {
-        if (!signedIn && open) {
+        if (open && prevSignedInRef.current && !signedIn) {
             setOpen(false);
         }
+        prevSignedInRef.current = signedIn;
     }, [signedIn, open]);
 
     const focusableItems = useCallback((): HTMLElement[] => {
@@ -784,9 +893,15 @@ export function AccountMenu({
 
     useEffect(() => {
         if (!open || typeof window === "undefined") return;
+
         const t = window.setTimeout(() => {
-            focusFirstItem();
+            const active = document.activeElement as HTMLElement | null;
+            const menuContainsActive = !!(active && menuRef.current?.contains(active));
+            if (!menuContainsActive) {
+                focusFirstItem();
+            }
         }, 0);
+
         return () => window.clearTimeout(t);
     }, [open, focusFirstItem]);
 
@@ -795,8 +910,10 @@ export function AccountMenu({
             const t = window.setTimeout(() => {
                 safeFocus(btnRef.current);
             }, POINTER_DOWN_FOCUS_RESTORE_DELAY_MS);
+
             return () => window.clearTimeout(t);
         }
+
         return;
     }, [open]);
 
@@ -807,9 +924,11 @@ export function AccountMenu({
             if (e.key === "Tab") {
                 if (!items.length) return;
 
-                const first = items[0]!;
-                const last = items[items.length - 1]!;
+                const first = items[0] ?? null;
+                const last = items[items.length - 1] ?? null;
                 const active = document.activeElement as HTMLElement | null;
+
+                if (!first || !last) return;
 
                 if (e.shiftKey) {
                     if (active === first || !menuRef.current?.contains(active)) {
@@ -929,15 +1048,14 @@ export function AccountMenu({
         setActionState("signing_in");
         close({ restoreFocus: false });
 
-        try {
-            const returnTo =
-                typeof window !== "undefined" ? window.location.href : undefined;
-            signInWithGoogle({ returnTo });
-        } catch {
+        const returnTo =
+            typeof window !== "undefined" ? window.location.href : undefined;
+
+        Promise.resolve(signInWithGoogle({ returnTo })).catch(() => {
             if (mountedRef.current) {
                 setActionState("idle");
             }
-        }
+        });
     }, [signInWithGoogle, close]);
 
     const menuStatusTitle = loading
@@ -953,6 +1071,7 @@ export function AccountMenu({
             : "Sign in to sync";
 
     const triggerText = loading ? "…" : triggerTitle;
+    const triggerAriaLabel = open ? "Close account menu" : "Open account menu";
 
     const menu =
         open &&
@@ -993,6 +1112,7 @@ export function AccountMenu({
 
                     {!signedIn ? (
                         <RowButton
+                            ui={ui}
                             autoFocus
                             label="Continue with Google"
                             hint="Secure sign-in"
@@ -1004,6 +1124,7 @@ export function AccountMenu({
                     ) : (
                         <>
                             <RowButton
+                                ui={ui}
                                 autoFocus
                                 label="Account"
                                 hint="Manage your session"
@@ -1014,6 +1135,7 @@ export function AccountMenu({
                             />
 
                             <RowButton
+                                ui={ui}
                                 label="Refresh session"
                                 hint="Re-check login state"
                                 disabled={loading}
@@ -1023,6 +1145,7 @@ export function AccountMenu({
                             />
 
                             <RowButton
+                                ui={ui}
                                 label="Sign out"
                                 hint="End this session"
                                 disabled={loading}
@@ -1044,6 +1167,7 @@ export function AccountMenu({
                 ref={btnRef}
                 id={triggerId}
                 type="button"
+                aria-label={triggerAriaLabel}
                 aria-haspopup="menu"
                 aria-controls={open ? menuId : undefined}
                 aria-expanded={open}
@@ -1072,14 +1196,12 @@ export function AccountMenu({
                     ui={ui}
                 />
 
-                {showLabel ? (
-                    <>
-                        <span style={ui.triggerLabel}>{triggerText}</span>
+                {showLabel ? <span style={ui.triggerLabel}>{triggerText}</span> : null}
 
-                        <span aria-hidden="true" style={ui.triggerChevron}>
-                            <ChevronDown size={dims.chevron} />
-                        </span>
-                    </>
+                {showChevron ? (
+                    <span aria-hidden="true" style={ui.triggerChevron}>
+                        <ChevronDown size={dims.chevron} />
+                    </span>
                 ) : null}
             </button>
 

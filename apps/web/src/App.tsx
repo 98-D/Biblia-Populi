@@ -9,6 +9,7 @@ import { Search, type ReaderLocation } from "./Search";
 import { ThemeProvider, ThemeShell, ThemeTogglePill, useTheme } from "./theme";
 
 type Page = "home" | "learn" | "reader" | "account";
+type HistoryMode = "push" | "replace";
 
 const LS_LAST_PAGE = "bt_nav_last_page_v1";
 const LS_LAST_LOC = "bt_nav_last_loc_v1";
@@ -20,11 +21,11 @@ const LEARN_HASH = "#/learn";
 const READER_HASH = "#/reader";
 const ACCOUNT_HASH = "#/account";
 
-const DEFAULT_READER_LOCATION: ReaderLocation = {
+const DEFAULT_READER_LOCATION: ReaderLocation = Object.freeze({
     bookId: "GEN",
     chapter: 1,
     verse: 1,
-};
+});
 
 type AppStyles = Readonly<{
     page: React.CSSProperties;
@@ -42,12 +43,22 @@ type AppStyles = Readonly<{
     secondaryBtnButton: React.CSSProperties;
     subtleBtnButton: React.CSSProperties;
     signedInPill: React.CSSProperties;
+    learnMoreWrap: React.CSSProperties;
 }>;
 
 type UrlIntent = Readonly<{
     page?: Page;
     loc?: ReaderLocation;
 }>;
+
+type RouteState = Readonly<{
+    page: Page;
+    readerLoc: ReaderLocation;
+}>;
+
+function css<T extends React.CSSProperties>(value: T): React.CSSProperties {
+    return value;
+}
 
 function isBrowser(): boolean {
     return typeof window !== "undefined";
@@ -89,35 +100,39 @@ function isPage(value: unknown): value is Page {
 
 function toInt(value: unknown): number | null {
     const n =
-         typeof value === "number"
-              ? value
-              : typeof value === "string" && value.trim() !== ""
-                   ? Number(value)
-                   : Number.NaN;
+        typeof value === "number"
+            ? value
+            : typeof value === "string" && value.trim() !== ""
+                ? Number(value)
+                : Number.NaN;
 
     return Number.isFinite(n) ? Math.trunc(n) : null;
 }
 
-function normalizeLoc(loc: Partial<ReaderLocation> | null | undefined): ReaderLocation | null {
-    if (!loc || typeof loc.bookId !== "string" || loc.bookId.trim().length === 0) {
-        return null;
-    }
+function normalizeBookId(value: unknown): string | null {
+    if (typeof value !== "string") return null;
 
-    const bookId = loc.bookId.trim().toUpperCase();
+    const normalized = value.trim().toUpperCase();
+    return normalized.length > 0 ? normalized : null;
+}
+
+function normalizeLoc(loc: Partial<ReaderLocation> | null | undefined): ReaderLocation | null {
+    if (!loc) return null;
+
+    const bookId = normalizeBookId(loc.bookId);
     const chapter = toInt((loc as { chapter?: unknown }).chapter);
     const verseRaw = (loc as { verse?: unknown }).verse;
 
-    if (chapter == null || chapter < 1) {
+    if (!bookId || chapter == null || chapter < 1) {
         return null;
     }
 
-    const verse = verseRaw == null ? undefined : toInt(verseRaw) ?? undefined;
+    const verseInt = verseRaw == null ? undefined : toInt(verseRaw) ?? undefined;
+    const verse = verseInt != null && verseInt >= 1 ? verseInt : undefined;
 
-    if (verse != null && verse < 1) {
-        return { bookId, chapter };
-    }
-
-    return { bookId, chapter, verse };
+    return verse != null
+        ? { bookId, chapter, verse }
+        : { bookId, chapter };
 }
 
 function parseLoc(raw: string | null): ReaderLocation | null {
@@ -141,39 +156,56 @@ function encodeLoc(loc: ReaderLocation | null): string | null {
     });
 }
 
+function safeDecode(value: string): string {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
+
+function normalizePathname(pathname: string): string {
+    const trimmed = pathname.trim();
+    if (trimmed === "" || trimmed === "/") return "/";
+
+    const normalized = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+    return normalized.toLowerCase() || "/";
+}
+
+function parseReadHash(hash: string): ReaderLocation | null {
+    const raw = hash.trim();
+    if (!raw.toLowerCase().startsWith("#/read/")) return null;
+
+    const parts = raw
+        .slice("#/read/".length)
+        .split("/")
+        .map((part) => safeDecode(part).trim())
+        .filter(Boolean);
+
+    return normalizeLoc({
+        bookId: parts[0],
+        chapter: parts[1],
+        verse: parts[2],
+    });
+}
+
 function readUrlIntent(): UrlIntent {
     if (!isBrowser()) return {};
 
     try {
         const { hash, search, pathname } = window.location;
         const trimmedHash = hash.trim();
+        const lowerHash = trimmedHash.toLowerCase();
 
-        if (trimmedHash.startsWith("#/read/")) {
-            const parts = trimmedHash
-                 .slice("#/read/".length)
-                 .split("/")
-                 .map((part) => part.trim())
-                 .filter(Boolean);
-
-            const bookId = parts[0]?.toUpperCase();
-            const chapter = toInt(parts[1]);
-            const verse = parts[2] == null ? undefined : toInt(parts[2]) ?? undefined;
-
-            const loc = normalizeLoc({
-                bookId,
-                chapter: chapter ?? undefined,
-                verse,
-            });
-
-            if (loc) {
-                return { page: "reader", loc };
-            }
+        const readLoc = parseReadHash(trimmedHash);
+        if (readLoc) {
+            return { page: "reader", loc: readLoc };
         }
 
-        if (trimmedHash === READER_HASH) return { page: "reader" };
-        if (trimmedHash === LEARN_HASH) return { page: "learn" };
-        if (trimmedHash === HOME_HASH) return { page: "home" };
-        if (trimmedHash === ACCOUNT_HASH) return { page: "account" };
+        if (lowerHash === READER_HASH) return { page: "reader" };
+        if (lowerHash === LEARN_HASH) return { page: "learn" };
+        if (lowerHash === HOME_HASH) return { page: "home" };
+        if (lowerHash === ACCOUNT_HASH) return { page: "account" };
 
         const query = new URLSearchParams(search);
         const pageQuery = query.get("page")?.trim().toLowerCase();
@@ -183,10 +215,12 @@ function readUrlIntent(): UrlIntent {
         if (pageQuery === "home") return { page: "home" };
         if (pageQuery === "account") return { page: "account" };
 
-        if (pathname === "/account") return { page: "account" };
-        if (pathname === "/reader") return { page: "reader" };
-        if (pathname === "/learn") return { page: "learn" };
-        if (pathname === "/" || pathname === "") return { page: "home" };
+        const normalizedPath = normalizePathname(pathname);
+
+        if (normalizedPath === "/account") return { page: "account" };
+        if (normalizedPath === "/reader") return { page: "reader" };
+        if (normalizedPath === "/learn") return { page: "learn" };
+        if (normalizedPath === "/") return { page: "home" };
     } catch {
         // ignore
     }
@@ -197,8 +231,8 @@ function readUrlIntent(): UrlIntent {
 function hashForPage(page: Page, loc: ReaderLocation | null): string {
     if (page === "reader" && loc) {
         return loc.verse != null
-             ? `#/read/${loc.bookId}/${loc.chapter}/${loc.verse}`
-             : `#/read/${loc.bookId}/${loc.chapter}`;
+            ? `#/read/${loc.bookId}/${loc.chapter}/${loc.verse}`
+            : `#/read/${loc.bookId}/${loc.chapter}`;
     }
 
     switch (page) {
@@ -214,13 +248,16 @@ function hashForPage(page: Page, loc: ReaderLocation | null): string {
     }
 }
 
-function writeUrl(page: Page, loc: ReaderLocation | null): void {
+function writeUrl(mode: HistoryMode, page: Page, loc: ReaderLocation | null): void {
     if (!isBrowser()) return;
 
     const nextHash = hashForPage(page, loc);
     if (window.location.hash === nextHash) return;
 
-    window.history.replaceState(null, "", nextHash);
+    const nextUrl = `${window.location.pathname}${window.location.search}${nextHash}`;
+    const method = mode === "push" ? "pushState" : "replaceState";
+
+    window.history[method](null, "", nextUrl);
 }
 
 function getSavedPage(): Page | null {
@@ -252,231 +289,311 @@ function saveLoc(loc: ReaderLocation | null): void {
     safeDel(LS_LAST_LOC);
 }
 
-function createAppStyles(): AppStyles {
+const APP_STYLES: AppStyles = Object.freeze({
+    page: css({
+        minHeight: "100dvh",
+        background: "var(--bg)",
+        color: "var(--fg)",
+        minWidth: 0,
+    }),
+
+    stage: css({
+        minHeight: "100dvh",
+        minWidth: 0,
+    }),
+
+    centerStage: css({
+        minHeight: "100dvh",
+        display: "grid",
+        placeItems: "center",
+        padding: "28px 20px",
+        minWidth: 0,
+    }),
+
+    centerBlock: css({
+        width: "100%",
+        maxWidth: 880,
+        display: "grid",
+        justifyItems: "center",
+        textAlign: "center",
+        minWidth: 0,
+    }),
+
+    cornerControls: css({
+        position: "fixed",
+        top: "calc(16px + env(safe-area-inset-top, 0px))",
+        right: "calc(16px + env(safe-area-inset-right, 0px))",
+        zIndex: 20,
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+    }),
+
+    crossWrap: css({
+        width: 108,
+        height: 108,
+        marginBottom: 18,
+        display: "grid",
+        placeItems: "center",
+        flex: "0 0 auto",
+    }),
+
+    crossImg: css({
+        width: "100%",
+        height: "100%",
+        objectFit: "contain",
+        userSelect: "none",
+        pointerEvents: "none",
+    }),
+
+    h1: css({
+        margin: 0,
+        fontSize: "clamp(42px, 7vw, 82px)",
+        lineHeight: 0.95,
+        letterSpacing: "-0.04em",
+        fontWeight: 820,
+        minWidth: 0,
+    }),
+
+    lede: css({
+        margin: "16px 0 0",
+        maxWidth: 700,
+        fontSize: "clamp(16px, 2.1vw, 20px)",
+        lineHeight: 1.55,
+        opacity: 0.84,
+        minWidth: 0,
+    }),
+
+    searchContainer: css({
+        width: "100%",
+        maxWidth: 760,
+        marginTop: 28,
+        minWidth: 0,
+    }),
+
+    ctaRow: css({
+        marginTop: 18,
+        display: "flex",
+        flexWrap: "wrap",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 10,
+    }),
+
+    primaryBtnButton: css({
+        height: 44,
+        borderRadius: 999,
+        padding: "0 18px",
+        border: "1px solid transparent",
+        background: "var(--fg)",
+        color: "var(--bg)",
+        fontSize: 14,
+        fontWeight: 760,
+        cursor: "pointer",
+        boxShadow: "0 14px 32px color-mix(in srgb, black 14%, transparent)",
+        appearance: "none",
+        WebkitAppearance: "none",
+        outline: "none",
+        WebkitTapHighlightColor: "transparent",
+    }),
+
+    secondaryBtnButton: css({
+        height: 44,
+        borderRadius: 999,
+        padding: "0 18px",
+        border: "1px solid color-mix(in srgb, var(--border) 76%, transparent)",
+        background: "transparent",
+        color: "var(--fg)",
+        fontSize: 14,
+        fontWeight: 760,
+        cursor: "pointer",
+        appearance: "none",
+        WebkitAppearance: "none",
+        outline: "none",
+        WebkitTapHighlightColor: "transparent",
+    }),
+
+    subtleBtnButton: css({
+        height: 42,
+        borderRadius: 999,
+        padding: "0 16px",
+        border: "1px solid transparent",
+        background: "transparent",
+        color: "var(--fg)",
+        fontSize: 13,
+        fontWeight: 700,
+        cursor: "pointer",
+        opacity: 0.78,
+        appearance: "none",
+        WebkitAppearance: "none",
+        outline: "none",
+        WebkitTapHighlightColor: "transparent",
+    }),
+
+    signedInPill: css({
+        marginTop: 12,
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+        minHeight: 34,
+        borderRadius: 999,
+        padding: "0 12px",
+        border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
+        background: "color-mix(in srgb, var(--activeBg) 36%, transparent)",
+        fontSize: 13,
+        fontWeight: 650,
+        opacity: 0.9,
+        minWidth: 0,
+        maxWidth: "100%",
+    }),
+
+    learnMoreWrap: css({
+        marginTop: 10,
+    }),
+});
+
+function getInitialRouteState(): RouteState {
+    const intent = readUrlIntent();
+    const savedPage = getSavedPage();
+    const savedLoc = getSavedLoc();
+    const readerLoc = intent.loc ?? savedLoc ?? DEFAULT_READER_LOCATION;
+    const page = intent.page ?? savedPage ?? "home";
+
     return {
-        page: {
-            minHeight: "100dvh",
-            background: "var(--bg)",
-            color: "var(--fg)",
-        },
-        stage: {
-            minHeight: "100dvh",
-        },
-        centerStage: {
-            minHeight: "100dvh",
-            display: "grid",
-            placeItems: "center",
-            padding: "28px 20px",
-        },
-        centerBlock: {
-            width: "100%",
-            maxWidth: 880,
-            display: "grid",
-            justifyItems: "center",
-            textAlign: "center",
-        },
-        cornerControls: {
-            position: "fixed",
-            top: 16,
-            right: 16,
-            zIndex: 20,
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-        },
-        crossWrap: {
-            width: 108,
-            height: 108,
-            marginBottom: 18,
-            display: "grid",
-            placeItems: "center",
-        },
-        crossImg: {
-            width: "100%",
-            height: "100%",
-            objectFit: "contain",
-            userSelect: "none",
-        },
-        h1: {
-            margin: 0,
-            fontSize: "clamp(42px, 7vw, 82px)",
-            lineHeight: 0.95,
-            letterSpacing: "-0.04em",
-            fontWeight: 820,
-        },
-        lede: {
-            margin: "16px 0 0",
-            maxWidth: 700,
-            fontSize: "clamp(16px, 2.1vw, 20px)",
-            lineHeight: 1.55,
-            opacity: 0.84,
-        },
-        searchContainer: {
-            width: "100%",
-            maxWidth: 760,
-            marginTop: 28,
-        },
-        ctaRow: {
-            marginTop: 18,
-            display: "flex",
-            flexWrap: "wrap",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: 10,
-        },
-        primaryBtnButton: {
-            height: 44,
-            borderRadius: 999,
-            padding: "0 18px",
-            border: "1px solid transparent",
-            background: "var(--fg)",
-            color: "var(--bg)",
-            fontSize: 14,
-            fontWeight: 760,
-            cursor: "pointer",
-            boxShadow: "0 14px 32px color-mix(in srgb, black 14%, transparent)",
-        },
-        secondaryBtnButton: {
-            height: 44,
-            borderRadius: 999,
-            padding: "0 18px",
-            border: "1px solid color-mix(in srgb, var(--border) 76%, transparent)",
-            background: "transparent",
-            color: "var(--fg)",
-            fontSize: 14,
-            fontWeight: 760,
-            cursor: "pointer",
-        },
-        subtleBtnButton: {
-            height: 42,
-            borderRadius: 999,
-            padding: "0 16px",
-            border: "1px solid transparent",
-            background: "transparent",
-            color: "var(--fg)",
-            fontSize: 13,
-            fontWeight: 700,
-            cursor: "pointer",
-            opacity: 0.78,
-        },
-        signedInPill: {
-            marginTop: 12,
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 8,
-            minHeight: 34,
-            borderRadius: 999,
-            padding: "0 12px",
-            border: "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
-            background: "color-mix(in srgb, var(--activeBg) 36%, transparent)",
-            fontSize: 13,
-            fontWeight: 650,
-            opacity: 0.9,
-        },
+        page,
+        readerLoc,
     };
 }
 
 function AppInner() {
     const { mode, toggle } = useTheme();
-    const { openAccountPage } = useAuth();
 
-    const initialUrlIntentRef = useRef<UrlIntent>(readUrlIntent());
+    const initialRouteRef = useRef<RouteState>(getInitialRouteState());
 
-    const [page, setPage] = useState<Page>(() => {
-        const initialPage = initialUrlIntentRef.current.page;
-        return initialPage ?? getSavedPage() ?? "home";
-    });
+    const [page, setPage] = useState<Page>(initialRouteRef.current.page);
+    const [readerLoc, setReaderLoc] = useState<ReaderLocation>(initialRouteRef.current.readerLoc);
 
-    const [readerLoc, setReaderLoc] = useState<ReaderLocation | null>(() => {
-        return initialUrlIntentRef.current.loc ?? getSavedLoc() ?? DEFAULT_READER_LOCATION;
-    });
-
-    const styles = useMemo<AppStyles>(() => createAppStyles(), []);
+    const readerLocRef = useRef(readerLoc);
 
     useEffect(() => {
-        if (!isBrowser()) return;
+        readerLocRef.current = readerLoc;
+    }, [readerLoc]);
 
-        const onHashChange = () => {
-            const next = readUrlIntent();
+    const styles = useMemo<AppStyles>(() => APP_STYLES, []);
+    const readerRouteKey = useMemo(
+        () => `${readerLoc.bookId}:${readerLoc.chapter}:${readerLoc.verse ?? 0}`,
+        [readerLoc],
+    );
 
-            if (next.page) {
-                setPage(next.page);
-            }
+    const navigateToPage = useCallback(
+        (nextPage: Page, historyMode: HistoryMode = "push") => {
+            setPage(nextPage);
+            savePage(nextPage);
+            writeUrl(historyMode, nextPage, nextPage === "reader" ? readerLocRef.current : null);
+        },
+        [],
+    );
 
-            if (next.loc) {
-                setReaderLoc(next.loc);
-            }
-        };
+    const navigateToReader = useCallback(
+        (loc: ReaderLocation, historyMode: HistoryMode = "push") => {
+            const normalized = normalizeLoc(loc);
+            if (!normalized) return;
 
-        window.addEventListener("hashchange", onHashChange);
-        return () => window.removeEventListener("hashchange", onHashChange);
-    }, []);
+            setReaderLoc(normalized);
+            setPage("reader");
+
+            saveLoc(normalized);
+            savePage("reader");
+            writeUrl(historyMode, "reader", normalized);
+        },
+        [],
+    );
 
     useEffect(() => {
         savePage(page);
-        writeUrl(page, page === "reader" ? readerLoc : null);
-    }, [page, readerLoc]);
+    }, [page]);
 
     useEffect(() => {
         saveLoc(readerLoc);
     }, [readerLoc]);
 
-    const goHome = useCallback(() => {
-        setPage("home");
+    useEffect(() => {
+        if (!isBrowser()) return;
+        writeUrl("replace", page, page === "reader" ? readerLoc : null);
+        // intentional one-time canonical sync
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    useEffect(() => {
+        if (!isBrowser()) return;
+
+        const syncFromUrl = () => {
+            const intent = readUrlIntent();
+            const nextPage = intent.page ?? "home";
+            const fallbackLoc = readerLocRef.current ?? DEFAULT_READER_LOCATION;
+            const nextLoc = intent.loc ?? fallbackLoc;
+
+            setPage(nextPage);
+
+            const normalized = normalizeLoc(nextLoc);
+            if (normalized) {
+                setReaderLoc(normalized);
+            }
+        };
+
+        window.addEventListener("hashchange", syncFromUrl);
+        window.addEventListener("popstate", syncFromUrl);
+
+        return () => {
+            window.removeEventListener("hashchange", syncFromUrl);
+            window.removeEventListener("popstate", syncFromUrl);
+        };
+    }, []);
+
+    const goHome = useCallback(() => {
+        navigateToPage("home");
+    }, [navigateToPage]);
 
     const goLearn = useCallback(() => {
-        setPage("learn");
-    }, []);
+        navigateToPage("learn");
+    }, [navigateToPage]);
 
     const goAccount = useCallback(() => {
-        setPage("account");
-        openAccountPage();
-    }, [openAccountPage]);
-
-    const beginReader = useCallback((loc: ReaderLocation) => {
-        const normalized = normalizeLoc(loc);
-        if (!normalized) return;
-
-        setReaderLoc(normalized);
-        setPage("reader");
-    }, []);
+        navigateToPage("account");
+    }, [navigateToPage]);
 
     const startReading = useCallback(() => {
-        beginReader(readerLoc ?? DEFAULT_READER_LOCATION);
-    }, [beginReader, readerLoc]);
+        navigateToReader(readerLocRef.current ?? DEFAULT_READER_LOCATION);
+    }, [navigateToReader]);
 
     const navigateTo = useCallback(
-         (loc: ReaderLocation) => {
-             const normalized = normalizeLoc(loc);
-             if (!normalized) return;
-
-             beginReader(normalized);
-         },
-         [beginReader],
+        (loc: ReaderLocation) => {
+            navigateToReader(loc);
+        },
+        [navigateToReader],
     );
 
     const renderPage = useCallback((): React.ReactNode => {
         if (page === "home") {
             return (
-                 <Home
-                      styles={styles}
-                      onLearnMore={goLearn}
-                      onStartReading={startReading}
-                      onNavigate={navigateTo}
-                      onOpenAccount={goAccount}
-                 />
+                <Home
+                    styles={styles}
+                    onLearnMore={goLearn}
+                    onStartReading={startReading}
+                    onNavigate={navigateTo}
+                    onOpenAccount={goAccount}
+                />
             );
         }
 
         if (page === "learn") {
             return (
-                 <LearnMorePage
-                      mode={mode}
-                      onToggleTheme={toggle}
-                      onBack={goHome}
-                      styles={styles}
-                 />
+                <LearnMorePage
+                    mode={mode}
+                    onToggleTheme={toggle}
+                    onBack={goHome}
+                    styles={styles}
+                />
             );
         }
 
@@ -485,28 +602,29 @@ function AppInner() {
         }
 
         return (
-             <Reader
-                  styles={styles}
-                  initialLocation={readerLoc ?? undefined}
-                  onBackHome={goHome}
-                  mode={mode}
-                  onToggleTheme={toggle}
-             />
+            <Reader
+                key={readerRouteKey}
+                styles={styles}
+                initialLocation={readerLoc}
+                onBackHome={goHome}
+                mode={mode}
+                onToggleTheme={toggle}
+            />
         );
-    }, [goAccount, goHome, goLearn, mode, navigateTo, page, readerLoc, startReading, styles, toggle]);
+    }, [goAccount, goHome, goLearn, mode, navigateTo, page, readerLoc, readerRouteKey, startReading, styles, toggle]);
 
     const showCornerTheme = page !== "reader";
 
     return (
-         <ThemeShell style={styles.page}>
-             {showCornerTheme ? (
-                  <div style={styles.cornerControls} aria-label="Theme">
-                      <ThemeTogglePill mode={mode} onToggle={toggle} />
-                  </div>
-             ) : null}
+        <ThemeShell style={styles.page}>
+            {showCornerTheme ? (
+                <div style={styles.cornerControls} aria-label="Theme">
+                    <ThemeTogglePill mode={mode} onToggle={toggle} />
+                </div>
+            ) : null}
 
-             <div style={styles.stage}>{renderPage()}</div>
-         </ThemeShell>
+            <div style={styles.stage}>{renderPage()}</div>
+        </ThemeShell>
     );
 }
 
@@ -523,103 +641,105 @@ function Home(props: HomeProps) {
     const { user, signedIn, signInWithGoogle } = useAuth();
 
     const onSignIn = useCallback(() => {
-        signInWithGoogle({
-            returnTo: isBrowser() ? window.location.href : undefined,
+        const returnTo = isBrowser() ? window.location.href : undefined;
+
+        Promise.resolve(signInWithGoogle({ returnTo })).catch(() => {
+            // auth layer can surface its own error UI
         });
     }, [signInWithGoogle]);
 
     const signedInLabel = user?.displayName?.trim() || user?.email?.trim() || "User";
 
     return (
-         <main style={styles.centerStage} aria-label="Landing">
-             <div style={styles.centerBlock}>
-                 <div style={styles.crossWrap} aria-hidden="true">
-                     <img
-                          src="/cross.png"
-                          alt=""
-                          style={styles.crossImg}
-                          draggable={false}
-                          decoding="async"
-                          loading="eager"
-                     />
-                 </div>
+        <main style={styles.centerStage} aria-label="Landing">
+            <div style={styles.centerBlock}>
+                <div style={styles.crossWrap} aria-hidden="true">
+                    <img
+                        src="/cross.png"
+                        alt=""
+                        style={styles.crossImg}
+                        draggable={false}
+                        decoding="async"
+                        loading="eager"
+                    />
+                </div>
 
-                 <h1 style={styles.h1}>Biblia.to</h1>
+                <h1 style={styles.h1}>Biblia.to</h1>
 
-                 <p style={styles.lede}>
-                     A public, open-access KJV Scripture platform centered on{" "}
-                     <strong>Jesus Christ</strong>, crucified and risen.
-                 </p>
+                <p style={styles.lede}>
+                    A public, open-access KJV Scripture platform centered on{" "}
+                    <strong>Jesus Christ</strong>, crucified and risen.
+                </p>
 
-                 {signedIn ? (
-                      <div style={styles.signedInPill}>
-                          Signed in as {signedInLabel}
-                      </div>
-                 ) : null}
+                {signedIn ? (
+                    <div style={styles.signedInPill} title={signedInLabel}>
+                        Signed in as {signedInLabel}
+                    </div>
+                ) : null}
 
-                 <div style={styles.searchContainer}>
-                     <Search
-                          styles={styles}
-                          onNavigate={onNavigate}
-                          onStartReading={onStartReading}
-                          hint="Type a word or a reference (John 3:16)"
-                     />
-                 </div>
+                <div style={styles.searchContainer}>
+                    <Search
+                        styles={styles}
+                        onNavigate={onNavigate}
+                        onStartReading={onStartReading}
+                        hint="Type a word or a reference (John 3:16)"
+                    />
+                </div>
 
-                 <div style={styles.ctaRow}>
-                     <button
-                          type="button"
-                          onClick={onStartReading}
-                          style={styles.primaryBtnButton}
-                          aria-label="Start reading"
-                     >
-                         Start reading
-                     </button>
+                <div style={styles.ctaRow}>
+                    <button
+                        type="button"
+                        onClick={onStartReading}
+                        style={styles.primaryBtnButton}
+                        aria-label="Start reading"
+                    >
+                        Start reading
+                    </button>
 
-                     {signedIn ? (
-                          <button
-                               type="button"
-                               onClick={onOpenAccount}
-                               style={styles.secondaryBtnButton}
-                               aria-label="Open account"
-                          >
-                              Account
-                          </button>
-                     ) : (
-                          <button
-                               type="button"
-                               onClick={onSignIn}
-                               style={styles.secondaryBtnButton}
-                               aria-label="Continue with Google"
-                          >
-                              Continue with Google
-                          </button>
-                     )}
-                 </div>
+                    {signedIn ? (
+                        <button
+                            type="button"
+                            onClick={onOpenAccount}
+                            style={styles.secondaryBtnButton}
+                            aria-label="Open account"
+                        >
+                            Account
+                        </button>
+                    ) : (
+                        <button
+                            type="button"
+                            onClick={onSignIn}
+                            style={styles.secondaryBtnButton}
+                            aria-label="Continue with Google"
+                        >
+                            Continue with Google
+                        </button>
+                    )}
+                </div>
 
-                 <div style={{ marginTop: 10 }}>
-                     <button
-                          type="button"
-                          onClick={onLearnMore}
-                          style={styles.subtleBtnButton}
-                          aria-label="Learn more"
-                     >
-                         Learn more
-                     </button>
-                 </div>
-             </div>
-         </main>
+                <div style={styles.learnMoreWrap}>
+                    <button
+                        type="button"
+                        onClick={onLearnMore}
+                        style={styles.subtleBtnButton}
+                        aria-label="Learn more"
+                    >
+                        Learn more
+                    </button>
+                </div>
+            </div>
+        </main>
     );
 }
 
 export default function App() {
     return (
-         <ThemeProvider>
-             <AuthProvider>
-                 <ReaderPrefsProvider>
-                     <AppInner />
-                 </ReaderPrefsProvider>
-             </AuthProvider>
-         </ThemeProvider>
+        <ThemeProvider>
+            <AuthProvider>
+                <ReaderPrefsProvider>
+                    <AppInner />
+                </ReaderPrefsProvider>
+            </AuthProvider>
+        </ThemeProvider>
     );
 }

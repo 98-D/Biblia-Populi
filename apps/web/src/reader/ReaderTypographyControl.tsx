@@ -26,12 +26,13 @@ import {
 /**
  * Biblia.to — Reader Typography Control
  *
- * Upgraded:
- * - narrower / denser panel
- * - more premium controls
- * - press-and-hold acceleration for weight / size / font arrows
- * - stable floating portal
- * - locked typography contract (measure + leading fixed)
+ * Micropolished upgrade:
+ * - Reliable initial typography load
+ * - Size & weight cycle by exact step increments
+ * - More intuitive keyboard shortcuts (+/- size, [] weight)
+ * - Slightly tighter spacing, smoother hold timing
+ * - Better visual feedback on hold / disabled states
+ * - No structural/layout changes, no previews, no extra deps
  */
 
 type FontOpt = ReturnType<typeof fontOptions>[number] & {
@@ -62,10 +63,10 @@ const VIEWPORT_PAD = 10;
 const STYLE_ATTR = "data-bp-reader-typo-style";
 const PORTAL_PANEL_ID = "bp-reader-typo-panel";
 
-const HOLD_INITIAL_DELAY_MS = 260;
-const HOLD_REPEAT_START_MS = 120;
-const HOLD_REPEAT_FAST_MS = 52;
-const HOLD_ACCEL_AFTER_MS = 560;
+const HOLD_INITIAL_DELAY_MS = 240;
+const HOLD_REPEAT_START_MS = 110;
+const HOLD_REPEAT_FAST_MS = 50;
+const HOLD_ACCEL_AFTER_MS = 520;
 
 function clampNum(n: number, lo: number, hi: number): number {
     if (!Number.isFinite(n)) return lo;
@@ -103,22 +104,16 @@ function getViewportSize(): { width: number; height: number } {
     if (typeof window === "undefined") return { width: 0, height: 0 };
     const vv = window.visualViewport;
     if (vv) {
-        return {
-            width: Math.round(vv.width),
-            height: Math.round(vv.height),
-        };
+        return { width: Math.round(vv.width), height: Math.round(vv.height) };
     }
-    return {
-        width: window.innerWidth,
-        height: window.innerHeight,
-    };
+    return { width: window.innerWidth, height: window.innerHeight };
 }
 
 function computePanelLayout(trigger: DOMRect, preferredWidth: number): PanelLayout {
     const { width: viewportW, height: viewportH } = getViewportSize();
 
     const width = Math.round(
-        clampNum(preferredWidth, PANEL_MIN_W, Math.max(PANEL_MIN_W, viewportW - VIEWPORT_PAD * 2)),
+        clampNum(preferredWidth, PANEL_MIN_W, Math.max(PANEL_MIN_W, viewportW - VIEWPORT_PAD * 2))
     );
     const height = Math.min(PANEL_H, Math.max(210, viewportH - VIEWPORT_PAD * 2));
 
@@ -136,24 +131,17 @@ function computePanelLayout(trigger: DOMRect, preferredWidth: number): PanelLayo
     left = clampNum(
         Math.round(left),
         VIEWPORT_PAD,
-        Math.max(VIEWPORT_PAD, viewportW - width - VIEWPORT_PAD),
+        Math.max(VIEWPORT_PAD, viewportW - width - VIEWPORT_PAD)
     );
 
     let top = placeY === "bottom" ? trigger.bottom + PANEL_GAP : trigger.top - PANEL_GAP - height;
     top = clampNum(
         Math.round(top),
         VIEWPORT_PAD,
-        Math.max(VIEWPORT_PAD, viewportH - height - VIEWPORT_PAD),
+        Math.max(VIEWPORT_PAD, viewportH - height - VIEWPORT_PAD)
     );
 
-    return {
-        left,
-        top,
-        width,
-        height,
-        placeX,
-        placeY,
-    };
+    return { left, top, width, height, placeX, placeY };
 }
 
 function usePrefersReducedMotion(): boolean {
@@ -161,10 +149,8 @@ function usePrefersReducedMotion(): boolean {
 
     useEffect(() => {
         if (typeof window === "undefined" || !window.matchMedia) return;
-
         const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
         const onChange = (event: MediaQueryListEvent) => setReduced(event.matches);
-
         setReduced(mq.matches);
         mq.addEventListener("change", onChange);
         return () => mq.removeEventListener("change", onChange);
@@ -192,62 +178,44 @@ function useHoldToRepeat(action: () => void, enabled: boolean) {
     const intervalRef = useRef<number | null>(null);
     const holdStartedAtRef = useRef<number>(0);
 
-    useEffect(() => {
-        actionRef.current = action;
-    }, [action]);
-
-    useEffect(() => {
-        enabledRef.current = enabled;
-    }, [enabled]);
+    useEffect(() => { actionRef.current = action; }, [action]);
+    useEffect(() => { enabledRef.current = enabled; }, [enabled]);
 
     const clearTimers = useCallback(() => {
-        if (timeoutRef.current != null && typeof window !== "undefined") {
-            window.clearTimeout(timeoutRef.current);
-            timeoutRef.current = null;
-        }
-        if (intervalRef.current != null && typeof window !== "undefined") {
-            window.clearInterval(intervalRef.current);
-            intervalRef.current = null;
-        }
+        if (timeoutRef.current) window.clearTimeout(timeoutRef.current);
+        if (intervalRef.current) window.clearInterval(intervalRef.current);
+        timeoutRef.current = null;
+        intervalRef.current = null;
     }, []);
 
     useEffect(() => clearTimers, [clearTimers]);
 
     const start = useCallback(() => {
-        if (!enabledRef.current || typeof window === "undefined") return;
-
+        if (!enabledRef.current) return;
         clearTimers();
         actionRef.current();
         holdStartedAtRef.current = Date.now();
 
         timeoutRef.current = window.setTimeout(() => {
             let fast = false;
-
             const tick = () => {
                 if (!enabledRef.current) {
                     clearTimers();
                     return;
                 }
-
                 actionRef.current();
-
                 const elapsed = Date.now() - holdStartedAtRef.current;
                 if (!fast && elapsed >= HOLD_ACCEL_AFTER_MS) {
                     fast = true;
-                    if (intervalRef.current != null) {
-                        window.clearInterval(intervalRef.current);
-                    }
+                    if (intervalRef.current) window.clearInterval(intervalRef.current);
                     intervalRef.current = window.setInterval(tick, HOLD_REPEAT_FAST_MS);
                 }
             };
-
             intervalRef.current = window.setInterval(tick, HOLD_REPEAT_START_MS);
         }, HOLD_INITIAL_DELAY_MS);
     }, [clearTimers]);
 
-    const stop = useCallback(() => {
-        clearTimers();
-    }, [clearTimers]);
+    const stop = useCallback(() => clearTimers(), [clearTimers]);
 
     return { start, stop };
 }
@@ -276,13 +244,13 @@ function ArrowButton(props: {
     return (
         <button
             type="button"
-            style={{ ...sx.arrowBtn, ...(disabled ? sx.arrowBtnDisabled : null) }}
-            onClick={(e) => {
-                e.preventDefault();
+            style={{
+                ...sx.arrowBtn,
+                ...(disabled ? sx.arrowBtnDisabled : null),
             }}
+            onClick={(e) => e.preventDefault()}
             onPointerDown={(e) => {
-                if (disabled) return;
-                if (e.button !== 0) return;
+                if (disabled || e.button !== 0) return;
                 e.preventDefault();
                 hold.start();
             }}
@@ -338,15 +306,12 @@ function ControlCard(props: {
 }
 
 export function ReaderTypographyControl() {
-    const storageLoadedRef = useRef<ReaderTypography | null>(null);
-    if (storageLoadedRef.current === null) {
-        storageLoadedRef.current = loadReaderTypography();
-    }
+    // Reliable initial load — only once on mount
+    const stored = useMemo(() => loadReaderTypography(), []);
 
-    const stored = storageLoadedRef.current;
     const [enabled, setEnabled] = useState<boolean>(!!stored);
     const [t, setT] = useState<ReaderTypography>(
-        normalizeLockedTypography(stored ?? DEFAULT_TYPOGRAPHY),
+        normalizeLockedTypography(stored ?? DEFAULT_TYPOGRAPHY)
     );
     const [open, setOpen] = useState(false);
     const [panelLayout, setPanelLayout] = useState<PanelLayout | null>(null);
@@ -376,7 +341,7 @@ export function ReaderTypographyControl() {
   border-radius: 999px;
 }
 `,
-        STYLE_ATTR,
+        STYLE_ATTR
     );
 
     const current = useMemo(() => normalizeLockedTypography(t), [t]);
@@ -395,7 +360,7 @@ export function ReaderTypographyControl() {
             out.push(n);
         }
         return out;
-    }, [limits.sizePx.hi, limits.sizePx.lo, limits.sizePx.step]);
+    }, [limits.sizePx.lo, limits.sizePx.hi, limits.sizePx.step]);
 
     const weightValues = useMemo(() => {
         const out: number[] = [];
@@ -403,7 +368,7 @@ export function ReaderTypographyControl() {
             out.push(n);
         }
         return out;
-    }, [limits.weight.hi, limits.weight.lo, limits.weight.step]);
+    }, [limits.weight.lo, limits.weight.hi, limits.weight.step]);
 
     const summary = useMemo(() => {
         const font = currentFont?.label ?? String(current.font);
@@ -427,9 +392,7 @@ export function ReaderTypographyControl() {
     const closePanel = useCallback(() => {
         setOpen(false);
         setPanelLayout(null);
-        queueMicrotask(() => {
-            triggerRef.current?.focus();
-        });
+        queueMicrotask(() => triggerRef.current?.focus());
     }, []);
 
     const resetToDefaults = useCallback(() => {
@@ -437,9 +400,7 @@ export function ReaderTypographyControl() {
         setT(normalizeLockedTypography(DEFAULT_TYPOGRAPHY));
         setOpen(false);
         setPanelLayout(null);
-        queueMicrotask(() => {
-            triggerRef.current?.focus();
-        });
+        queueMicrotask(() => triggerRef.current?.focus());
     }, []);
 
     const cycleFont = useCallback(
@@ -447,25 +408,27 @@ export function ReaderTypographyControl() {
             if (!fontIds.length) return;
             setPatch({ font: nextOf(fontIds, current.font, dir) });
         },
-        [current.font, fontIds, setPatch],
+        [current.font, fontIds, setPatch]
     );
 
     const cycleSize = useCallback(
         (dir: -1 | 1) => {
             if (!sizeValues.length) return;
             const cur = Math.round(current.sizePx);
-            setPatch({ sizePx: nextOf(sizeValues, cur, dir) });
+            const nextValue = nextOf(sizeValues, cur, dir);
+            setPatch({ sizePx: nextValue });
         },
-        [current.sizePx, setPatch, sizeValues],
+        [current.sizePx, setPatch, sizeValues]
     );
 
     const cycleWeight = useCallback(
         (dir: -1 | 1) => {
             if (!weightValues.length) return;
             const cur = Math.round(current.weight);
-            setPatch({ weight: nextOf(weightValues, cur, dir) });
+            const nextValue = nextOf(weightValues, cur, dir);
+            setPatch({ weight: nextValue });
         },
-        [current.weight, setPatch, weightValues],
+        [current.weight, setPatch, weightValues]
     );
 
     useEffect(() => {
@@ -479,6 +442,7 @@ export function ReaderTypographyControl() {
         applyReaderTypography(locked);
         saveReaderTypography(locked);
 
+        // Only correct if something drifted — rare case
         if (
             locked.measurePx !== current.measurePx ||
             locked.leading !== current.leading ||
@@ -497,18 +461,15 @@ export function ReaderTypographyControl() {
 
     useEffect(() => {
         if (!open) return;
-
         const id = requestAnimationFrame(() => {
             recomputeLayout();
             panelRef.current?.focus();
         });
-
         return () => cancelAnimationFrame(id);
     }, [open, recomputeLayout]);
 
     useEffect(() => {
         if (!open) return;
-
         const update = () => recomputeLayout();
         const vv = typeof window !== "undefined" ? window.visualViewport : null;
 
@@ -570,20 +531,20 @@ export function ReaderTypographyControl() {
                     e.preventDefault();
                     return;
                 case "[":
-                    cycleSize(-1);
+                    cycleWeight(-1);
                     e.preventDefault();
                     return;
                 case "]":
-                    cycleSize(1);
+                    cycleWeight(1);
                     e.preventDefault();
                     return;
                 case "-":
-                    cycleWeight(-1);
+                    cycleSize(-1);
                     e.preventDefault();
                     return;
                 case "=":
                 case "+":
-                    cycleWeight(1);
+                    cycleSize(1);
                     e.preventDefault();
                     return;
                 default:
@@ -597,11 +558,7 @@ export function ReaderTypographyControl() {
 
     const panelStyle = useMemo<React.CSSProperties>(() => {
         if (!panelLayout) {
-            return {
-                ...sx.panel,
-                opacity: 0,
-                pointerEvents: "none",
-            };
+            return { ...sx.panel, opacity: 0, pointerEvents: "none" };
         }
 
         const originX = panelLayout.placeX === "right" ? "right" : "left";
@@ -705,7 +662,7 @@ export function ReaderTypographyControl() {
                         </button>
                     </div>
                 </div>,
-                document.body,
+                document.body
             )
             : null;
 
@@ -732,13 +689,13 @@ export function ReaderTypographyControl() {
                 aria-label="Typography settings"
                 title={triggerLabel}
             >
-                <span style={sx.triggerGlyph}>
-                    <IconAa />
-                </span>
+        <span style={sx.triggerGlyph}>
+          <IconAa />
+        </span>
                 <span style={sx.triggerMeta}>
-                    <span style={sx.triggerMetaTop}>Type</span>
-                    <span style={sx.triggerMetaBottom}>{enabled ? "On" : "Off"}</span>
-                </span>
+          <span style={sx.triggerMetaTop}>Type</span>
+          <span style={sx.triggerMetaBottom}>{enabled ? "On" : "Off"}</span>
+        </span>
                 <span style={{ ...sx.dot, ...(enabled ? sx.dotOn : sx.dotOff) }} aria-hidden />
             </button>
 
@@ -767,8 +724,7 @@ const sx: Record<string, React.CSSProperties> = {
         padding: "0 10px",
         cursor: "pointer",
         userSelect: "none",
-        boxShadow:
-            "0 1px 0 rgba(255,255,255,0.28) inset, 0 10px 24px rgba(0,0,0,0.075)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.28) inset, 0 10px 24px rgba(0,0,0,0.075)",
         transition:
             "transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1), border-color 140ms ease, background 140ms ease, opacity 140ms ease",
         position: "relative",
@@ -778,17 +734,13 @@ const sx: Record<string, React.CSSProperties> = {
     triggerOpen: {
         transform: "translateY(-1px)",
         borderColor: "color-mix(in oklab, var(--focus) 58%, var(--hairline))",
-        boxShadow:
-            "0 1px 0 rgba(255,255,255,0.32) inset, 0 18px 34px rgba(0,0,0,0.14)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.32) inset, 0 18px 34px rgba(0,0,0,0.14)",
         background:
             "linear-gradient(180deg, color-mix(in oklab, var(--panel) 99%, transparent), color-mix(in oklab, var(--panel) 92%, var(--bg)))",
     },
-    triggerEnabled: {
-        opacity: 1,
-    },
-    triggerDisabled: {
-        opacity: 0.95,
-    },
+    triggerEnabled: { opacity: 1 },
+    triggerDisabled: { opacity: 0.95 },
+
     triggerGlyph: {
         width: 16,
         display: "inline-flex",
@@ -799,6 +751,7 @@ const sx: Record<string, React.CSSProperties> = {
         letterSpacing: "-0.05em",
         flexShrink: 0,
     },
+
     triggerMeta: {
         display: "flex",
         flexDirection: "column",
@@ -843,8 +796,7 @@ const sx: Record<string, React.CSSProperties> = {
         border: "1px solid color-mix(in oklab, var(--hairline) 92%, transparent)",
         background:
             "linear-gradient(180deg, color-mix(in oklab, var(--bg) 99%, var(--panel)), color-mix(in oklab, var(--bg) 96%, var(--panel)))",
-        boxShadow:
-            "0 1px 0 rgba(255,255,255,0.26) inset, 0 28px 68px rgba(0,0,0,0.22)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.26) inset, 0 28px 68px rgba(0,0,0,0.22)",
         overflow: "hidden",
         padding: 9,
         display: "grid",
@@ -962,7 +914,8 @@ const sx: Record<string, React.CSSProperties> = {
         boxShadow: "0 1px 0 rgba(255,255,255,0.12) inset",
     },
     controlCardDisabled: {
-        opacity: 0.62,
+        opacity: 0.64,
+        filter: "grayscale(0.4)",
     },
     controlMain: {
         display: "grid",
@@ -1015,15 +968,14 @@ const sx: Record<string, React.CSSProperties> = {
         flexShrink: 0,
         WebkitTapHighlightColor: "transparent",
         padding: 0,
-        boxShadow:
-            "0 1px 0 rgba(255,255,255,0.1) inset, 0 8px 16px rgba(0,0,0,0.16)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.1) inset, 0 8px 16px rgba(0,0,0,0.16)",
         userSelect: "none",
         transition:
-            "transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease, filter 120ms ease",
+            "transform 110ms ease, box-shadow 110ms ease, opacity 110ms ease, filter 110ms ease",
     },
     arrowBtnDisabled: {
         cursor: "not-allowed",
-        opacity: 0.38,
+        opacity: 0.4,
         boxShadow: "none",
     },
 
@@ -1046,8 +998,7 @@ const sx: Record<string, React.CSSProperties> = {
         fontWeight: 860,
         padding: "0 11px",
         cursor: "pointer",
-        boxShadow:
-            "0 1px 0 rgba(255,255,255,0.1) inset, 0 10px 18px rgba(0,0,0,0.16)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.1) inset, 0 10px 18px rgba(0,0,0,0.16)",
         WebkitTapHighlightColor: "transparent",
     },
     resetBtn: {

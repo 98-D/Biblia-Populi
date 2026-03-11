@@ -9,15 +9,15 @@ import { sx } from "./sx";
 import { ReaderTypographyControl } from "./ReaderTypographyControl";
 import { Home } from "lucide-react";
 
-type CurrentPos = {
+type CurrentPos = Readonly<{
     label: string;
     ord: number;
     bookId: string | null;
     chapter: number | null;
     verse: number | null;
-};
+}>;
 
-type Props = {
+type Props = Readonly<{
     styles: Record<string, React.CSSProperties>;
     books: BookRow[] | null;
 
@@ -26,23 +26,28 @@ type Props = {
     current: CurrentPos;
     onJumpRef: (bookId: string, chapter: number, verse: number | null) => void;
 
-    // retained for API compatibility, not used by header anymore
+    // retained for API compatibility
     onNavigate: (loc: { bookId: string; chapter: number; verse?: number }) => void;
 
-    // legacy: keep props but header uses global theme now
+    // retained for API compatibility
     mode?: "light" | "dark";
     onToggleTheme?: () => void;
-};
+}>;
 
-type DockProps = {
+type DockProps = Readonly<{
     children: ReactNode;
     title?: string;
     ariaLabel?: string;
     pad?: number;
     minHeight?: number;
-};
+}>;
 
+// @ts-ignore
 const TOKENS = Object.freeze({
+    topGap: 8,
+    groupGap: 8,
+    subtleGap: 6,
+
     dockRadius: 999,
     dockMinHeight: 38,
     dockPad: 3,
@@ -59,15 +64,16 @@ const TOKENS = Object.freeze({
     iconBtnTransition:
         "transform 120ms ease, background 140ms ease, border-color 140ms ease, opacity 140ms ease, box-shadow 140ms ease",
 
-    groupGap: 8,
-    subtleGap: 6,
     dividerColor: "color-mix(in srgb, var(--border) 68%, transparent)",
     dividerHeight: 20,
     dividerWidth: 1,
-});
+
+    centerMaxWidth: 520,
+    centerMinWidth: 0,
+}) as const;
 
 function releasePointerCaptureSafe(target: EventTarget | null, pointerId: number): void {
-    if (!(target instanceof Element)) return;
+    if (typeof Element === "undefined" || !(target instanceof Element)) return;
 
     const el = target as Element & {
         releasePointerCapture?: (id: number) => void;
@@ -91,19 +97,63 @@ function releasePointerCaptureSafe(target: EventTarget | null, pointerId: number
 }
 
 const ui = {
-    shell: Object.freeze<CSSProperties>({
+    headerRoot: Object.freeze<CSSProperties>({
+        ...sx.topBar,
+        display: "grid",
+        gridTemplateColumns: "auto minmax(0, 1fr) auto",
+        alignItems: "center",
+        columnGap: TOKENS.topGap,
+        rowGap: TOKENS.topGap,
+        minWidth: 0,
+    }),
+
+    leftSlot: Object.freeze<CSSProperties>({
+        ...sx.topLeft,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "flex-start",
+        minWidth: 0,
+    }),
+
+    centerSlot: Object.freeze<CSSProperties>({
+        ...sx.topCenter,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        minWidth: TOKENS.centerMinWidth,
+        width: "100%",
+    }),
+
+    rightSlot: Object.freeze<CSSProperties>({
+        ...sx.topRight,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "flex-end",
+        minWidth: 0,
+    }),
+
+    headerGroup: Object.freeze<CSSProperties>({
         display: "flex",
         alignItems: "center",
         gap: TOKENS.groupGap,
         minWidth: 0,
+        flexWrap: "nowrap",
     }),
 
-    centerWrap: Object.freeze<CSSProperties>({
+    centerOuter: Object.freeze<CSSProperties>({
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        minWidth: 0,
         width: "100%",
+        minWidth: 0,
+    }),
+
+    centerInner: Object.freeze<CSSProperties>({
+        width: "min(100%, 520px)",
+        minWidth: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
     }),
 
     rightCluster: Object.freeze<CSSProperties>({
@@ -169,11 +219,8 @@ const HeaderGroup = memo(function HeaderGroup(props: {
 
     const style = useMemo<CSSProperties>(
         () => ({
-            display: "flex",
-            alignItems: "center",
+            ...ui.headerGroup,
             gap,
-            minWidth: 0,
-            flexWrap: "nowrap",
         }),
         [gap],
     );
@@ -189,13 +236,13 @@ const Divider = memo(function Divider() {
     return <div aria-hidden style={ui.divider} />;
 });
 
-type IconDockButtonProps = {
+type IconDockButtonProps = Readonly<{
     ariaLabel: string;
     title: string;
     onClick: () => void;
     icon: ReactNode;
     pressed?: boolean;
-};
+}>;
 
 const IconDockButton = memo(function IconDockButton(props: IconDockButtonProps) {
     const { ariaLabel, title, onClick, icon, pressed = false } = props;
@@ -284,14 +331,12 @@ const IconDockButton = memo(function IconDockButton(props: IconDockButtonProps) 
 });
 
 const HomeDock = memo(function HomeDock(props: { onBackHome: () => void }) {
-    const { onBackHome } = props;
-
     return (
         <Dock title="Home" ariaLabel="Home">
             <IconDockButton
                 ariaLabel="Home"
                 title="Home"
-                onClick={onBackHome}
+                onClick={props.onBackHome}
                 icon={<Home size={17} aria-hidden />}
             />
         </Dock>
@@ -300,8 +345,14 @@ const HomeDock = memo(function HomeDock(props: { onBackHome: () => void }) {
 
 const AccountDock = memo(function AccountDock() {
     return (
-        <Dock title="Account" ariaLabel="Account">
-            <AccountMenu size="sm" />
+        <Dock title="Account" ariaLabel="Account" pad={2}>
+            <AccountMenu
+                size="sm"
+                align="left"
+                chrome="docked"
+                showChevron
+                showLabelWhenSignedIn={false}
+            />
         </Dock>
     );
 });
@@ -331,13 +382,15 @@ const PositionDock = memo(function PositionDock(props: {
     const { styles, books, current, onJump } = props;
 
     return (
-        <div style={ui.centerWrap}>
-            <PositionPill
-                styles={styles}
-                books={books}
-                current={current}
-                onJump={onJump}
-            />
+        <div style={ui.centerOuter}>
+            <div style={ui.centerInner}>
+                <PositionPill
+                    styles={styles}
+                    books={books}
+                    current={current}
+                    onJump={onJump}
+                />
+            </div>
         </div>
     );
 });
@@ -353,15 +406,15 @@ export const ReaderHeader = memo(function ReaderHeader(props: Props) {
     );
 
     return (
-        <div style={sx.topBar}>
-            <div style={sx.topLeft}>
+        <header style={ui.headerRoot} aria-label="Reader header">
+            <div style={ui.leftSlot}>
                 <HeaderGroup ariaLabel="Navigation and account">
                     <HomeDock onBackHome={onBackHome} />
                     <AccountDock />
                 </HeaderGroup>
             </div>
 
-            <div style={sx.topCenter}>
+            <div style={ui.centerSlot}>
                 <PositionDock
                     styles={styles}
                     books={books}
@@ -370,7 +423,7 @@ export const ReaderHeader = memo(function ReaderHeader(props: Props) {
                 />
             </div>
 
-            <div style={sx.topRight}>
+            <div style={ui.rightSlot}>
                 <div style={ui.rightCluster}>
                     <HeaderGroup ariaLabel="Reader controls">
                         <TypographyDock />
@@ -382,6 +435,6 @@ export const ReaderHeader = memo(function ReaderHeader(props: Props) {
                     </HeaderGroup>
                 </div>
             </div>
-        </div>
+        </header>
     );
 });

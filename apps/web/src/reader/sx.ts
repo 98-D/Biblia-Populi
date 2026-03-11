@@ -4,39 +4,37 @@ import type { CSSProperties } from "react";
 /**
  * Reader UI tokens (inline styles)
  *
- * Hardened / improved:
- * - stable virtualized reader viewport
- * - safe-area aware shell/header/body
- * - explicit z/layer tokens
- * - true shrinkable center header column
- * - calmer premium row states
- * - no invalid / non-portable inline style tokens
- * - explicit row wrapper surface for verse containers
- * - safer cross-browser fallbacks for inline React CSSProperties
- * - stricter reusable constants to reduce drift
- *
- * Notes:
- * - keep layout-critical surfaces simple and deterministic
- * - avoid size containment on virtualized row wrappers
- * - inline styles only: no pseudo selectors, no unsupported token tricks
- * - values are chosen to cooperate with base.css tokens
+ * Upgraded:
+ * - calmer, stricter shared layout tokens
+ * - safer header geometry for narrow widths
+ * - more deterministic viewport / scroll surfaces
+ * - better center-column shrink behavior
+ * - slightly more premium verse row states
+ * - cross-browser inline-style friendly values only
  */
 
 type SxMap = Readonly<Record<string, CSSProperties>>;
 
 const RADIUS_PX = 14;
-const HEADER_Z = 60;
+
+const Z = Object.freeze({
+    header: 60,
+});
 
 const mix = (value: string) => `color-mix(in oklab, ${value})`;
 
 const HAIRLINE = mix("var(--hairline) 92%, transparent");
 const HAIRLINE_STRONG = mix("var(--hairline) 98%, transparent");
+
 const PANEL_WASH = mix("var(--panel) 22%, transparent");
 const PANEL_WASH_FOCUS = mix("var(--panel) 26%, transparent");
 const PANEL_WASH_SELECTED = mix("var(--panel) 30%, transparent");
+
 const FOCUS_RING_WASH = mix("var(--focusRing) 90%, transparent");
+
 const PANEL_BG_SOFT = mix("var(--panel) 90%, transparent");
 const PANEL_BG_SOFT_HOVER = mix("var(--panel) 94%, transparent");
+
 const HEADER_BG = mix("var(--bg) 88%, transparent");
 const SKELETON_BG = mix("var(--hairline) 92%, transparent");
 const SCROLLBAR_THUMB = mix("var(--hairline) 86%, transparent");
@@ -48,25 +46,31 @@ const SAFE_RIGHT = "env(safe-area-inset-right, 0px)";
 
 const HEADER_HORIZONTAL_PAD = 12;
 const BODY_HORIZONTAL_PAD = 16;
+
 const HEADER_TOP_PAD = 10;
 const HEADER_BOTTOM_PAD = 10;
+
 const SCROLL_TOP_PAD = 18;
 const SCROLL_BOTTOM_PAD = 96;
 
 const HEADER_MIN_HEIGHT = 60;
 const HEADER_BLUR = 12;
 const HEADER_SHADOW = "0 10px 22px rgba(0, 0, 0, 0.032)";
+
 const BUTTON_SHADOW = "0 8px 18px rgba(0,0,0,0.055)";
 const BUTTON_SHADOW_HOVER = "0 10px 20px rgba(0,0,0,0.07)";
 const BUTTON_SHADOW_ACTIVE = "0 6px 14px rgba(0,0,0,0.06)";
+
+const HEADER_GAP = 12;
+const HEADER_SIDE_MIN_HEIGHT = 40;
 
 const VERSE_NUM_COL = 34;
 const VERSE_ROW_GAP = 12;
 const VERSE_ROW_PAD_Y = 9;
 const VERSE_ROW_PAD_X = 6;
 
-const BOOK_TITLE_SIZE = 24;
-const CHAPTER_TITLE_SIZE = 16;
+const BOOK_TITLE_SIZE = "clamp(22px, 1.2vw + 18px, 28px)";
+const CHAPTER_TITLE_SIZE = "clamp(15px, 0.5vw + 14px, 18px)";
 
 const ROW_SCROLL_MARGIN_TOP = `calc(${HEADER_MIN_HEIGHT}px + ${SCROLL_TOP_PAD}px + ${SAFE_TOP})`;
 
@@ -74,9 +78,9 @@ const BUTTON_TRANSITION =
     "transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease";
 
 const ROW_TRANSITION =
-    "background 140ms ease, transform 140ms ease, box-shadow 140ms ease";
+    "background 140ms ease, transform 140ms ease, box-shadow 140ms ease, opacity 140ms ease";
 
-export const sx = {
+const sxMap = {
     /* ---------- Shell ---------- */
     page: {
         height: "100dvh",
@@ -88,18 +92,23 @@ export const sx = {
         isolation: "isolate",
         overflow: "hidden",
         minWidth: 0,
+        width: "100%",
+        boxSizing: "border-box",
     },
 
     /* ---------- Header ---------- */
     topBar: {
         position: "sticky",
         top: 0,
-        zIndex: HEADER_Z,
+        zIndex: Z.header,
         display: "grid",
-        gridTemplateColumns: "auto minmax(0, 1fr) auto",
+        gridTemplateColumns: "max-content minmax(0, 1fr) max-content",
         alignItems: "center",
-        columnGap: 12,
+        columnGap: HEADER_GAP,
+        rowGap: 8,
         minHeight: HEADER_MIN_HEIGHT,
+        width: "100%",
+        minWidth: 0,
         paddingTop: `calc(${HEADER_TOP_PAD}px + ${SAFE_TOP})`,
         paddingBottom: HEADER_BOTTOM_PAD,
         paddingLeft: `calc(${HEADER_HORIZONTAL_PAD}px + ${SAFE_LEFT})`,
@@ -119,7 +128,8 @@ export const sx = {
         justifyContent: "flex-start",
         gap: 10,
         minWidth: 0,
-        minHeight: 40,
+        minHeight: HEADER_SIDE_MIN_HEIGHT,
+        flex: "0 1 auto",
     },
 
     topCenter: {
@@ -127,7 +137,9 @@ export const sx = {
         alignItems: "center",
         justifyContent: "center",
         minWidth: 0,
+        width: "100%",
         textAlign: "center",
+        justifySelf: "stretch",
     },
 
     topRight: {
@@ -135,7 +147,8 @@ export const sx = {
         alignItems: "center",
         justifyContent: "flex-end",
         minWidth: 0,
-        minHeight: 40,
+        minHeight: HEADER_SIDE_MIN_HEIGHT,
+        flex: "0 1 auto",
     },
 
     rightCluster: {
@@ -148,7 +161,7 @@ export const sx = {
     },
 
     searchWrap: {
-        width: "clamp(200px, 26vw, 520px)",
+        width: "min(100%, clamp(220px, 28vw, 520px))",
         minWidth: 0,
         maxWidth: "100%",
         flex: "1 1 auto",
@@ -170,6 +183,7 @@ export const sx = {
         alignItems: "center",
         justifyContent: "center",
         fontSize: 12,
+        fontWeight: 600,
         lineHeight: 1,
         whiteSpace: "nowrap",
         userSelect: "none",
@@ -210,6 +224,8 @@ export const sx = {
         minWidth: 0,
         overflow: "hidden",
         contain: "layout paint",
+        background: "var(--bg)",
+        isolation: "isolate",
     },
 
     scroll: {
@@ -220,6 +236,7 @@ export const sx = {
         paddingTop: SCROLL_TOP_PAD,
         paddingBottom: `calc(${SCROLL_BOTTOM_PAD}px + ${SAFE_BOTTOM})`,
         overscrollBehaviorY: "contain",
+        overscrollBehaviorX: "none",
         scrollbarGutter: "stable",
         scrollbarWidth: "thin",
         scrollbarColor: `${SCROLLBAR_THUMB} transparent`,
@@ -227,6 +244,7 @@ export const sx = {
         touchAction: "pan-y",
         transform: "translateZ(0)",
         minWidth: 0,
+        width: "100%",
         boxSizing: "border-box",
     },
 
@@ -243,6 +261,7 @@ export const sx = {
     msg: {
         padding: "18px 0",
         fontSize: 12,
+        lineHeight: 1.45,
         color: "var(--muted)",
         whiteSpace: "pre-wrap",
     },
@@ -268,10 +287,11 @@ export const sx = {
         marginTop: 9,
         fontSize: BOOK_TITLE_SIZE,
         fontWeight: 650,
-        lineHeight: 1.15,
+        lineHeight: 1.12,
         letterSpacing: "-0.03em",
         overflowWrap: "anywhere",
         wordBreak: "break-word",
+        minWidth: 0,
     },
 
     chapterHeader: {
@@ -297,6 +317,7 @@ export const sx = {
         letterSpacing: "-0.02em",
         overflowWrap: "anywhere",
         wordBreak: "break-word",
+        minWidth: 0,
     },
 
     /* ---------- Verse rows ---------- */
@@ -383,3 +404,5 @@ export const sx = {
         minWidth: 0,
     },
 } satisfies SxMap;
+
+export const sx = sxMap;
